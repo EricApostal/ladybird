@@ -330,9 +330,9 @@ endif()
 # AsmInterpreter: generate platform-specific assembly from DSL
 # NB: Win64 uses a different ABI (shadow space, different arg registers)
 #     from SysV AMD64, and the x86_64 backend only supports SysV for now.
-if (NOT WIN32 AND ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64"))
+if (NOT CMAKE_CROSSCOMPILING AND NOT WIN32 AND ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "AMD64"))
     set(ASMINT_ARCH "x86_64")
-elseif ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "aarch64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64")
+elseif (NOT CMAKE_CROSSCOMPILING AND ("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "aarch64" OR "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64"))
     set(ASMINT_ARCH "aarch64")
 endif()
 
@@ -348,6 +348,11 @@ if (DEFINED ASMINT_ARCH)
     # offsetof() to emit struct field offsets as DSL constants.
     add_executable(gen_asm_offsets "${CMAKE_CURRENT_SOURCE_DIR}/Bytecode/AsmInterpreter/gen_asm_offsets.cpp")
     target_link_libraries(gen_asm_offsets PRIVATE AK)
+
+    if (ANDROID)
+        target_link_libraries(gen_asm_offsets PRIVATE log)
+    endif()
+
     target_compile_definitions(gen_asm_offsets PRIVATE private=public protected=public)
     # NB: Strip fuzzer sanitizer flags so gen_asm_offsets can define its own main().
     if (ENABLE_FUZZERS_LIBFUZZER)
