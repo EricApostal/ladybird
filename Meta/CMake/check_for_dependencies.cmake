@@ -16,7 +16,7 @@ find_package(harfbuzz REQUIRED)
 find_package(JPEG REQUIRED)
 find_package(LIBAVIF REQUIRED)
 find_package(PNG REQUIRED)
-find_package(WebP REQUIRED)
+find_package(WebP CONFIG REQUIRED)
 
 pkg_check_modules(WOFF2 REQUIRED IMPORTED_TARGET libwoff2dec)
 

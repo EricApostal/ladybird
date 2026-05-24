@@ -76,6 +76,14 @@
         "icu"
       ]
     },
+    {
+      "name": "harfbuzz",
+      "platform": "android",
+      "features": [
+        "freetype",
+        "icu"
+      ]
+    },
     "icu",
     {
       "name": "libavif",

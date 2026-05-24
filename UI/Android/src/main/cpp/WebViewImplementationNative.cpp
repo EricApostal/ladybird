@@ -6,8 +6,9 @@
 
 #include "WebViewImplementationNative.h"
 #include "JNIHelpers.h"
+#include <LibCore/System.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/DecodedImageFrame.h>
+#include <LibGfx/ImmutableBitmap.h>
 #include <LibGfx/Painter.h>
 #include <LibWeb/Crypto/Crypto.h>
 #include <LibWebView/ViewImplementation.h>
@@ -53,10 +54,6 @@ void WebViewImplementationNative::initialize_client(WebView::ViewImplementation:
     auto new_client = bind_web_content_client();
 
     m_client_state.client = new_client;
-    m_client_state.client->on_web_content_process_crash = [] {
-        warnln("WebContent crashed!");
-        // FIXME: launch a new client
-    };
 
     m_client_state.client_handle = MUST(Web::Crypto::generate_random_uuid());
     client().async_set_window_handle(0, m_client_state.client_handle);
@@ -77,7 +74,7 @@ void WebViewImplementationNative::paint_into_bitmap(void* android_bitmap_raw, An
     auto android_bitmap = MUST(Gfx::Bitmap::create_wrapper(to_gfx_bitmap_format(info.format), Gfx::AlphaType::Premultiplied, { info.width, info.height }, info.stride, android_bitmap_raw));
     auto painter = Gfx::Painter::create(android_bitmap);
     if (auto* bitmap = m_client_state.has_usable_bitmap ? m_client_state.front_bitmap.bitmap.ptr() : m_backup_bitmap.ptr())
-        painter->draw_bitmap(android_bitmap->rect().to_type<float>(), Gfx::DecodedImageFrame { *MUST(bitmap->clone()) }, bitmap->rect(), Gfx::ScalingMode::NearestNeighbor, {}, 1.0f, Gfx::CompositingAndBlendingOperator::Copy);
+        painter->draw_bitmap(android_bitmap->rect().to_type<float>(), Gfx::ImmutableBitmap::create(MUST(bitmap->clone())), bitmap->rect(), Gfx::ScalingMode::NearestNeighbor, {}, 1.0f, Gfx::CompositingAndBlendingOperator::Copy);
     else
         painter->fill_rect(android_bitmap->rect().to_type<float>(), Gfx::Color::Magenta);
 }
