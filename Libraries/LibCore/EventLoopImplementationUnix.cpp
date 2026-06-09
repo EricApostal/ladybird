@@ -442,10 +442,10 @@ try_select_again:
         for (size_t i = 1; i < thread_data.poll_fds.size(); ++i) {
             auto& notifier = *thread_data.notifiers[i];
 
-#ifdef AK_OS_ANDROID
-            // FIXME: Make the check work under Android, perhaps use ALooper.
-            ThreadEventQueue::current().post_event(notifier, Core::Event::Type::NotifierActivation);
-#else
+// #ifdef AK_OS_ANDROID
+//             // FIXME: Make the check work under Android, perhaps use ALooper.
+//             ThreadEventQueue::current().post_event(notifier, Core::Event::Type::NotifierActivation);
+// #else
             auto revents = thread_data.poll_fds[i].revents;
 
             NotificationType type = NotificationType::None;
@@ -462,7 +462,7 @@ try_select_again:
 
             if (type != NotificationType::None)
                 ThreadEventQueue::current().post_event(&notifier, Core::Event::Type::NotifierActivation);
-#endif
+// #endif
         }
     }
 

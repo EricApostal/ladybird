@@ -76,6 +76,14 @@
         "icu"
       ]
     },
+    {
+      "name": "harfbuzz",
+      "platform": "android",
+      "features": [
+        "freetype",
+        "icu"
+      ]
+    },
     "icu",
     {
       "name": "libavif",
@@ -98,10 +106,6 @@
     {
       "name": "libproxy",
       "platform": "!(android | bsd)"
-    },
-    {
-      "name": "libedit",
-      "platform": "!windows & !android"
     },
     "libtommath",
     {

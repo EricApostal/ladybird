@@ -73,7 +73,15 @@ endif()
 
 function(set_helper_process_properties)
     set(targets ${ARGV})
-    if (APPLE OR WIN32)
+    if (ANDROID)
+        # The APK packaging step will only include files that look like shared libraries from the
+        # CMake library output directory. Disguise the helper process executables accordingly; at
+        # runtime they are executed directly out of the app's native library directory.
+        set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+        foreach(target IN LISTS targets)
+            set_target_properties(${target} PROPERTIES OUTPUT_NAME "lib${target}.so")
+        endforeach()
+    elseif (APPLE OR WIN32)
         # Store helper processes in the same bundle directory as the main application
         set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:ladybird>")
     else()

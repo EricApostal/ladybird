@@ -12,14 +12,15 @@
         android:smallScreens="true" />
 
     <uses-permission android:name="com.android.browser.permission.READ_HISTORY_BOOKMARKS" />
-    <uses-permission android:name="android.permission.INTERNET"/>
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:allowBackup="true"
         android:allowNativeHeapPointerTagging="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:enableOnBackInvokedCallback="true"
+        android:extractNativeLibs="true"
         android:fullBackupContent="@xml/backup_rules"
         android:fullBackupOnly="false"
         android:hardwareAccelerated="true"
@@ -46,21 +47,6 @@
                 android:name="android.app.extract_android_style"
                 android:value="minimal" />
         </activity>
-        <service
-            android:name=".WebContentService"
-            android:enabled="true"
-            android:exported="false"
-            android:process=":WebContent" />
-        <service
-            android:name=".RequestServerService"
-            android:enabled="true"
-            android:exported="false"
-            android:process=":RequestServer" />
-        <service
-            android:name=".ImageDecoderService"
-            android:enabled="true"
-            android:exported="false"
-            android:process=":ImageDecoder" />
     </application>
 
 </manifest>

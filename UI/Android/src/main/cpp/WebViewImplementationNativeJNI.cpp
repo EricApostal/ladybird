@@ -10,7 +10,6 @@
 using namespace Ladybird;
 
 jclass WebViewImplementationNative::global_class_reference;
-jmethodID WebViewImplementationNative::bind_webcontent_method;
 jmethodID WebViewImplementationNative::invalidate_layout_method;
 jmethodID WebViewImplementationNative::on_load_start_method;
 
@@ -26,12 +25,7 @@ Java_org_serenityos_ladybird_WebViewImplementation_00024Companion_nativeClassIni
     WebViewImplementationNative::global_class_reference = reinterpret_cast<jclass>(env->NewGlobalRef(local_class));
     env->DeleteLocalRef(local_class);
 
-    auto method = env->GetMethodID(WebViewImplementationNative::global_class_reference, "bindWebContentService", "(I)V");
-    if (!method)
-        TODO();
-    WebViewImplementationNative::bind_webcontent_method = method;
-
-    method = env->GetMethodID(WebViewImplementationNative::global_class_reference, "invalidateLayout", "()V");
+    auto method = env->GetMethodID(WebViewImplementationNative::global_class_reference, "invalidateLayout", "()V");
     if (!method)
         TODO();
     WebViewImplementationNative::invalidate_layout_method = method;

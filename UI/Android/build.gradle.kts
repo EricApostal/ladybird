@@ -30,6 +30,10 @@ android {
                     "-DVCPKG_ROOT=$sourceDir/Build/vcpkg",
                     "-DVCPKG_TARGET_ANDROID=ON"
                 )
+                // The helper processes (WebContent, RequestServer, etc.) are dependencies of the
+                // ladybird target, and are packaged as "shared libraries" so that they end up in
+                // the APK's native library directory.
+                targets += listOf("ladybird")
             }
         }
         ndk {
@@ -65,6 +69,14 @@ android {
     buildFeatures {
         viewBinding = true
         prefab = true
+    }
+
+    packaging {
+        jniLibs {
+            // The helper process executables are packaged as lib*.so files; they must be extracted
+            // to the filesystem so they can be executed directly.
+            useLegacyPackaging = true
+        }
     }
 }
 

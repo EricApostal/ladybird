@@ -36,7 +36,7 @@ class LadybirdActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         resourceDir = TransferAssets.transferAssets(this)
-        val testFile = File("$resourceDir/res/icons/48x48/app-browser.png")
+        val testFile = File("$resourceDir/icons/48x48/app-browser.png")
         if (!testFile.exists())
         {
             ZipFile("$resourceDir/ladybird-assets.zip").use { zip ->
@@ -70,8 +70,9 @@ class LadybirdActivity : AppCompatActivity() {
                 }
             }
         }
-        val userDir = applicationContext.getExternalFilesDir(null)!!.absolutePath;
-        initNativeCode(resourceDir, "Ladybird", timerService, userDir)
+        val userDir = applicationContext.getExternalFilesDir(null)!!.absolutePath
+        val nativeLibraryDir = applicationInfo.nativeLibraryDir
+        initNativeCode(resourceDir, "Ladybird", timerService, userDir, nativeLibraryDir)
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -87,7 +88,7 @@ class LadybirdActivity : AppCompatActivity() {
             }
             false
         }
-        view.initialize(resourceDir)
+        view.initialize()
         view.loadURL(intent.dataString ?: "https://ladybird.dev")
     }
 
@@ -108,7 +109,11 @@ class LadybirdActivity : AppCompatActivity() {
     }
 
     private external fun initNativeCode(
-        resourceDir: String, tag: String, timerService: TimerExecutorService, userDir: String
+        resourceDir: String,
+        tag: String,
+        timerService: TimerExecutorService,
+        userDir: String,
+        nativeLibraryDir: String
     )
 
     private external fun disposeNativeCode()

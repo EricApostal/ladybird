@@ -11,7 +11,7 @@ macro(copy_res_folder folder)
     add_custom_target(copy-${folder}
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${LADYBIRD_RESOURCE_ROOT}/${folder}"
-            "asset-bundle/res/${folder}"
+            "asset-bundle/${folder}"
     )
     add_dependencies(archive-assets copy-${folder})
 endmacro()

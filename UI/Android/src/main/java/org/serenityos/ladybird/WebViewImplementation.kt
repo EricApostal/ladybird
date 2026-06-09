@@ -6,14 +6,7 @@
 
 package org.serenityos.ladybird
 
-import android.content.Context
-import android.content.Intent
-import android.content.ServiceConnection
 import android.graphics.Bitmap
-import android.util.Log
-import android.view.MotionEvent
-import android.view.View
-import java.net.URL
 
 /**
  * Wrapper around WebView::ViewImplementation for use by Kotlin
@@ -21,11 +14,8 @@ import java.net.URL
 class WebViewImplementation(private val view: WebView) {
     // Instance Pointer to native object, very unsafe :)
     private var nativeInstance: Long = 0
-    private lateinit var resourceDir: String
-    private lateinit var connection: ServiceConnection
 
-    fun initialize(resourceDir: String) {
-        this.resourceDir = resourceDir
+    fun initialize() {
         nativeInstance = nativeObjectInit()
     }
 
@@ -55,21 +45,6 @@ class WebViewImplementation(private val view: WebView) {
     }
 
     // Functions called from native code
-    fun bindWebContentService(ipcFd: Int) {
-        val connector = LadybirdServiceConnection(ipcFd, resourceDir)
-        connector.onDisconnect = {
-            // FIXME: Notify impl that service is dead and might need restarted
-            Log.e("WebContentView", "WebContent Died! :(")
-        }
-        // FIXME: Unbind this at some point maybe
-        view.context.bindService(
-            Intent(view.context, WebContentService::class.java),
-            connector,
-            Context.BIND_AUTO_CREATE
-        )
-        connection = connector
-    }
-
     fun invalidateLayout() {
         view.requestLayout()
         view.invalidate()

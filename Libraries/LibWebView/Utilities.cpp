@@ -80,6 +80,12 @@ void platform_init(Optional<ByteString> ladybird_binary_path)
     s_ladybird_binary_path = move(ladybird_binary_path);
 
     s_ladybird_resource_root = [] {
+#if defined(AK_OS_ANDROID)
+        // The UI process extracts the resources from the APK and sets this environment variable,
+        // which is inherited by all helper processes.
+        if (auto resource_root = Core::Environment::get("LADYBIRD_RESOURCE_ROOT"sv); resource_root.has_value())
+            return ByteString { *resource_root };
+#endif
         auto home = Core::Environment::get("XDG_CONFIG_HOME"sv)
                         .value_or_lazy_evaluated_optional([]() { return Core::Environment::get("HOME"sv); });
         if (home.has_value()) {
@@ -121,7 +127,11 @@ ErrorOr<Vector<ByteString>> get_paths_for_helper_process(StringView process_name
     auto application_path = TRY(application_directory());
     Vector<ByteString> paths;
 
-#if !defined(AK_OS_MACOS) && !defined(AK_OS_WINDOWS)
+#if defined(AK_OS_ANDROID)
+    // Helper processes are packaged in the APK as "shared libraries" (e.g. libWebContent.so), and
+    // are executed directly out of the app's native library directory.
+    TRY(paths.try_append(ByteString::formatted("{}/lib{}.so", application_path, process_name)));
+#elif !defined(AK_OS_MACOS) && !defined(AK_OS_WINDOWS)
     auto prefix = find_prefix(LexicalPath(application_path));
     TRY(paths.try_append(LexicalPath::join(prefix.string(), libexec_path, process_name).string()));
     TRY(paths.try_append(LexicalPath::join(prefix.string(), "bin"sv, process_name).string()));

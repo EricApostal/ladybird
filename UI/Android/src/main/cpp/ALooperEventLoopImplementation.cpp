@@ -234,23 +234,16 @@ static int notifier_callback(int fd, int events, void* data)
 
 void ALooperEventLoopImplementation::register_notifier(Core::Notifier& notifier)
 {
-    auto event_flags = 0;
-    switch (notifier.type()) {
-    case Core::Notifier::Type::Read:
-        event_flags = ALOOPER_EVENT_INPUT;
-        break;
-    case Core::Notifier::Type::Write:
-        event_flags = ALOOPER_EVENT_OUTPUT;
-        break;
-    case Core::Notifier::Type::Error:
-        event_flags = ALOOPER_EVENT_ERROR;
-        break;
-    case Core::Notifier::Type::HangUp:
-        event_flags = ALOOPER_EVENT_HANGUP;
-        break;
-    case Core::Notifier::Type::None:
-        TODO();
-    }
+    int event_flags = 0;
+    if (has_flag(notifier.type(), Core::NotificationType::Read))
+        event_flags |= ALOOPER_EVENT_INPUT;
+    if (has_flag(notifier.type(), Core::NotificationType::Write))
+        event_flags |= ALOOPER_EVENT_OUTPUT;
+    if (has_flag(notifier.type(), Core::NotificationType::Error))
+        event_flags |= ALOOPER_EVENT_ERROR;
+    if (has_flag(notifier.type(), Core::NotificationType::HangUp))
+        event_flags |= ALOOPER_EVENT_HANGUP;
+    VERIFY(event_flags != 0);
 
     auto ret = ALooper_addFd(m_event_loop, notifier.fd(), ALOOPER_POLL_CALLBACK, event_flags, &notifier_callback, &notifier);
     VERIFY(ret == 1);

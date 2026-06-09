@@ -70,7 +70,9 @@ public:
     virtual void quit(int) override;
     virtual void wake() override;
 
-    virtual bool was_exit_requested() const override { return false; }
+    virtual bool was_exit_requested() const override { return m_exit_requested.load(MemoryOrder::memory_order_acquire); }
+
+    void post_event(Core::EventReceiver&, NonnullOwnPtr<Core::Event>&&);
 
     EventLoopThreadData& thread_data();
 

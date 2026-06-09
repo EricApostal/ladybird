@@ -19,8 +19,8 @@ class WebView(context: Context, attributeSet: AttributeSet) : View(context, attr
     private lateinit var contentBitmap: Bitmap
     var onLoadStart: (url: String, isRedirect: Boolean) -> Unit = { _, _ -> }
 
-    fun initialize(resourceDir: String) {
-        viewImpl.initialize(resourceDir)
+    fun initialize() {
+        viewImpl.initialize()
     }
 
     fun dispose() {

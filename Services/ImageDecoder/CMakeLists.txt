@@ -6,16 +6,7 @@ set(SOURCES
     ConnectionFromClient.cpp
 )
 
-if (ANDROID)
-    add_library(imagedecoderservice SHARED
-        ${LADYBIRD_SOURCE_DIR}/UI/Android/src/main/cpp/ImageDecoderService.cpp
-        ${LADYBIRD_SOURCE_DIR}/UI/Android/src/main/cpp/LadybirdServiceBaseJNI.cpp
-        ${SOURCES}
-    )
-    target_link_libraries(imagedecoderservice PRIVATE LibWebView)
-else()
-    add_library(imagedecoderservice STATIC ${SOURCES})
-endif()
+add_library(imagedecoderservice STATIC ${SOURCES})
 
 add_executable(ImageDecoder main.cpp)
 
