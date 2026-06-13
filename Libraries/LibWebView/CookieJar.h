@@ -38,14 +38,17 @@ public:
     ~CookieJar();
 
     String get_cookie(URL::URL const& url, HTTP::Cookie::Source source);
-    void set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie const& parsed_cookie, HTTP::Cookie::Source source);
+    ErrorOr<void> set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCookie const& parsed_cookie, HTTP::Cookie::Source source);
     void update_cookie(HTTP::Cookie::Cookie);
+    ErrorOr<void> set_cookie_from_devtools(URL::URL const&, Optional<CookieStorageKey> old_key, HTTP::Cookie::Cookie);
+    bool delete_cookie(CookieStorageKey const&);
     void dump_cookies();
     Vector<HTTP::Cookie::Cookie> get_all_cookies();
     Vector<HTTP::Cookie::Cookie> get_all_cookies_webdriver(URL::URL const& url);
     Vector<HTTP::Cookie::Cookie> get_all_cookies_cookiestore(URL::URL const& url);
     Optional<HTTP::Cookie::Cookie> get_named_cookie(URL::URL const& url, StringView name);
     void expire_cookies_with_time_offset(AK::Duration);
+    void delete_all_cookies(URL::URL const&);
     void expire_cookies_accessed_since(UnixDateTime since);
     Requests::CacheSizes estimate_storage_size_accessed_since(UnixDateTime since) const;
 

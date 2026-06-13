@@ -21,6 +21,7 @@ find_package(JPEG REQUIRED)
 find_package(LIBAVIF REQUIRED)
 find_package(PNG REQUIRED)
 find_package(WebP CONFIG REQUIRED)
+find_path(WUFFS_INCLUDE_DIR NAMES wuffs/wuffs-v0.3.c REQUIRED)
 
 pkg_check_modules(WOFF2 REQUIRED IMPORTED_TARGET libwoff2dec)
 
@@ -53,12 +54,13 @@ endif()
 if (NOT APPLE)
     find_package(VulkanHeaders CONFIG QUIET)
     find_package(Vulkan QUIET)
+    find_program(GLSLANG_VALIDATOR glslangValidator)
     if (VulkanHeaders_FOUND AND Vulkan_FOUND)
         set(HAS_VULKAN ON CACHE BOOL "" FORCE)
         add_cxx_compile_definitions(USE_VULKAN=1)
 
         # Sharable Vulkan images are currently only implemented on Linux and BSDs
-        if ((LINUX AND NOT ANDROID) OR BSD)
+        if (((LINUX AND NOT ANDROID) OR BSD) AND GLSLANG_VALIDATOR)
             set(USE_VULKAN_DMABUF_IMAGES ON CACHE BOOL "" FORCE)
             add_cxx_compile_definitions(USE_VULKAN_DMABUF_IMAGES=1)
         endif()
@@ -75,6 +77,7 @@ find_package(SQLite3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
+pkg_check_modules(LIBPSL REQUIRED IMPORTED_TARGET libpsl)
 pkg_check_modules(libtommath REQUIRED IMPORTED_TARGET libtommath)
 
 find_package(unofficial-angle CONFIG)

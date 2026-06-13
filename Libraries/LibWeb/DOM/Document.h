@@ -53,6 +53,7 @@
 #include <LibWeb/Painting/GridInspectorOverlay.h>
 #include <LibWeb/Painting/HitTestResult.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
+#include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/TrustedTypes/InjectionSink.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
@@ -628,7 +629,11 @@ public:
     void run_the_scroll_steps();
 
     void evaluate_media_queries_and_report_changes();
-    void set_needs_media_query_evaluation() { m_needs_media_query_evaluation = true; }
+    void set_needs_media_query_evaluation()
+    {
+        m_needs_media_query_list_evaluation = true;
+        m_needs_media_rule_evaluation = true;
+    }
     void add_media_query_list(GC::Ref<CSS::MediaQueryList>);
 
     GC::Ref<CSS::VisualViewport> visual_viewport();
@@ -659,6 +664,10 @@ public:
 
     void register_document_observer(Badge<DocumentObserver>, DocumentObserver&);
     void unregister_document_observer(Badge<DocumentObserver>, DocumentObserver&);
+
+    void register_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement&);
+    void unregister_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement&);
+    SVG::SVGUseElement::DocumentUseElementList& svg_use_elements() { return m_svg_use_elements; }
 
     template<typename Callback>
     void for_each_node_iterator(Callback callback)
@@ -902,6 +911,7 @@ public:
         u64 element_inherited_style_noop_recomputations { 0 };
         u64 previous_sibling_invalidation_walk_visits { 0 };
         u64 descendant_slot_invalidation_subtree_scans { 0 };
+        u64 media_rule_evaluations { 0 };
     };
     StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
     void reset_style_invalidation_counters() const;
@@ -989,8 +999,7 @@ public:
     GC::Ptr<HTML::Navigable> navigable() const;
     void set_navigable(GC::Ptr<HTML::Navigable>);
 
-    template<OneOf<Node, Painting::Paintable, HTML::Navigable, CSS::VisualViewport, Web::EventHandler> T>
-    void set_needs_repaint(Badge<T>, InvalidateDisplayList should_invalidate_display_list = InvalidateDisplayList::Yes)
+    void set_needs_repaint(Badge<Node, Painting::Paintable, HTML::Navigable, CSS::VisualViewport, Web::EventHandler>, InvalidateDisplayList should_invalidate_display_list = InvalidateDisplayList::Yes)
     {
         set_needs_repaint(should_invalidate_display_list);
     }
@@ -1143,6 +1152,14 @@ public:
     GC::Ptr<HTML::CustomElementRegistry> effective_global_custom_element_registry() const;
 
     void upgrade_particular_elements(GC::Ref<HTML::CustomElementRegistry>, GC::Ref<HTML::CustomElementDefinition>, String local_name, Optional<String> name = {});
+
+    Vector<URL::Origin> internal_ancestor_origin_objects_list_creation_steps(ReferrerPolicy::ReferrerPolicy) const;
+    Optional<Vector<URL::Origin>>& internal_ancestor_origin_objects_list() { return m_internal_ancestor_origin_objects_list; }
+    void set_internal_ancestor_origin_objects_list(Optional<Vector<URL::Origin>>&& list) { m_internal_ancestor_origin_objects_list = move(list); }
+
+    GC::Ref<HTML::DOMStringList> ancestor_origins_list_creation_steps() const;
+    GC::Ptr<HTML::DOMStringList> ancestor_origins_list() { return m_ancestor_origins_list; }
+    void set_ancestor_origins_list(GC::Ptr<HTML::DOMStringList> list) { m_ancestor_origins_list = move(list); }
 
 protected:
     virtual void initialize(JS::Realm&) override;
@@ -1352,7 +1369,8 @@ private:
     Vector<PendingScrollEvent> m_pending_scroll_events;
 
     // Used by evaluate_media_queries_and_report_changes().
-    bool m_needs_media_query_evaluation { false };
+    bool m_needs_media_query_list_evaluation { false };
+    bool m_needs_media_rule_evaluation { false };
     Vector<GC::Weak<CSS::MediaQueryList>> m_media_query_lists;
 
     bool m_needs_full_style_update { false };
@@ -1373,6 +1391,11 @@ private:
     // It's responsibility of object that requires DocumentObserver to keep it alive.
     HashTable<GC::RawRef<DocumentObserver>> m_document_observers;
     Vector<GC::Ref<DocumentObserver>> m_document_observers_being_notified;
+
+    // Every SVG use element connected to this document's node tree, maintained by SVGUseElement on insertion and
+    // removal. This lets SVG elements notify interested use elements about mutations without traversing the entire
+    // document. Not visited: registered elements are connected and thus kept alive by the tree.
+    SVG::SVGUseElement::DocumentUseElementList m_svg_use_elements;
 
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool m_is_initial_about_blank { false };
@@ -1623,6 +1646,12 @@ private:
 
     // https://dom.spec.whatwg.org/#document-custom-element-registry
     GC::Ptr<HTML::CustomElementRegistry> m_custom_element_registry;
+
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-internal-ancestor-origin-objects-list
+    Optional<Vector<URL::Origin>> m_internal_ancestor_origin_objects_list;
+
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-ancestor-origins-list
+    GC::Ptr<HTML::DOMStringList> m_ancestor_origins_list;
 };
 
 template<>

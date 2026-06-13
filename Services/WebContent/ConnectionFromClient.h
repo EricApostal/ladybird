@@ -92,6 +92,10 @@ private:
     virtual void debug_request(u64 page_id, ByteString, ByteString) override;
     virtual void get_source(u64 page_id) override;
     virtual void inspect_dom_tree(u64 page_id) override;
+    virtual void inspect_storage(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, u64 request_id) override;
+    virtual Messages::WebContentServer::SetSessionStorageItemResponse set_session_storage_item(u64 page_id, String key, String value) override;
+    virtual Messages::WebContentServer::RemoveSessionStorageItemResponse remove_session_storage_item(u64 page_id, String key) override;
+    virtual Messages::WebContentServer::ClearSessionStorageResponse clear_session_storage(u64 page_id) override;
     virtual void inspect_dom_node(u64 page_id, WebView::DOMNodeProperties::Type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonValue options) override;
     virtual void inspect_grid_layouts(u64 page_id, Web::UniqueNodeID root_node_id) override;
     virtual void inspect_current_grid(u64 page_id, Web::UniqueNodeID node_id) override;
@@ -143,6 +147,7 @@ private:
     virtual void set_window_size(u64 page_id, Web::DevicePixelSize) override;
     virtual void did_update_window_rect(u64 page_id) override;
     virtual void handle_file_return(u64 page_id, i32 error, Optional<IPC::File> file, i32 request_id) override;
+    virtual void did_delete_all_cookies(u64 page_id, u64 request_id) override;
     virtual void set_system_visibility_state(u64 page_id, Web::HTML::VisibilityState) override;
     virtual void reset_zoom(u64 page_id) override;
 

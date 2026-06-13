@@ -19,7 +19,6 @@ from Generators.libweb_bindings.cpp_types import add_include_for_string_cpp_type
 from Generators.libweb_bindings.cpp_types import converter_function_name
 from Generators.libweb_bindings.cpp_types import cpp_empty_value
 from Generators.libweb_bindings.cpp_types import cpp_name
-from Generators.libweb_bindings.cpp_types import cpp_null_value
 from Generators.libweb_bindings.cpp_types import cpp_type
 from Generators.libweb_bindings.cpp_types import cpp_type_for_idl_type
 from Generators.libweb_bindings.cpp_types import cpp_type_for_idl_type_details
@@ -676,9 +675,6 @@ def callback_function_to_idl_value(
     includes.add("LibWeb/HTML/Scripting/Environments.h")
     includes.add("LibWeb/WebIDL/CallbackType.h")
 
-    # https://webidl.spec.whatwg.org/#js-callback-function
-    # 1. If the result of calling IsCallable(V) is false and the conversion to an IDL value is not being performed due to V being assigned to an attribute whose type is a nullable callback function that is annotated with [LegacyTreatNonObjectAsNull], then throw a TypeError.
-    # 2. Return the IDL callback function type value that represents a reference to the same object that V represents, with the incumbent settings object as the callback context.
     operation_returns_promise = (
         "WebIDL::OperationReturnsPromise::Yes"
         if callback_function.return_type.name.split("<", 1)[0] == "Promise"
@@ -687,23 +683,25 @@ def callback_function_to_idl_value(
 
     legacy_treat_non_object_as_null = "LegacyTreatNonObjectAsNull" in callback_function.extended_attributes
     return_cpp_type = "GC::Ptr<WebIDL::CallbackType>" if legacy_treat_non_object_as_null else return_cpp_type
-    if legacy_treat_non_object_as_null:
-        callable_check = f"""                    if (!{value_name}.is_function())
-                        return nullptr;
-"""
-    else:
-        callable_check = f"""                    // 1. If the result of calling IsCallable(V) is false and the conversion to an IDL value is not being performed due to V being assigned to an attribute whose type is a nullable callback function that is annotated with [LegacyTreatNonObjectAsNull], then throw a TypeError.
-                    if (!{value_name}.is_function())
-                        return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAFunction, {value_name});
+
+    conversion = f"""[&]() -> JS::ThrowCompletionOr<{return_cpp_type}> {{
 """
 
-    return f"""[&]() -> JS::ThrowCompletionOr<{return_cpp_type}> {{
-{callable_check}
-                    return vm.heap().allocate<WebIDL::CallbackType>(
-                        {value_name}.as_object(),
-                        HTML::incumbent_realm(),
-                        {operation_returns_promise});
-                    }}()"""
+    # 1. If the result of calling IsCallable(V) is false and the conversion to an IDL value is not being
+    #    performed due to V being assigned to an attribute whose type is a nullable callback function that
+    #    is annotated with [LegacyTreatNonObjectAsNull], then throw a TypeError.
+    if not legacy_treat_non_object_as_null:
+        conversion += f"""
+        if (!{value_name}.is_function())
+            return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAFunction, {value_name});
+"""
+
+    # 2. Return the IDL callback function type value that represents a reference to the same object that V
+    #    represents, with the incumbent settings object as the callback context.
+    conversion += f"""
+        return vm.heap().allocate<WebIDL::CallbackType>({value_name}.as_object(),  HTML::incumbent_realm(), {operation_returns_promise});
+    }}()"""
+    return conversion
 
 
 # 3.2.20. Nullable types — T?, https://webidl.spec.whatwg.org/#js-nullable-type
@@ -716,23 +714,63 @@ def nullable_to_idl_value(
     includes: GeneratedIncludes,
     context: GenerationContext,
 ) -> str:
-    # 1. If V is not an Object, and the conversion to an IDL value is being performed due to V being assigned to an attribute whose type is a nullable callback function that is annotated with [LegacyTreatNonObjectAsNull], then return the IDL nullable type T? value null.
-    # 2. Otherwise, if V is undefined, and T includes undefined, return the unique undefined value.
-    # 3. Otherwise, if V is null or undefined, then return the IDL nullable type T? value null.
-    # 4. Otherwise, return the result of converting V using the rules for the inner IDL type T.
     inner_type = idl_type.clone_with_nullable(False)
+    cpp_type = cpp_type_for_idl_type_details(
+        idl_type,
+        context,
+        extended_attributes=extended_attributes,
+    )
+    conversion = f"""[&]() -> JS::ThrowCompletionOr<{return_cpp_type}> {{
+        {cpp_type.name} value;
+"""
+
+    # 1. If V is not an Object, and the conversion to an IDL value is being performed due to V being assigned to an
+    #    attribute whose type is a nullable callback function that is annotated with [LegacyTreatNonObjectAsNull],
+    #    then return the IDL nullable type T? value null.
+    callback_function = context.callback_function(inner_type)
+    legacy_treat_non_object_as_null = (
+        callback_function is not None and "LegacyTreatNonObjectAsNull" in callback_function.extended_attributes
+    )
+    if legacy_treat_non_object_as_null:
+        conversion += f"        if ({value_name}.is_object()) {{\n"
+
     inner_conversion = to_idl_value_from_type(
         inner_type, identifier, extended_attributes, value_name, includes, context
     )
-    null_value = cpp_null_value(idl_type, context)
     inner_return = (
         f"TRY({inner_conversion})" if idl_value_conversion_is_throwing(inner_type, context) else inner_conversion
     )
-    return f"""[&]() -> JS::ThrowCompletionOr<{return_cpp_type}> {{
-        if ({value_name}.is_nullish())
-            return {null_value};
-        return {inner_return};
-    }}()"""
+    inner_type_includes_undefined = inner_type.includes_undefined()
+
+    # 2. Otherwise, if V is undefined, and T includes undefined, return the unique undefined value.
+    if inner_type_includes_undefined:
+        conversion += f"""
+        if ({value_name}.is_undefined()) {{
+            value = Empty {{}};
+        }}
+"""
+        # 3. Otherwise, if V is null or undefined, then return the IDL nullable type T? value null.
+        conversion += f"""
+        else if (!{value_name}.is_nullish()) {{
+"""
+    else:
+        # 3. Otherwise, if V is null or undefined, then return the IDL nullable type T? value null.
+        conversion += f"""
+        if (!{value_name}.is_nullish()) {{
+"""
+
+    # 4. Otherwise, return the result of converting V using the rules for the inner IDL type T.
+    conversion += f"""
+            value = {inner_return};
+        }}
+"""
+
+    if legacy_treat_non_object_as_null:
+        conversion += "        }\n"
+
+    conversion += """        return value;
+    }()"""
+    return conversion
 
 
 # 3.2.21. Sequences — sequence<T>, https://webidl.spec.whatwg.org/#js-sequence
@@ -740,6 +778,35 @@ def sequence_to_idl_value(
     sequence_type: IDLParameterizedType,
     identifier: str,
     value_name: str,
+    includes: GeneratedIncludes,
+    context: GenerationContext,
+) -> str:
+    element_type = sequence_type.parameters[0]
+    element_cpp_type = cpp_type_for_idl_type_details(element_type, context)
+    storage_type_name = element_cpp_type.contained_storage_type.value
+
+    # 1. If V is not an Object, throw a TypeError.
+    # 2. Let method be ? GetMethod(V, %Symbol.iterator%).
+    # 3. If method is undefined, throw a TypeError.
+    # 4. Return the result of creating a sequence from V and method.
+    return f"""[&]() -> JS::ThrowCompletionOr<{storage_type_name}<{element_cpp_type.name}>> {{
+        if (!{value_name}.is_object())
+            return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObject, {value_name});
+
+        auto method = TRY({value_name}.get_method(vm, vm.well_known_symbol_iterator()));
+        if (!method)
+            return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotIterable, {value_name});
+
+        return TRY({create_sequence_from_iterable(sequence_type, identifier, value_name, "method", includes, context)});
+    }}()"""
+
+
+# 3.2.21.1. Creating a sequence from an iterable, https://webidl.spec.whatwg.org/#create-sequence-from-iterable
+def create_sequence_from_iterable(
+    sequence_type: IDLParameterizedType,
+    identifier: str,
+    value_name: str,
+    iterator_method_name: str,
     includes: GeneratedIncludes,
     context: GenerationContext,
 ) -> str:
@@ -753,21 +820,10 @@ def sequence_to_idl_value(
     element_cpp_type = cpp_type_for_idl_type_details(element_type, context)
     storage_type_name = element_cpp_type.contained_storage_type.value
 
-    # 1. If V is not an Object, throw a TypeError.
-    # 2. Let method be ? GetMethod(V, %Symbol.iterator%).
-    # 3. If method is undefined, throw a TypeError.
-    # 4. Return the result of creating a sequence from V and method.
     return f"""[&]() -> JS::ThrowCompletionOr<{storage_type_name}<{element_cpp_type.name}>> {{
-        if (!{value_name}.is_object())
-            return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObject, {value_name});
-
-        auto iterator_method0 = TRY({value_name}.get_method(vm, vm.well_known_symbol_iterator()));
-        if (!iterator_method0)
-            return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotIterable, {value_name});
-
         // To create an IDL value of type sequence<T> given an iterable iterable and an iterator getter method, perform the following steps:
         // 1. Let iteratorRecord be ? GetIteratorFromMethod(iterable, method).
-        auto iterator0 = TRY(JS::get_iterator_from_method(vm, {value_name}, *iterator_method0));
+        auto iterator = TRY(JS::get_iterator_from_method(vm, {value_name}, *{iterator_method_name}));
 
         {storage_type_name}<{element_cpp_type.name}> sequence;
 
@@ -775,7 +831,7 @@ def sequence_to_idl_value(
         // 3. Repeat
         for (;;) {{
             // 1. Let next be ? IteratorStepValue(iteratorRecord).
-            auto next = TRY(JS::iterator_step_value(vm, iterator0));
+            auto next = TRY(JS::iterator_step_value(vm, iterator));
 
             // 2. If next is done, then return an IDL sequence value of type sequence<T> of length i, where the value of the element at index j is Sj.
             if (!next.has_value())
@@ -1045,30 +1101,26 @@ def union_to_idl_value(
     # FIXME: 11.1 If types includes an async sequence type, then
     # 11.2. If types includes a sequence type, then
     if types.sequence_type is not None:
-        sequence_conversion = sequence_to_idl_value(types.sequence_type, identifier, value_name, includes, context)
         append(f"""
             // 1. Let method be ? GetMethod(V, @@iterator).
             auto method = TRY({value_name}.get_method(vm, vm.well_known_symbol_iterator()));
 
             // 2. If method is not undefined, return the result of creating a sequence of that type from V and method.
             if (method) {{
-                auto sequence_union_type = TRY({sequence_conversion});
+                auto sequence_union_type = TRY({create_sequence_from_iterable(types.sequence_type, identifier, value_name, "method", includes, context)});
                 return {variant_type} {{ sequence_union_type }};
             }}
 
 """)
     # 11.3. If types includes a frozen array type, then
     if types.frozen_array_type is not None:
-        frozen_array_conversion = sequence_to_idl_value(
-            types.frozen_array_type, identifier, value_name, includes, context
-        )
         append(f"""
             // 1. Let method be ? GetMethod(V, @@iterator).
             auto frozen_array_method = TRY({value_name}.get_method(vm, vm.well_known_symbol_iterator()));
 
             // 2. If method is not undefined, return the result of creating a frozen array of that type from V and method.
             if (frozen_array_method) {{
-                auto frozen_array_union_type = TRY({frozen_array_conversion});
+                auto frozen_array_union_type = TRY({create_sequence_from_iterable(types.frozen_array_type, identifier, value_name, "frozen_array_method", includes, context)});
                 return {variant_type} {{ frozen_array_union_type }};
             }}
 """)

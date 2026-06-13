@@ -119,6 +119,7 @@
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
+#include <LibWeb/HTML/DOMStringList.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/DragEvent.h>
@@ -206,6 +207,7 @@
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
+#include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
@@ -235,7 +237,7 @@ static Optional<u64> s_style_invalidation_counter_dump_interval;
 static void dump_style_invalidation_counters(Document const& document)
 {
     auto const& counters = document.style_invalidation_counters();
-    dbgln("Style invalidation counters for {}: styleInvalidations={}, fullStyleInvalidations={}, elementStyleRecomputations={}, elementStyleNoopRecomputations={}, elementInheritedStyleRecomputations={}, elementInheritedStyleNoopRecomputations={}, previousSiblingInvalidationWalkVisits={}, hasAncestorWalkInvocations={}, hasAncestorWalkVisits={}, hasAncestorSiblingElementChecks={}, hasInvalidationMetadataCandidates={}, hasMatchInvocations={}, hasResultCacheHits={}, hasResultCacheMisses={}",
+    dbgln("Style invalidation counters for {}: styleInvalidations={}, fullStyleInvalidations={}, elementStyleRecomputations={}, elementStyleNoopRecomputations={}, elementInheritedStyleRecomputations={}, elementInheritedStyleNoopRecomputations={}, previousSiblingInvalidationWalkVisits={}, mediaRuleEvaluations={}, hasAncestorWalkInvocations={}, hasAncestorWalkVisits={}, hasAncestorSiblingElementChecks={}, hasInvalidationMetadataCandidates={}, hasMatchInvocations={}, hasResultCacheHits={}, hasResultCacheMisses={}",
         document.url_string(),
         counters.style_invalidations,
         counters.full_style_invalidations,
@@ -244,6 +246,7 @@ static void dump_style_invalidation_counters(Document const& document)
         counters.element_inherited_style_recomputations,
         counters.element_inherited_style_noop_recomputations,
         counters.previous_sibling_invalidation_walk_visits,
+        counters.media_rule_evaluations,
         counters.has_ancestor_walk_invocations,
         counters.has_ancestor_walk_visits,
         counters.has_ancestor_sibling_element_checks,
@@ -471,10 +474,18 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     // 10. Set window's associated Document to document.
     window->set_associated_document(*document);
 
-    // 11. Run CSP initialization for a Document given document.
+    // 11. Set document's internal ancestor origin objects list to the result of running the internal ancestor origin
+    //     objects list creation steps given document and navigationParams's iframe element referrer policy.
+    document->set_internal_ancestor_origin_objects_list(document->internal_ancestor_origin_objects_list_creation_steps(navigation_params.iframe_element_referrer_policy));
+
+    // 12. Set document's ancestor origins list to the result of running the ancestor origins list creation steps given
+    //     document.
+    document->set_ancestor_origins_list(document->ancestor_origins_list_creation_steps());
+
+    // 13. Run CSP initialization for a Document given document.
     document->run_csp_initialization();
 
-    // 12. If navigationParams's request is non-null, then:
+    // 14. If navigationParams's request is non-null, then:
     if (navigation_params.request) {
         // 1. Set document's referrer to the empty string.
         document->m_referrer = String {};
@@ -488,12 +499,13 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         }
     }
 
-    // FIXME: 13: If navigationParams's fetch controller is not null, then:
+    // FIXME: 15: If navigationParams's fetch controller is not null, then:
 
-    // FIXME: 14. Create the navigation timing entry for document, with navigationParams's response's timing info, redirectCount, navigationParams's navigation timing type, and
-    //            navigationParams's response's service worker timing info.
+    // FIXME: 16. Create the navigation timing entry for document, with navigationParams's response's timing info,
+    //        redirectCount, navigationParams's navigation timing type, and navigationParams's response's service
+    //        worker timing info.
 
-    // 15. If navigationParams's response has a `Refresh` header, then:
+    // 17. If navigationParams's response has a `Refresh` header, then:
     if (auto maybe_refresh = navigation_params.response->header_list()->get("Refresh"sv); maybe_refresh.has_value()) {
         // 1. Let value be the isomorphic decoding of the value of the header.
         auto value = TextCodec::isomorphic_decode(maybe_refresh.value());
@@ -502,13 +514,17 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         document->shared_declarative_refresh_steps(value, nullptr);
     }
 
-    // FIXME: 16. If navigationParams's commit early hints is not null, then call navigationParams's commit early hints with document.
+    // FIXME: 18. If navigationParams's commit early hints is not null, then call navigationParams's commit early hints
+    //        with document.
 
-    // FIXME: 17. Process link headers given document, navigationParams's response, and "pre-media".
+    // FIXME: 19. Process link headers given document, navigationParams's response, and "pre-media".
 
-    // FIXME: 18. Potentially free deferred fetch quota for document.
+    // FIXME: 20. If navigationParams's navigable is a top-level traversable, then process the `Speculation-Rules`
+    //        header given document and navigationParams's response .
 
-    // 19. Return document.
+    // FIXME: 21. Potentially free deferred fetch quota for document.
+
+    // 22. Return document.
     return document;
 }
 
@@ -777,6 +793,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_style_invalidator);
     visitor.visit(m_deferred_parser_start);
     visitor.visit(m_custom_element_registry);
+    visitor.visit(m_ancestor_origins_list);
 }
 
 String const& Document::content_blocker_style_sheet()
@@ -2185,14 +2202,14 @@ void Document::update_style()
         CSS::Invalidation::invalidate_style_for_pending_has_mutations(*this);
     }
 
-    if (!m_style_invalidator->has_pending_invalidations() && !needs_full_style_update() && !needs_style_update() && !child_needs_style_update() && !m_needs_media_query_evaluation)
+    if (!m_style_invalidator->has_pending_invalidations() && !needs_full_style_update() && !needs_style_update() && !child_needs_style_update() && !m_needs_media_rule_evaluation)
         return;
 
     // NOTE: If this is a document hosting <template> contents, style update is unnecessary.
     if (m_created_for_appropriate_template_contents)
         return;
 
-    if (m_needs_media_query_evaluation)
+    if (m_needs_media_rule_evaluation)
         evaluate_media_rules();
 
     if (!m_style_invalidator->has_pending_invalidations() && !needs_full_style_update() && !needs_style_update() && !child_needs_style_update())
@@ -2311,7 +2328,7 @@ CSS::ComputedProperties const* Document::update_style_for_element(AbstractElemen
 
         // Media query evaluation can enqueue normal style invalidations, so do it before deciding whether the full
         // style traversal needs to run.
-        if (m_needs_media_query_evaluation)
+        if (m_needs_media_rule_evaluation)
             evaluate_media_rules();
 
         if (!m_is_running_update_layout
@@ -2435,7 +2452,7 @@ bool Document::element_needs_style_update(AbstractElement const& abstract_elemen
         return true;
     if (m_needs_invalidation_of_elements_affected_by_has)
         return true;
-    if (m_needs_media_query_evaluation)
+    if (m_needs_media_rule_evaluation)
         return true;
     if (m_style_invalidator->has_pending_invalidations())
         return true;
@@ -4655,55 +4672,61 @@ void Document::run_the_scroll_steps()
 
 void Document::add_media_query_list(GC::Ref<CSS::MediaQueryList> media_query_list)
 {
-    m_needs_media_query_evaluation = true;
     m_media_query_lists.append(media_query_list);
+    m_needs_media_query_list_evaluation = true;
 }
 
 // https://drafts.csswg.org/cssom-view/#evaluate-media-queries-and-report-changes
 void Document::evaluate_media_queries_and_report_changes()
 {
-    if (!m_needs_media_query_evaluation)
+    if (!m_needs_media_query_list_evaluation && !m_needs_media_rule_evaluation)
         return;
-    m_needs_media_query_evaluation = false;
 
-    // NOTE: Not in the spec, but we take this opportunity to prune null WeakPtrs.
-    m_media_query_lists.remove_all_matching([](auto& it) {
-        return !it;
-    });
+    bool evaluate_media_query_lists = m_needs_media_query_list_evaluation;
+    m_needs_media_query_list_evaluation = false;
 
-    // 1. For each MediaQueryList object target that has doc as its document,
-    //    in the order they were created, oldest first, run these substeps:
-    for (auto& media_query_list_ptr : m_media_query_lists) {
-        // 1. If target’s matches state has changed since the last time these steps
-        //    were run, fire an event at target using the MediaQueryListEvent constructor,
-        //    with its type attribute initialized to change, its isTrusted attribute
-        //    initialized to true, its media attribute initialized to target’s media,
-        //    and its matches attribute initialized to target’s matches state.
-        if (!media_query_list_ptr)
-            continue;
-        GC::Ptr<CSS::MediaQueryList> media_query_list = media_query_list_ptr.ptr();
-        bool did_match = media_query_list->matches();
-        bool now_matches = media_query_list->evaluate();
+    if (evaluate_media_query_lists) {
+        // NOTE: Not in the spec, but we take this opportunity to prune null WeakPtrs.
+        m_media_query_lists.remove_all_matching([](auto& it) {
+            return !it;
+        });
 
-        auto did_change_internally = media_query_list->has_changed_state();
-        media_query_list->set_has_changed_state(false);
+        // 1. For each MediaQueryList object target that has doc as its document,
+        //    in the order they were created, oldest first, run these substeps:
+        for (auto& media_query_list_ptr : m_media_query_lists) {
+            // 1. If target’s matches state has changed since the last time these steps
+            //    were run, fire an event at target using the MediaQueryListEvent constructor,
+            //    with its type attribute initialized to change, its isTrusted attribute
+            //    initialized to true, its media attribute initialized to target’s media,
+            //    and its matches attribute initialized to target’s matches state.
+            if (!media_query_list_ptr)
+                continue;
+            GC::Ptr<CSS::MediaQueryList> media_query_list = media_query_list_ptr.ptr();
+            bool did_match = media_query_list->matches();
+            bool now_matches = media_query_list->evaluate();
 
-        if (did_change_internally == true || did_match != now_matches) {
-            Bindings::MediaQueryListEventInit init;
-            init.media = media_query_list->media();
-            init.matches = now_matches;
-            auto event = CSS::MediaQueryListEvent::create(realm(), HTML::EventNames::change, init);
-            event->set_is_trusted(true);
-            media_query_list->dispatch_event(*event);
+            auto did_change_internally = media_query_list->has_changed_state();
+            media_query_list->set_has_changed_state(false);
+
+            if (did_change_internally == true || did_match != now_matches) {
+                Bindings::MediaQueryListEventInit init;
+                init.media = media_query_list->media();
+                init.matches = now_matches;
+                auto event = CSS::MediaQueryListEvent::create(realm(), HTML::EventNames::change, init);
+                event->set_is_trusted(true);
+                media_query_list->dispatch_event(*event);
+            }
         }
     }
 
     // Also not in the spec, but this is as good a place as any to evaluate @media rules!
-    evaluate_media_rules();
+    if (m_needs_media_rule_evaluation)
+        evaluate_media_rules();
 }
 
 void Document::evaluate_media_rules()
 {
+    m_needs_media_rule_evaluation = false;
     CSS::Invalidation::evaluate_media_rules_and_invalidate_style(*this);
 }
 
@@ -4873,6 +4896,16 @@ void Document::unregister_document_observer(Badge<DocumentObserver>, DocumentObs
 {
     bool was_removed = m_document_observers.remove(document_observer);
     VERIFY(was_removed);
+}
+
+void Document::register_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement& use_element)
+{
+    m_svg_use_elements.append(use_element);
+}
+
+void Document::unregister_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement& use_element)
+{
+    m_svg_use_elements.remove(use_element);
 }
 
 void Document::increment_number_of_things_delaying_the_load_event(Badge<DocumentLoadEventDelayer>)
@@ -6776,6 +6809,11 @@ void Document::prune_image_resource_caches()
     static constexpr size_t decoded_image_resource_cache_limit = 8 * MiB;
     static constexpr size_t decoded_image_resource_cache_count_limit = 96;
 
+    auto is_used_by_css_image_resource = [&](URL::URL const& url, HTML::SharedResourceRequest const& request) {
+        auto* css_image_resource = this->css_image_resource(url);
+        return css_image_resource && css_image_resource->image_data() == request.image_data();
+    };
+
     struct CacheSize {
         size_t decoded_image_size { 0 };
         size_t decoded_image_count { 0 };
@@ -6788,6 +6826,8 @@ void Document::prune_image_resource_caches()
         for (auto const& it : m_shared_resource_requests) {
             auto const& request = *it.value;
             if (!request.can_be_pruned_from_memory_cache())
+                continue;
+            if (is_used_by_css_image_resource(it.key, request))
                 continue;
             ++count;
             if (auto image_data = request.image_data())
@@ -6806,6 +6846,8 @@ void Document::prune_image_resource_caches()
         for (auto const& it : m_shared_resource_requests) {
             auto const& request = *it.value;
             if (!request.can_be_pruned_from_memory_cache())
+                continue;
+            if (is_used_by_css_image_resource(it.key, request))
                 continue;
             if (request.cache_touch_serial() >= least_recently_used_serial)
                 continue;
@@ -9290,6 +9332,87 @@ void Document::ensure_cookie_version_index(URL::URL const& new_url, URL::URL con
 
     page().client().page_did_request_document_cookie_version_index(unique_id(), *new_domain);
     m_cookie_version_index = {};
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#internal-ancestor-origin-objects-list-creation-steps
+Vector<URL::Origin> Document::internal_ancestor_origin_objects_list_creation_steps(ReferrerPolicy::ReferrerPolicy referrer_policy) const
+{
+    // 1. Let output be « ».
+    Vector<URL::Origin> output;
+
+    // 2. Let parentDoc be document's container document.
+    auto parent_doc = container_document();
+
+    // 3. If parentDoc is null, then return output.
+    if (!parent_doc)
+        return output;
+
+    // 4. Assert: parentDoc is fully active.
+    VERIFY(parent_doc->is_fully_active());
+
+    // 5. Let ancestorOrigins be parentDoc's internal ancestor origin objects list.
+    auto ancestor_origins = parent_doc->internal_ancestor_origin_objects_list();
+
+    // 6. Let container be document's node navigable's container.
+    // AD-HOC: This isn't used, see https://github.com/whatwg/html/issues/12566
+    // auto container = navigable()->container();
+
+    // 7. Let masked be false.
+    auto masked = false;
+
+    // 8. If referrerPolicy is "no-referrer", then set masked to true.
+    if (referrer_policy == ReferrerPolicy::ReferrerPolicy::NoReferrer)
+        masked = true;
+
+    // 9. Otherwise, if referrerPolicy is "same-origin" and parentDoc's origin is not same origin with document's origin, then set masked to true.
+    else if (referrer_policy == ReferrerPolicy::ReferrerPolicy::SameOrigin && parent_doc->origin().is_same_origin(origin()))
+        masked = true;
+
+    // 10. If masked is true, then append a new opaque origin to output.
+    if (masked)
+        output.append(URL::Origin::create_opaque());
+
+    // 11. Otherwise, append parentDoc's origin to output.
+    else
+        output.append(parent_doc->origin());
+
+    // 12. For each ancestorOrigin of ancestorOrigins:
+    for (auto const& ancestor_origin : ancestor_origins.value()) {
+        // 1. If masked is true and ancestorOrigin is same origin with parentDoc's origin, then append a new opaque origin to output and continue.
+        if (masked && ancestor_origin.is_same_origin(parent_doc->origin())) {
+            output.append(URL::Origin::create_opaque());
+            continue;
+        }
+
+        // 2. Append ancestorOrigin to output and set masked to false.
+        output.append(ancestor_origin);
+        masked = false;
+    }
+
+    // 13. Return output.
+    return output;
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#ancestor-origins-list-creation-steps
+GC::Ref<HTML::DOMStringList> Document::ancestor_origins_list_creation_steps() const
+{
+    // 1. Let ancestorOrigins be document's internal ancestor origin objects list.
+    auto& ancestor_origins = m_internal_ancestor_origin_objects_list;
+
+    // 2. Assert: ancestorOrigins is not null.
+    VERIFY(ancestor_origins.has_value());
+
+    // 3. Let output be « ».
+    Vector<String> output;
+
+    // 4. For each origin of ancestorOrigins:
+    for (auto const& origin : ancestor_origins.value()) {
+        // 1. Append the serialization of origin to output.
+        output.append(origin.serialize());
+    }
+
+    // 5. Return a new DOMStringList object whose associated list is output.
+    return HTML::DOMStringList::create(realm(), move(output));
 }
 
 StringView to_string(SetNeedsLayoutReason reason)

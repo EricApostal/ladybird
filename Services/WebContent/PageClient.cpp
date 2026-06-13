@@ -32,11 +32,13 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/WebIDL/Promise.h>
 #include <LibWebView/SiteIsolation.h>
 #include <LibWebView/ViewImplementation.h>
 #include <WebContent/ConnectionFromClient.h>
@@ -110,6 +112,8 @@ void PageClient::visit_edges(JS::Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_page);
     visitor.visit(m_top_level_document_console_client);
+    for (auto& promise : m_pending_delete_all_cookies_promises)
+        visitor.visit(promise.value);
     m_pending_dom_mutations.for_each([&](auto& pending_mutation) {
         visitor.visit(pending_mutation.target);
     });
@@ -634,6 +638,28 @@ void PageClient::page_did_expire_cookies_with_time_offset(AK::Duration offset)
         document->reset_cookie_version();
 }
 
+void PageClient::page_did_delete_all_cookies(URL::URL const& url, GC::Ref<Web::WebIDL::Promise> promise)
+{
+    auto request_id = m_next_delete_all_cookies_request_id++;
+    m_pending_delete_all_cookies_promises.set(request_id, promise);
+    client().async_did_request_delete_all_cookies(m_id, request_id, url);
+
+    if (auto* document = page().top_level_browsing_context().active_document())
+        document->reset_cookie_version();
+}
+
+void PageClient::did_delete_all_cookies(u64 request_id)
+{
+    auto maybe_promise = m_pending_delete_all_cookies_promises.take(request_id);
+    if (!maybe_promise.has_value())
+        return;
+
+    auto promise = maybe_promise.release_value();
+    auto& realm = promise->promise()->shape().realm();
+    Web::HTML::TemporaryExecutionContext execution_context { realm, Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+    Web::WebIDL::resolve_promise(realm, promise);
+}
+
 void PageClient::page_did_store_hsts_policy(String const& domain, HTTP::HSTS::ParsedHSTSPolicy const& policy)
 {
     client().async_did_store_hsts_policy(domain, policy);
@@ -695,6 +721,11 @@ void PageClient::page_did_clear_storage(Web::StorageAPI::StorageEndpointType sto
         dbgln("WebContent client disconnected during DidClearStorage. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
     }
+}
+
+void PageClient::page_did_broadcast_storage_change(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& url, Optional<String> const& key, Optional<String> const& old_value, Optional<String> const& new_value)
+{
+    client().async_did_change_storage_item(m_id, storage_endpoint, url, key, old_value, new_value);
 }
 
 void PageClient::page_did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage const& message)
