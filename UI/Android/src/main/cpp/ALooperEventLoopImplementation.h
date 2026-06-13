@@ -10,6 +10,7 @@
 #include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/WeakPtr.h>
+#include <LibCore/Event.h>
 #include <LibCore/EventLoopImplementation.h>
 #include <jni.h>
 
@@ -72,7 +73,7 @@ public:
 
     virtual bool was_exit_requested() const override { return m_exit_requested.load(MemoryOrder::memory_order_acquire); }
 
-    void post_event(Core::EventReceiver&, NonnullOwnPtr<Core::Event>&&);
+    void post_event(Core::EventReceiver&, Core::Event::Type);
 
     EventLoopThreadData& thread_data();
 
