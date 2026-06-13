@@ -82,9 +82,16 @@ android {
                     "-DVCPKG_TARGET_ANDROID=ON"
                 )
                 // The helper processes (WebContent, RequestServer, etc.) are dependencies of the
-                // ladybird target, and are packaged as "shared libraries" so that they end up in
-                // the APK's native library directory.
-                targets += listOf("ladybird")
+                // ladybird target, but AGP only republishes explicitly requested targets into the
+                // APK native-lib directory. Include helpers explicitly so they can be executed.
+                targets += listOf(
+                    "ladybird",
+                    "Compositor",
+                    "ImageDecoder",
+                    "RequestServer",
+                    "WebContent",
+                    "WebWorker"
+                )
             }
         }
         ndk {
