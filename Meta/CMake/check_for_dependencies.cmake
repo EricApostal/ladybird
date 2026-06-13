@@ -1,6 +1,7 @@
 include_guard()
 
 find_package(PkgConfig REQUIRED)
+include(${CMAKE_CURRENT_LIST_DIR}/utils.cmake)
 
 if (NOT WIN32 AND NOT ANDROID)
     pkg_check_modules(LIBEDIT REQUIRED IMPORTED_TARGET libedit)
@@ -38,11 +39,18 @@ else()
     find_package(hwy REQUIRED)
 
     find_package(FFMPEG REQUIRED)
-    # if (ANDROID)
-    #     # FIXME: Submit a proper patch to vcpkg in order not to bring host's libc++ when compiling for Android
-    #     filter_android_libcxx_list(filtered_libs ${FFMPEG_LIBRARIES})
-    #     set(FFMPEG_LIBRARIES ${filtered_libs})
-    # endif()
+
+    # Work around a vcpkg Android issue where pkg-config dependencies can add
+    # the host NDK libc++.so path into imported targets.
+    get_property(all_targets GLOBAL PROPERTY TARGETS)
+    foreach(target_name IN LISTS all_targets)
+        filter_android_libcxx(${target_name})
+    endforeach()
+
+    if (FFMPEG_LIBRARIES)
+        filter_android_libcxx_list(filtered_libs ${FFMPEG_LIBRARIES})
+        set(FFMPEG_LIBRARIES ${filtered_libs})
+    endif()
 endif()
 
 if (NOT APPLE AND NOT ANDROID AND NOT WIN32)
@@ -104,15 +112,7 @@ if(unofficial-skia_FOUND)
         set_property(TARGET unofficial::skia::skia APPEND PROPERTY INTERFACE_LINK_LIBRARIES "$<LINK_GROUP:no_as_needed,Fontconfig::Fontconfig>")
     endif()
     if (ANDROID)
-        # FIXME: Submit a proper patch to vcpkg in order not to bring host's libc++ when compiling for Android
-        get_target_property(link_libs unofficial::skia::skia INTERFACE_LINK_LIBRARIES)
-        set(filtered_libs)
-        foreach(lib ${link_libs})
-            if (NOT lib MATCHES "lib/libc\\+\\+.so$")
-                list(APPEND filtered_libs ${lib})
-            endif()
-        endforeach()
-        set_property(TARGET unofficial::skia::skia PROPERTY INTERFACE_LINK_LIBRARIES ${filtered_libs})
+        filter_android_libcxx(unofficial::skia::skia)
     endif()
 else()
     # Get skia version from vcpkg.json
