@@ -24,6 +24,19 @@ foreach(source IN LISTS TEST_SOURCES)
     ladybird_test("${source}" LibWeb LIBS LibWeb)
 endforeach()
 
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(rescan_libs)
+    foreach(lib IN ITEMS LibWeb LibURL LibRegex LibUnicode LibTextCodec libweb_rust liburl_rust libregex_rust libunicode_rust)
+        if (TARGET ${lib})
+            list(APPEND rescan_libs ${lib})
+        endif()
+    endforeach()
+
+    if (rescan_libs)
+        target_link_libraries(TestMicrosyntax PRIVATE "$<LINK_GROUP:RESCAN,${rescan_libs}>")
+    endif()
+endif()
+
 ladybird_utility(css-tokenizer SOURCES css-tokenizer.cpp LIBS LibFileSystem LibMain LibWeb)
 
 target_link_libraries(TestContentBlocker PRIVATE LibURL)
