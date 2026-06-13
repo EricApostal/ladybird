@@ -16,6 +16,7 @@ pick_host_compiler
 
 BUILD_DIR=${BUILD_DIR:-"${LADYBIRD_SOURCE_DIR}/Build"}
 CACHE_DIR=${CACHE_DIR:-"${BUILD_DIR}/caches"}
+CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-RelWithDebInfo}
 
 # HACK: This export of XDG_CACHE_HOME is required to make vcpkg happy.
 # This is because vcpkg tries to find a cache directory by:
@@ -31,6 +32,7 @@ export XDG_CACHE_HOME="$CACHE_DIR"
 
 cmake -S "${LADYBIRD_SOURCE_DIR}" -B "$BUILD_DIR/lagom-tools" \
     -GNinja -Dpackage=LagomTools \
+    -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
     -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/lagom-tools-install"  \
     -DCMAKE_C_COMPILER="$CC" \
     -DCMAKE_CXX_COMPILER="$CXX" \
