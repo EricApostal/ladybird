@@ -1,9 +1,7 @@
 import com.android.build.gradle.internal.tasks.factory.dependsOn
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
-plugins {
-    id("com.android.application") version "9.1.0"
-}
+plugins { id("com.android.application") version "9.1.0" }
 
 var buildDir = layout.buildDirectory.get()
 var cacheDir = System.getenv("LADYBIRD_CACHE_DIR") ?: "$buildDir/caches"
@@ -12,25 +10,33 @@ var sourceDir = layout.projectDirectory.dir("../../").toString()
 data class Sdl3JavaInputs(val jar: File?, val sourceDirs: List<File>)
 
 fun Project.resolveSdl3JavaInputs(sourceDir: String): Sdl3JavaInputs {
-    val jar = fileTree("$sourceDir/Build/vcpkg/packages") {
-        include("**/SDL3.jar")
-        include("**/SDL3-*.jar")
-        exclude("**/*-sources.jar")
-    }.files.minByOrNull { it.path }
-
-    val sourceDirs = if (jar == null) {
-        fileTree("$sourceDir/Build/vcpkg/buildtrees/sdl3") {
-            include("**/android-project/app/src/main/java/**/*.java")
-        }.files.mapNotNull { file ->
-            var current: File? = file
-            while (current != null && current.name != "java") {
-                current = current.parentFile
+    val jar =
+            fileTree("$sourceDir/Build/vcpkg/packages") {
+                include("**/SDL3.jar")
+                include("**/SDL3-*.jar")
+                exclude("**/*-sources.jar")
             }
-            current
-        }.distinct().sortedBy { it.path }
-    } else {
-        emptyList()
-    }
+                    .files
+                    .minByOrNull { it.path }
+
+    val sourceDirs =
+            if (jar == null) {
+                fileTree("$sourceDir/Build/vcpkg/buildtrees/sdl3") {
+                    include("**/android-project/app/src/main/java/**/*.java")
+                }
+                        .files
+                        .mapNotNull { file ->
+                            var current: File? = file
+                            while (current != null && current.name != "java") {
+                                current = current.parentFile
+                            }
+                            current
+                        }
+                        .distinct()
+                        .sortedBy { it.path }
+            } else {
+                emptyList()
+            }
 
     return Sdl3JavaInputs(jar = jar, sourceDirs = sourceDirs)
 }
@@ -41,23 +47,22 @@ fun verifySdl3JavaInputs(inputs: Sdl3JavaInputs) {
     }
 }
 
-var hostToolsTask = tasks.register<Exec>("buildLagomTools") {
-    commandLine = listOf("./BuildLagomTools.sh")
-    environment = mapOf(
-        "BUILD_DIR" to buildDir,
-        "CACHE_DIR" to cacheDir,
-        "PATH" to System.getenv("PATH")!!
-    )
-}
+var hostToolsTask =
+        tasks.register<Exec>("buildLagomTools") {
+            commandLine = listOf("./BuildLagomTools.sh")
+            environment =
+                    mapOf(
+                            "BUILD_DIR" to buildDir,
+                            "CACHE_DIR" to cacheDir,
+                            "PATH" to System.getenv("PATH")!!
+                    )
+        }
+
 tasks.named("preBuild").dependsOn(hostToolsTask)
+
 tasks.named("prepareKotlinBuildScriptModel").dependsOn(hostToolsTask)
 
-kotlin {
-    compilerOptions {
-        jvmTarget = JvmTarget.fromTarget("11")
-    }
-}
-
+kotlin { compilerOptions { jvmTarget = JvmTarget.fromTarget("11") } }
 
 android {
     namespace = "org.serenityos.ladybird"
@@ -75,23 +80,25 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++23"
-                arguments += listOf(
-                    "-DANDROID_STL=c++_shared",
-                    "-DLADYBIRD_CACHE_DIR=$cacheDir",
-                    "-DVCPKG_ROOT=$sourceDir/Build/vcpkg",
-                    "-DVCPKG_TARGET_ANDROID=ON"
-                )
+                arguments +=
+                        listOf(
+                                "-DANDROID_STL=c++_shared",
+                                "-DLADYBIRD_CACHE_DIR=$cacheDir",
+                                "-DVCPKG_ROOT=$sourceDir/Build/vcpkg",
+                                "-DVCPKG_TARGET_ANDROID=ON"
+                        )
                 // The helper processes (WebContent, RequestServer, etc.) are dependencies of the
                 // ladybird target, but AGP only republishes explicitly requested targets into the
                 // APK native-lib directory. Include helpers explicitly so they can be executed.
-                targets += listOf(
-                    "ladybird",
-                    "Compositor",
-                    "ImageDecoder",
-                    "RequestServer",
-                    "WebContent",
-                    "WebWorker"
-                )
+                targets +=
+                        listOf(
+                                "ladybird",
+                                "Compositor",
+                                "ImageDecoder",
+                                "RequestServer",
+                                "WebContent",
+                                "WebWorker"
+                        )
             }
         }
         ndk {
@@ -105,8 +112,8 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                    getDefaultProguardFile("proguard-android-optimize.txt"),
+                    "proguard-rules.pro"
             )
         }
     }
@@ -136,33 +143,32 @@ android {
 }
 
 // Use a lazy file tree so SDL jars generated during externalNativeBuild are picked up.
-val sdl3JavaJarFiles = fileTree("$sourceDir/Build/vcpkg/packages") {
-    include("**/SDL3.jar")
-    include("**/SDL3-*.jar")
-    exclude("**/*-sources.jar")
-}
+val sdl3JavaJarFiles =
+        fileTree("$sourceDir/Build/vcpkg/packages") {
+            include("**/SDL3.jar")
+            include("**/SDL3-*.jar")
+            exclude("**/*-sources.jar")
+        }
 
 // Keep source fallback for environments where unpacked SDL Java sources are used.
 val sdl3JavaSourceDirs = resolveSdl3JavaInputs(sourceDir).sourceDirs
 
-val verifySdl3JavaInputsTask = tasks.register("verifySdl3JavaInputs") {
-    group = "verification"
-    description = "Verifies SDL Android Java inputs exist after externalNativeBuild."
+val verifySdl3JavaInputsTask =
+        tasks.register("verifySdl3JavaInputs") {
+            group = "verification"
+            description = "Verifies SDL Android Java inputs exist after externalNativeBuild."
 
-    doLast {
-        verifySdl3JavaInputs(resolveSdl3JavaInputs(sourceDir))
-    }
-}
+            doLast { verifySdl3JavaInputs(resolveSdl3JavaInputs(sourceDir)) }
+        }
 
 // In assemble flows AGP typically runs buildCMake* tasks directly.
-tasks.matching { it.name.startsWith("buildCMake") || it.name.startsWith("externalNativeBuild") }
-    .configureEach {
-        finalizedBy(verifySdl3JavaInputsTask)
-    }
+tasks
+        .matching { it.name.startsWith("buildCMake") || it.name.startsWith("externalNativeBuild") }
+        .configureEach { finalizedBy(verifySdl3JavaInputsTask) }
 
 android.sourceSets.named("main") {
     if (sdl3JavaSourceDirs.isNotEmpty())
-        java.directories.addAll(sdl3JavaSourceDirs.map { it.absolutePath })
+            java.directories.addAll(sdl3JavaSourceDirs.map { it.absolutePath })
 }
 
 dependencies {
