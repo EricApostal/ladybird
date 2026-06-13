@@ -88,6 +88,10 @@ Java_org_serenityos_ladybird_LadybirdActivity_initNativeCode(JNIEnv* env, jobjec
     MUST(Core::Environment::set("HOME"sv, user_directory, Core::Environment::Overwrite::Yes));
     MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, ByteString::formatted("{}/config", user_directory), Core::Environment::Overwrite::Yes));
     MUST(Core::Environment::set("XDG_DATA_HOME"sv, ByteString::formatted("{}/userdata", user_directory), Core::Environment::Overwrite::Yes));
+    if (auto existing_library_path = Core::Environment::get("LD_LIBRARY_PATH"sv); existing_library_path.has_value())
+        MUST(Core::Environment::set("LD_LIBRARY_PATH"sv, ByteString::formatted("{}:{}", native_library_directory, *existing_library_path), Core::Environment::Overwrite::Yes));
+    else
+        MUST(Core::Environment::set("LD_LIBRARY_PATH"sv, native_library_directory, Core::Environment::Overwrite::Yes));
 
     dbgln("Set resource root to {}", resource_root);
 
