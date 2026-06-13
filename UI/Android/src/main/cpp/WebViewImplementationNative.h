@@ -36,6 +36,10 @@ public:
 private:
     jobject m_java_instance = nullptr;
     Web::DevicePixelSize m_viewport_size;
+    u64 m_paint_call_count { 0 };
+    u64 m_ready_to_paint_count { 0 };
+    bool m_logged_first_usable_frame { false };
+    bool m_logged_waiting_for_first_frame { false };
 };
 
 }

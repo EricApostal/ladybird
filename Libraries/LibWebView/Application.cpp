@@ -67,7 +67,7 @@ static double sanitized_display_refresh_rate(double refresh_rate)
 struct ApplicationSettingsObserver final : public SettingsObserver {
     virtual void tab_settings_changed() override
     {
-        Application::the().tab_settings_changed({});
+        Application::the().tab_settings_changed({ });
     }
 
     virtual void browsing_data_settings_changed() override
@@ -104,13 +104,13 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
 struct ApplicationBookmarkStoreObserver final : public BookmarkStoreObserver {
     virtual void bookmarks_changed() override
     {
-        Application::the().bookmarks_changed({});
+        Application::the().bookmarks_changed({ });
     }
 };
 
 Application::Application(Optional<ByteString> ladybird_binary_path)
-    : m_settings(Settings::create({}))
-    , m_bookmark_store(BookmarkStore::create({}))
+    : m_settings(Settings::create({ }))
+    , m_bookmark_store(BookmarkStore::create({ }))
 {
     VERIFY(!s_the);
     s_the = this;
@@ -418,7 +418,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     m_request_server_options = {
         .certificates = move(certificates),
         .http_disk_cache_mode = http_disk_cache_mode,
-        .resource_substitution_map_path = resource_substitution_map_path.has_value() ? Optional<ByteString> { *resource_substitution_map_path } : OptionalNone {},
+        .resource_substitution_map_path = resource_substitution_map_path.has_value() ? Optional<ByteString> { *resource_substitution_map_path } : OptionalNone { },
     };
 
     m_web_content_options = {
@@ -463,13 +463,13 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     m_event_loop = &create_platform_event_loop();
     TRY(launch_services());
 
-    return {};
+    return { };
 }
 
 ErrorOr<void> Application::load_content_blocker_lists()
 {
     if (m_browser_options.content_blocker_list_paths.is_empty())
-        return {};
+        return { };
 
     Checked<size_t> total_size = 0;
     for (auto const& path : m_browser_options.content_blocker_list_paths) {
@@ -496,7 +496,7 @@ ErrorOr<void> Application::load_content_blocker_lists()
 
     m_content_blocker_list_buffer = move(blocker_list_buffer);
 
-    return {};
+    return { };
 }
 
 void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab) const
@@ -524,7 +524,7 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
     auto client = TRY(WebView::launch_web_content_process(initial_page_id));
     client->async_initialize(initial_page_id);
     if (view.has_value())
-        client->assign_view({}, *view);
+        client->assign_view({ }, *view);
 
     client->async_connect_to_request_server(move(request_server_handle));
     client->async_connect_to_image_decoder(move(image_decoder_handle));
@@ -554,8 +554,8 @@ static bool can_send_compositor_process_ipc(RefPtr<CompositorClient> const& comp
 
 ErrorOr<void> Application::connect_web_content_to_compositor(WebContentClient& web_content_client)
 {
-    if (web_content_client.compositor_connection_id({}).has_value())
-        return {};
+    if (web_content_client.compositor_connection_id({ }).has_value())
+        return { };
 
     if (!m_compositor_client)
         return Error::from_string_literal("Compositor process is not available");
@@ -565,9 +565,9 @@ ErrorOr<void> Application::connect_web_content_to_compositor(WebContentClient& w
         return Error::from_string_literal("Compositor process disconnected while connecting WebContent");
     auto response = response_or_error.release_value();
 
-    web_content_client.set_compositor_connection_id({}, response.web_content_connection_id());
+    web_content_client.set_compositor_connection_id({ }, response.web_content_connection_id());
     web_content_client.async_connect_to_compositor_process(response.take_handle());
-    return {};
+    return { };
 }
 
 void Application::register_compositor_context(WebContentClient& web_content_client, Web::Compositor::CompositorContextId context_id, Optional<u64> page_id)
@@ -576,10 +576,10 @@ void Application::register_compositor_context(WebContentClient& web_content_clie
         return;
     VERIFY(m_compositor_client);
 
-    auto web_content_connection_id = web_content_client.compositor_connection_id({});
+    auto web_content_connection_id = web_content_client.compositor_connection_id({ });
     if (!web_content_connection_id.has_value()) {
         MUST(connect_web_content_to_compositor(web_content_client));
-        web_content_connection_id = web_content_client.compositor_connection_id({});
+        web_content_connection_id = web_content_client.compositor_connection_id({ });
     }
     VERIFY(web_content_connection_id.has_value());
 
@@ -591,10 +591,10 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     if (!m_compositor_client)
         return Error::from_string_literal("Compositor process is not available");
 
-    auto web_content_connection_id = web_content_client.compositor_connection_id({});
+    auto web_content_connection_id = web_content_client.compositor_connection_id({ });
     if (!web_content_connection_id.has_value()) {
         TRY(connect_web_content_to_compositor(web_content_client));
-        web_content_connection_id = web_content_client.compositor_connection_id({});
+        web_content_connection_id = web_content_client.compositor_connection_id({ });
     }
     VERIFY(web_content_connection_id.has_value());
 
@@ -602,7 +602,7 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
     if (result.is_error())
         return Error::from_string_literal("Compositor process disconnected while creating context");
 
-    return {};
+    return { };
 }
 
 void Application::update_compositor_viewport(Web::Compositor::CompositorContextId context_id, Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress window_resize_in_progress)
@@ -683,7 +683,7 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process
         auto web_content_client = m_spare_web_content_process.release_nonnull();
         launch_spare_web_content_process();
 
-        web_content_client->assign_view({}, view);
+        web_content_client->assign_view({ }, view);
         return web_content_client;
     }
 
@@ -712,7 +712,7 @@ void Application::launch_spare_web_content_process()
     Core::deferred_invoke([this]() {
         m_has_queued_task_to_launch_spare_web_content_process = false;
 
-        auto web_content_client = create_web_content_client({}, allocate_page_id());
+        auto web_content_client = create_web_content_client({ }, allocate_page_id());
         if (web_content_client.is_error()) {
             dbgln("Unable to create spare web content client: {}", web_content_client.error());
             return;
@@ -774,14 +774,17 @@ ErrorOr<void> Application::launch_services()
         }
     }
 
+    dbgln("[HelperLaunch] Starting RequestServer launch");
     TRY(launch_request_server());
+    dbgln("[HelperLaunch] Starting ImageDecoder launch");
     TRY(launch_image_decoder_server());
+    dbgln("[HelperLaunch] Starting Compositor launch");
     TRY(launch_compositor_process());
 
     if (m_browser_options.devtools_port.has_value())
         TRY(launch_devtools_server());
 
-    return {};
+    return { };
 }
 
 ErrorOr<void> Application::launch_compositor_process()
@@ -792,7 +795,7 @@ ErrorOr<void> Application::launch_compositor_process()
         handle_compositor_process_death();
     };
 
-    return {};
+    return { };
 }
 
 void Application::handle_compositor_process_death()
@@ -852,21 +855,21 @@ void Application::recover_compositor_process()
     });
 
     for (auto& client : clients) {
-        if (auto result = client->reconnect_to_compositor_process({}); result.is_error()) {
+        if (auto result = client->reconnect_to_compositor_process({ }); result.is_error()) {
             warnln("Unable to reconnect WebContent process {} to Compositor: {}", client->pid(), result.error());
             VERIFY_NOT_REACHED();
         }
     }
     for (auto& client : clients) {
-        if (auto result = client->recreate_compositor_contexts({}); result.is_error()) {
+        if (auto result = client->recreate_compositor_contexts({ }); result.is_error()) {
             warnln("Unable to recreate Compositor contexts for WebContent process {}: {}", client->pid(), result.error());
             VERIFY_NOT_REACHED();
         }
     }
     for (auto& client : clients)
-        client->replay_compositor_view_state_after_reconnect({});
+        client->replay_compositor_view_state_after_reconnect({ });
     for (auto& client : clients)
-        client->notify_compositor_process_reconnected({});
+        client->notify_compositor_process_reconnected({ });
 }
 
 ErrorOr<void> Application::launch_request_server()
@@ -913,7 +916,7 @@ ErrorOr<void> Application::launch_request_server()
     if (m_browser_options.dns_settings.has_value())
         m_settings.set_dns_settings(m_browser_options.dns_settings.value(), true);
 
-    return {};
+    return { };
 }
 
 ErrorOr<void> Application::launch_image_decoder_server()
@@ -944,7 +947,7 @@ ErrorOr<void> Application::launch_image_decoder_server()
         });
     };
 
-    return {};
+    return { };
 }
 
 ErrorOr<void> Application::launch_devtools_server()
@@ -957,7 +960,7 @@ ErrorOr<void> Application::launch_devtools_server()
     m_devtools = TRY(DevTools::DevToolsServer::create(*this, *m_browser_options.devtools_port));
     on_devtools_enabled();
 
-    return {};
+    return { };
 }
 
 static NonnullRefPtr<Core::Timer> load_page_for_screenshot_and_exit(Core::EventLoop& event_loop, HeadlessWebView& view, URL::URL const& url, u32 screenshot_timeout)
@@ -1083,6 +1086,11 @@ void Application::process_did_exit(Process&& process, Optional<int> exit_status)
     if (m_event_loop->was_exit_requested())
         return;
 
+    dbgln("[ProcessExit] {} pid={} raw_status={}",
+        process_name_from_type(process.type()),
+        process.pid(),
+        exit_status.has_value() ? *exit_status : -1);
+
     dbgln_if(WEBVIEW_PROCESS_DEBUG, "Process {} died, type: {}", process.pid(), process_name_from_type(process.type()));
 
     switch (process.type()) {
@@ -1163,9 +1171,9 @@ bool Application::supports_clipboard_type(ClipboardType type) const
 Utf16String Application::clipboard_text(ClipboardType) const
 {
     if (!m_clipboard.has_value())
-        return {};
+        return { };
     if (m_clipboard->mime_type != "text/plain"sv)
-        return {};
+        return { };
     return Utf16String::from_utf8(m_clipboard->data);
 }
 
@@ -1180,7 +1188,7 @@ void Application::set_clipboard_text(String text, ClipboardType)
 Vector<Web::Clipboard::SystemClipboardRepresentation> Application::clipboard_entries() const
 {
     if (!m_clipboard.has_value())
-        return {};
+        return { };
     return { *m_clipboard };
 }
 
@@ -1428,7 +1436,7 @@ void Application::initialize_actions()
 
         display_add_bookmark_dialog()
             ->when_resolved([this, bookmark_id = bookmark_id.release_value()](BookmarkItem::Bookmark bookmark) {
-                m_bookmark_store.add_bookmark(move(bookmark.url), move(bookmark.title), {}, bookmark_id.target_folder_id);
+                m_bookmark_store.add_bookmark(move(bookmark.url), move(bookmark.title), { }, bookmark_id.target_folder_id);
             });
     });
     auto add_bookmark_folder_action = Action::create("Add Folder..."sv, ActionID::AddBookmarkFolder, [this]() {
@@ -1661,14 +1669,14 @@ void Application::create_bookmark_menu_items(Optional<MenuData> data)
         return {
             .menu = *m_bookmarks_menu,
             .items = m_bookmark_store.root_items(),
-            .target_folder_id = {},
+            .target_folder_id = { },
         };
     });
 
     for (auto const& item : items) {
         item.data.visit(
             [&](BookmarkItem::Bookmark const& bookmark) {
-                auto action = Action::create(bookmark.title.value_or({}), ActionID::BookmarkItem, [this, url = bookmark.url]() {
+                auto action = Action::create(bookmark.title.value_or({ }), ActionID::BookmarkItem, [this, url = bookmark.url]() {
                     if (auto view = active_web_view(); view.has_value())
                         view->load(url);
                 });
@@ -1741,7 +1749,7 @@ ErrorOr<void> Application::toggle_devtools_enabled()
         TRY(launch_devtools_server());
     }
 
-    return {};
+    return { };
 }
 
 void Application::on_devtools_enabled() const
@@ -1765,7 +1773,7 @@ Optional<Core::TimeZoneWatcher&> Application::time_zone_watcher()
 {
     if (m_time_zone_watcher != nullptr)
         return *m_time_zone_watcher;
-    return {};
+    return { };
 }
 
 Vector<DevTools::TabDescription> Application::tab_list() const
@@ -1824,7 +1832,7 @@ void Application::traverse_the_history_by_delta(DevTools::TabDescription const& 
 Vector<HTTP::Cookie::Cookie> Application::cookies(DevTools::TabDescription const& description) const
 {
     if (!ViewImplementation::find_view_by_id(description.id).has_value())
-        return {};
+        return { };
 
     return Application::cookie_jar().get_all_cookies();
 }
@@ -1843,7 +1851,7 @@ ErrorOr<void> Application::set_cookie(DevTools::TabDescription const& descriptio
         old_key = CookieStorageKey { old_cookie->name, old_cookie->domain, old_cookie->path };
 
     TRY(Application::cookie_jar().set_cookie_from_devtools(*url, move(old_key), move(cookie)));
-    return {};
+    return { };
 }
 
 void Application::delete_cookies(DevTools::TabDescription const& description, Vector<HTTP::Cookie::Cookie> cookies) const
@@ -1924,7 +1932,7 @@ ErrorOr<Optional<String>> Application::remove_storage_item(DevTools::TabDescript
 
     auto old_value = Application::storage_jar().get_item(storage_endpoint, storage_key, key);
     if (!old_value.has_value())
-        return Optional<String> {};
+        return Optional<String> { };
 
     Application::storage_jar().remove_item(storage_endpoint, storage_key, key);
     view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Deleted, key });
@@ -1939,16 +1947,16 @@ ErrorOr<void> Application::clear_storage(DevTools::TabDescription const& descrip
 
     if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage) {
         view->clear_session_storage();
-        return {};
+        return { };
     }
 
     auto keys = Application::storage_jar().get_all_keys(storage_endpoint, storage_key);
     if (keys.is_empty())
-        return {};
+        return { };
 
     Application::storage_jar().clear_storage_key(storage_endpoint, storage_key);
-    view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Cleared, {} });
-    return {};
+    view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Cleared, { } });
+    return { };
 }
 
 u64 Application::add_storage_change_listener(DevTools::TabDescription const& description, OnStorageChange on_storage_change) const
@@ -2027,7 +2035,7 @@ void Application::inspect_grid_layouts(DevTools::TabDescription const& descripti
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
-        on_grid_layouts_received({});
+        on_grid_layouts_received({ });
         return;
     }
 
@@ -2043,7 +2051,7 @@ void Application::inspect_current_grid(DevTools::TabDescription const& descripti
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
-        on_current_grid_received({});
+        on_current_grid_received({ });
         return;
     }
 
@@ -2059,7 +2067,7 @@ void Application::inspect_current_flexbox(DevTools::TabDescription const& descri
 {
     auto view = ViewImplementation::find_view_by_id(description.id);
     if (!view.has_value()) {
-        on_current_flexbox_received({});
+        on_current_flexbox_received({ });
         return;
     }
 

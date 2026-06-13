@@ -5,6 +5,9 @@
  */
 
 #include "WebViewImplementationNative.h"
+#include <AK/ByteString.h>
+#include <AK/Debug.h>
+#include <cstring>
 #include <jni.h>
 
 using namespace Ladybird;
@@ -66,7 +69,7 @@ Java_org_serenityos_ladybird_WebViewImplementation_nativeDrawIntoBitmap(JNIEnv* 
 {
     auto* impl = reinterpret_cast<WebViewImplementationNative*>(instance);
 
-    AndroidBitmapInfo bitmap_info = {};
+    AndroidBitmapInfo bitmap_info = { };
     void* pixels = nullptr;
     AndroidBitmap_getInfo(env, bitmap, &bitmap_info);
     AndroidBitmap_lockPixels(env, bitmap, &pixels);
@@ -94,8 +97,18 @@ Java_org_serenityos_ladybird_WebViewImplementation_nativeLoadURL(JNIEnv* env, jo
 {
     auto* impl = reinterpret_cast<WebViewImplementationNative*>(instance);
     char const* raw_url = env->GetStringUTFChars(url, nullptr);
-    auto ak_url = URL::create_with_url_or_path(StringView { raw_url, strlen(raw_url) });
+    ByteString requested_url { raw_url };
+    dbgln("[AndroidWebView] JNI nativeLoadURL request='{}'", requested_url);
+
+    auto ak_url = URL::create_with_url_or_path(requested_url);
     env->ReleaseStringUTFChars(url, raw_url);
+
+    if (!ak_url.has_value()) {
+        warnln("[AndroidWebView] JNI nativeLoadURL parse failed for '{}'", requested_url);
+        return;
+    }
+
+    dbgln("[AndroidWebView] JNI nativeLoadURL parsed='{}'", ak_url->serialize());
     impl->load(ak_url.release_value());
 }
 

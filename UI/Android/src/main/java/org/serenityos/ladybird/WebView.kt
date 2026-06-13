@@ -3,31 +3,36 @@
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
-
 package org.serenityos.ladybird
 
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.util.AttributeSet
+import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 
 // FIXME: This should (eventually) implement NestedScrollingChild3 and ScrollingView
 class WebView(context: Context, attributeSet: AttributeSet) : View(context, attributeSet) {
+    private val logTag = "LadybirdWebView"
     private val viewImpl = WebViewImplementation(this)
     private lateinit var contentBitmap: Bitmap
+    private var drawCount: Long = 0
     var onLoadStart: (url: String, isRedirect: Boolean) -> Unit = { _, _ -> }
 
     fun initialize() {
+        Log.i(logTag, "initialize")
         viewImpl.initialize()
     }
 
     fun dispose() {
+        Log.i(logTag, "dispose")
         viewImpl.dispose()
     }
 
     fun loadURL(url: String) {
+        Log.i(logTag, "loadURL: $url")
         viewImpl.loadURL(url)
     }
 
@@ -35,9 +40,10 @@ class WebView(context: Context, attributeSet: AttributeSet) : View(context, attr
         // The native side only supports down, move, and up events.
         // So, ignore any other MotionEvents.
         if (event.action != MotionEvent.ACTION_DOWN &&
-            event.action != MotionEvent.ACTION_MOVE &&
-            event.action != MotionEvent.ACTION_UP) {
-            return super.onTouchEvent(event);
+                        event.action != MotionEvent.ACTION_MOVE &&
+                        event.action != MotionEvent.ACTION_UP
+        ) {
+            return super.onTouchEvent(event)
         }
 
         // FIXME: We are passing these through as mouse events.
@@ -53,6 +59,7 @@ class WebView(context: Context, attributeSet: AttributeSet) : View(context, attr
         contentBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
 
         val pixelDensity = context.resources.displayMetrics.density
+        Log.i(logTag, "onSizeChanged new=${w}x$h old=${oldw}x$oldh density=$pixelDensity")
         viewImpl.setDevicePixelRatio(pixelDensity)
 
         // FIXME: Account for scroll offset when view supports scrolling
@@ -62,8 +69,14 @@ class WebView(context: Context, attributeSet: AttributeSet) : View(context, attr
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        viewImpl.drawIntoBitmap(contentBitmap);
+        drawCount += 1
+        if (drawCount <= 10L || drawCount % 30L == 0L)
+                Log.i(
+                        logTag,
+                        "onDraw #$drawCount size=${width}x$height bitmap=${contentBitmap.width}x${contentBitmap.height}"
+                )
+
+        viewImpl.drawIntoBitmap(contentBitmap)
         canvas.drawBitmap(contentBitmap, 0f, 0f, null)
     }
-
 }

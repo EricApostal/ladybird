@@ -47,18 +47,23 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
             options.executable = path;
         }
 
+        dbgln("[HelperLaunch] Attempting {} launch via '{}'", server_name, options.executable);
+
         bool capture_output = WebView::Application::the().should_capture_web_content_output();
         auto result = WebView::Process::spawn<ClientType>(process_type, move(options), capture_output, forward<ClientArguments>(client_arguments)...);
 
         if (!result.is_error()) {
             auto&& [process, client] = result.release_value();
 
-            if constexpr (requires { client->set_pid(pid_t {}); })
+            dbgln("[HelperLaunch] Launched {} (pid={})", server_name, process.pid());
+
+            if constexpr (requires { client->set_pid(pid_t { }); })
                 client->set_pid(process.pid());
 
             if constexpr (requires { client->transport().set_peer_pid(0); } && !IsSame<ClientType, WebWorkerClient>) {
                 auto response = client->template send_sync<typename ClientType::InitTransport>(Core::System::getpid());
                 client->transport().set_peer_pid(response->peer_pid());
+                dbgln("[HelperLaunch] {} InitTransport peer_pid={}", server_name, response->peer_pid());
             }
 
             WebView::Application::the().add_child_process(move(process));
@@ -77,6 +82,8 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
             warnln("Could not launch any of {}: {}", candidate_server_paths, result.error());
             return result.release_error();
         }
+
+        dbgln("[HelperLaunch] Failed to launch {} via '{}': {}", server_name, path, result.error());
     }
 
     VERIFY_NOT_REACHED();
@@ -265,7 +272,7 @@ ErrorOr<NonnullRefPtr<Requests::RequestClient>> launch_request_server_process()
     client->async_set_disk_cache_settings(browsing_data_settings.disk_cache_settings);
 
     Application::settings().dns_settings().visit(
-        [](SystemDNS) {},
+        [](SystemDNS) { },
         [&](DNSOverTLS const& dns_over_tls) {
             dbgln("Setting DNS server to {}:{} with TLS ({} local dnssec)", dns_over_tls.server_address, dns_over_tls.port, dns_over_tls.validate_dnssec_locally ? "with" : "without");
             client->async_set_dns_server(dns_over_tls.server_address, dns_over_tls.port, true, dns_over_tls.validate_dnssec_locally);
