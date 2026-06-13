@@ -38,7 +38,7 @@ public:
     virtual void unregister_signal(int) override { }
 
 private:
-    int m_pipe[2] = {};
+    int m_pipe[2] = { };
     ALooper* m_main_looper { nullptr };
     jobject m_timer_service { nullptr };
     jmethodID m_register_timer { nullptr };

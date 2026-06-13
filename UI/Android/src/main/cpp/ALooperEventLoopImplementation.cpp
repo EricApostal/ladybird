@@ -18,7 +18,7 @@ namespace Ladybird {
 
 EventLoopThreadData& EventLoopThreadData::the()
 {
-    static thread_local EventLoopThreadData s_thread_data { {}, {}, &Core::ThreadEventQueue::current() };
+    static thread_local EventLoopThreadData s_thread_data { { }, { }, &Core::ThreadEventQueue::current() };
     return s_thread_data;
 }
 
