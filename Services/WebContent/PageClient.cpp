@@ -229,6 +229,7 @@ void PageClient::set_window_size(Web::DevicePixelSize size)
 
 void PageClient::compositor_process_reconnected()
 {
+    dbgln("[WebContent] PageClient {} replaying render state after compositor connect/reconnect", m_id);
     page().top_level_traversable()->repaint_after_compositor_process_reconnect();
     page().republish_all_canvas_element_surfaces();
     page().update_all_media_element_video_sinks();
@@ -475,7 +476,7 @@ void PageClient::page_did_request_alert(String const& message)
     client().async_did_request_alert(m_id, message);
 
     if (m_webdriver)
-        m_webdriver->page_did_open_dialog({});
+        m_webdriver->page_did_open_dialog({ });
 }
 
 void PageClient::alert_closed()
@@ -488,7 +489,7 @@ void PageClient::page_did_request_confirm(String const& message)
     client().async_did_request_confirm(m_id, message);
 
     if (m_webdriver)
-        m_webdriver->page_did_open_dialog({});
+        m_webdriver->page_did_open_dialog({ });
 }
 
 void PageClient::confirm_closed(bool accepted)
@@ -501,7 +502,7 @@ void PageClient::page_did_request_prompt(String const& message, String const& de
     client().async_did_request_prompt(m_id, message, default_);
 
     if (m_webdriver)
-        m_webdriver->page_did_open_dialog({});
+        m_webdriver->page_did_open_dialog({ });
 }
 
 void PageClient::page_did_request_set_prompt_text(String const& text)
@@ -762,14 +763,14 @@ void PageClient::page_did_request_activate_tab()
 
 void PageClient::page_did_close_top_level_traversable()
 {
-    page().top_level_traversable()->compositor_context().set_presentation_mode(Empty {});
+    page().top_level_traversable()->compositor_context().set_presentation_mode(Empty { });
 
     // FIXME: Rename this IPC call
     client().async_did_close_browsing_context(m_id);
 
     // NOTE: This only removes the strong reference the PageHost has for this PageClient.
     //       It will be GC'd 'later'.
-    m_owner.remove_page({}, m_id);
+    m_owner.remove_page({ }, m_id);
 }
 
 void PageClient::page_did_change_needs_beforeunload_check(bool needs_beforeunload_check)
@@ -887,7 +888,7 @@ void PageClient::page_did_mutate_dom(FlyString const& type, Web::DOM::Node const
         VERIFY_NOT_REACHED();
     }
 
-    auto mutation_message = WebView::Mutation { type.to_string(), target.unique_id(), {}, mutation.release_value() };
+    auto mutation_message = WebView::Mutation { type.to_string(), target.unique_id(), { }, mutation.release_value() };
     if (m_pending_dom_mutations.is_empty() && target.document().layout_is_up_to_date()) {
         send_dom_mutation(target, move(mutation_message));
         return;
@@ -933,19 +934,19 @@ ErrorOr<void> PageClient::connect_to_webdriver(ByteString const& webdriver_endpo
     VERIFY(!m_webdriver);
     m_webdriver = TRY(WebDriverConnection::connect(*this, webdriver_endpoint));
 
-    return {};
+    return { };
 }
 
 ErrorOr<void> PageClient::connect_to_web_ui(IPC::TransportHandle handle)
 {
     auto* active_document = page().top_level_browsing_context().active_document();
     if (!active_document || !active_document->window())
-        return {};
+        return { };
 
     VERIFY(!m_web_ui);
     m_web_ui = TRY(WebUIConnection::connect(move(handle), *active_document));
 
-    return {};
+    return { };
 }
 
 void PageClient::received_message_from_web_ui(String const& name, JS::Value data)

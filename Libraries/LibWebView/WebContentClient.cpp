@@ -42,11 +42,11 @@ static constexpr auto detached_page_forced_exit_timeout_ms = detached_page_close
 static Optional<String> history_title(Utf16String const& title, URL::URL const& url)
 {
     if (title.is_empty())
-        return {};
+        return { };
 
     auto title_utf8 = title.to_utf8();
     if (title_utf8 == url.serialize() || title_utf8 == url.serialize(URL::ExcludeFragment::Yes))
-        return {};
+        return { };
 
     return title_utf8;
 }
@@ -100,7 +100,7 @@ Optional<u64> WebContentClient::page_id_for_compositor_context_id(Web::Composito
 {
     auto page_id = m_compositor_contexts.get(context_id);
     if (!page_id.has_value())
-        return {};
+        return { };
     return *page_id;
 }
 
@@ -110,8 +110,8 @@ Messages::WebContentClient::AllocateCompositorContextIdResponse WebContentClient
         return compositor_context_id_for_page(page_id);
 
     auto context_id = Application::the().allocate_compositor_context_id();
-    remember_compositor_context(context_id, {});
-    Application::the().register_compositor_context(*this, context_id, {});
+    remember_compositor_context(context_id, { });
+    Application::the().register_compositor_context(*this, context_id, { });
     return context_id;
 }
 
@@ -224,22 +224,22 @@ void WebContentClient::destroy_all_compositor_contexts()
 ErrorOr<void> WebContentClient::reconnect_to_compositor_process(Badge<Application>)
 {
     if (!is_open())
-        return {};
+        return { };
 
     m_compositor_connection_id.clear();
     TRY(Application::the().connect_web_content_to_compositor(*this));
-    return {};
+    return { };
 }
 
 ErrorOr<void> WebContentClient::recreate_compositor_contexts(Badge<Application>)
 {
     if (!is_open())
-        return {};
+        return { };
 
     for (auto const& [context_id, page_id] : m_compositor_contexts)
         TRY(Application::the().try_register_compositor_context(*this, context_id, page_id));
 
-    return {};
+    return { };
 }
 
 void WebContentClient::replay_compositor_view_state_after_reconnect(Badge<Application>)
@@ -330,10 +330,11 @@ void WebContentClient::notify_presented_bitmap_ready_to_paint(u64 page_id, i32 b
 
 void WebContentClient::did_present_bitmap(u64 page_id, Gfx::IntRect rect, i32 bitmap_id)
 {
+    dbgln("[WebContentUI] did_present_bitmap page={} bitmap={} rect={}x{}@{},{}", page_id, bitmap_id, rect.width(), rect.height(), rect.x(), rect.y());
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC did_paint for page {} bitmap {} rect={}x{} at {},{}",
         page_id, bitmap_id, rect.width(), rect.height(), rect.x(), rect.y());
     if (auto view = view_for_page_id(page_id); view.has_value()) {
-        view->server_did_paint({}, bitmap_id, rect.size());
+        view->server_did_paint({ }, bitmap_id, rect.size());
     } else {
         dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI dropping did_paint for page {} bitmap {}: no view",
             page_id, bitmap_id);
@@ -368,8 +369,9 @@ void WebContentClient::maybe_record_history_visit_for_current_load(u64 page_id, 
 
 void WebContentClient::did_start_loading(u64 page_id, URL::URL url, bool is_redirect)
 {
+    dbgln("[WebContentUI] did_start_loading page={} url={} redirect={}", page_id, url, is_redirect);
     if (auto process = WebView::Application::the().find_process(m_process_handle.pid); process.has_value())
-        process->set_title(OptionalNone {});
+        process->set_title(OptionalNone { });
 
     m_history_recorded_urls_for_current_load.remove(page_id);
 
@@ -377,7 +379,7 @@ void WebContentClient::did_start_loading(u64 page_id, URL::URL url, bool is_redi
         view->m_should_suppress_history_for_current_load = view->m_should_suppress_history_for_next_load;
         view->m_should_suppress_history_for_next_load = false;
 
-        view->set_url({}, url);
+        view->set_url({ }, url);
 
         if (view->on_load_start)
             view->on_load_start(url, is_redirect);
@@ -405,7 +407,7 @@ void WebContentClient::did_finish_loading(u64 page_id, URL::URL url)
         if (view->m_should_suppress_history_for_current_load)
             client_url = view->url();
         else
-            view->set_url({}, url);
+            view->set_url({ }, url);
         auto should_update_history = !view->m_should_suppress_history_for_current_load;
         auto title = history_title(view->title(), url);
 
@@ -504,7 +506,7 @@ void WebContentClient::did_change_title(u64 page_id, Utf16String title)
         if (title.is_empty())
             title = Utf16String::from_utf8(view->url().serialize());
 
-        view->set_title({}, title);
+        view->set_title({ }, title);
 
         if (view->on_title_change)
             view->on_title_change(title);
@@ -520,7 +522,7 @@ void WebContentClient::did_change_url(u64 page_id, URL::URL url)
         if (view->url() == url)
             return;
 
-        view->set_url({}, url);
+        view->set_url({ }, url);
 
         if (view->on_url_change)
             view->on_url_change(url);
@@ -593,25 +595,25 @@ void WebContentClient::did_middle_click_link(u64, URL::URL url, ByteString, unsi
 void WebContentClient::did_request_context_menu(u64 page_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_request_page_context_menu({}, content_position, for_input_events_target);
+        view->did_request_page_context_menu({ }, content_position, for_input_events_target);
 }
 
 void WebContentClient::did_request_link_context_menu(u64 page_id, Gfx::IntPoint content_position, URL::URL url, ByteString, unsigned)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_request_link_context_menu({}, content_position, move(url));
+        view->did_request_link_context_menu({ }, content_position, move(url));
 }
 
 void WebContentClient::did_request_image_context_menu(u64 page_id, Gfx::IntPoint content_position, URL::URL url, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_request_image_context_menu({}, content_position, move(url), move(bitmap));
+        view->did_request_image_context_menu({ }, content_position, move(url), move(bitmap));
 }
 
 void WebContentClient::did_request_media_context_menu(u64 page_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::Page::MediaContextMenu menu)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_request_media_context_menu({}, content_position, move(menu));
+        view->did_request_media_context_menu({ }, content_position, move(menu));
 }
 
 void WebContentClient::did_get_source(u64, URL::URL url, URL::URL base_url, String source)
@@ -627,12 +629,12 @@ static JsonObject parse_json(StringView json, StringView name)
     auto parsed_tree = JsonValue::from_string(json);
     if (parsed_tree.is_error()) {
         dbgln("Unable to parse {}: {}", name, parsed_tree.error());
-        return {};
+        return { };
     }
 
     if (!parsed_tree.value().is_object()) {
         dbgln("Expected {} to be an object: {}", name, parsed_tree.value());
-        return {};
+        return { };
     }
 
     return move(parsed_tree.release_value().as_object());
@@ -643,12 +645,12 @@ static JsonArray parse_json_array(StringView json, StringView name)
     auto parsed_tree = JsonValue::from_string(json);
     if (parsed_tree.is_error()) {
         dbgln("Unable to parse {}: {}", name, parsed_tree.error());
-        return {};
+        return { };
     }
 
     if (!parsed_tree.value().is_array()) {
         dbgln("Expected {} to be an array: {}", name, parsed_tree.value());
-        return {};
+        return { };
     }
 
     return move(parsed_tree.release_value().as_array());
@@ -659,15 +661,15 @@ static Optional<JsonObject> parse_optional_json_object(StringView json, StringVi
     auto parsed_tree = JsonValue::from_string(json);
     if (parsed_tree.is_error()) {
         dbgln("Unable to parse {}: {}", name, parsed_tree.error());
-        return {};
+        return { };
     }
 
     if (parsed_tree.value().is_null())
-        return {};
+        return { };
 
     if (!parsed_tree.value().is_object()) {
         dbgln("Expected {} to be an object or null: {}", name, parsed_tree.value());
-        return {};
+        return { };
     }
 
     return move(parsed_tree.release_value().as_object());
@@ -812,13 +814,13 @@ void WebContentClient::did_get_style_sheet_source(u64 page_id, Web::CSS::StyleSh
 void WebContentClient::did_take_screenshot(u64 page_id, Gfx::ShareableBitmap screenshot)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_receive_screenshot({}, screenshot);
+        view->did_receive_screenshot({ }, screenshot);
 }
 
 void WebContentClient::did_get_internal_page_info(u64 page_id, WebView::PageInfoType type, Optional<Core::AnonymousBuffer> info)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_receive_internal_page_info({}, type, info);
+        view->did_receive_internal_page_info({ }, type, info);
 }
 
 void WebContentClient::did_execute_js_console_input(u64 page_id, JsonValue result)
@@ -927,14 +929,14 @@ void WebContentClient::did_change_favicon(u64 page_id, Gfx::ShareableBitmap favi
     if (auto view = view_for_page_id(page_id); view.has_value()) {
         if (!view->m_should_suppress_history_for_current_load)
             maybe_record_history_visit_for_current_load(page_id, view->url(), history_title(view->title(), view->url()), "favicon change"sv);
-        view->set_favicon({}, *favicon.bitmap());
+        view->set_favicon({ }, *favicon.bitmap());
     }
 }
 
 void WebContentClient::did_request_document_cookie_version_index(u64 page_id, i64 document_id, String domain)
 {
     if (auto view = view_for_page_id(page_id); view.has_value()) {
-        if (auto document_index = view->ensure_document_cookie_version_index({}, domain); !document_index.is_error())
+        if (auto document_index = view->ensure_document_cookie_version_index({ }, domain); !document_index.is_error())
             async_set_document_cookie_version_index(page_id, document_id, document_index.value());
     }
 }
@@ -1095,7 +1097,7 @@ void WebContentClient::did_close_browsing_context(u64 page_id)
 void WebContentClient::did_change_needs_beforeunload_check(u64 page_id, bool needs_beforeunload_check)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_change_needs_beforeunload_check({}, needs_beforeunload_check);
+        view->did_change_needs_beforeunload_check({ }, needs_beforeunload_check);
 }
 
 void WebContentClient::did_update_resource_count(u64 page_id, i32 count_waiting)
@@ -1197,13 +1199,13 @@ void WebContentClient::did_request_select_dropdown(u64 page_id, Gfx::IntPoint co
 void WebContentClient::did_finish_handling_input_event(u64 page_id, Web::EventResult event_result)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_finish_handling_input_event({}, event_result);
+        view->did_finish_handling_input_event({ }, event_result);
 }
 
 void WebContentClient::did_update_input_caret_rect(u64 page_id, Optional<Web::DevicePixelRect> rect)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->set_input_caret_rect({}, rect);
+        view->set_input_caret_rect({ }, rect);
 }
 
 void WebContentClient::did_change_theme_color(u64 page_id, Gfx::Color color)
@@ -1217,7 +1219,7 @@ void WebContentClient::did_change_theme_color(u64 page_id, Gfx::Color color)
 void WebContentClient::did_change_background_color(u64 page_id, Gfx::Color color)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_change_background_color({}, color);
+        view->did_change_background_color({ }, color);
 }
 
 void WebContentClient::did_insert_clipboard_entry(u64, Web::Clipboard::SystemClipboardRepresentation entry, String)
@@ -1253,21 +1255,22 @@ void WebContentClient::did_update_primary_selection(u64 page_id, String text)
 void WebContentClient::did_change_audio_play_state(u64 page_id, Web::HTML::AudioPlayState play_state)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_change_audio_play_state({}, play_state);
+        view->did_change_audio_play_state({ }, play_state);
 }
 
 void WebContentClient::did_update_navigation_buttons_state(u64 page_id, bool back_enabled, bool forward_enabled)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_update_navigation_buttons_state({}, back_enabled, forward_enabled);
+        view->did_update_navigation_buttons_state({ }, back_enabled, forward_enabled);
 }
 
 void WebContentClient::did_present_backing_stores(u64 page_id, i32 front_bitmap_id, Gfx::SharedImage front_backing_store, i32 back_bitmap_id, Gfx::SharedImage back_backing_store)
 {
+    dbgln("[WebContentUI] did_present_backing_stores page={} front={} back={}", page_id, front_bitmap_id, back_bitmap_id);
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received backing stores for page {} front={} back={}",
         page_id, front_bitmap_id, back_bitmap_id);
     if (auto view = view_for_page_id(page_id); view.has_value()) {
-        view->did_allocate_backing_stores({}, front_bitmap_id, move(front_backing_store), back_bitmap_id, move(back_backing_store));
+        view->did_allocate_backing_stores({ }, front_bitmap_id, move(front_backing_store), back_bitmap_id, move(back_backing_store));
     } else {
         dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI dropping backing stores for page {} front={} back={}: no view",
             page_id, front_bitmap_id, back_bitmap_id);
@@ -1293,13 +1296,13 @@ Optional<ViewImplementation&> WebContentClient::view_for_page_id(u64 page_id, So
 {
     // Don't bother logging anything for the spare WebContent process. It will only receive a load notification for about:blank.
     if (m_views.is_empty())
-        return {};
+        return { };
 
     if (auto view = m_views.get(page_id); view.has_value())
         return *view.value();
 
     dbgln("WebContentClient::{}: Did not find a page with ID {}", location.function_name(), page_id);
-    return {};
+    return { };
 }
 
 }

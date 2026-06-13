@@ -112,7 +112,13 @@ class LadybirdActivity : AppCompatActivity() {
         val initialUrl = normalizeInputUrl(intent.dataString ?: "https://ladybird.org")
         Log.i(logTag, "Initial URL request: $initialUrl")
         urlEditText.setText(initialUrl, TextView.BufferType.EDITABLE)
-        view.loadURL(initialUrl)
+        view.post {
+            Log.i(
+                    logTag,
+                    "Dispatching initial URL after layout: ${view.width}x${view.height} -> $initialUrl"
+            )
+            view.loadURL(initialUrl)
+        }
 
         Log.i(logTag, "Starting periodic event loop pump every ${eventLoopPumpIntervalMs}ms")
         eventLoopHandler.post(eventLoopPumpRunnable)
