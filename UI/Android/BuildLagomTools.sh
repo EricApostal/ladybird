@@ -7,10 +7,10 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 LADYBIRD_SOURCE_DIR="$(realpath "${DIR}"/../..)"
 
 # shellcheck source=/dev/null
-. "${LADYBIRD_SOURCE_DIR}/Meta/utils/shell_include.sh"
+. "${LADYBIRD_SOURCE_DIR}/Meta/Utils/shell_include.sh"
 
 # shellcheck source=/dev/null
-. "${LADYBIRD_SOURCE_DIR}/Meta/utils/find_compiler.sh"
+. "${LADYBIRD_SOURCE_DIR}/Meta/Utils/find_compiler.sh"
 
 pick_host_compiler
 
