@@ -1,17 +1,68 @@
+import com.android.build.gradle.internal.tasks.factory.dependsOn
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
-    id("com.android.application") version "8.11.0"
-    id("org.jetbrains.kotlin.android") version "2.1.20"
+    id("com.android.application") version "9.1.0"
 }
 
 var buildDir = layout.buildDirectory.get()
 var cacheDir = System.getenv("LADYBIRD_CACHE_DIR") ?: "$buildDir/caches"
 var sourceDir = layout.projectDirectory.dir("../../").toString()
 
+data class Sdl3JavaInputs(val jar: File?, val sourceDirs: List<File>)
+
+fun Project.resolveSdl3JavaInputs(sourceDir: String): Sdl3JavaInputs {
+    val jar = fileTree("$sourceDir/Build/vcpkg/packages") {
+        include("**/SDL3.jar")
+        include("**/SDL3-*.jar")
+        exclude("**/*-sources.jar")
+    }.files.minByOrNull { it.path }
+
+    val sourceDirs = if (jar == null) {
+        fileTree("$sourceDir/Build/vcpkg/buildtrees/sdl3") {
+            include("**/android-project/app/src/main/java/**/*.java")
+        }.files.mapNotNull { file ->
+            var current: File? = file
+            while (current != null && current.name != "java") {
+                current = current.parentFile
+            }
+            current
+        }.distinct().sortedBy { it.path }
+    } else {
+        emptyList()
+    }
+
+    return Sdl3JavaInputs(jar = jar, sourceDirs = sourceDirs)
+}
+
+fun verifySdl3JavaInputs(inputs: Sdl3JavaInputs) {
+    check(inputs.jar != null || inputs.sourceDirs.isNotEmpty()) {
+        "Unable to locate SDL Android Java sources. Expected either packaged SDL3 Java artifacts or unpacked SDL buildtree sources under Build/vcpkg."
+    }
+}
+
+var hostToolsTask = tasks.register<Exec>("buildLagomTools") {
+    commandLine = listOf("./BuildLagomTools.sh")
+    environment = mapOf(
+        "BUILD_DIR" to buildDir,
+        "CACHE_DIR" to cacheDir,
+        "PATH" to System.getenv("PATH")!!
+    )
+}
+tasks.named("preBuild").dependsOn(hostToolsTask)
+tasks.named("prepareKotlinBuildScriptModel").dependsOn(hostToolsTask)
+
+kotlin {
+    compilerOptions {
+        jvmTarget = JvmTarget.fromTarget("11")
+    }
+}
+
+
 android {
     namespace = "org.serenityos.ladybird"
-    compileSdk = 35
-    // FIXME: Replace the NDK version to a stable one (this is r29 beta 2)
-    ndkVersion = "29.0.13599879"
+    compileSdk = 36
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
         applicationId = "org.serenityos.ladybird"
@@ -39,7 +90,7 @@ android {
         ndk {
             // Specifies the ABI configurations of your native
             // libraries Gradle should build and package with your app.
-            abiFilters += listOf("x86_64", "arm64-v8a")
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
@@ -55,9 +106,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
-    }
-    kotlinOptions {
-        jvmTarget = "11"
     }
     externalNativeBuild {
         cmake {
@@ -78,6 +126,36 @@ android {
             useLegacyPackaging = true
         }
     }
+}
+
+// Use a lazy file tree so SDL jars generated during externalNativeBuild are picked up.
+val sdl3JavaJarFiles = fileTree("$sourceDir/Build/vcpkg/packages") {
+    include("**/SDL3.jar")
+    include("**/SDL3-*.jar")
+    exclude("**/*-sources.jar")
+}
+
+// Keep source fallback for environments where unpacked SDL Java sources are used.
+val sdl3JavaSourceDirs = resolveSdl3JavaInputs(sourceDir).sourceDirs
+
+val verifySdl3JavaInputsTask = tasks.register("verifySdl3JavaInputs") {
+    group = "verification"
+    description = "Verifies SDL Android Java inputs exist after externalNativeBuild."
+
+    doLast {
+        verifySdl3JavaInputs(resolveSdl3JavaInputs(sourceDir))
+    }
+}
+
+// In assemble flows AGP typically runs buildCMake* tasks directly.
+tasks.matching { it.name.startsWith("buildCMake") || it.name.startsWith("externalNativeBuild") }
+    .configureEach {
+        finalizedBy(verifySdl3JavaInputsTask)
+    }
+
+android.sourceSets.named("main") {
+    if (sdl3JavaSourceDirs.isNotEmpty())
+        java.directories.addAll(sdl3JavaSourceDirs.map { it.absolutePath })
 }
 
 dependencies {

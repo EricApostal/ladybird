@@ -37,6 +37,11 @@ else()
     find_package(hwy REQUIRED)
 
     find_package(FFMPEG REQUIRED)
+    # if (ANDROID)
+    #     # FIXME: Submit a proper patch to vcpkg in order not to bring host's libc++ when compiling for Android
+    #     filter_android_libcxx_list(filtered_libs ${FFMPEG_LIBRARIES})
+    #     set(FFMPEG_LIBRARIES ${filtered_libs})
+    # endif()
 endif()
 
 if (NOT APPLE AND NOT ANDROID AND NOT WIN32)

@@ -972,7 +972,7 @@ static RuntimeHelpers make_runtime_helpers()
     };
 }
 
-static CraneliftInsn serialize_insn(Dispatch const& dispatch, SourcesAndDestination const& addr)
+[[maybe_unused]] static CraneliftInsn serialize_insn(Dispatch const& dispatch, SourcesAndDestination const& addr)
 {
     CraneliftInsn out {};
     auto const* insn = dispatch.instruction;

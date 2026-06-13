@@ -95,6 +95,10 @@
       "name": "libdwarf",
       "platform": "linux | windows | osx"
     },
+    {
+      "name": "libedit",
+      "platform": "linux | bsd | osx"
+    },
     "libjpeg-turbo",
     "libjxl",
     {
