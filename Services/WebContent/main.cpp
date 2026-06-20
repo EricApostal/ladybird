@@ -58,6 +58,39 @@
 
 #include <SDL3/SDL_init.h>
 
+#if defined(__ANDROID__)
+#    include <android/log.h>
+#    include <pthread.h>
+#    include <unistd.h>
+
+static int s_child_logpipe[2];
+static void* child_log_thread(void*)
+{
+    char buffer[2048];
+    ssize_t bytes_read;
+    while ((bytes_read = read(s_child_logpipe[0], buffer, sizeof(buffer) - 1)) > 0) {
+        buffer[bytes_read] = '\0';
+        __android_log_print(ANDROID_LOG_FATAL, "LadybirdWebContent", "%s", buffer);
+    }
+    return nullptr;
+}
+
+static void hook_child_stderr_to_logcat()
+{
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
+    if (pipe(s_child_logpipe) == 0) {
+        dup2(s_child_logpipe[1], STDOUT_FILENO);
+        dup2(s_child_logpipe[1], STDERR_FILENO);
+
+        pthread_t thread;
+        pthread_create(&thread, nullptr, child_log_thread, nullptr);
+        pthread_detach(thread);
+    }
+}
+#endif
+
 #if !defined(AK_OS_WINDOWS)
 #    include <signal.h>
 static void crash_signal_handler(int signo)
@@ -83,6 +116,11 @@ static void crash_signal_handler(int signo)
         name = "unknown";
         break;
     }
+
+#    if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_FATAL, "LadybirdCrash", "CRASH: Received signal %s (%d)", name, signo);
+#    endif
+
     warnln("\n\033[31;1mCRASH\033[0m: Received signal {} ({})", name, signo);
     dump_backtrace(2, 100);
     Core::Process::terminate_immediately(128 + signo);
@@ -111,6 +149,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
 
+#if defined(__ANDROID__)
+    hook_child_stderr_to_logcat();
+#endif
+
 #if !defined(AK_OS_WINDOWS)
     install_crash_signal_handlers();
 #endif
@@ -125,7 +167,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     // SDL is used for the Gamepad API.
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
         dbgln("Failed to initialize SDL3: {}", SDL_GetError());
+#if !defined(__ANDROID__)
         return -1;
+#endif
     }
 
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
@@ -135,7 +179,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
     auto config_path = ByteString::formatted("{}/ladybird/default-config", WebView::s_ladybird_resource_root);
-    StringView mach_server_name {};
+    StringView mach_server_name { };
     Vector<ByteString> certificates;
     bool enable_test_mode = false;
     bool expose_experimental_interfaces = false;
@@ -152,9 +196,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     bool disable_scrollbar_painting = false;
     bool disable_async_scrolling = false;
     bool enable_sandbox = false;
-    StringView echo_server_port_string_view {};
-    StringView default_time_zone {};
-    StringView style_invalidation_counter_dump_interval {};
+    StringView echo_server_port_string_view { };
+    StringView default_time_zone { };
+    StringView style_invalidation_counter_dump_interval { };
     bool file_origins_are_tuple_origins = false;
 
     Core::ArgsParser args_parser;
@@ -305,7 +349,7 @@ static ErrorOr<void> load_content_blockers(StringView config_path)
     auto& content_blocker = Web::ContentBlocker::the();
     TRY(content_blocker.set_patterns(patterns));
 
-    return {};
+    return { };
 }
 
 ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle)
@@ -320,7 +364,7 @@ ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle co
         Web::ResourceLoader::the().set_client(move(request_client));
     else
         Web::ResourceLoader::initialize(heap, move(request_client));
-    return {};
+    return { };
 }
 
 ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
@@ -335,5 +379,5 @@ ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
         static_cast<WebView::ImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
     else
         Web::Platform::ImageCodecPlugin::install(*new WebView::ImageCodecPlugin(move(new_client)));
-    return {};
+    return { };
 }

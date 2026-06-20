@@ -98,7 +98,7 @@ class LadybirdActivity : AppCompatActivity() {
         urlEditText.setOnEditorActionListener { textView: TextView, actionId: Int, _: KeyEvent? ->
             when (actionId) {
                 EditorInfo.IME_ACTION_GO, EditorInfo.IME_ACTION_SEARCH -> {
-                    val requestedUrl = normalizeInputUrl(textView.text.toString())
+                    val requestedUrl = textView.text.toString()
                     Log.i(logTag, "URL bar load request: $requestedUrl")
                     view.loadURL(requestedUrl)
                     urlEditText.setText(requestedUrl, TextView.BufferType.EDITABLE)
@@ -109,7 +109,9 @@ class LadybirdActivity : AppCompatActivity() {
         }
 
         view.initialize()
-        val initialUrl = normalizeInputUrl(intent.dataString ?: "https://ladybird.org")
+        // val initialUrl = normalizeInputUrl(intent.dataString ?: "about:settings")
+        val initialUrl = "about:settings"
+
         Log.i(logTag, "Initial URL request: $initialUrl")
         urlEditText.setText(initialUrl, TextView.BufferType.EDITABLE)
         view.post {
@@ -144,12 +146,12 @@ class LadybirdActivity : AppCompatActivity() {
         }
     }
 
-    private fun normalizeInputUrl(value: String): String {
-        val trimmed = value.trim()
-        if (trimmed.isEmpty()) return "about:blank"
-        if (trimmed.contains("://")) return trimmed
-        return "https://$trimmed"
-    }
+    // private fun normalizeInputUrl(value: String): String {
+    //     val trimmed = value.trim()
+    //     if (trimmed.isEmpty()) return "about:blank"
+    //     if (trimmed.contains("://")) return trimmed
+    //     return "https://$trimmed"
+    // }
 
     private external fun initNativeCode(
             resourceDir: String,

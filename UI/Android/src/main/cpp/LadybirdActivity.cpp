@@ -38,11 +38,8 @@ private:
 
     virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions& request_server_options, WebView::WebContentOptions& web_content_options) override
     {
-        // The UI process assembles a certificate bundle from the system certificate store, as
-        // Android does not ship a cacert.pem that curl can use directly.
         request_server_options.certificates.append(ByteString::formatted("{}/cacert.pem", WebView::s_ladybird_resource_root));
 
-        // The Compositor process does not have access to a GPU surface, so paint on the CPU.
         web_content_options.force_cpu_painting = WebView::ForceCPUPainting::Yes;
     }
 
@@ -82,12 +79,13 @@ Java_org_serenityos_ladybird_LadybirdActivity_initNativeCode(JNIEnv* env, jobjec
 
     AK::set_log_tag_name(get_string(tag_name).characters());
 
-    // Helper processes inherit our environment, so everything they need to know must be set here,
-    // before WebView::Application launches them.
     MUST(Core::Environment::set("LADYBIRD_RESOURCE_ROOT"sv, resource_root, Core::Environment::Overwrite::Yes));
     MUST(Core::Environment::set("HOME"sv, user_directory, Core::Environment::Overwrite::Yes));
     MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, ByteString::formatted("{}/config", user_directory), Core::Environment::Overwrite::Yes));
     MUST(Core::Environment::set("XDG_DATA_HOME"sv, ByteString::formatted("{}/userdata", user_directory), Core::Environment::Overwrite::Yes));
+    MUST(Core::Environment::set("XDG_RUNTIME_DIR"sv, ByteString::formatted("{}/runtime", user_directory), Core::Environment::Overwrite::Yes));
+    MUST(Core::Environment::set("TMPDIR"sv, ByteString::formatted("{}/cache", user_directory), Core::Environment::Overwrite::Yes));
+
     if (auto existing_library_path = Core::Environment::get("LD_LIBRARY_PATH"sv); existing_library_path.has_value())
         MUST(Core::Environment::set("LD_LIBRARY_PATH"sv, ByteString::formatted("{}:{}", native_library_directory, *existing_library_path), Core::Environment::Overwrite::Yes));
     else
@@ -107,7 +105,6 @@ Java_org_serenityos_ladybird_LadybirdActivity_initNativeCode(JNIEnv* env, jobjec
 
     s_timer_service = env->NewGlobalRef(timer_service);
 
-    // The strings cannot be empty
     static StringView s_program_name_argument = "ladybird"sv;
     Main::Arguments arguments = {
         .argc = 0,

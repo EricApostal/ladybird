@@ -55,7 +55,12 @@ WebViewImplementationNative::WebViewImplementationNative(jobject thiz)
     };
 
     dbgln("[AndroidWebView] WebViewImplementationNative created");
+
+    m_viewport_size = { 1080, 2188 };
+    m_device_pixel_ratio = 2.625;
+
     initialize_client(CreateNewClient::Yes);
+    set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 }
 
 void WebViewImplementationNative::paint_into_bitmap(void* android_bitmap_raw, AndroidBitmapInfo const& info)
