@@ -58,9 +58,9 @@ WebViewImplementationNative::WebViewImplementationNative(jobject thiz)
 
     m_viewport_size = { 1080, 2188 };
     m_device_pixel_ratio = 2.625;
+    set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 
     initialize_client(CreateNewClient::Yes);
-    set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 }
 
 void WebViewImplementationNative::paint_into_bitmap(void* android_bitmap_raw, AndroidBitmapInfo const& info)
@@ -73,15 +73,22 @@ void WebViewImplementationNative::paint_into_bitmap(void* android_bitmap_raw, An
 
     ++m_paint_call_count;
 
-    if (m_client_state.has_usable_bitmap && m_client_state.front_bitmap.shared_image_buffer) {
+    if (m_client_state.front_bitmap.shared_image_buffer) {
         if (!m_logged_first_usable_frame) {
             m_logged_first_usable_frame = true;
-            dbgln("[AndroidWebView] first usable frame available at paint #{} front_id={} painted_size={}x{}",
-                m_paint_call_count,
-                m_client_state.front_bitmap.id,
-                m_client_state.front_bitmap.last_painted_size.width().value(),
-                m_client_state.front_bitmap.last_painted_size.height().value());
+            // dbgln("[AndroidWebView] first usable frame available at paint #{} front_id={} painted_size={}x{}",
+            //     m_paint_call_count,
+            //     m_client_state.front_bitmap.id,
+            //     m_client_state.front_bitmap.last_painted_size.width().value(),
+            //     m_client_state.front_bitmap.last_painted_size.height().value());
         }
+
+        dbgln("[AndroidWebView] first usable frame available at paint #{} front_id={} painted_size={}x{} usable={}",
+            m_paint_call_count,
+            m_client_state.front_bitmap.id,
+            m_client_state.front_bitmap.last_painted_size.width().value(),
+            m_client_state.front_bitmap.last_painted_size.height().value(),
+            m_client_state.has_usable_bitmap);
 
         auto bitmap = m_client_state.front_bitmap.shared_image_buffer->bitmap();
         auto painted_rect = Gfx::IntRect { { }, m_client_state.front_bitmap.last_painted_size.to_type<int>() };
