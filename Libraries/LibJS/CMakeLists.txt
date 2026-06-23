@@ -344,24 +344,44 @@ if (DEFINED ASMINT_ARCH)
 
     # Build-time offset generator: compiles a small C++ program that uses
     # offsetof() to emit struct field offsets as DSL constants.
-    add_executable(gen_asm_offsets "${CMAKE_CURRENT_SOURCE_DIR}/Bytecode/AsmInterpreter/gen_asm_offsets.cpp")
-    target_link_libraries(gen_asm_offsets PRIVATE AK)
-    if (MSVC)
-        target_compile_definitions(gen_asm_offsets PRIVATE _ALLOW_KEYWORD_MACROS)
-    endif()
-    target_compile_definitions(gen_asm_offsets PRIVATE private=public protected=public)
-    # NB: Strip fuzzer sanitizer flags so gen_asm_offsets can define its own main().
-    if (ENABLE_FUZZERS_LIBFUZZER)
-        target_compile_options(gen_asm_offsets PRIVATE -fno-sanitize=fuzzer)
-        target_link_options(gen_asm_offsets PRIVATE -fno-sanitize=fuzzer)
+    set(GEN_ASM_OFFSETS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Bytecode/AsmInterpreter/gen_asm_offsets.cpp")
+    if (CMAKE_CROSSCOMPILING)
+        set(GEN_ASM_OFFSETS_HOST_BUILD_DIR "${LADYBIRD_SOURCE_DIR}/Build/release")
+        if (LADYBIRD_HOST_BUILD_DIR)
+            set(GEN_ASM_OFFSETS_HOST_BUILD_DIR "${LADYBIRD_HOST_BUILD_DIR}")
+        endif()
+        set(GEN_ASM_OFFSETS_BIN "${GEN_ASM_OFFSETS_HOST_BUILD_DIR}/bin/gen_asm_offsets${CMAKE_EXECUTABLE_SUFFIX}")
+
+        add_custom_command(
+            OUTPUT "${GEN_ASM_OFFSETS_BIN}"
+            COMMAND ${CMAKE_COMMAND} --build "${GEN_ASM_OFFSETS_HOST_BUILD_DIR}" --target gen_asm_offsets
+            DEPENDS "${GEN_ASM_OFFSETS_SOURCE}"
+            COMMENT "Building host gen_asm_offsets in ${GEN_ASM_OFFSETS_HOST_BUILD_DIR}"
+            VERBATIM
+        )
+        set(GEN_ASM_OFFSETS_DEPENDS "${GEN_ASM_OFFSETS_BIN}")
+    else()
+        add_executable(gen_asm_offsets "${GEN_ASM_OFFSETS_SOURCE}")
+        target_link_libraries(gen_asm_offsets PRIVATE AK)
+        if (MSVC)
+            target_compile_definitions(gen_asm_offsets PRIVATE _ALLOW_KEYWORD_MACROS)
+        endif()
+        target_compile_definitions(gen_asm_offsets PRIVATE private=public protected=public)
+        # NB: Strip fuzzer sanitizer flags so gen_asm_offsets can define its own main().
+        if (ENABLE_FUZZERS_LIBFUZZER)
+            target_compile_options(gen_asm_offsets PRIVATE -fno-sanitize=fuzzer)
+            target_link_options(gen_asm_offsets PRIVATE -fno-sanitize=fuzzer)
+        endif()
+        set(GEN_ASM_OFFSETS_BIN "$<TARGET_FILE:gen_asm_offsets>")
+        set(GEN_ASM_OFFSETS_DEPENDS gen_asm_offsets)
     endif()
     # NB: gen_asm_offsets no longer depends on Op.h since opcode field
     # offsets are now computed from Bytecode.def by asmintgen directly.
 
     add_custom_command(
         OUTPUT "${ASM_OFFSETS_FILE}"
-        COMMAND "$<TARGET_FILE:gen_asm_offsets>" > "${ASM_OFFSETS_FILE}"
-        DEPENDS gen_asm_offsets
+        COMMAND "${GEN_ASM_OFFSETS_BIN}" > "${ASM_OFFSETS_FILE}"
+        DEPENDS ${GEN_ASM_OFFSETS_DEPENDS}
         COMMENT "Generating asm struct offsets"
     )
 
@@ -383,6 +403,7 @@ if (DEFINED ASMINT_ARCH)
         COMMAND ${CMAKE_COMMAND} -E env
             --unset=CC
             --unset=CXX
+            --unset=CARGO_BUILD_TARGET
             --unset=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
             --unset=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             cargo build --release

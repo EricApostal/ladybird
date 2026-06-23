@@ -197,8 +197,6 @@ void ConnectionFromClient::connect_to_image_decoder(IPC::TransportHandle handle)
 
 void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle handle)
 {
-    bool had_open_connection = m_compositor_connection && m_compositor_connection->is_open();
-
     auto transport = MUST(handle.create_transport());
     m_compositor_connection = adopt_ref(*new CompositorConnection(move(transport)));
     m_compositor_connection->on_mouse_event = [this](u64 page_id, Web::MouseEvent event) {
