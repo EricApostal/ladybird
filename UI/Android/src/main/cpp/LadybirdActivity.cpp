@@ -47,10 +47,8 @@ private:
     {
         auto& event_loop_manager = *new ALooperEventLoopManager(s_timer_service);
         event_loop_manager.on_did_post_event = [] {
-            dbgln("IS POSTING EVENT IN DA JAVA");
             JavaEnvironment env(global_vm);
             env.get()->CallVoidMethod(s_java_instance, s_schedule_event_loop_method);
-            dbgln("it worked I think this is very wrong though");
         };
         Core::EventLoopManager::install(event_loop_manager);
 

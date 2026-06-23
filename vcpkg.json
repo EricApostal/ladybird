@@ -14,7 +14,7 @@
     },
     {
       "name": "cpptrace",
-      "platform": "linux | windows | osx"
+      "platform": "linux | windows | osx | android"
     },
     {
       "name": "curl",

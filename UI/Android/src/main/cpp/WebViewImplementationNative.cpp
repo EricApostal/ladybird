@@ -58,7 +58,7 @@ WebViewImplementationNative::WebViewImplementationNative(jobject thiz)
 
     m_viewport_size = { 1080, 2188 };
     m_device_pixel_ratio = 2.625;
-    
+
     initialize_client(CreateNewClient::Yes);
     set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 }
@@ -73,7 +73,7 @@ void WebViewImplementationNative::paint_into_bitmap(void* android_bitmap_raw, An
 
     ++m_paint_call_count;
 
-    if (m_client_state.front_bitmap.shared_image_buffer) {
+    if (m_client_state.front_bitmap.shared_image_buffer && m_client_state.has_usable_bitmap) {
         if (!m_logged_first_usable_frame) {
             m_logged_first_usable_frame = true;
             // dbgln("[AndroidWebView] first usable frame available at paint #{} front_id={} painted_size={}x{}",

@@ -50,41 +50,11 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
             options.executable = path;
         }
 
-        dbgln("[HelperLaunch] Attempting {} launch via '{}'", server_name, options.executable);
-
-#if defined(__ANDROID__)
-        // PROOF 1: Check if the OS actually allows execution of this file
-        if (access(options.executable.characters(), X_OK) != 0) {
-            dbgln("[HelperLaunch] \033[31;1mOS BLOCK\033[0m: {} is NOT executable! access(X_OK) failed with errno={} ({}). The kernel will silently kill the child.", options.executable, errno, strerror(errno));
-        } else {
-            dbgln("[HelperLaunch] OS confirms {} has executable permissions.", options.executable);
-        }
-#endif
-
         bool capture_output = WebView::Application::the().should_capture_web_content_output();
         auto result = WebView::Process::spawn<ClientType>(process_type, move(options), capture_output, forward<ClientArguments>(client_arguments)...);
 
         if (!result.is_error()) {
             auto&& [process, client] = result.release_value();
-
-            dbgln("[HelperLaunch] Launched {} (pid={})", server_name, process.pid());
-
-            // #if defined(__ANDROID__)
-            //             // PROOF 2: Check if the child instantly died before we even try to IPC
-            //             usleep(50000); // Give the child 50ms to fail execve
-            //             int status = 0;
-            //             pid_t wait_result = waitpid(process.pid(), &status, WNOHANG);
-            //             if (wait_result == process.pid()) {
-            //                 if (WIFEXITED(status)) {
-            //                     dbgln("[HelperLaunch] \033[31;1mFATAL\033[0m: {} (pid={}) instantly exited with code {}. (Code 127 = execve failed).", server_name, process.pid(), WEXITSTATUS(status));
-            //                 } else if (WIFSIGNALED(status)) {
-            //                     dbgln("[HelperLaunch] \033[31;1mFATAL\033[0m: {} (pid={}) was instantly killed by signal {}.", server_name, process.pid(), WTERMSIG(status));
-            //                 }
-            //             } else {
-            //                 dbgln("[HelperLaunch] {} (pid={}) is still alive after 50ms. Moving to IPC handshake.", server_name, process.pid());
-            //             }
-            // #endif
-
             if constexpr (requires { client->set_pid(pid_t { }); })
                 client->set_pid(process.pid());
 

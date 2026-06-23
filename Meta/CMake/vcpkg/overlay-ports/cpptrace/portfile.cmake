@@ -8,9 +8,31 @@ vcpkg_from_github(
     delay.patch
 )
 
+set(cpptrace_options
+    -DCPPTRACE_VCPKG=ON
+    -DCPPTRACE_DELAYLOAD_DBGHELP=ON
+)
+
+if(VCPKG_TARGET_IS_ANDROID)
+    # Android builds avoid libdwarf and use in-process symbolization.
+    list(APPEND cpptrace_options
+        -DCPPTRACE_GET_SYMBOLS_WITH_LIBDL=ON
+        -DCPPTRACE_GET_SYMBOLS_WITH_LIBDWARF=OFF
+        -DCPPTRACE_GET_SYMBOLS_WITH_ADDR2LINE=OFF
+        -DCPPTRACE_GET_SYMBOLS_WITH_LIBBACKTRACE=OFF
+        -DCPPTRACE_UNWIND_WITH_UNWIND=ON
+        -DCPPTRACE_DEMANGLE_WITH_CXXABI=ON
+    )
+else()
+    list(APPEND cpptrace_options
+        -DCPPTRACE_USE_EXTERNAL_LIBDWARF=ON
+        -DCPPTRACE_USE_EXTERNAL_ZSTD=ON
+    )
+endif()
+
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
-    OPTIONS -DCPPTRACE_USE_EXTERNAL_LIBDWARF=ON -DCPPTRACE_USE_EXTERNAL_ZSTD=ON -DCPPTRACE_VCPKG=ON -DCPPTRACE_DELAYLOAD_DBGHELP=ON
+    OPTIONS ${cpptrace_options}
 )
 
 vcpkg_cmake_install()
