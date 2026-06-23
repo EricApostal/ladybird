@@ -10,6 +10,7 @@
 #include <AK/Array.h>
 #include <AK/GenericShorthands.h>
 #include <AK/StdLibExtras.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGfx/Font/Font.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
@@ -1371,10 +1372,10 @@ void PaintableBox::paint_inspector_overlay_internal(DisplayListRecordingContext&
 
     auto font = Platform::FontPlugin::the().default_font(12);
 
-    StringBuilder builder(StringBuilder::Mode::UTF16);
-    builder.append(debug_description());
+    Utf16StringBuilder builder;
+    builder.appendff("{}", debug_description());
     builder.appendff(" {}x{} @ {},{}", border_rect.width(), border_rect.height(), border_rect.x(), border_rect.y());
-    auto size_text = builder.to_utf16_string();
+    auto size_text = builder.to_string();
     auto size_text_rect = border_rect;
     size_text_rect.set_y(border_rect.y() + border_rect.height());
     size_text_rect.set_top(size_text_rect.top());
@@ -1768,7 +1769,7 @@ Optional<CSSPixelPoint> PaintableBox::transform_point_to_local_for_descendants(C
     return (*result / pixel_ratio).to_type<CSSPixels>();
 }
 
-CSSPixelRect PaintableBox::transform_rect_to_viewport(CSSPixelRect const& rect) const
+CSSPixelRect PaintableBox::transform_rect_to_viewport(CSSPixelRect const& rect, AccumulatedVisualContextTree::IncludeVisualViewportTransform include_visual_viewport_transform) const
 {
     auto viewport_paintable = document().paintable();
     if (!viewport_paintable || !viewport_paintable->has_visual_context_tree())
@@ -1776,7 +1777,7 @@ CSSPixelRect PaintableBox::transform_rect_to_viewport(CSSPixelRect const& rect) 
     auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
     auto const& scroll_state = viewport_paintable->scroll_state_snapshot();
     auto const& visual_context_tree = viewport_paintable->visual_context_tree();
-    auto result = visual_context_tree.transform_rect_to_viewport(m_accumulated_visual_context_index, rect.to_type<float>() * pixel_ratio, scroll_state);
+    auto result = visual_context_tree.transform_rect_to_viewport(m_accumulated_visual_context_index, rect.to_type<float>() * pixel_ratio, scroll_state, include_visual_viewport_transform);
     return (result * (1.f / pixel_ratio)).to_type<CSSPixels>();
 }
 

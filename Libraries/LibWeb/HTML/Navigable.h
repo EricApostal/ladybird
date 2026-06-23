@@ -114,6 +114,11 @@ public:
     GC::Ptr<Window> active_window();
 
     RefPtr<SessionHistoryEntry> get_the_target_history_entry(int target_step) const;
+    RefPtr<SessionHistoryEntry> get_the_target_history_entry_if_present(int target_step) const;
+
+    void save_persisted_state_to_active_session_history_entry();
+    void restore_persisted_state_from_session_history_entry(SessionHistoryEntry const&);
+    void restore_scroll_position_data(SessionHistoryEntry const&);
 
     String target_name() const;
 
@@ -147,6 +152,10 @@ public:
 
     Variant<Empty, Traversal, String> ongoing_navigation() const { return m_ongoing_navigation; }
     void set_ongoing_navigation(Variant<Empty, Traversal, String> ongoing_navigation, NavigationAPIAbortBehavior = NavigationAPIAbortBehavior::Abort);
+
+    // Test-only (Internals.clobberNextNavigationWithATraversal): make the next navigation's unload check be interrupted
+    // by a synthetic session-history traversal that re-stamps the ongoing navigation.
+    static void clobber_next_navigation_with_a_traversal_for_testing();
 
     void populate_session_history_entry_document(
         URL::URL url,
@@ -262,10 +271,12 @@ public:
         VERIFY(m_compositor_context);
         return *m_compositor_context;
     }
+    Compositor::CompositorContextHandle const& compositor_context() const
+    {
+        VERIFY(m_compositor_context);
+        return *m_compositor_context;
+    }
     bool has_compositor_context() const { return m_compositor_context; }
-
-    Painting::CompositorSurfaceId compositor_surface_id() const;
-    bool has_compositor_surface_id() const { return m_compositor_surface_id.has_value(); }
 
     void set_pending_set_browser_zoom_request(bool value) { m_pending_set_browser_zoom_request = value; }
     bool pending_set_browser_zoom_request() const { return m_pending_set_browser_zoom_request; }
@@ -296,14 +307,21 @@ protected:
     Variant<Empty, Traversal, String> m_ongoing_navigation;
 
 private:
+    enum class PendingNavigationBehavior {
+        Append,
+        Replace
+    };
+
     void begin_navigation(NavigateParams);
+    void queue_pending_navigation(NavigateParams, PendingNavigationBehavior);
+    void process_pending_navigations();
     void navigate_to_a_fragment(URL::URL const&, HistoryHandlingBehavior, UserNavigationInvolvement, GC::Ptr<DOM::Element> source_element, Optional<SerializationRecord> navigation_api_state, String navigation_id);
     void navigate_to_a_javascript_url(URL::URL const&, HistoryHandlingBehavior, GC::Ref<SourceSnapshotParams>, URL::Origin const& initiator_origin, UserNavigationInvolvement, ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, InitialInsertion, String navigation_id);
 
     void reset_cursor_blink_cycle();
 
     void scroll_offset_did_change();
-    void clear_compositor_surface();
+    void clear_parent_compositor_context();
     void destroy_compositor_context();
 
     void inform_the_navigation_api_about_aborting_navigation();
@@ -373,7 +391,6 @@ private:
     Painting::DisplayListResourceStorage m_display_list_resource_storage;
     Painting::DisplayListResourceSet m_compositor_display_list_resources;
     OwnPtr<Compositor::CompositorContextHandle> m_compositor_context;
-    Optional<Painting::CompositorSurfaceId> m_compositor_surface_id;
     RefPtr<Core::Timer> m_async_scroll_hover_update_timer;
 
     struct PendingAsyncScrollOperation {
@@ -406,8 +423,10 @@ private:
 
 WEB_API HashTable<GC::RawRef<Navigable>>& all_navigables();
 
+Vector<NonnullRefPtr<SessionHistoryEntry>>* append_nested_history_for_child_navigable(
+    Navigable& parent_navigable, Navigable& child_navigable, SessionHistoryEntry& history_entry);
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document);
-void finalize_a_cross_document_navigation(GC::Ref<Navigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, GC::Ref<OnApplyHistoryStepComplete> on_complete);
+void finalize_a_cross_document_navigation(GC::Ref<Navigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Optional<String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete);
 void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<SerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);
 
 }

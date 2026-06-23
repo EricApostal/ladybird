@@ -93,8 +93,13 @@ struct AccumulatedVisualContextNode {
 
 class AccumulatedVisualContextTree {
 public:
-    static AccumulatedVisualContextTree create();
-    static AccumulatedVisualContextTree create(TransformData visual_viewport_transform);
+    enum class IncludeVisualViewportTransform {
+        No,
+        Yes,
+    };
+
+    static WEB_API AccumulatedVisualContextTree create();
+    static WEB_API AccumulatedVisualContextTree create(TransformData visual_viewport_transform);
 
     AccumulatedVisualContextTree(AccumulatedVisualContextTree const&) = default;
     AccumulatedVisualContextTree& operator=(AccumulatedVisualContextTree const&) = default;
@@ -104,8 +109,10 @@ public:
 
     u64 version() const { return m_version; }
 
-    VisualContextIndex append(VisualContextData data, VisualContextIndex parent_index);
-    void set_visual_viewport_transform(TransformData);
+    WEB_API VisualContextIndex append(VisualContextData data, VisualContextIndex parent_index);
+    WEB_API void set_visual_viewport_transform(TransformData);
+    WEB_API bool is_compatible_with(AccumulatedVisualContextTree const&) const;
+    WEB_API void reuse_version_from(AccumulatedVisualContextTree const&);
 
     AccumulatedVisualContextNode const& node_at(VisualContextIndex index) const { return m_nodes[index.value()]; }
     ReadonlySpan<AccumulatedVisualContextNode> nodes() const { return m_nodes.span(); }
@@ -113,7 +120,7 @@ public:
     VisualContextIndex find_common_ancestor(VisualContextIndex a, VisualContextIndex b) const;
     Optional<Gfx::FloatPoint> transform_point_for_hit_test(VisualContextIndex, Gfx::FloatPoint, ScrollStateSnapshot const&) const;
     Gfx::FloatPoint inverse_transform_point(VisualContextIndex, Gfx::FloatPoint) const;
-    Gfx::FloatRect transform_rect_to_viewport(VisualContextIndex, Gfx::FloatRect const&, ScrollStateSnapshot const&) const;
+    Gfx::FloatRect transform_rect_to_viewport(VisualContextIndex, Gfx::FloatRect const&, ScrollStateSnapshot const&, IncludeVisualViewportTransform = IncludeVisualViewportTransform::Yes) const;
     void dump(VisualContextIndex, StringBuilder&) const;
 
     bool has_empty_effective_clip(VisualContextIndex i) const { return m_nodes[i.value()].has_empty_effective_clip; }

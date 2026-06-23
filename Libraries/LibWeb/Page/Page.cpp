@@ -116,9 +116,21 @@ void Page::navigable_document_destroyed(Badge<DOM::Document>, HTML::Navigable& n
         m_focused_navigable = nullptr;
 }
 
-void Page::load(URL::URL const& url)
+void Page::load(URL::URL const& url, Bindings::NavigationHistoryBehavior history_handling)
 {
-    (void)top_level_traversable()->navigate({ .url = url, .source_document = *top_level_traversable()->active_document(), .user_involvement = HTML::UserNavigationInvolvement::BrowserUI });
+    (void)top_level_traversable()->navigate({ .url = url, .source_document = *top_level_traversable()->active_document(), .history_handling = history_handling, .user_involvement = HTML::UserNavigationInvolvement::BrowserUI });
+}
+
+void Page::load(URL::URL const& url, Variant<Empty, String, HTML::POSTResource> document_resource,
+    Bindings::NavigationHistoryBehavior history_handling)
+{
+    (void)top_level_traversable()->navigate({
+        .url = url,
+        .source_document = *top_level_traversable()->active_document(),
+        .document_resource = move(document_resource),
+        .history_handling = history_handling,
+        .user_involvement = HTML::UserNavigationInvolvement::BrowserUI,
+    });
 }
 
 void Page::load_html(StringView html)
@@ -163,6 +175,14 @@ void Page::reload()
 }
 
 void Page::traverse_the_history_by_delta(int delta)
+{
+    if (m_client->page_did_request_traverse_the_history_by_delta(delta, HistoryTraversalPrecheck::Needed))
+        return;
+
+    traverse_the_history_by_delta_from_ui_process(delta);
+}
+
+void Page::traverse_the_history_by_delta_from_ui_process(int delta)
 {
     top_level_traversable()->traverse_the_history_by_delta(delta);
 }
@@ -696,17 +716,24 @@ void Page::for_each_canvas_element(Callback&& callback)
     }
 }
 
-void Page::present_all_canvas_element_surfaces()
+void Page::prepare_canvas_contexts_for_compositing()
 {
     for_each_canvas_element([](auto& canvas_element) {
-        canvas_element.present();
+        canvas_element.prepare_for_compositing();
     });
 }
 
-void Page::republish_all_canvas_element_surfaces()
+void Page::notify_all_canvas_elements_of_lost_backing_storage()
 {
     for_each_canvas_element([](auto& canvas_element) {
-        canvas_element.republish_compositor_surface();
+        canvas_element.notify_compositor_backing_storage_lost();
+    });
+}
+
+void Page::notify_all_webgl_contexts_lost()
+{
+    for_each_canvas_element([](auto& canvas_element) {
+        canvas_element.notify_compositor_connection_lost();
     });
 }
 
@@ -831,7 +858,7 @@ void Page::invalidate_user_style()
 
     auto invalidate_document = [](DOM::Document& document) {
         document.invalidate_content_blocker_style_sheet();
-        document.style_scope().invalidate_rule_cache();
+        document.style_scope().invalidate_user_style_sheet();
         document.for_each_shadow_root([](auto& shadow_root) {
             shadow_root.invalidate_style(DOM::StyleInvalidationReason::StyleSheetReplace);
         });

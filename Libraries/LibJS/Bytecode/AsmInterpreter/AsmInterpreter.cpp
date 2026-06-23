@@ -27,9 +27,9 @@
 // counters. They are printed on exit when the asm interpreter is active.
 #ifdef JS_ASMINT_SLOW_PATH_COUNTERS
 static struct AsmSlowPathStats {
-    u64 fallback_by_type[256] {};
-    u64 slow_path_by_type[256] {};
-    bool registered {};
+    u64 fallback_by_type[256] { };
+    u64 slow_path_by_type[256] { };
+    bool registered { };
 } s_stats;
 
 static void print_asm_slow_path_stats()
@@ -82,7 +82,7 @@ namespace JS::Bytecode {
 
 // The asm interpreter is available on x86_64 (non-Windows) and AArch64.
 // Win64 uses a different ABI that the x86_64 backend doesn't support yet.
-#if ARCH(AARCH64) && !defined(AK_OS_ANDROID)
+#if ARCH(AARCH64)
 #    define HAS_ASM_INTERPRETER 1
 #elif ARCH(X86_64) && !defined(_WIN32)
 #    define HAS_ASM_INTERPRETER 1

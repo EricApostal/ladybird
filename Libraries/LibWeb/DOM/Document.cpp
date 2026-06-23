@@ -197,7 +197,6 @@
 #include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
-#include <LibWeb/PermissionsPolicy/AutoplayAllowlist.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
@@ -222,6 +221,7 @@
 #include <LibWeb/UIEvents/PointerTypes.h>
 #include <LibWeb/UIEvents/TextEvent.h>
 #include <LibWeb/ViewTransition/ViewTransition.h>
+#include <LibWeb/WebDriver/UserPrompt.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -2040,7 +2040,10 @@ static void apply_element_style_invalidation_after_style_change(Element& element
 
 static void apply_document_style_invalidation_after_style_change(Document& document, CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
-    if (!invalidation.is_none())
+    if (invalidation.repaint
+        || invalidation.rebuild_stacking_context_tree
+        || invalidation.relayout
+        || invalidation.rebuild_layout_tree)
         document.set_needs_to_record_display_list();
     if (invalidation.rebuild_accumulated_visual_contexts)
         document.set_needs_accumulated_visual_contexts_update(true);
@@ -5804,9 +5807,8 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
     // FIXME: This is ad-hoc. Implement the Permissions Policy specification.
     switch (feature) {
     case PolicyControlledFeature::Autoplay:
-        if (PermissionsPolicy::AutoplayAllowlist::the().is_allowed_for_origin(*this, origin()) == PermissionsPolicy::Decision::Enabled)
-            return true;
-        break;
+        // FIXME: Implement allowlist for this.
+        return true;
     case PolicyControlledFeature::Camera:
         // FIXME: Implement allowlist for this.
         return true;
@@ -6150,7 +6152,7 @@ static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect t
             auto overflow_y = container->computed_values().overflow_y();
             bool has_content_clip = overflow_x != CSS::Overflow::Visible || overflow_y != CSS::Overflow::Visible;
             if (has_content_clip) {
-                auto clip_rect = container->transform_rect_to_viewport(container->absolute_padding_box_rect());
+                auto clip_rect = container->transform_rect_to_viewport(container->absolute_padding_box_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
 
                 // Apply scroll margin to expand the scrollport for scroll containers.
                 auto& scroll_margin = observer.scroll_margin_values();
@@ -6652,7 +6654,9 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
             auto pop_state_event = HTML::PopStateEvent::create(realm(), "popstate"_fly_string, popstate_event_init);
             relevant_global_object.dispatch_event(pop_state_event);
 
-            // FIXME: 4. Restore persisted state given entry.
+            // 4. Restore persisted state given entry.
+            if (auto navigable = this->navigable())
+                navigable->restore_persisted_state_from_session_history_entry(*entry);
 
             // 5. If oldURL's fragment is not equal to entry's URL's fragment, then queue a global task on the DOM manipulation task source
             //    given document's relevant global object to fire an event named hashchange at document's relevant global object,
@@ -6672,12 +6676,16 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
         // 5. Otherwise:
         else {
             // 1. Assert: entriesForNavigationAPI is given.
-            VERIFY(entries_for_navigation_api.has_value());
+            VERIFY(!update_navigation_api || entries_for_navigation_api.has_value());
 
-            // FIXME: 2. Restore persisted state given entry.
+            // 2. Restore persisted state given entry.
+            if (auto navigable = this->navigable())
+                navigable->restore_persisted_state_from_session_history_entry(*entry);
 
             // 3. Initialize the navigation API entries for a new document given navigation, entriesForNavigationAPI, and entry.
-            navigation->initialize_the_navigation_api_entries_for_a_new_document(*entries_for_navigation_api, entry);
+            if (update_navigation_api)
+                navigation->initialize_the_navigation_api_entries_for_a_new_document(
+                    *entries_for_navigation_api, entry);
         }
     }
 
@@ -6767,14 +6775,14 @@ CSS::ImageStyleValueResource const* Document::css_image_resource(URL::URL const&
     return it->value.ptr();
 }
 
-CSS::ImageStyleValueResource& Document::ensure_css_image_resource(URL::URL const& url)
+CSS::ImageStyleValueResource& Document::create_css_image_resource(GC::Ref<HTML::SharedResourceRequest> request)
 {
-    if (auto* resource = css_image_resource(url))
-        return *resource;
+    // NB: The caller should guard against creating already existing resources.
+    VERIFY(!m_css_image_resources.contains(request->url()));
 
-    auto resource = make<CSS::ImageStyleValueResource>(url);
+    auto resource = make<CSS::ImageStyleValueResource>(request, *this);
     auto& resource_ref = *resource;
-    m_css_image_resources.set(url, move(resource));
+    m_css_image_resources.set(request->url(), move(resource));
     return resource_ref;
 }
 
@@ -6788,22 +6796,6 @@ void Document::remove_css_image_resource_if_unused(URL::URL const& url)
     m_css_image_resources.remove(it);
 }
 
-void Document::animate_css_image_resource(URL::URL const& url)
-{
-    if (auto* resource = css_image_resource(url))
-        resource->animate(*this);
-}
-
-u64 Document::active_css_image_animation_timer_count() const
-{
-    u64 count = 0;
-    for (auto const& it : m_css_image_resources) {
-        if (it.value->has_active_animation_timer())
-            ++count;
-    }
-    return count;
-}
-
 void Document::prune_image_resource_caches()
 {
     static constexpr size_t decoded_image_resource_cache_limit = 8 * MiB;
@@ -6811,7 +6803,7 @@ void Document::prune_image_resource_caches()
 
     auto is_used_by_css_image_resource = [&](URL::URL const& url, HTML::SharedResourceRequest const& request) {
         auto* css_image_resource = this->css_image_resource(url);
-        return css_image_resource && css_image_resource->image_data() == request.image_data();
+        return css_image_resource && css_image_resource->decoded_image_data() == request.image_data();
     };
 
     struct CacheSize {
@@ -8212,7 +8204,7 @@ GC::Ref<WebIDL::Promise> Document::exit_fullscreen()
     // 2. If doc is not fully active or doc’s fullscreen element is null, then reject promise with a TypeError exception
     //    and return promise.
     if (!is_fully_active() || !fullscreen_element()) {
-        WebIDL::reject_promise(realm, promise, JS::TypeError::create(realm, "Document not fully active or no fullscreen element."sv));
+        WebIDL::reject_promise(realm, promise, JS::TypeError::create(realm, "Document not fully active or no fullscreen element."_utf16));
         return promise;
     }
 
@@ -8556,6 +8548,13 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
     }
 }
 
+void Document::set_needs_accumulated_visual_contexts_update(bool value)
+{
+    m_needs_accumulated_visual_contexts_update = value;
+    if (value)
+        set_needs_repaint(InvalidateDisplayList::No);
+}
+
 void Document::set_needs_to_record_display_list()
 {
     m_hit_test_display_list = nullptr;
@@ -8805,8 +8804,8 @@ Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(boo
     // 5. Decrease document's relevant agent's event loop's termination nesting level by 1.
     event_loop.decrement_termination_nesting_level();
 
-    // FIXME: 6. If all of the following are true:
-    if (false &&
+    // 6. If all of the following are true:
+    if (
         //    - unloadPromptShown is false;
         !unload_prompt_shown
         //    - document's active sandboxing flag set does not have its sandboxed modals flag set;
@@ -8817,10 +8816,18 @@ Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(boo
         && (!event_firing_result || !beforeunload_event->return_value().is_empty())
         //    - FIXME: showing an unload prompt is unlikely to be annoying, deceptive, or pointless
     ) {
-        // FIXME: 1. Set unloadPromptShown to true.
+        // 1. Set unloadPromptShown to true.
+        unload_prompt_shown = true;
+
         // FIXME: 2. Invoke WebDriver BiDi user prompt opened with document's relevant global object, "beforeunload", and "".
         // FIXME: 3. Ask the user to confirm that they wish to unload the document, and pause while waiting for the user's response.
-        // FIXME: 4. If the user did not confirm the page navigation, set unloadPromptCanceled to true.
+
+        auto user_prompt_handler = WebDriver::get_the_prompt_handler(WebDriver::PromptType::BeforeUnload);
+
+        // 4. If the user did not confirm the page navigation, set unloadPromptCanceled to true.
+        if (user_prompt_handler.handler == WebDriver::PromptHandler::Dismiss)
+            unload_prompt_canceled = true;
+
         // FIXME: 5. Invoke WebDriver BiDi user prompt closed with document's relevant global object and true if unloadPromptCanceled is false or false otherwise.
     }
 

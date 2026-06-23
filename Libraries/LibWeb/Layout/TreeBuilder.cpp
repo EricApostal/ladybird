@@ -203,51 +203,11 @@ public:
         unregister_image_style_value_client();
     }
 
-    virtual bool is_image_available() const override
-    {
-        if (auto document = this->document())
-            return m_image->is_paintable(*document);
-        return false;
-    }
-
-    virtual Optional<CSSPixels> intrinsic_width() const override
-    {
-        if (auto document = this->document())
-            return m_image->natural_width(*document);
-        return {};
-    }
-
-    virtual Optional<CSSPixels> intrinsic_height() const override
-    {
-        if (auto document = this->document())
-            return m_image->natural_height(*document);
-        return {};
-    }
-
-    virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override
-    {
-        if (auto document = this->document())
-            return m_image->natural_aspect_ratio(*document);
-        return {};
-    }
-
-    virtual Optional<Gfx::DecodedImageFrame> current_image_frame_sized(Gfx::IntSize size) const override
-    {
-        auto document = this->document();
-        if (!document)
-            return {};
-        auto rect = DevicePixelRect { DevicePixelPoint {}, size.to_type<DevicePixels>() };
-        return m_image->current_frame(*document, rect);
-    }
-
-    virtual void set_visible_in_viewport(bool) override { }
     virtual void layout_node_was_detached() const override
     {
         unregister_image_style_value_client();
         m_layout_node = nullptr;
     }
-
-    virtual GC::Ptr<DOM::Element const> to_html_element() const override { return nullptr; }
 
     static NonnullOwnPtr<GeneratedContentImageProvider> create(DOM::Document& document, NonnullRefPtr<CSS::ImageStyleValue> image)
     {
@@ -257,13 +217,6 @@ public:
     void set_layout_node(Layout::Node& layout_node)
     {
         m_layout_node = layout_node;
-    }
-
-    virtual size_t current_frame_index() const override
-    {
-        if (auto document = this->document())
-            return m_image->current_frame_index(*document);
-        return 0;
     }
 
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override
@@ -494,7 +447,9 @@ void TreeBuilder::create_first_letter_wrapper_if_needed(DOM::Element& element, B
         first_letter_slice = make_ref_counted<GeneratedTextNode>(document, Utf16String::from_utf16(text.utf16_view().substring_view(0, letter_end)));
     }
 
-    auto first_letter_wrapper = make_ref_counted<InlineNode>(document, nullptr, *first_letter_style);
+    auto first_letter_wrapper = DOM::Element::create_layout_node_for_display_type(document, first_letter_style->display(), *first_letter_style, nullptr);
+    if (!first_letter_wrapper)
+        return;
     first_letter_wrapper->set_generated_for(CSS::PseudoElement::FirstLetter, element);
     first_letter_wrapper->set_children_are_inline(true);
     first_letter_wrapper->append_child(*first_letter_slice);
@@ -561,7 +516,6 @@ RefPtr<NodeWithStyle> TreeBuilder::create_pseudo_element_if_needed(DOM::Element&
                 element,
                 *pseudo_element_style);
             list_box->set_marker(list_item_marker);
-            element.set_computed_properties(CSS::PseudoElement::Marker, pseudo_element_style);
             element.set_synthetic_pseudo_element_node({}, CSS::PseudoElement::Marker, list_item_marker);
             list_box->prepend_child(*list_item_marker);
             return list_item_marker;
@@ -924,7 +878,7 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
     }
 
     auto& style_computer = document.style_computer();
-    RefPtr<CSS::ComputedProperties> style;
+    RefPtr<CSS::ComputedProperties const> style;
     CSS::Display display;
 
     if (!should_create_layout_node) {

@@ -193,7 +193,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool disable_http_memory_cache = false;
     bool disable_http_disk_cache = false;
     bool disable_content_blocker = false;
-    bool enable_sandbox = false;
+    bool disable_sandbox = false;
     Vector<StringView> content_blocker_list_paths;
     Optional<StringView> resource_substitution_map_path;
     bool enable_autoplay = false;
@@ -269,7 +269,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(disable_http_memory_cache, "Disable HTTP memory cache", "disable-http-memory-cache");
     args_parser.add_option(disable_http_disk_cache, "Disable HTTP disk cache", "disable-http-disk-cache");
     args_parser.add_option(disable_content_blocker, "Disable content blocker", "disable-content-blocker");
-    args_parser.add_option(enable_sandbox, "Enable helper process sandboxing", "enable-sandbox");
+    args_parser.add_option(disable_sandbox, "Disable helper process sandboxing", "disable-sandbox");
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
         .help_string = "Path to a content blocker list. May be specified multiple times.",
@@ -393,7 +393,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
                 : OptionalNone()),
         .devtools_port = devtools_port,
         .enable_content_blocker = disable_content_blocker ? EnableContentBlocker::No : EnableContentBlocker::Yes,
-        .enable_sandbox = enable_sandbox ? EnableSandbox::Yes : EnableSandbox::No,
+        .disable_sandbox = disable_sandbox ? DisableSandbox::Yes : DisableSandbox::No,
         .content_blocker_list_paths = move(content_blocker_list_paths_as_byte_strings),
     };
 
@@ -640,6 +640,17 @@ bool Application::handle_mouse_event_in_compositor(Web::Compositor::CompositorCo
         return false;
 
     auto result = m_compositor_client->try_handle_mouse_event(context_id, event.clone_without_browser_data());
+    if (result.is_error())
+        return false;
+    return result.release_value();
+}
+
+bool Application::handle_pinch_event_in_compositor(Web::Compositor::CompositorContextId context_id, Web::PinchEvent const& event)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return false;
+
+    auto result = m_compositor_client->try_handle_pinch_event(context_id, event);
     if (result.is_error())
         return false;
     return result.release_value();
@@ -1521,7 +1532,8 @@ void Application::initialize_actions()
 
     m_history_menu = Menu::create("History"sv);
     m_history_menu->add_action(Action::create("View History"sv, ActionID::ViewHistory, [this]() {
-        open_url_in_new_tab(URL::about_history(), Web::HTML::ActivateTab::Yes);
+        if (!activate_tab_with_url(URL::about_history()))
+            open_url_in_new_tab(URL::about_history(), Web::HTML::ActivateTab::Yes);
     }));
 
     m_inspect_menu = Menu::create("Inspect"sv);
@@ -1679,6 +1691,8 @@ void Application::create_bookmark_menu_items(Optional<MenuData> data)
                 auto action = Action::create(bookmark.title.value_or({ }), ActionID::BookmarkItem, [this, url = bookmark.url]() {
                     if (auto view = active_web_view(); view.has_value())
                         view->load(url);
+                    else
+                        open_url_in_new_tab(url, Web::HTML::ActivateTab::Yes);
                 });
 
                 action->set_base64_png_icon(bookmark.favicon_base64_png);
@@ -1826,7 +1840,7 @@ void Application::navigate_tab(DevTools::TabDescription const& description, Stri
 void Application::traverse_the_history_by_delta(DevTools::TabDescription const& description, int delta) const
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
-        view->traverse_the_history_by_delta(delta);
+        (void)view->traverse_the_history_by_delta(delta);
 }
 
 Vector<HTTP::Cookie::Cookie> Application::cookies(DevTools::TabDescription const& description) const
@@ -1970,6 +1984,74 @@ void Application::remove_storage_change_listener(DevTools::TabDescription const&
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->remove_storage_change_listener(listener_id);
+}
+
+void Application::inspect_indexed_database_storage(DevTools::TabDescription const& description, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->inspect_indexed_database_storage(move(on_complete));
+}
+
+void Application::inspect_indexed_database_objects(DevTools::TabDescription const& description, String const& host, Optional<JsonArray> names, JsonObject options, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->inspect_indexed_database_objects(host, move(names), move(options), move(on_complete));
+}
+
+void Application::delete_indexed_database(DevTools::TabDescription const& description, String const& host, String const& name, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->delete_indexed_database(host, name, move(on_complete));
+}
+
+void Application::clear_indexed_database_object_store(DevTools::TabDescription const& description, String const& host, String const& name, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->clear_indexed_database_object_store(host, name, move(on_complete));
+}
+
+void Application::delete_indexed_database_record(DevTools::TabDescription const& description, String const& host, String const& name, OnIndexedDBInspectionComplete on_complete) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    view->delete_indexed_database_record(host, name, move(on_complete));
+}
+
+u64 Application::add_indexed_database_change_listener(DevTools::TabDescription const& description, OnIndexedDatabaseChange on_indexed_database_change) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        return view->add_indexed_database_change_listener(move(on_indexed_database_change));
+    return 0;
+}
+
+void Application::remove_indexed_database_change_listener(DevTools::TabDescription const& description, u64 listener_id) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->remove_indexed_database_change_listener(listener_id);
 }
 
 void Application::inspect_tab(DevTools::TabDescription const& description, OnTabInspectionComplete on_complete) const

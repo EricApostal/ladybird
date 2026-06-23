@@ -44,8 +44,25 @@ public:
     virtual bool is_top_level_traversable() const override;
 
     int current_session_history_step() const { return m_current_session_history_step; }
+
+    // Claims the step number for a new push-type session history entry. Claims are tracked separately from the current
+    // step: The current step only advances when an apply-history-step run commits — and several runs can have claimed
+    // steps in flight at once. So, computing a new step from the current step alone can hand out a step number that an
+    // existing entry already holds. A claim is retired when the run that applies it completes.
+    [[nodiscard]] int claim_next_session_history_step();
+    void retire_claimed_session_history_step(int step);
     Vector<NonnullRefPtr<SessionHistoryEntry>>& session_history_entries() { return m_session_history_entries; }
     Vector<NonnullRefPtr<SessionHistoryEntry>> const& session_history_entries() const { return m_session_history_entries; }
+    struct SessionHistorySnapshot {
+        Vector<SessionHistoryEntryDescriptor> top_level_session_history_entries;
+        Vector<i32> used_session_history_steps;
+        size_t current_used_step_index { 0 };
+    };
+    enum class SaveActiveEntryPersistedState : bool {
+        No,
+        Yes,
+    };
+    SessionHistorySnapshot create_session_history_snapshot(SaveActiveEntryPersistedState = SaveActiveEntryPersistedState::Yes);
 
     VisibilityState system_visibility_state() const { return m_system_visibility_state; }
     void set_system_visibility_state(VisibilityState);
@@ -66,7 +83,8 @@ public:
         Yes,
         No,
     };
-    void apply_the_push_or_replace_history_step(int step, HistoryHandlingBehavior history_handling, UserNavigationInvolvement, SynchronousNavigation, GC::Ptr<DOM::Document> pending_document, GC::Ref<OnApplyHistoryStepComplete> on_complete);
+    [[nodiscard]] bool try_to_synchronously_commit_same_document_navigation(GC::Ref<Navigable>, NonnullRefPtr<SessionHistoryEntry>, RefPtr<SessionHistoryEntry> entry_to_replace);
+    void apply_the_push_or_replace_history_step(int step, HistoryHandlingBehavior history_handling, UserNavigationInvolvement, SynchronousNavigation, GC::Ptr<DOM::Document> pending_document, GC::Ptr<Navigable> expected_ongoing_navigation_navigable, Optional<String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete);
     void update_for_navigable_creation_or_destruction(GC::Ref<OnApplyHistoryStepComplete> on_complete);
 
     int get_the_used_step(int step) const;
@@ -77,6 +95,10 @@ public:
     Vector<int> get_all_used_history_steps() const;
     void clear_the_forward_session_history();
     void traverse_the_history_by_delta(int delta, GC::Ptr<DOM::Document> source_document = {});
+    void traverse_the_history_to_step(int step, GC::Ref<GC::Function<void(bool step_was_available, HistoryStepResult)>> on_complete);
+    void check_if_traverse_history_step_is_canceled(int step, GC::Ref<OnApplyHistoryStepComplete> on_complete);
+    bool replace_top_level_session_history_entries_from_ui_process(Vector<SessionHistoryEntryDescriptor>, size_t current_top_level_entry_index, bool allow_reconstructing_current_entry);
+    void reset_session_history_for_testing(GC::Ref<GC::Function<void()>> on_complete);
 
     void close_top_level_traversable();
     void definitely_close_top_level_traversable();
@@ -128,7 +150,7 @@ private:
 
     virtual void visit_edges(Cell::Visitor&) override;
 
-    // FIXME: Fix spec typo cancelation --> cancellation
+    // NB: The HTML Standard spells this algorithm argument "checkForCancelation".
     void apply_the_history_step(
         int step,
         bool check_for_cancelation,
@@ -139,6 +161,8 @@ private:
         SynchronousNavigation,
         Navigable::NavigationAPIAbortBehavior,
         GC::Ptr<DOM::Document> pending_document,
+        GC::Ptr<Navigable> expected_ongoing_navigation_navigable,
+        Optional<String> expected_ongoing_navigation_id,
         GC::Ref<OnApplyHistoryStepComplete> on_complete);
 
     void apply_the_history_step_after_unload_check(
@@ -150,16 +174,54 @@ private:
         SynchronousNavigation,
         Navigable::NavigationAPIAbortBehavior,
         GC::Ptr<DOM::Document> pending_document,
+        GC::Ptr<Navigable> expected_ongoing_navigation_navigable,
+        Optional<String> expected_ongoing_navigation_id,
         GC::Ref<OnApplyHistoryStepComplete> on_complete);
+
+    using OnHistoryStepPrechecksComplete = GC::Function<void(HistoryStepResult, int target_step, Navigable::NavigationAPIAbortBehavior)>;
+    void run_the_history_step_prechecks(
+        int step,
+        bool check_for_cancelation,
+        GC::Ptr<SourceSnapshotParams>,
+        GC::Ptr<Navigable> initiator_to_check,
+        UserNavigationInvolvement user_involvement,
+        Optional<Bindings::NavigationType> navigation_type,
+        Navigable::NavigationAPIAbortBehavior,
+        GC::Ref<OnHistoryStepPrechecksComplete>);
 
     void check_if_unloading_is_canceled(Vector<GC::Root<Navigable>> navigables_that_need_before_unload, GC::Ptr<TraversableNavigable> traversable, Optional<int> target_step, Optional<UserNavigationInvolvement> user_involvement_for_navigate_events, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult)>> callback);
 
     Vector<NonnullRefPtr<SessionHistoryEntry>> get_session_history_entries_for_the_navigation_api(GC::Ref<Navigable>, int);
 
+    [[nodiscard]] bool can_go_back() const;
     [[nodiscard]] bool can_go_forward() const;
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-current-session-history-step
     int m_current_session_history_step { 0 };
+
+    // Concurrent apply-history-step runs share the step numbering below. Runs are serialized through the session
+    // history traversal queue — but a synchronous navigation can jump the queue while another run is paused (see the
+    // "sync navigations jump queue" in the spec). So, a nested run mutates this state while an outer run is mid-flight.
+    // The spec describes that concurrency — but not the necessary bookkeeping it ends up requiring in implementations.
+    // See https://github.com/whatwg/html/issues/12576.
+    //
+    // Four invariants keep the numbering coherent under that nesting:
+    //
+    //  - uniqueness: a new step number is claimed past every claimed-but-uncommitted step — never just current step + 1
+    //    (claim_next_session_history_step);
+    //
+    //  - ordering: a run commits its target step only if no newer run has committed first — so the current step can't
+    //    move backwards past a newer run's commit (ApplyHistoryStepState::complete);
+    //
+    //  - integrity: clearing the forward session history spares entries whose steps are claimed by runs still in flight
+    //    (clear_the_forward_session_history);
+    //
+    //  - initialization: step numbers are only compared once assigned; a pushed entry is the active session history
+    //    entry before its queued synchronous step assigns its step number (the Push assertion in
+    //    ApplyHistoryStepState::start).
+    u64 m_apply_history_step_generation_counter { 0 };
+    u64 m_committed_apply_history_step_generation { 0 };
+    Vector<int> m_outstanding_claimed_session_history_steps;
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-session-history-entries
     Vector<NonnullRefPtr<SessionHistoryEntry>> m_session_history_entries;

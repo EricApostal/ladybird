@@ -16,6 +16,9 @@
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/Icon.h>
+#if defined(AK_OS_MACOS)
+#    include <UI/Qt/MacWindow.h>
+#endif
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WindowControlButton.h>
@@ -85,6 +88,43 @@ static QToolButton* create_toolbar_button(QWidget& parent, QAction& action)
     //        It would be nicer if we didn't have to do this here.
     button->setVisible(action.isVisible());
 
+    return button;
+}
+
+static void populate_navigation_history_menu(QMenu& menu, WebContentView& view, int direction)
+{
+    static constexpr int const MENU_ICON_SIZE = 16;
+
+    menu.clear();
+
+    for (auto const& item : view.session_history_traversal_menu_items(direction)) {
+        auto* action = menu.addAction(qstring_from_ak_string(item.title));
+        action->setToolTip(qstring_from_ak_string(item.url));
+        if (item.favicon_base64_png.has_value())
+            action->setIcon(icon_from_base64_png(*item.favicon_base64_png, MENU_ICON_SIZE));
+        else
+            action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
+        QObject::connect(action, &QAction::triggered, &view, [&view, delta = item.delta] {
+            (void)view.traverse_the_history_by_delta(delta);
+        });
+    }
+}
+
+static QToolButton* create_navigation_history_toolbar_button(QWidget& parent, QAction& action, WebContentView& view, int direction)
+{
+    auto* button = create_toolbar_button(parent, action);
+    auto* menu = new QMenu(button);
+    QObject::connect(menu, &QMenu::aboutToShow, button, [menu, &view, direction] {
+        populate_navigation_history_menu(*menu, view, direction);
+    });
+    button->setMenu(menu);
+    button->setPopupMode(QToolButton::DelayedPopup);
+    button->setContextMenuPolicy(Qt::CustomContextMenu);
+    QObject::connect(button, &QToolButton::customContextMenuRequested, button, [button, menu, &view, direction](QPoint const&) {
+        populate_navigation_history_menu(*menu, view, direction);
+        if (!menu->isEmpty())
+            button->showMenu();
+    });
     return button;
 }
 
@@ -213,8 +253,8 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_toggle_vertical_tabs_expanded_action));
     m_sidebar_toggle_navigation_spacer = new QSpacerItem(0, 0, QSizePolicy::Fixed, QSizePolicy::Minimum);
     navigation_button_layout->addItem(m_sidebar_toggle_navigation_spacer);
-    navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_navigate_back_action));
-    navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_navigate_forward_action));
+    navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_back_action, view(), -1));
+    navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_forward_action, view(), 1));
     navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_reload_action));
 
     if (use_left_traffic_light_window_controls()) {
@@ -561,8 +601,12 @@ Tab::~Tab() = default;
 
 void Tab::focus_location_editor()
 {
+#if defined(AK_OS_MACOS)
+    make_appkit_window_first_responder(*m_location_edit);
+#endif
     m_location_edit->setFocus();
     m_location_edit->selectAll();
+    m_location_edit->show_autocomplete();
 }
 
 void Tab::set_window(BrowserWindow& window)

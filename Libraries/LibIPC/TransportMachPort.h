@@ -67,6 +67,7 @@ public:
 
 private:
     static constexpr unsigned int IPC_DATA_MESSAGE_ID = 0x4950C001;
+    static constexpr unsigned int IPC_INLINE_DATA_MESSAGE_ID = 0x4950C002;
     static constexpr unsigned int IPC_WAKEUP_MESSAGE_ID = 0x4950C003;
 
     struct PendingMessage {
@@ -83,7 +84,8 @@ private:
     intptr_t io_thread_loop();
     void stop_io_thread(IOThreadState desired_state);
     void wake_io_thread();
-    void notify_read_available();
+    bool schedule_read_notification_if_needed_locked();
+    void write_read_notification_byte();
     void mark_peer_eof();
     void send_mach_message(PendingMessage&);
     void process_received_message(u8* buffer);
@@ -110,6 +112,7 @@ private:
     Sync::Mutex m_incoming_mutex;
     Sync::ConditionVariable m_incoming_cv { m_incoming_mutex };
     Vector<NonnullOwnPtr<Message>> m_incoming_messages;
+    bool m_read_notification_pending { false };
 
     RefPtr<AutoCloseFileDescriptor> m_notify_hook_read_fd;
     RefPtr<AutoCloseFileDescriptor> m_notify_hook_write_fd;

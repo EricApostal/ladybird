@@ -13,6 +13,7 @@
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -142,7 +143,7 @@ size_t CSSStyleProperties::length() const
     return m_properties.size() + m_custom_properties.size();
 }
 
-String CSSStyleProperties::item(size_t index) const
+Utf16String CSSStyleProperties::item(size_t index) const
 {
     // The item(index) method must return the property name of the CSS declaration at position index.
     // If there is no indexth object in the collection, then the method must return the empty string.
@@ -153,13 +154,13 @@ String CSSStyleProperties::item(size_t index) const
 
     if (is_computed()) {
         auto property_id = static_cast<PropertyID>(index + to_underlying(first_longhand_property_id));
-        return string_from_property_id(property_id).to_string();
+        return Utf16String::from_utf8(string_from_property_id(property_id));
     }
 
     if (index < custom_properties_count)
-        return m_custom_properties.keys()[index].to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
+        return m_custom_properties.keys()[index].to_utf16_string();
 
-    return CSS::string_from_property_id(m_properties[index - custom_properties_count].property_id).to_string();
+    return Utf16String::from_utf8(CSS::string_from_property_id(m_properties[index - custom_properties_count].property_id));
 }
 
 Optional<StyleProperty> CSSStyleProperties::get_property(PropertyID property_id) const
@@ -541,6 +542,33 @@ Optional<StyleProperty> CSSStyleProperties::get_property_internal(PropertyNameAn
     return get_direct_property(property);
 }
 
+static void ensure_pseudo_element_style_for_cssom(DOM::AbstractElement abstract_element)
+{
+    auto pseudo_element = abstract_element.pseudo_element();
+    if (!pseudo_element.has_value())
+        return;
+    if (!is_synthetic_pseudo_element(*pseudo_element))
+        return;
+    if (abstract_element.computed_properties())
+        return;
+
+    auto& style_computer = abstract_element.document().style_computer();
+    style_computer.reset_has_result_cache();
+
+    auto const* first_ancestor = &abstract_element.element();
+    for (auto* ancestor = first_ancestor; ancestor; ancestor = ancestor->parent_or_shadow_host_element())
+        style_computer.push_ancestor(*ancestor);
+
+    ScopeGuard pop_ancestors = [&] {
+        for (auto* ancestor = first_ancestor; ancestor; ancestor = ancestor->parent_or_shadow_host_element())
+            style_computer.pop_ancestor(*ancestor);
+    };
+
+    bool did_change_custom_properties = false;
+    auto style = style_computer.compute_pseudo_element_style_if_needed(abstract_element, did_change_custom_properties);
+    abstract_element.element().set_computed_properties(*pseudo_element, move(style));
+}
+
 Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndID const& property_name_and_id) const
 {
     auto const property_id = property_name_and_id.id();
@@ -588,6 +616,7 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
         // so the leaf and its inheritance ancestors may still be stale at this point.
         if (abstract_element.document().element_needs_style_update(abstract_element))
             abstract_element.document().update_style_for_element(abstract_element);
+        ensure_pseudo_element_style_for_cssom(abstract_element);
 
         // Container queries and container-relative units need layout to resolve. Avoid forcing layout for every
         // getComputedStyle() call; only elements that actually depend on a query container need the post-layout style.

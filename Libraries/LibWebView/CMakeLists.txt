@@ -9,6 +9,7 @@ set(SOURCES
     DOMNodeProperties.cpp
     FileDownloader.cpp
     HeadlessWebView.cpp
+    HistoryDebug.cpp
     HistoryStore.cpp
     HelperProcess.cpp
     HSTSStore.cpp
@@ -20,6 +21,7 @@ set(SOURCES
     ProcessManager.cpp
     ProcessMonitor.cpp
     SearchEngine.cpp
+    SessionHistory.cpp
     Settings.cpp
     SiteIsolation.cpp
     SourceHighlighter.cpp
@@ -39,6 +41,12 @@ set(SOURCES
     WebUI/VersionUI.cpp
     CompositorClient.cpp
 )
+
+if (APPLE)
+    list(APPEND SOURCES
+        PlatformColorsMacOS.cpp
+    )
+endif()
 
 set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
 

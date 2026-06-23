@@ -474,6 +474,7 @@ set(SOURCES
     HTML/AudioTrack.cpp
     HTML/AudioTrackList.cpp
     HTML/AutocompleteElement.cpp
+    HTML/AutoplaySettings.cpp
     HTML/BarProp.cpp
     HTML/BeforeUnloadEvent.cpp
     HTML/BroadcastChannel.cpp
@@ -656,6 +657,7 @@ set(SOURCES
     HTML/Plugin.cpp
     HTML/PluginArray.cpp
     HTML/PolicyContainers.cpp
+    HTML/POSTResource.cpp
     HTML/PopoverTargetAttributes.cpp
     HTML/PopStateEvent.cpp
     HTML/PotentialCORSRequest.cpp
@@ -686,6 +688,7 @@ set(SOURCES
     HTML/SessionHistoryEntry.cpp
     HTML/SessionHistoryTraversalQueue.cpp
     HTML/SharedResourceRequest.cpp
+    HTML/AnimatedBitmapDecodedImageData.cpp
     HTML/AnimatedDecodedImageData.cpp
     HTML/SharedWorker.cpp
     HTML/SharedWorkerGlobalScope.cpp
@@ -730,6 +733,7 @@ set(SOURCES
     HTML/WorkerNavigator.cpp
     HTML/WorkletGlobalScope.cpp
     HTML/XMLSerializer.cpp
+    IndexedDB/Inspection.cpp
     IndexedDB/IDBCursor.cpp
     IndexedDB/IDBDatabase.cpp
     IndexedDB/IDBFactory.cpp
@@ -910,7 +914,6 @@ set(SOURCES
     PerformanceTimeline/PerformanceEntry.cpp
     PerformanceTimeline/PerformanceObserver.cpp
     PerformanceTimeline/PerformanceObserverEntryList.cpp
-    PermissionsPolicy/AutoplayAllowlist.cpp
     PermissionsAPI/Permissions.cpp
     PermissionsAPI/PermissionStore.cpp
     PermissionsAPI/PermissionStatus.cpp
@@ -1148,13 +1151,15 @@ set(SOURCES
     WebGL/Extensions/WebGLDebugRendererInfo.cpp
     WebGL/Extensions/WebGLDrawBuffers.cpp
     WebGL/Extensions/WebGLVertexArrayObjectOES.cpp
-    WebGL/OpenGLContext.cpp
+    WebGL/TextureUpload.cpp
     WebGL/WebGL2RenderingContext.cpp
     WebGL/WebGL2RenderingContextImpl.cpp
     WebGL/WebGL2RenderingContextOverloads.cpp
     WebGL/WebGLActiveInfo.cpp
     WebGL/WebGLBuffer.cpp
+    WebGL/WebGLCommandList.cpp
     WebGL/WebGLContextAttributes.cpp
+    WebGL/WebGLContextProxyBase.cpp
     WebGL/WebGLContextEvent.cpp
     WebGL/WebGLFramebuffer.cpp
     WebGL/WebGLObject.cpp
@@ -1254,12 +1259,25 @@ set(GENERATED_SOURCES
     Worker/WebWorkerServerEndpoint.h
     HTML/MediaControlsDOM.cpp
     HTML/Parser/NamedCharacterReferences.cpp
-    WebGL/GLFunctions.cpp
+    WebGL/WebGLCommands.cpp
+    WebGL/WebGLContextProxy.cpp
 )
 
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)
+add_dependencies(LibWeb generate_GLFunctions.cpp)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibWasm LibXML LibURL LibTLS LibRequests LibGC LibSync LibThreading skia ${ANGLE_TARGETS} SDL3::SDL3 LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibWasm LibXML LibURL LibTLS LibRequests LibGC LibSync LibThreading skia SDL3::SDL3 LibXml2::LibXml2)
+
+# LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
+# the actual GL entry points live in the Compositor. Copy only ANGLE's compile
+# interface here so LibWeb can include those headers without linking ANGLE into
+# WebContent.
+foreach(angle_target IN LISTS ANGLE_TARGETS)
+    target_include_directories(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_INCLUDE_DIRECTORIES>)
+    target_include_directories(LibWeb SYSTEM PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_DEFINITIONS>)
+    target_compile_options(LibWeb PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_OPTIONS>)
+endforeach()
 
 import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust FFI_HEADER RustFFI.h)
 

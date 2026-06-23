@@ -31,6 +31,7 @@
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/AgentType.h>
+#include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/CSS/PreferredColorScheme.h>
 #include <LibWeb/CSS/PreferredContrast.h>
 #include <LibWeb/CSS/PreferredMotion.h>
@@ -42,10 +43,13 @@
 #include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWeb/HTML/ColorPickerUpdateState.h>
 #include <LibWeb/HTML/FileFilter.h>
+#include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/SelectItem.h>
+#include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
 #include <LibWeb/HTML/WebViewHints.h>
 #include <LibWeb/HTML/WorkerAgentForward.h>
+#include <LibWeb/IndexedDB/TransactionChanges.h>
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/EventResult.h>
 #include <LibWeb/Page/InputEvent.h>
@@ -97,7 +101,9 @@ public:
     void set_focused_navigable(Badge<EventHandler>, HTML::Navigable&);
     void navigable_document_destroyed(Badge<DOM::Document>, HTML::Navigable&);
 
-    void load(URL::URL const&);
+    void load(URL::URL const&, Bindings::NavigationHistoryBehavior = Bindings::NavigationHistoryBehavior::Auto);
+    void load(URL::URL const&, Variant<Empty, String, HTML::POSTResource>,
+        Bindings::NavigationHistoryBehavior = Bindings::NavigationHistoryBehavior::Auto);
 
     void load_html(StringView);
     void load_html(StringView, URL::URL const&);
@@ -105,6 +111,7 @@ public:
     void reload();
 
     void traverse_the_history_by_delta(int delta);
+    void traverse_the_history_by_delta_from_ui_process(int delta);
 
     CSSPixelPoint device_to_css_point(DevicePixelPoint) const;
     DevicePixelPoint css_to_device_point(CSSPixelPoint) const;
@@ -227,8 +234,9 @@ public:
     void register_canvas_element(Badge<HTML::HTMLCanvasElement>, UniqueNodeID canvas_id);
     void unregister_canvas_element(Badge<HTML::HTMLCanvasElement>, UniqueNodeID canvas_id);
 
-    void present_all_canvas_element_surfaces();
-    void republish_all_canvas_element_surfaces();
+    void prepare_canvas_contexts_for_compositing();
+    void notify_all_canvas_elements_of_lost_backing_storage();
+    void notify_all_webgl_contexts_lost();
 
     struct MediaContextMenu {
         URL::URL media_url;
@@ -396,14 +404,15 @@ private:
     bool m_processing_fullscreen_operations { false };
 };
 
-enum class DisplayListPlayerType {
-    SkiaGPUIfAvailable,
-    SkiaCPU,
-};
-
 enum class ContextMenuForInputEventsTarget : u8 {
     No,
     Yes,
+};
+
+enum class HistoryTraversalPrecheck : u8 {
+    Needed,
+    AlreadyDone,
+    SourceDocumentSandboxingAlreadyDone,
 };
 
 class PageClient : public JS::Cell {
@@ -417,7 +426,7 @@ public:
     virtual bool has_focus() const { return true; }
     virtual bool has_active_devtools_client() const { return false; }
     virtual bool is_url_suitable_for_same_process_navigation([[maybe_unused]] URL::URL const& current_url, [[maybe_unused]] URL::URL const& target_url) const { return true; }
-    virtual void request_new_process_for_navigation(URL::URL const&) { }
+    virtual void request_new_process_for_navigation(URL::URL const&, Variant<Empty, String, HTML::POSTResource>, Bindings::NavigationHistoryBehavior) { }
     virtual Gfx::Palette palette() const = 0;
     virtual DevicePixelRect screen_rect() const = 0;
     virtual double zoom_level() const = 0;
@@ -446,7 +455,13 @@ public:
     virtual void page_did_request_minimize_window() { }
     virtual void page_did_request_fullscreen_window() { }
     virtual void page_did_request_exit_fullscreen() { }
-    virtual void page_did_start_loading(URL::URL const&, bool is_redirect) { (void)is_redirect; }
+    virtual void page_did_start_loading(URL::URL const&, Variant<Empty, String, HTML::POSTResource> document_resource, bool is_redirect, Bindings::NavigationHistoryBehavior history_handling = Bindings::NavigationHistoryBehavior::Auto)
+    {
+        (void)document_resource;
+        (void)is_redirect;
+        (void)history_handling;
+    }
+    virtual void page_did_cancel_loading(URL::URL const&) { }
     virtual void page_did_create_new_document(Web::DOM::Document&) { }
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) { }
     virtual void page_did_finish_loading(URL::URL const&) { }
@@ -490,6 +505,7 @@ public:
     virtual Vector<String> page_did_request_storage_keys([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key) { return {}; }
     virtual void page_did_clear_storage([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& storage_key) { }
     virtual void page_did_broadcast_storage_change([[maybe_unused]] Web::StorageAPI::StorageEndpointType storage_endpoint, [[maybe_unused]] String const& url, [[maybe_unused]] Optional<String> const& key, [[maybe_unused]] Optional<String> const& old_value, [[maybe_unused]] Optional<String> const& new_value) { }
+    virtual void page_did_update_indexed_database([[maybe_unused]] String const& url, [[maybe_unused]] IndexedDB::TransactionChanges const&) { }
     virtual void page_did_update_resource_count(i32) { }
     struct NewWebViewResult {
         GC::Ptr<Page> page;
@@ -499,6 +515,11 @@ public:
     virtual void page_did_request_activate_tab() { }
     virtual void page_did_close_top_level_traversable() { }
     virtual void page_did_update_navigation_buttons_state([[maybe_unused]] bool back_enabled, [[maybe_unused]] bool forward_enabled) { }
+    virtual bool should_report_session_history_updates() const { return true; }
+    virtual void page_did_update_session_history([[maybe_unused]] Vector<HTML::SessionHistoryEntryDescriptor> const& entries, [[maybe_unused]] Vector<i32> const& used_steps, [[maybe_unused]] size_t current_used_step_index) { }
+    virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
+    virtual String page_did_update_session_history_and_request_ui_process_session_history_for_testing([[maybe_unused]] Vector<HTML::SessionHistoryEntryDescriptor> const& entries, [[maybe_unused]] Vector<i32> const& used_steps, [[maybe_unused]] size_t current_used_step_index) { return "{}"_string; }
+    virtual bool page_did_request_traverse_the_history_by_delta([[maybe_unused]] int delta, [[maybe_unused]] HistoryTraversalPrecheck history_traversal_precheck) { return false; }
     virtual void page_did_change_needs_beforeunload_check([[maybe_unused]] bool needs_beforeunload_check) { }
 
     virtual void request_file(FileRequest) = 0;
@@ -541,8 +562,6 @@ public:
     virtual void page_did_take_screenshot(Gfx::ShareableBitmap const&) { }
 
     virtual void received_message_from_web_ui([[maybe_unused]] String const& name, [[maybe_unused]] JS::Value data) { }
-
-    virtual DisplayListPlayerType display_list_player_type() const = 0;
 
     virtual bool is_headless() const = 0;
 
