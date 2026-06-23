@@ -63,6 +63,8 @@
 #    include <pthread.h>
 #    include <unistd.h>
 
+// TODO: Remove all of the AI slop logging for android (and see if cpptrace is possible)
+
 static int s_child_logpipe[2];
 static void* child_log_thread(void*)
 {
@@ -93,6 +95,32 @@ static void hook_child_stderr_to_logcat()
 
 #if !defined(AK_OS_WINDOWS)
 #    include <signal.h>
+#    if defined(__ANDROID__)
+#        include <android/log.h>
+#        include <dlfcn.h>
+#        include <unistd.h>
+#        include <unwind.h>
+
+struct BacktraceState {
+    void** current;
+    void** end;
+};
+
+static _Unwind_Reason_Code unwind_callback(struct _Unwind_Context* context, void* arg)
+{
+    BacktraceState* state = static_cast<BacktraceState*>(arg);
+    uintptr_t pc = _Unwind_GetIP(context);
+    if (pc) {
+        if (state->current == state->end) {
+            return _URC_END_OF_STACK;
+        } else {
+            *state->current++ = reinterpret_cast<void*>(pc);
+        }
+    }
+    return _URC_NO_REASON;
+}
+#    endif
+
 static void crash_signal_handler(int signo)
 {
     char const* name;
@@ -118,11 +146,57 @@ static void crash_signal_handler(int signo)
     }
 
 #    if defined(__ANDROID__)
-    __android_log_print(ANDROID_LOG_FATAL, "LadybirdCrash", "CRASH: Received signal %s (%d)", name, signo);
+    __android_log_print(ANDROID_LOG_FATAL, "LadybirdCrash", "CRASH: Received signal %s (%d). Generating native Android trace...", name, signo);
+
+    size_t const max_frames = 50;
+    void* buffer[max_frames];
+    BacktraceState state = { buffer, buffer + max_frames };
+    _Unwind_Backtrace(unwind_callback, &state);
+    size_t count = state.current - buffer;
+
+    __android_log_print(ANDROID_LOG_FATAL, "LadybirdCrash", "--- ANDROID NDK BACKTRACE ---");
+
+    // 1. Dig into the Android kernel memory map to find our library's base address
+    uintptr_t base_addr = 0;
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (maps) {
+        char line[512];
+        while (fgets(line, sizeof(line), maps)) {
+            if (strstr(line, "libWebContent.so")) {
+                sscanf(line, "%lx", &base_addr);
+                __android_log_print(ANDROID_LOG_FATAL, "LadybirdCrash", "Found libWebContent.so Base Address: 0x%lx", base_addr);
+                break;
+            }
+        }
+        fclose(maps);
+    }
+
+    // 2. Print the exact offsets
+    for (size_t i = 0; i < count; ++i) {
+        uintptr_t addr = (uintptr_t)buffer[i];
+
+        // If the address is higher than our base address, it belongs to WebContent!
+        if (base_addr > 0 && addr >= base_addr && addr < (base_addr + 0x10000000)) {
+            size_t offset = addr - base_addr;
+            __android_log_print(ANDROID_LOG_FATAL, "LadybirdCrash", "Frame %02zu: offset 0x%zx", i, offset);
+        } else {
+            // This is a system/kernel frame (like __kernel_rt_sigreturn)
+            __android_log_print(ANDROID_LOG_FATAL, "LadybirdCrash", "Frame %02zu: 0x%lx <system>", i, addr);
+        }
+    }
+    __android_log_print(ANDROID_LOG_FATAL, "LadybirdCrash", "-----------------------------");
 #    endif
 
     warnln("\n\033[31;1mCRASH\033[0m: Received signal {} ({})", name, signo);
+
+    // We can safely leave this here; it will just be ignored if unsupported
     dump_backtrace(2, 100);
+
+#    if defined(__ANDROID__)
+    // Give the logcat pipe 2 seconds to flush before taking the process out
+    sleep(2);
+#    endif
+
     Core::Process::terminate_immediately(128 + signo);
 }
 
@@ -172,11 +246,15 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #endif
     }
 
+    dbgln("LadybirdBoot: 1. WebContent process started!");
+
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
     WebView::platform_init();
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
+
+    dbgln("LadybirdBoot: 2. Core EventLoop and Platform initialized.");
 
     auto config_path = ByteString::formatted("{}/ladybird/default-config", WebView::s_ladybird_resource_root);
     StringView mach_server_name { };
@@ -226,6 +304,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(file_origins_are_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
 
     args_parser.parse(arguments);
+
+    dbgln("LadybirdBoot: 3. Arguments parsed. mach-server-name='{}', force-cpu-painting={}", mach_server_name, force_cpu_painting);
 
     if (wait_for_debugger) {
         Core::Process::wait_for_debugger_and_break();
@@ -284,6 +364,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Web::HTML::Window::set_internals_object_exposed(expose_internals_object);
     Web::HTML::UniversalGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
 
+    dbgln("LadybirdBoot: 4. Core settings applied. Initializing Main Thread VM.");
+
     Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(enable_test_mode, &font_provider));
 
     Web::Bindings::initialize_main_thread_vm(Web::Bindings::AgentType::SimilarOriginWindow);
@@ -299,12 +381,16 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         Web::WebIDL::set_enable_idl_tracing(true);
     }
 
+    dbgln("LadybirdBoot: 5. Main Thread VM initialized. Loading content blockers.");
+
     auto maybe_content_blocker_error = load_content_blockers(config_path);
     if (maybe_content_blocker_error.is_error())
         dbgln("Failed to load content blockers: {}", maybe_content_blocker_error.error());
 
     if (enable_sandbox)
         TRY(RendererSandbox::apply_sandbox(config_path));
+
+    dbgln("LadybirdBoot: 6. Attempting to take over IPC Client Connection");
 
 #if defined(AK_OS_MACOS)
     auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
@@ -315,6 +401,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto webcontent_client = TRY(IPC::take_over_accepted_client_from_system_server<WebContent::ConnectionFromClient>(mach_server_name));
 #endif
 
+    dbgln("LadybirdBoot: 7. IPC Connection established! Binding server connections.");
+
     auto& heap = Web::Bindings::main_thread_vm().heap();
     webcontent_client->on_request_server_connection = [&heap](auto const& handle) {
         if (auto result = connect_to_resource_loader(heap, handle); result.is_error())
@@ -324,6 +412,24 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         if (auto result = connect_to_image_decoder(handle); result.is_error())
             dbgln("Failed to connect to image decoder: {}", result.error());
     };
+
+    dbgln("LadybirdBoot: 8. Entering main EventLoop.");
+
+#if defined(__ANDROID__)
+    // --- TARGETED WATCHDOG TIMEBOMB ---
+    // 1. Grab the ID of the main thread before we enter the event loop
+    static pthread_t main_thread_id = pthread_self();
+
+    pthread_t watchdog_thread;
+    pthread_create(&watchdog_thread, nullptr, [](void*) -> void* {
+            sleep(5); // Wait 5 seconds for the main thread to get stuck
+            __android_log_print(ANDROID_LOG_ERROR, "LadybirdWatchdog", "TIMEBOMB DETONATED! Snipping the main thread...");
+            
+            // 2. Fire the crash signal directly into the frozen main thread!
+            pthread_kill(main_thread_id, SIGABRT); 
+            return nullptr; }, nullptr);
+    // ----------------------------------
+#endif
 
     return event_loop.exec();
 }

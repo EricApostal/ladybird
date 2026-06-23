@@ -107,7 +107,7 @@ static Optional<EventResult> dispatch_event_to_nested_navigable(Painting::Painta
 {
     auto node = dom_node_for_event_dispatch(paintable);
     if (!node)
-        return {};
+        return { };
 
     if (auto* navigable_paintable = as_if<Painting::NavigableContainerViewportPaintable>(paintable)) {
         auto position = navigable_paintable->transform_to_local_coordinates(viewport_position) - navigable_paintable->absolute_rect().location();
@@ -117,7 +117,7 @@ static Optional<EventResult> dispatch_event_to_nested_navigable(Painting::Painta
         return EventResult::Dropped;
     }
 
-    return {};
+    return { };
 }
 
 static bool parent_element_for_event_dispatch(Painting::Paintable& paintable, GC::Ptr<DOM::Node>& node, Layout::Node*& layout_node)
@@ -205,7 +205,7 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     if (dispath_result.has_value())
         return *dispath_result;
 
-    m_navigable->page().set_focused_navigable({}, m_navigable);
+    m_navigable->page().set_focused_navigable({ }, m_navigable);
 
     // NB: Search for the first parent of the hit target that's an element.
     //
@@ -223,7 +223,7 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     m_mousedown_visual_viewport_position = visual_viewport_position;
 
     auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *paintable, *layout_node);
-    if (!dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerDown, *node, chrome_widget, coordinates, screen_position, {}, button, buttons, modifiers, click_count))
+    if (!dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerDown, *node, chrome_widget, coordinates, screen_position, { }, button, buttons, modifiers, click_count))
         return EventResult::Cancelled;
 
     // FIXME: The spec allows this to be fired following mousedown or mouseup. The native behavior on Windows is to
@@ -256,7 +256,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
 
     if (should_ignore_device_input_event()) {
         if (m_mousedown_target_is_drag_candidate)
-            return handle_drag_and_drop_event(DragEvent::Type::DragMove, visual_viewport_position, screen_position, UIEvents::MouseButton::Primary, buttons, modifiers, {});
+            return handle_drag_and_drop_event(DragEvent::Type::DragMove, visual_viewport_position, screen_position, UIEvents::MouseButton::Primary, buttons, modifiers, { });
         return EventResult::Dropped;
     }
 
@@ -295,7 +295,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
                 caret_position->paintable->debug_description(),
                 caret_position->debug_rect);
         } else {
-            document->set_caret_hit_test_debug_rect({});
+            document->set_caret_hit_test_debug_rect({ });
             dbgln("Caret hit test: point=({}, {}) no caret position", visual_viewport_position.x(), visual_viewport_position.y());
         }
     };
@@ -305,7 +305,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
         auto delta = visual_viewport_position - *m_mousedown_visual_viewport_position;
 
         if (delta.x().abs() >= DRAG_THRESHOLD || delta.y().abs() >= DRAG_THRESHOLD) {
-            auto result = handle_drag_and_drop_event(DragEvent::Type::DragStart, visual_viewport_position, screen_position, UIEvents::MouseButton::Primary, buttons, modifiers, {});
+            auto result = handle_drag_and_drop_event(DragEvent::Type::DragStart, visual_viewport_position, screen_position, UIEvents::MouseButton::Primary, buttons, modifiers, { });
 
             if (result == EventResult::Handled) {
                 set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Drag);
@@ -424,7 +424,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
 
     if (should_ignore_device_input_event()) {
         if (m_mousedown_target_is_drag_candidate) {
-            auto result = handle_drag_and_drop_event(DragEvent::Type::Drop, visual_viewport_position, screen_position, button, buttons, modifiers, {});
+            auto result = handle_drag_and_drop_event(DragEvent::Type::Drop, visual_viewport_position, screen_position, button, buttons, modifiers, { });
             if (result == EventResult::Dropped && should_ignore_device_input_event())
                 return cancel_drag_and_drop_event(visual_viewport_position, screen_position, button, buttons, modifiers);
             set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Arrow);
@@ -464,7 +464,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
         //     chance to end a drag that went outside the window.
         if (m_mousedown_target) {
             auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *document->paintable(), *document->layout_node());
-            dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerUp, document->html_element(), nullptr, coordinates, screen_position, {}, button, buttons, modifiers, click_count);
+            dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerUp, document->html_element(), nullptr, coordinates, screen_position, { }, button, buttons, modifiers, click_count);
             return EventResult::Handled;
         }
 
@@ -498,7 +498,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
         return EventResult::Dropped;
 
     auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *paintable, *layout_node);
-    dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerUp, *node, chrome_widget, coordinates, screen_position, {}, button, buttons, modifiers, click_count);
+    dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerUp, *node, chrome_widget, coordinates, screen_position, { }, button, buttons, modifiers, click_count);
 
     // FIXME: Per spec, the click target should be the nearest common inclusive ancestor of the pointerdown
     //        and pointerup targets. Currently we require an exact match.
@@ -624,7 +624,7 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
         auto perform_wheel_default_action = [&](RefPtr<Painting::Paintable> target) -> EventResult {
             RefPtr<Painting::Paintable> containing_block = move(target);
             while (containing_block) {
-                auto handled_scroll_event = containing_block->handle_mousewheel({}, visual_viewport_position, buttons, modifiers, wheel_delta_x, wheel_delta_y);
+                auto handled_scroll_event = containing_block->handle_mousewheel({ }, visual_viewport_position, buttons, modifiers, wheel_delta_x, wheel_delta_y);
                 if (handled_scroll_event)
                     return EventResult::Handled;
 
@@ -749,7 +749,7 @@ EventResult EventHandler::handle_mouseleave()
 {
     if (should_ignore_device_input_event()) {
         if (m_mousedown_target_is_drag_candidate)
-            return cancel_drag_and_drop_event(m_last_known_mouse_visual_viewport_position.value_or({}), m_last_known_mouse_screen_position, UIEvents::MouseButton::Primary, UIEvents::MouseButton::Primary, 0);
+            return cancel_drag_and_drop_event(m_last_known_mouse_visual_viewport_position.value_or({ }), m_last_known_mouse_screen_position, UIEvents::MouseButton::Primary, UIEvents::MouseButton::Primary, 0);
 
         return EventResult::Dropped;
     }
@@ -838,7 +838,7 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
                                                                        .page_offset = coordinates.page_offset,
                                                                        .viewport_position = coordinates.viewport_position,
                                                                        .offset = coordinates.offset,
-                                                                       .movement = {},
+                                                                       .movement = { },
                                                                        .button = button,
                                                                        .buttons = buttons,
                                                                        .modifiers = modifiers,
@@ -895,7 +895,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         return EventResult::Dropped;
 
     if (should_ignore_device_input_event() && m_mousedown_target_is_drag_candidate && key == UIEvents::KeyCode::Key_Escape)
-        return cancel_drag_and_drop_event(m_last_known_mouse_visual_viewport_position.value_or({}), m_last_known_mouse_screen_position, UIEvents::MouseButton::Primary, m_last_known_mouse_buttons, modifiers);
+        return cancel_drag_and_drop_event(m_last_known_mouse_visual_viewport_position.value_or({ }), m_last_known_mouse_screen_position, UIEvents::MouseButton::Primary, m_last_known_mouse_buttons, modifiers);
 
     auto dispatch_result = fire_keyboard_event(UIEvents::EventNames::keydown, m_navigable, key, modifiers, code_point, repeat);
     if (dispatch_result != EventResult::Accepted)
@@ -1199,7 +1199,7 @@ EventResult EventHandler::cancel_drag_and_drop_event(CSSPixelPoint visual_viewpo
 
     auto viewport_position = document->visual_viewport()->map_to_layout_viewport(visual_viewport_position);
     auto page_offset = compute_mouse_event_page_offset(viewport_position);
-    auto result = m_drag_and_drop_event_handler->handle_drag_cancel(document->realm(), screen_position, page_offset, viewport_position, {}, button, buttons, modifiers);
+    auto result = m_drag_and_drop_event_handler->handle_drag_cancel(document->realm(), screen_position, page_offset, viewport_position, { }, button, buttons, modifiers);
     set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Arrow);
     clear_mousedown_tracking();
     stop_updating_selection();
@@ -1257,6 +1257,10 @@ EventResult EventHandler::handle_paste(Utf16String const& text)
 
 void EventHandler::handle_sdl_input_events()
 {
+#if defined(__ANDROID__)
+    // TODO: FIX SDL ON ANDROID
+    return;
+#endif
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
@@ -1289,7 +1293,7 @@ void EventHandler::handle_gamepad_updated(SDL_JoystickID sdl_joystick_id)
 {
     auto active_document = m_navigable->active_document();
     if (active_document)
-        active_document->window()->navigator()->handle_gamepad_updated({}, sdl_joystick_id);
+        active_document->window()->navigator()->handle_gamepad_updated({ }, sdl_joystick_id);
 
     for (auto const& child_navigable : m_navigable->child_navigables())
         child_navigable->event_handler().handle_gamepad_updated(sdl_joystick_id);
@@ -1299,7 +1303,7 @@ void EventHandler::handle_gamepad_disconnected(SDL_JoystickID sdl_joystick_id)
 {
     auto active_document = m_navigable->active_document();
     if (active_document)
-        active_document->window()->navigator()->handle_gamepad_disconnected({}, sdl_joystick_id);
+        active_document->window()->navigator()->handle_gamepad_disconnected({ }, sdl_joystick_id);
 
     for (auto const& child_navigable : m_navigable->child_navigables())
         child_navigable->event_handler().handle_gamepad_disconnected(sdl_joystick_id);
@@ -1466,16 +1470,16 @@ bool EventHandler::fire_click_events(GC::Ref<DOM::Node> node, MouseEventCoordina
 
     if (button == UIEvents::MouseButton::Primary) {
         // https://w3c.github.io/pointerevents/#click
-        run_activation_behavior = node->dispatch_event(UIEvents::MouseEvent::create_from_platform_event(node->realm(), m_navigable->active_window_proxy(), UIEvents::EventNames::click, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, {}, button, buttons, modifiers, click_count).release_value_but_fixme_should_propagate_errors());
+        run_activation_behavior = node->dispatch_event(UIEvents::MouseEvent::create_from_platform_event(node->realm(), m_navigable->active_window_proxy(), UIEvents::EventNames::click, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, { }, button, buttons, modifiers, click_count).release_value_but_fixme_should_propagate_errors());
 
         // https://w3c.github.io/uievents/#event-type-dblclick
         // This event type MUST be dispatched after the event type click if a click and
         // double click occur simultaneously, and after the event type mouseup otherwise.
         if (click_count == 2)
-            node->dispatch_event(UIEvents::MouseEvent::create_from_platform_event(node->realm(), m_navigable->active_window_proxy(), UIEvents::EventNames::dblclick, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, {}, button, buttons, modifiers, click_count).release_value_but_fixme_should_propagate_errors());
+            node->dispatch_event(UIEvents::MouseEvent::create_from_platform_event(node->realm(), m_navigable->active_window_proxy(), UIEvents::EventNames::dblclick, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, { }, button, buttons, modifiers, click_count).release_value_but_fixme_should_propagate_errors());
     } else {
         // https://w3c.github.io/pointerevents/#auxclick
-        run_activation_behavior = node->dispatch_event(UIEvents::MouseEvent::create_from_platform_event(node->realm(), m_navigable->active_window_proxy(), UIEvents::EventNames::auxclick, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, {}, button, buttons, modifiers, click_count).release_value_but_fixme_should_propagate_errors());
+        run_activation_behavior = node->dispatch_event(UIEvents::MouseEvent::create_from_platform_event(node->realm(), m_navigable->active_window_proxy(), UIEvents::EventNames::auxclick, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, { }, button, buttons, modifiers, click_count).release_value_but_fixme_should_propagate_errors());
     }
 
     return run_activation_behavior;
@@ -1527,18 +1531,18 @@ Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelP
 {
     auto document = m_navigable->active_document();
     if (!document)
-        return {};
+        return { };
 
     if (auto result = document->hit_test(position, Painting::HitTestType::Exact); result.has_value())
         return Target { .paintable = result->paintable.ptr(), .chrome_widget = result->chrome_widget, .index_in_node = result->index_in_node };
-    return {};
+    return { };
 }
 
 GC::Ptr<DOM::Node> EventHandler::target_node_for_mouse_position(CSSPixelPoint position)
 {
     auto target = target_for_mouse_position(position);
     if (!target.has_value() || !target->paintable)
-        return {};
+        return { };
 
     return target->paintable->dom_node();
 }
@@ -1547,7 +1551,7 @@ GC::Ptr<DOM::Node> EventHandler::focus_candidate_for_position(CSSPixelPoint visu
 {
     auto exact_hit = m_navigable->active_document()->hit_test(visual_viewport_position, Painting::HitTestType::Exact);
     if (!exact_hit.has_value())
-        return {};
+        return { };
 
     auto focus_dom_node = exact_hit->paintable->dom_node();
 
@@ -1658,7 +1662,7 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
     if ((modifiers & UIEvents::Mod_Shift) == 0) {
         // 1. Let menuevent = create a PointerEvent with "contextmenu", target
         // 2. If native is valid, then set MouseEvent attributes from native.
-        auto menuevent = UIEvents::MouseEvent::create_from_platform_event(node->realm(), m_navigable->active_window_proxy(), UIEvents::EventNames::contextmenu, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, {}, UIEvents::MouseButton::Secondary, buttons, modifiers).release_value_but_fixme_should_propagate_errors();
+        auto menuevent = UIEvents::MouseEvent::create_from_platform_event(node->realm(), m_navigable->active_window_proxy(), UIEvents::EventNames::contextmenu, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, { }, UIEvents::MouseButton::Secondary, buttons, modifiers).release_value_but_fixme_should_propagate_errors();
 
         // 3. Let result = dispatch menuevent at target.
         bool result = node->dispatch_event(menuevent);
@@ -2200,7 +2204,7 @@ void EventHandler::apply_mouse_selection(CSSPixelPoint visual_viewport_position)
                 set_user_selection(*focus_node, focus_index, *focus_node, focus_index, selection, caret_position->paintable->layout_node().user_select_used_value());
             }
 
-            document.set_needs_repaint(Badge<EventHandler> {});
+            document.set_needs_repaint(Badge<EventHandler> { });
         }
     }
 }
@@ -2213,7 +2217,7 @@ void EventHandler::clear_mousedown_tracking()
         set_node_and_ancestors_being_activated(m_mousedown_target, false);
 
     m_mousedown_target = nullptr;
-    m_mousedown_visual_viewport_position = {};
+    m_mousedown_visual_viewport_position = { };
     m_mousedown_click_count = 0;
     m_mousedown_target_is_drag_candidate = false;
 }
@@ -2221,7 +2225,7 @@ void EventHandler::clear_mousedown_tracking()
 void EventHandler::stop_updating_selection()
 {
     m_selection_mode = SelectionMode::None;
-    m_selection_origin = {};
+    m_selection_origin = { };
     m_mouse_selection_target = nullptr;
 
     m_auto_scroll_handler = nullptr;
@@ -2513,7 +2517,7 @@ static Gfx::Cursor resolve_cursor(Layout::NodeWithStyle const& layout_node, Read
             [&layout_node](NonnullRefPtr<CSS::CursorStyleValue const> const& cursor_style_value) -> Optional<Gfx::Cursor> {
                 if (auto image_cursor = cursor_style_value->make_image_cursor(layout_node); image_cursor.has_value())
                     return image_cursor.release_value();
-                return {};
+                return { };
             });
         if (result.has_value())
             return result.release_value();

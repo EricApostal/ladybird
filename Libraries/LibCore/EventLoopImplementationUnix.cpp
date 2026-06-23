@@ -25,6 +25,10 @@
 #include <sys/select.h>
 #include <unistd.h>
 
+#if defined(AK_OS_ANDROID)
+#    include <android/log.h>
+#endif
+
 namespace Core {
 
 namespace {
@@ -121,14 +125,14 @@ public:
         if (!m_heap.is_empty()) {
             return m_heap.peek_min()->fire_time();
         } else {
-            return {};
+            return { };
         }
     }
 
     void absolutize_relative_timeouts(MonotonicTime current_time)
     {
         for (auto timeout : m_scheduled_timeouts) {
-            timeout->absolutize({}, current_time);
+            timeout->absolutize({ }, current_time);
             m_heap.insert(timeout);
         }
         m_scheduled_timeouts.clear();
@@ -143,7 +147,7 @@ public:
             if (timeout.fire_time() <= current_time) {
                 ++fired_count;
                 m_heap.pop_min();
-                timeout.set_index({}, EventLoopTimeout::INVALID_INDEX);
+                timeout.set_index({ }, EventLoopTimeout::INVALID_INDEX);
                 timeout.fire(*this, current_time);
             } else {
                 break;
@@ -155,7 +159,7 @@ public:
     void schedule_relative(EventLoopTimeout* timeout)
     {
         timeout->set_sequence_id(m_next_sequence_id++);
-        timeout->set_index({}, -1 - static_cast<ssize_t>(m_scheduled_timeouts.size()));
+        timeout->set_index({ }, -1 - static_cast<ssize_t>(m_scheduled_timeouts.size()));
         m_scheduled_timeouts.append(timeout);
     }
 
@@ -167,26 +171,26 @@ public:
 
     void unschedule(EventLoopTimeout* timeout)
     {
-        if (timeout->index({}) < 0) {
-            size_t i = -1 - timeout->index({});
+        if (timeout->index({ }) < 0) {
+            size_t i = -1 - timeout->index({ });
             size_t j = m_scheduled_timeouts.size() - 1;
             VERIFY(m_scheduled_timeouts[i] == timeout);
             swap(m_scheduled_timeouts[i], m_scheduled_timeouts[j]);
-            swap(m_scheduled_timeouts[i]->index({}), m_scheduled_timeouts[j]->index({}));
+            swap(m_scheduled_timeouts[i]->index({ }), m_scheduled_timeouts[j]->index({ }));
             (void)m_scheduled_timeouts.take_last();
         } else {
-            m_heap.pop(timeout->index({}));
+            m_heap.pop(timeout->index({ }));
         }
-        timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
+        timeout->set_index({ }, EventLoopTimeout::INVALID_INDEX);
     }
 
     void clear()
     {
         for (auto* timeout : m_heap.nodes_in_arbitrary_order())
-            timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
+            timeout->set_index({ }, EventLoopTimeout::INVALID_INDEX);
         m_heap.clear();
         for (auto* timeout : m_scheduled_timeouts)
-            timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
+            timeout->set_index({ }, EventLoopTimeout::INVALID_INDEX);
         m_scheduled_timeouts.clear();
     }
 
@@ -199,7 +203,7 @@ private:
             return a->fire_time() < b->fire_time();
         }),
         decltype([](EventLoopTimeout* timeout, size_t index) {
-            timeout->set_index({}, static_cast<ssize_t>(index));
+            timeout->set_index({ }, static_cast<ssize_t>(index));
         }),
         8>
         m_heap;
@@ -233,7 +237,7 @@ public:
                 //       special way. TimeoutSet::schedule_absolute for them will result in an
                 //       infinite loop. TimeoutSet::schedule_relative, on the other hand, will do a
                 //       correct thing of scheduling them for the next iteration of the loop.
-                m_duration = {};
+                m_duration = { };
                 timeout_set.schedule_relative(this);
             }
         }
@@ -442,12 +446,12 @@ try_select_again:
         for (size_t i = 1; i < thread_data.poll_fds.size(); ++i) {
             auto& notifier = *thread_data.notifiers[i];
 
-// #ifdef AK_OS_ANDROID
-//             // FIXME: Make the check work under Android, perhaps use ALooper.
-//             ThreadEventQueue::current().post_event(notifier, Core::Event::Type::NotifierActivation);
-// #else
             auto revents = thread_data.poll_fds[i].revents;
 
+            // #ifdef AK_OS_ANDROID
+            //             // FIXME: Make the check work under Android, perhaps use ALooper.
+            //             ThreadEventQueue::current().post_event(notifier, Core::Event::Type::NotifierActivation);
+            // #else
             NotificationType type = NotificationType::None;
             if (has_flag(revents, POLLIN))
                 type |= NotificationType::Read;
@@ -462,7 +466,7 @@ try_select_again:
 
             if (type != NotificationType::None)
                 ThreadEventQueue::current().post_event(&notifier, Core::Event::Type::NotifierActivation);
-// #endif
+            // #endif
         }
     }
 
@@ -584,7 +588,7 @@ bool SignalHandlers::remove(int handler_id)
         auto it = m_handlers.find(handler_id);
         if (it != m_handlers.end()) {
             // Mark pending remove
-            m_handlers_pending.set(handler_id, {});
+            m_handlers_pending.set(handler_id, { });
             return true;
         }
         it = m_handlers_pending.find(handler_id);

@@ -47,8 +47,10 @@ private:
     {
         auto& event_loop_manager = *new ALooperEventLoopManager(s_timer_service);
         event_loop_manager.on_did_post_event = [] {
+            dbgln("IS POSTING EVENT IN DA JAVA");
             JavaEnvironment env(global_vm);
             env.get()->CallVoidMethod(s_java_instance, s_schedule_event_loop_method);
+            dbgln("it worked I think this is very wrong though");
         };
         Core::EventLoopManager::install(event_loop_manager);
 
@@ -106,10 +108,13 @@ Java_org_serenityos_ladybird_LadybirdActivity_initNativeCode(JNIEnv* env, jobjec
     s_timer_service = env->NewGlobalRef(timer_service);
 
     static StringView s_program_name_argument = "ladybird"sv;
+    static StringView s_devtools_argument = "--devtools=6000"sv;
+    static StringView s_args[] = { s_program_name_argument, s_devtools_argument };
+
     Main::Arguments arguments = {
         .argc = 0,
         .argv = nullptr,
-        .strings = Span<StringView> { &s_program_name_argument, 1 }
+        .strings = Span<StringView> { s_args, 2 }
     };
 
     s_application = Ladybird::Application::create(arguments, native_library_directory).release_value_but_fixme_should_propagate_errors();

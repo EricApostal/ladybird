@@ -110,6 +110,7 @@ class LadybirdActivity : AppCompatActivity() {
 
         view.initialize()
         // val initialUrl = normalizeInputUrl(intent.dataString ?: "about:settings")
+        // val initialUrl = "http://neverssl.com/"
         val initialUrl = "https://ladybird.org/"
 
         Log.i(logTag, "Initial URL request: $initialUrl")

@@ -138,6 +138,7 @@ android {
             // The helper process executables are packaged as lib*.so files; they must be extracted
             // to the filesystem so they can be executed directly.
             useLegacyPackaging = true
+            keepDebugSymbols.add("**/libWebContent.so")
         }
     }
 }

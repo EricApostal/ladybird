@@ -129,6 +129,10 @@ void ALooperEventLoopManager::did_post_event()
 
 int looper_callback(int fd, int events, void* data)
 {
+    if (events & (ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP)) {
+        __android_log_print(ANDROID_LOG_ERROR, "LadybirdSpin", "SPIN TRAP: Internal pipe FD %d got HANGUP/ERROR! events=%d", fd, events);
+    }
+
     auto& manager = *static_cast<ALooperEventLoopManager*>(data);
 
     if (events & ALOOPER_EVENT_INPUT) {
@@ -207,6 +211,10 @@ void ALooperEventLoopImplementation::post_event(Core::EventReceiver& receiver, C
 
 static int notifier_callback(int fd, int events, void* data)
 {
+    if (events & (ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP)) {
+        __android_log_print(ANDROID_LOG_ERROR, "LadybirdSpin", "SPIN TRAP: Notifier FD %d got HANGUP/ERROR! events=%d", fd, events);
+    }
+
     auto& notifier = *static_cast<Core::Notifier*>(data);
 
     VERIFY(fd == notifier.fd());
