@@ -16,6 +16,12 @@ function(import_rust_crate)
         set(ffi_output "${ARG_FFI_OUTPUT_DIR}/${ARG_FFI_HEADER}")
     endif()
 
+    # Don't assume we are the top-level cmake
+    set(rust_toolchain_file "${CMAKE_SOURCE_DIR}/rust-toolchain.toml")
+    if (DEFINED LADYBIRD_SOURCE_DIR)
+        set(rust_toolchain_file "${LADYBIRD_SOURCE_DIR}/rust-toolchain.toml")
+    endif()
+
     _rust_crate_common_setup(
         MANIFEST_PATH "${ARG_MANIFEST_PATH}"
         CRATE_NAME ${ARG_CRATE_NAME}
@@ -54,7 +60,7 @@ function(import_rust_crate)
                 -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/sync_rust_ffi_header.cmake"
         DEPENDS "${manifest_path}"
             "${workspace_dir}/Cargo.lock" "${workspace_dir}/Cargo.toml"
-            "${RUST_RUSTC}" "${CMAKE_SOURCE_DIR}/rust-toolchain.toml"
+            "${RUST_RUSTC}" "${rust_toolchain_file}"
         DEPFILE "${depfile}"
         COMMENT "Building Rust crate ${ARG_CRATE_NAME}"
         USES_TERMINAL
@@ -88,6 +94,12 @@ function(build_rust_binary)
         set(ARG_OUTPUT_NAME "${ARG_BINARY_NAME}")
     endif()
 
+    # Don't assume we are the top-level cmake
+    set(rust_toolchain_file "${CMAKE_SOURCE_DIR}/rust-toolchain.toml")
+    if (DEFINED LADYBIRD_SOURCE_DIR)
+        set(rust_toolchain_file "${LADYBIRD_SOURCE_DIR}/rust-toolchain.toml")
+    endif()
+
     _rust_crate_common_setup(
         MANIFEST_PATH "${ARG_MANIFEST_PATH}"
         CRATE_NAME ${ARG_CRATE_NAME}
@@ -109,7 +121,7 @@ function(build_rust_binary)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${cargo_binary}" "${output_binary}"
         DEPENDS "${manifest_path}"
             "${workspace_dir}/Cargo.lock" "${workspace_dir}/Cargo.toml"
-            "${RUST_RUSTC}" "${CMAKE_SOURCE_DIR}/rust-toolchain.toml"
+            "${RUST_RUSTC}" "${rust_toolchain_file}"
         DEPFILE "${depfile}"
         COMMENT "Building Rust binary ${ARG_BINARY_NAME}"
         USES_TERMINAL
