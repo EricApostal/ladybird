@@ -6,6 +6,7 @@
 package org.serenityos.ladybird
 
 import android.graphics.Bitmap
+import android.hardware.HardwareBuffer
 import android.util.Log
 
 /** Wrapper around WebView::ViewImplementation for use by Kotlin */
@@ -35,6 +36,10 @@ class WebViewImplementation(private val view: WebView) {
 
     fun drawIntoBitmap(bitmap: Bitmap) {
         nativeDrawIntoBitmap(nativeInstance, bitmap)
+    }
+
+    fun hardwareBuffer(): HardwareBuffer? {
+        return nativeGetHardwareBuffer(nativeInstance)
     }
 
     fun setViewportGeometry(w: Int, h: Int) {
@@ -68,6 +73,7 @@ class WebViewImplementation(private val view: WebView) {
     private external fun nativeObjectInit(): Long
     private external fun nativeObjectDispose(instance: Long)
 
+    private external fun nativeGetHardwareBuffer(instance: Long): HardwareBuffer?
     private external fun nativeDrawIntoBitmap(instance: Long, bitmap: Bitmap)
     private external fun nativeSetViewportGeometry(instance: Long, w: Int, h: Int)
     private external fun nativeSetDevicePixelRatio(instance: Long, ratio: Float)

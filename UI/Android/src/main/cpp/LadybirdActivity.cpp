@@ -36,11 +36,9 @@ private:
     {
     }
 
-    virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions& request_server_options, WebView::WebContentOptions& web_content_options) override
+    virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions& request_server_options, WebView::WebContentOptions&) override
     {
         request_server_options.certificates.append(ByteString::formatted("{}/cacert.pem", WebView::s_ladybird_resource_root));
-
-        web_content_options.force_cpu_painting = WebView::ForceCPUPainting::Yes;
     }
 
     virtual Core::EventLoop& create_platform_event_loop() override

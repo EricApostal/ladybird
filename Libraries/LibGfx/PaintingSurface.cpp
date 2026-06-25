@@ -21,7 +21,7 @@
 
 #ifdef AK_OS_MACOS
 #    include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
-#elif defined(USE_VULKAN_DMABUF_IMAGES)
+#elif defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 #    include <LibGfx/VulkanImage.h>
 #    include <gpu/ganesh/vk/GrVkBackendSurface.h>
 #    include <gpu/ganesh/vk/GrVkTypes.h>
@@ -36,7 +36,7 @@ struct PaintingSurface::Impl {
     RefPtr<Bitmap> bitmap;
 };
 
-#if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES)
+#if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 static GrSurfaceOrigin origin_to_sk_origin(PaintingSurface::Origin origin)
 {
     switch (origin) {
@@ -50,12 +50,14 @@ static GrSurfaceOrigin origin_to_sk_origin(PaintingSurface::Origin origin)
 }
 #endif
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 static SkColorType vk_format_to_sk_color_type(VkFormat format)
 {
     switch (format) {
     case VK_FORMAT_B8G8R8A8_UNORM:
         return kBGRA_8888_SkColorType;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        return kRGBA_8888_SkColorType;
     // add more as needed
     default:
         VERIFY_NOT_REACHED();
@@ -74,7 +76,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_vkimage(NonnullRefPt
     IntSize size(vulkan_image->info.extent.width, vulkan_image->info.extent.height);
     GrVkImageInfo info = {
         .fImage = vulkan_image->image,
-        .fAlloc = {}, // we're managing the memory ourselves
+        .fAlloc = { }, // we're managing the memory ourselves
         .fImageTiling = vulkan_image->info.tiling,
         .fImageLayout = vulkan_image->info.layout,
         .fFormat = vulkan_image->info.format,
@@ -83,7 +85,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_vkimage(NonnullRefPt
         .fLevelCount = 1,
         .fCurrentQueueFamily = VK_QUEUE_FAMILY_IGNORED,
         .fProtected = skgpu::Protected::kNo,
-        .fYcbcrConversionInfo = {},
+        .fYcbcrConversionInfo = { },
         .fSharingMode = vulkan_image->info.sharing_mode,
     };
     GrBackendRenderTarget rt = GrBackendRenderTargets::MakeVk(size.width(), size.height(), info);
@@ -122,7 +124,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::wrap_bitmap(Bitmap& bitmap)
     auto size = bitmap.size();
     auto image_info = SkImageInfo::Make(bitmap.width(), bitmap.height(), color_type, alpha_type, SkColorSpace::MakeSRGB());
     auto surface = SkSurfaces::WrapPixels(image_info, bitmap.begin(), bitmap.pitch());
-    return adopt_ref(*new PaintingSurface(make<Impl>(RefPtr<SkiaBackendContext> {}, size, surface, bitmap)));
+    return adopt_ref(*new PaintingSurface(make<Impl>(RefPtr<SkiaBackendContext> { }, size, surface, bitmap)));
 }
 
 #ifdef AK_OS_MACOS
@@ -196,7 +198,7 @@ void PaintingSurface::copy_from_surface(PaintingSurface& source)
         image.get(),
         SkRect::MakeIWH(image->width(), image->height()),
         SkRect::MakeIWH(size().width(), size().height()),
-        SkSamplingOptions {},
+        SkSamplingOptions { },
         &paint,
         SkCanvas::kStrict_SrcRectConstraint);
 }
@@ -208,7 +210,7 @@ IntSize PaintingSurface::size() const
 
 IntRect PaintingSurface::rect() const
 {
-    return { {}, m_impl->size };
+    return { { }, m_impl->size };
 }
 
 SkCanvas& PaintingSurface::canvas() const

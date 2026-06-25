@@ -8,6 +8,7 @@
 
 #include <LibWebView/ViewImplementation.h>
 #include <android/bitmap.h>
+#include <android/hardware_buffer.h>
 #include <jni.h>
 
 namespace Ladybird {
@@ -24,6 +25,7 @@ public:
 
     void set_viewport_geometry(int w, int h);
     void set_device_pixel_ratio(double f);
+    AHardwareBuffer* front_ahb() const;
 
     void mouse_event(Web::MouseEvent::Type event_type, float x, float y, float raw_x, float raw_y);
 

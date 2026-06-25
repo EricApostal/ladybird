@@ -84,6 +84,10 @@ if (HAS_FONTCONFIG)
     target_link_libraries(LibGfx PRIVATE Fontconfig::Fontconfig)
 endif()
 
+if (ANDROID)
+    target_link_libraries(LibGfx PRIVATE android nativewindow)
+endif()
+
 if (NOT ANDROID)
     # FIXME: Build vcpkg libraries with clang-cl so they can also build in sanitize.
     # https://github.com/LadybirdBrowser/ladybird/issues/5224

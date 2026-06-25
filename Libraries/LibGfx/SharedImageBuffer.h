@@ -12,6 +12,10 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/SharedImage.h>
 
+#ifdef USE_VULKAN_AHB_IMAGES
+#    include <android/hardware_buffer.h>
+#endif
+
 #ifdef AK_OS_MACOS
 #    include <LibCore/IOSurface.h>
 #endif
@@ -39,6 +43,11 @@ public:
     LinuxDmaBufHandle const* linux_dmabuf_handle() const { return m_linux_dmabuf_handle.has_value() ? &m_linux_dmabuf_handle.value() : nullptr; }
 #endif
 
+#ifdef USE_VULKAN_AHB_IMAGES
+    AndroidAhbHandle const* android_ahb_handle() const { return m_android_ahb_handle.has_value() ? &m_android_ahb_handle.value() : nullptr; }
+    AHardwareBuffer* native_buffer() const { return m_android_ahb; }
+#endif
+
 private:
 #ifdef AK_OS_MACOS
     SharedImageBuffer(Core::IOSurfaceHandle&&, NonnullRefPtr<Bitmap>);
@@ -48,6 +57,11 @@ private:
 #    ifdef USE_VULKAN_DMABUF_IMAGES
     SharedImageBuffer(NonnullRefPtr<Bitmap>, LinuxDmaBufHandle&&);
     Optional<LinuxDmaBufHandle> m_linux_dmabuf_handle;
+#    endif
+#    ifdef USE_VULKAN_AHB_IMAGES
+    SharedImageBuffer(NonnullRefPtr<Bitmap>, AndroidAhbHandle&&, AHardwareBuffer*);
+    Optional<AndroidAhbHandle> m_android_ahb_handle;
+    AHardwareBuffer* m_android_ahb { nullptr };
 #    endif
 #endif
     NonnullRefPtr<Bitmap> m_bitmap;

@@ -14,7 +14,7 @@
 #include <LibGfx/Size.h>
 #include <LibGfx/SkiaBackendContext.h>
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 namespace Gfx {
 
 struct VulkanImage;
@@ -42,21 +42,21 @@ public:
 
     Function<void(PaintingSurface&)> on_flush;
 
-    static NonnullRefPtr<PaintingSurface> create_with_size(IntSize size, BitmapFormat color_type, AlphaType alpha_type, RefPtr<SkiaBackendContext> = {});
+    static NonnullRefPtr<PaintingSurface> create_with_size(IntSize size, BitmapFormat color_type, AlphaType alpha_type, RefPtr<SkiaBackendContext> = { });
     static NonnullRefPtr<PaintingSurface> wrap_bitmap(Bitmap&);
 
 #ifdef AK_OS_MACOS
     static NonnullRefPtr<PaintingSurface> create_from_shared_image_buffer(SharedImageBuffer&, NonnullRefPtr<SkiaBackendContext>, Origin = Origin::TopLeft);
 #endif
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
     static NonnullRefPtr<PaintingSurface> create_from_vkimage(NonnullRefPtr<SkiaBackendContext> context, NonnullRefPtr<VulkanImage> vulkan_image, Origin origin);
 #endif
 
     NonnullRefPtr<Bitmap> snapshot_bitmap() const;
     SharedImage snapshot_into_shared_image() const;
 
-    void read_into_bitmap(Bitmap&, IntPoint source_position = {}) const;
+    void read_into_bitmap(Bitmap&, IntPoint source_position = { }) const;
     void write_from_bitmap(Bitmap const&);
     void copy_from_surface(PaintingSurface&);
 

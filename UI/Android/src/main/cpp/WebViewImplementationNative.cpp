@@ -74,6 +74,7 @@ void WebViewImplementationNative::paint_into_bitmap(void* android_bitmap_raw, An
     ++m_paint_call_count;
 
     if (m_client_state.front_bitmap.shared_image_buffer && m_client_state.has_usable_bitmap) {
+
         if (!m_logged_first_usable_frame) {
             m_logged_first_usable_frame = true;
             // dbgln("[AndroidWebView] first usable frame available at paint #{} front_id={} painted_size={}x{}",
@@ -135,6 +136,26 @@ void WebViewImplementationNative::set_device_pixel_ratio(double f)
     dbgln("[AndroidWebView] set_device_pixel_ratio {}", f);
     m_device_pixel_ratio = f;
     handle_resize();
+}
+
+AHardwareBuffer* WebViewImplementationNative::front_ahb() const
+{
+#ifdef USE_VULKAN_AHB_IMAGES
+    if (!m_client_state.has_usable_bitmap) {
+        dbgln("front_ahb: returning nullptr because has_usable_bitmap is false");
+        return nullptr;
+    }
+    if (!m_client_state.front_bitmap.shared_image_buffer) {
+        dbgln("front_ahb: returning nullptr because shared_image_buffer is null");
+        return nullptr;
+    }
+    auto* ahb = m_client_state.front_bitmap.shared_image_buffer->native_buffer();
+    dbgln("front_ahb: returning ahb = {}", ahb);
+    return ahb;
+#else
+    dbgln("front_ahb: returning nullptr because USE_VULKAN_AHB_IMAGES is not defined");
+    return nullptr;
+#endif
 }
 
 void WebViewImplementationNative::mouse_event(Web::MouseEvent::Type event_type, float x, float y, float raw_x, float raw_y)

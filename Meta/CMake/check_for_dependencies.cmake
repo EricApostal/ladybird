@@ -67,20 +67,30 @@ if (NOT APPLE AND NOT WIN32)
         set(HAS_VULKAN ON CACHE BOOL "" FORCE)
         add_cxx_compile_definitions(USE_VULKAN=1)
 
-        # Sharable Vulkan images are currently only implemented on Linux and BSDs
+        # Sharable Vulkan images are implemented via dmabuf on Linux/BSD and
+        # AHardwareBuffer on Android.
         if (((LINUX AND NOT ANDROID) OR BSD) AND GLSLANG_VALIDATOR)
             set(USE_VULKAN_DMABUF_IMAGES ON CACHE BOOL "" FORCE)
             add_cxx_compile_definitions(USE_VULKAN_DMABUF_IMAGES=1)
         else()
             set(USE_VULKAN_DMABUF_IMAGES OFF CACHE BOOL "" FORCE)
         endif()
+
+        if (ANDROID)
+            set(USE_VULKAN_AHB_IMAGES ON CACHE BOOL "" FORCE)
+            add_cxx_compile_definitions(USE_VULKAN_AHB_IMAGES=1)
+        else()
+            set(USE_VULKAN_AHB_IMAGES OFF CACHE BOOL "" FORCE)
+        endif()
     else()
         set(HAS_VULKAN OFF CACHE BOOL "" FORCE)
         set(USE_VULKAN_DMABUF_IMAGES OFF CACHE BOOL "" FORCE)
+        set(USE_VULKAN_AHB_IMAGES OFF CACHE BOOL "" FORCE)
     endif()
 else()
     set(HAS_VULKAN OFF CACHE BOOL "" FORCE)
     set(USE_VULKAN_DMABUF_IMAGES OFF CACHE BOOL "" FORCE)
+    set(USE_VULKAN_AHB_IMAGES OFF CACHE BOOL "" FORCE)
 endif()
 
 find_package(CURL REQUIRED)

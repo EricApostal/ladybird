@@ -63,7 +63,7 @@ static void invoke_async_flush_callback(void* context)
 
 static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurface* surface, Function<void()>&& callback)
 {
-    GrFlushInfo flush_info {};
+    GrFlushInfo flush_info { };
     flush_info.fFinishedProc = invoke_async_flush_callback;
     flush_info.fFinishedContext = new Function<void()>(move(callback));
     context.flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
@@ -133,25 +133,25 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_independent_gpu_backend()
 #ifdef AK_OS_MACOS
     auto metal_context = get_metal_context();
     if (!metal_context)
-        return {};
+        return { };
     return create_metal_context(*metal_context);
 #elif defined(USE_DIRECTX)
     auto maybe_direct3d_context = Gfx::create_direct3d_context();
     if (maybe_direct3d_context.is_error()) {
         dbgln("Direct3D 12 context creation failed: {}", maybe_direct3d_context.error());
-        return {};
+        return { };
     }
     return create_direct3d_context(maybe_direct3d_context.release_value());
 #elif defined(USE_VULKAN)
     auto maybe_vulkan_context = Gfx::create_vulkan_context();
     if (maybe_vulkan_context.is_error()) {
         dbgln("Vulkan context creation failed: {}", maybe_vulkan_context.error());
-        return {};
+        return { };
     }
     auto vulkan_context = maybe_vulkan_context.release_value();
     return create_vulkan_context(vulkan_context);
 #else
-    return {};
+    return { };
 #endif
 }
 
@@ -179,7 +179,7 @@ public:
 
     void flush_and_submit_impl(SkSurface* surface) override
     {
-        GrFlushInfo const flush_info {};
+        GrFlushInfo const flush_info { };
         m_context->flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
         m_context->submit(GrSyncCpu::kYes);
     }
@@ -211,7 +211,7 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_direct3d_context(NonnullRe
     auto context = GrDirectContext::MakeDirect3D(backend_context);
     if (!context) {
         dbgln("Skia Direct3D context creation failed");
-        return {};
+        return { };
     }
 
     context->setResourceCacheLimit(skia_resource_cache_limit);
@@ -235,7 +235,7 @@ public:
     ~SkiaVulkanBackendContext() override
     {
         m_context.reset();
-#    ifdef USE_VULKAN_DMABUF_IMAGES
+#    if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
         if (m_vulkan_context.command_pool != VK_NULL_HANDLE)
             vkDestroyCommandPool(m_vulkan_context.logical_device, m_vulkan_context.command_pool, nullptr);
 #    endif
@@ -247,7 +247,7 @@ public:
 
     void flush_and_submit_impl(SkSurface* surface) override
     {
-        GrFlushInfo const flush_info {};
+        GrFlushInfo const flush_info { };
         m_context->flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
         m_context->submit(GrSyncCpu::kYes);
     }
@@ -317,7 +317,7 @@ public:
 
     void flush_and_submit_impl(SkSurface* surface) override
     {
-        GrFlushInfo const flush_info {};
+        GrFlushInfo const flush_info { };
         m_context->flush(surface, SkSurfaces::BackendSurfaceAccess::kPresent, flush_info);
         m_context->submit(GrSyncCpu::kYes);
     }

@@ -9,9 +9,12 @@
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SkiaBackendContext.h>
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 #    include <AK/Array.h>
 #    include <LibGfx/VulkanImage.h>
+#endif
+
+#ifdef USE_VULKAN_DMABUF_IMAGES
 #    include <libdrm/drm_fourcc.h>
 #endif
 
@@ -62,24 +65,35 @@ static BackingStorePair create_shareable_bitmap_backing_stores([[maybe_unused]] 
     };
 }
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
-struct DMABufBackingStorePair {
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
+struct VulkanBackingStorePair {
     RefPtr<Gfx::PaintingSurface> front;
     RefPtr<Gfx::PaintingSurface> back;
     Gfx::SharedImage front_shared_image;
     Gfx::SharedImage back_shared_image;
 };
 
-static ErrorOr<DMABufBackingStorePair> create_linear_dmabuf_backing_stores(Gfx::IntSize size, Gfx::SkiaBackendContext& skia_backend_context)
+static ErrorOr<VulkanBackingStorePair> create_vulkan_shared_backing_stores(Gfx::IntSize size, Gfx::SkiaBackendContext& skia_backend_context)
 {
     auto const& vulkan_context = skia_backend_context.vulkan_context();
+#    ifdef AK_OS_ANDROID
+    constexpr auto vulkan_format = VK_FORMAT_R8G8B8A8_UNORM;
+#    else
+    constexpr auto vulkan_format = VK_FORMAT_B8G8R8A8_UNORM;
+#    endif
+
+#    ifdef USE_VULKAN_DMABUF_IMAGES
     static constexpr Array<uint64_t, 1> linear_modifiers = { DRM_FORMAT_MOD_LINEAR };
-    auto front_image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), VK_FORMAT_B8G8R8A8_UNORM, linear_modifiers.span()));
-    auto back_image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), VK_FORMAT_B8G8R8A8_UNORM, linear_modifiers.span()));
+    auto front_image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), vulkan_format, linear_modifiers.span()));
+    auto back_image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), vulkan_format, linear_modifiers.span()));
+#    else
+    auto front_image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), vulkan_format, ReadonlySpan<uint64_t> { }));
+    auto back_image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), vulkan_format, ReadonlySpan<uint64_t> { }));
+#    endif
     auto front_shared_image = Gfx::duplicate_shared_image(*front_image);
     auto back_shared_image = Gfx::duplicate_shared_image(*back_image);
 
-    return DMABufBackingStorePair {
+    return VulkanBackingStorePair {
         .front = Gfx::PaintingSurface::create_from_vkimage(skia_backend_context, move(front_image), Gfx::PaintingSurface::Origin::TopLeft),
         .back = Gfx::PaintingSurface::create_from_vkimage(skia_backend_context, move(back_image), Gfx::PaintingSurface::Origin::TopLeft),
         .front_shared_image = move(front_shared_image),
@@ -92,7 +106,7 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
     Gfx::IntSize viewport_size, Web::Compositor::WindowResizingInProgress window_resize_in_progress)
 {
     if (viewport_size.is_empty())
-        return {};
+        return { };
 
     auto minimum_needed_size = viewport_size;
     bool force_reallocate = false;
@@ -114,14 +128,14 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
         };
     }
 
-    return {};
+    return { };
 }
 
 Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing_stores(Allocation const& allocation, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, bool should_publish)
 {
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
     if (skia_backend_context && should_publish) {
-        auto backing_stores = create_linear_dmabuf_backing_stores(allocation.size, *skia_backend_context);
+        auto backing_stores = create_vulkan_shared_backing_stores(allocation.size, *skia_backend_context);
         if (!backing_stores.is_error()) {
             auto backing_store_pair = backing_stores.release_value();
             m_backing_stores.front_store = move(backing_store_pair.front);
@@ -149,7 +163,7 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
     m_backing_stores.back_bitmap_id = allocation.back_bitmap_id;
 
     if (!should_publish)
-        return {};
+        return { };
 
     return Publication {
         .front_bitmap_id = allocation.front_bitmap_id,

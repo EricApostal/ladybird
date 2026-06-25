@@ -7,6 +7,7 @@
 #include "WebViewImplementationNative.h"
 #include <AK/ByteString.h>
 #include <AK/Debug.h>
+#include <android/hardware_buffer_jni.h>
 #include <cstring>
 #include <jni.h>
 
@@ -59,6 +60,28 @@ Java_org_serenityos_ladybird_WebViewImplementation_nativeObjectDispose(JNIEnv* e
     auto* impl = reinterpret_cast<WebViewImplementationNative*>(instance);
     env->DeleteGlobalRef(impl->java_instance());
     delete impl;
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_org_serenityos_ladybird_WebViewImplementation_nativeGetHardwareBuffer(JNIEnv* env, jobject /* thiz */, jlong instance);
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_org_serenityos_ladybird_WebViewImplementation_nativeGetHardwareBuffer(JNIEnv* env, jobject /* thiz */, jlong instance)
+{
+    auto* impl = reinterpret_cast<WebViewImplementationNative*>(instance);
+    if (!impl)
+        return nullptr;
+
+    auto* ahb = impl->front_ahb();
+    if (!ahb)
+        return nullptr;
+
+#if __ANDROID_API__ >= 26
+    return AHardwareBuffer_toHardwareBuffer(env, ahb);
+#else
+    (void)env;
+    return nullptr;
+#endif
 }
 
 extern "C" JNIEXPORT void JNICALL

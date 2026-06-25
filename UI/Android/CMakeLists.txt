@@ -6,7 +6,7 @@ add_library(ladybird SHARED
     src/main/cpp/TimerExecutorService.cpp
     src/main/cpp/JNIHelpers.cpp
 )
-target_link_libraries(ladybird PRIVATE jnigraphics android log)
+target_link_libraries(ladybird PRIVATE jnigraphics android log nativewindow)
 
 include(../cmake/AndroidExtras.cmake)
 create_ladybird_bundle(ladybird)

@@ -8,6 +8,7 @@ package org.serenityos.ladybird
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.ColorSpace
 import android.util.AttributeSet
 import android.util.Log
 import android.view.MotionEvent
@@ -75,6 +76,23 @@ class WebView(context: Context, attributeSet: AttributeSet) : View(context, attr
                         logTag,
                         "onDraw #$drawCount size=${width}x$height bitmap=${contentBitmap.width}x${contentBitmap.height}"
                 )
+
+        val hardwareBuffer = viewImpl.hardwareBuffer()
+        if (hardwareBuffer != null) {
+            val hardwareBitmap =
+                    Bitmap.wrapHardwareBuffer(hardwareBuffer, ColorSpace.get(ColorSpace.Named.SRGB))
+            hardwareBuffer.close()
+
+            if (hardwareBitmap != null) {
+                Log.i(logTag, "Rendering method: Hardware Buffer")
+                canvas.drawBitmap(hardwareBitmap, 0f, 0f, null)
+                return
+            } else {
+                Log.e(logTag, "Bitmap.wrapHardwareBuffer returned null!")
+            }
+        } else {
+            // It's normal for hardwareBuffer() to return null before the first frame is fully rendered.
+        }
 
         viewImpl.drawIntoBitmap(contentBitmap)
         canvas.drawBitmap(contentBitmap, 0f, 0f, null)

@@ -8,7 +8,11 @@
 
 #ifdef USE_VULKAN
 
+#    include <AK/Error.h>
 #    include <vulkan/vulkan.h>
+#    ifdef USE_VULKAN_AHB_IMAGES
+#        include <vulkan/vulkan_android.h>
+#    endif
 
 namespace Gfx {
 
@@ -19,13 +23,18 @@ struct VulkanContext {
     VkDevice logical_device { VK_NULL_HANDLE };
     VkQueue graphics_queue { VK_NULL_HANDLE };
     uint32_t graphics_queue_family { 0 };
-#    ifdef USE_VULKAN_DMABUF_IMAGES
+#    if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
     VkCommandPool command_pool { VK_NULL_HANDLE };
     VkCommandBuffer command_buffer { VK_NULL_HANDLE };
     struct
     {
+#        ifdef USE_VULKAN_DMABUF_IMAGES
         PFN_vkGetMemoryFdKHR get_memory_fd { nullptr };
         PFN_vkGetImageDrmFormatModifierPropertiesEXT get_image_drm_format_modifier_properties { nullptr };
+#        endif
+#        ifdef USE_VULKAN_AHB_IMAGES
+        PFN_vkGetMemoryAndroidHardwareBufferANDROID get_memory_android_hardware_buffer { nullptr };
+#        endif
     } ext_procs;
 #    endif
 };
