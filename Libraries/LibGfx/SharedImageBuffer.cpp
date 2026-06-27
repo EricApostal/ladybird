@@ -108,7 +108,7 @@ static NonnullRefPtr<Bitmap> create_bitmap_from_android_ahb(AndroidAhbHandle con
 
     AHardwareBuffer_Desc desc { };
     AHardwareBuffer_describe(out_ahb, &desc);
-    
+
     void* data = nullptr;
     int lock_result = AHardwareBuffer_lock(out_ahb, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, nullptr, &data);
     VERIFY(lock_result == 0);
@@ -185,18 +185,20 @@ SharedImageBuffer SharedImageBuffer::import_from_shared_image(SharedImage shared
 }
 
 SharedImageBuffer::SharedImageBuffer(SharedImageBuffer&& other)
+#if defined(AK_OS_MACOS)
+    : m_iosurface_handle(move(other.m_iosurface_handle))
+    , m_bitmap(move(other.m_bitmap))
+#elif defined(USE_VULKAN_DMABUF_IMAGES)
+    : m_linux_dmabuf_handle(move(other.m_linux_dmabuf_handle))
+    , m_bitmap(move(other.m_bitmap))
+#elif defined(USE_VULKAN_AHB_IMAGES)
+    : m_android_ahb_handle(move(other.m_android_ahb_handle))
+    , m_android_ahb(exchange(other.m_android_ahb, nullptr))
+    , m_bitmap(move(other.m_bitmap))
+#else
     : m_bitmap(move(other.m_bitmap))
+#endif
 {
-#ifdef AK_OS_MACOS
-    m_iosurface_handle = move(other.m_iosurface_handle);
-#endif
-#ifdef USE_VULKAN_DMABUF_IMAGES
-    m_linux_dmabuf_handle = move(other.m_linux_dmabuf_handle);
-#endif
-#ifdef USE_VULKAN_AHB_IMAGES
-    m_android_ahb_handle = move(other.m_android_ahb_handle);
-    m_android_ahb = exchange(other.m_android_ahb, nullptr);
-#endif
 }
 
 SharedImageBuffer& SharedImageBuffer::operator=(SharedImageBuffer&& other)
