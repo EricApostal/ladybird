@@ -6,6 +6,8 @@
 # When corrosion supports dependency tracking, we can use corrosion_import_crate() instead of this function. See:
 # https://github.com/corrosion-rs/corrosion/issues/206
 # https://github.com/corrosion-rs/corrosion/issues/624
+set_property(GLOBAL PROPERTY JOB_POOLS "${JOB_POOLS};cargo=1")
+
 function(import_rust_crate)
     cmake_parse_arguments(PARSE_ARGV 0 ARG "" "MANIFEST_PATH;CRATE_NAME;FFI_OUTPUT_DIR;FFI_HEADER" "FEATURES")
 
@@ -44,8 +46,11 @@ function(import_rust_crate)
 
     add_custom_command(
         OUTPUT "${output_lib}" ${ffi_output}
-        COMMAND
-            ${CMAKE_COMMAND} -E env ${cargo_env}
+        COMMAND ${CMAKE_COMMAND}
+            -DLOG=${cargo_output_dir}/cargo-${ARG_CRATE_NAME}.log
+            -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/run_quiet.cmake"
+            --
+            ${CMAKE_COMMAND} -E env ${cargo_env} CARGO_TERM_PROGRESS_WHEN=never TERM=dumb
             "${RUST_CARGO}"
                 rustc
                 --lib
@@ -63,7 +68,7 @@ function(import_rust_crate)
             "${RUST_RUSTC}" "${rust_toolchain_file}"
         DEPFILE "${depfile}"
         COMMENT "Building Rust crate ${ARG_CRATE_NAME}"
-        USES_TERMINAL
+        JOB_POOL cargo
         COMMAND_EXPAND_LISTS
     )
 
@@ -112,8 +117,11 @@ function(build_rust_binary)
 
     add_custom_command(
         OUTPUT "${output_binary}"
-        COMMAND
-            ${CMAKE_COMMAND} -E env ${cargo_env}
+        COMMAND ${CMAKE_COMMAND}
+            -DLOG=${cargo_output_dir}/cargo-${ARG_CRATE_NAME}.log
+            -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/run_quiet.cmake"
+            --
+            ${CMAKE_COMMAND} -E env ${cargo_env} CARGO_TERM_PROGRESS_WHEN=never TERM=dumb
             "${RUST_CARGO}"
                 rustc
                 --bin ${ARG_BINARY_NAME}
@@ -124,7 +132,7 @@ function(build_rust_binary)
             "${RUST_RUSTC}" "${rust_toolchain_file}"
         DEPFILE "${depfile}"
         COMMENT "Building Rust binary ${ARG_BINARY_NAME}"
-        USES_TERMINAL
+        JOB_POOL cargo
         COMMAND_EXPAND_LISTS
     )
 
@@ -156,6 +164,15 @@ function(_rust_crate_common_setup)
         set(rust_is_android_build TRUE)
     endif()
 
+    if (NOT DEFINED RUSTC_WRAPPER)
+        set(RUSTC_WRAPPER "$ENV{RUSTC_WRAPPER}" CACHE FILEPATH "Path to a rustc wrapper program, e.g. sccache")
+    endif()
+    if (NOT RUSTC_WRAPPER)
+        find_program(SCCACHE_PROGRAM sccache)
+        if (SCCACHE_PROGRAM)
+            set(RUSTC_WRAPPER "${SCCACHE_PROGRAM}" CACHE FILEPATH "Path to a rustc wrapper program, e.g. sccache" FORCE)
+        endif()
+    endif()
     if (NOT DEFINED CACHE{RUST_TARGET_TRIPLE})
         if (rust_is_android_build)
             set(android_abi "${CMAKE_ANDROID_ARCH_ABI}")
@@ -247,6 +264,13 @@ function(_rust_crate_common_setup)
         "CXX_${target_underscore}=${cargo_cxx_compiler}"
         "CARGO_BUILD_RUSTC=${RUST_RUSTC}"
     )
+
+    if (RUSTC_WRAPPER)
+        list(APPEND cargo_env
+            "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
+            "CARGO_INCREMENTAL=0"
+        )
+    endif()
 
     if (ARG_FFI_OUTPUT_DIR)
         list(APPEND cargo_env "FFI_OUTPUT_DIR=${ARG_FFI_OUTPUT_DIR}")

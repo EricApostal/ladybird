@@ -42,7 +42,7 @@
 #include <LibWeb/HTML/EventLoop/TaskQueue.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
@@ -306,7 +306,7 @@ void Internals::commit_text()
 
 void Internals::clobber_next_navigation_with_a_traversal()
 {
-    HTML::Navigable::clobber_next_navigation_with_a_traversal_for_testing();
+    HTML::LocalNavigable::clobber_next_navigation_with_a_traversal_for_testing();
 }
 
 UIEvents::MouseButton Internals::button_from_unsigned_short(WebIDL::UnsignedShort button)
@@ -727,6 +727,11 @@ String Internals::dump_ui_process_session_history()
     }
 
     return document.page().client().page_did_request_ui_process_session_history_for_testing();
+}
+
+String Internals::dump_site_isolation_process_tree()
+{
+    return window().associated_document().page().client().dump_site_isolation_process_tree_for_testing();
 }
 
 GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()

@@ -51,7 +51,7 @@
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
-#include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SelectedFile.h>
@@ -120,6 +120,30 @@ Messages::WebContentServer::InitTransportResponse ConnectionFromClient::init_tra
 void ConnectionFromClient::initialize(u64 initial_page_id)
 {
     m_page_host->initialize(initial_page_id);
+}
+
+void ConnectionFromClient::set_page_parent_context(u64 page_id, Optional<Web::Compositor::CompositorContextId> parent_context_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return;
+
+    auto& compositor_context = page->page().top_level_traversable()->compositor_context();
+    if (parent_context_id.has_value())
+        compositor_context.stop_presenting_to_client();
+    compositor_context.set_parent_context(parent_context_id);
+}
+
+void ConnectionFromClient::set_remote_child_frame_compositor_context(u64 page_id, String frame_id, Optional<Web::Compositor::CompositorContextId> context_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->set_remote_child_frame_compositor_context(move(frame_id), context_id);
+}
+
+void ConnectionFromClient::run_iframe_load_event_steps(u64 page_id, String frame_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->run_iframe_load_event_steps(frame_id);
 }
 
 Optional<PageClient&> ConnectionFromClient::page(u64 index, SourceLocation location)
@@ -826,7 +850,7 @@ void ConnectionFromClient::inspect_dom_node(u64 page_id, WebView::DOMNodePropert
 
         properties->for_each_property([&](auto property_id, auto& value) {
             serialized.set(
-                Web::CSS::string_from_property_id(property_id),
+                Web::CSS::string_from_property_id(property_id).to_utf16_string().to_utf8_but_should_be_ported_to_utf16(),
                 value.to_string(Web::CSS::SerializationMode::Normal));
         });
 
@@ -1331,7 +1355,7 @@ void ConnectionFromClient::clear_inspected_dom_node(u64 page_id)
     if (!page.has_value())
         return;
 
-    for (auto& navigable : Web::HTML::all_navigables()) {
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
         if (navigable->active_document() != nullptr) {
             navigable->active_document()->set_inspected_node(nullptr);
         }
@@ -1344,7 +1368,7 @@ void ConnectionFromClient::highlight_dom_node(u64 page_id, Web::UniqueNodeID nod
     if (!page.has_value())
         return;
 
-    for (auto& navigable : Web::HTML::all_navigables()) {
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
         if (navigable->active_document() != nullptr) {
             navigable->active_document()->set_highlighted_node(nullptr, { });
         }
@@ -1435,7 +1459,7 @@ void ConnectionFromClient::clear_flexbox_highlight(u64 page_id, Web::UniqueNodeI
         return;
     }
 
-    for (auto& navigable : Web::HTML::all_navigables()) {
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
         if (navigable->active_document())
             navigable->active_document()->clear_flexbox_highlighted_node(nullptr);
     }
@@ -1472,7 +1496,7 @@ void ConnectionFromClient::clear_grid_highlight(u64 page_id, Web::UniqueNodeID n
         return;
     }
 
-    for (auto& navigable : Web::HTML::all_navigables()) {
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
         if (navigable->active_document())
             navigable->active_document()->clear_grid_highlighted_node(nullptr);
     }

@@ -219,15 +219,9 @@ public:
         HTML
     };
 
-    enum class TemporaryDocumentForFragmentParsing {
-        No,
-        Yes,
-    };
-
     static WebIDL::ExceptionOr<GC::Ref<Document>> create_and_initialize(Type, String content_type, HTML::NavigationParams const&);
 
     [[nodiscard]] static GC::Ref<Document> create(JS::Realm&, URL::URL const& url = URL::about_blank());
-    [[nodiscard]] static GC::Ref<Document> create_for_fragment_parsing(JS::Realm&);
     static GC::Ref<Document> construct_impl(JS::Realm&);
     virtual ~Document() override;
 
@@ -656,7 +650,8 @@ public:
     void detach_parser();
     GC::Ptr<HTML::HTMLParser> parser() const { return m_parser; }
 
-    [[nodiscard]] bool is_temporary_document_for_fragment_parsing() const { return m_temporary_document_for_fragment_parsing == TemporaryDocumentForFragmentParsing::Yes; }
+    void set_temporary_document_for_fragment_parsing(Badge<HTML::HTMLParser>);
+    [[nodiscard]] bool is_temporary_document_for_fragment_parsing() const { return m_temporary_document_for_fragment_parsing; }
 
     static bool is_valid_name(String const&);
 
@@ -726,13 +721,13 @@ public:
     GC::Ref<HTML::PolicyContainer> policy_container() const;
     void set_policy_container(GC::Ref<HTML::PolicyContainer>);
 
-    Vector<GC::Root<HTML::Navigable>> descendant_navigables();
-    Vector<GC::Root<HTML::Navigable>> const descendant_navigables() const;
-    Vector<GC::Root<HTML::Navigable>> inclusive_descendant_navigables();
-    Vector<GC::Root<HTML::Navigable>> ancestor_navigables();
-    Vector<GC::Root<HTML::Navigable>> const ancestor_navigables() const;
-    Vector<GC::Root<HTML::Navigable>> inclusive_ancestor_navigables();
-    Vector<GC::Root<HTML::Navigable>> document_tree_child_navigables();
+    Vector<GC::Root<HTML::LocalNavigable>> descendant_navigables();
+    Vector<GC::Root<HTML::LocalNavigable>> const descendant_navigables() const;
+    Vector<GC::Root<HTML::LocalNavigable>> inclusive_descendant_navigables();
+    Vector<GC::Root<HTML::LocalNavigable>> ancestor_navigables();
+    Vector<GC::Root<HTML::LocalNavigable>> const ancestor_navigables() const;
+    Vector<GC::Root<HTML::LocalNavigable>> inclusive_ancestor_navigables();
+    Vector<GC::Root<HTML::LocalNavigable>> document_tree_child_navigables();
 
     [[nodiscard]] bool has_been_destroyed() const { return m_has_been_destroyed; }
 
@@ -998,11 +993,11 @@ public:
     bool cursor_blink_state() const { return m_cursor_blink_state; }
 
     // Back-pointer to the navigable whose active document is this document.
-    // Maintained by Navigable when it sets/clears its active document.
-    GC::Ptr<HTML::Navigable> navigable() const;
-    void set_navigable(GC::Ptr<HTML::Navigable>);
+    // Maintained by LocalNavigable when it sets/clears its active document.
+    GC::Ptr<HTML::LocalNavigable> navigable() const;
+    void set_navigable(GC::Ptr<HTML::LocalNavigable>);
 
-    void set_needs_repaint(Badge<Node, Painting::Paintable, HTML::Navigable, CSS::VisualViewport, Web::EventHandler>, InvalidateDisplayList should_invalidate_display_list = InvalidateDisplayList::Yes)
+    void set_needs_repaint(Badge<Node, Painting::Paintable, HTML::LocalNavigable, CSS::VisualViewport, Web::EventHandler>, InvalidateDisplayList should_invalidate_display_list = InvalidateDisplayList::Yes)
     {
         set_needs_repaint(should_invalidate_display_list);
     }
@@ -1168,7 +1163,7 @@ protected:
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    Document(JS::Realm&, URL::URL const&, TemporaryDocumentForFragmentParsing = TemporaryDocumentForFragmentParsing::No);
+    Document(JS::Realm&, URL::URL const&);
 
 private:
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
@@ -1489,7 +1484,7 @@ private:
 
     RefPtr<Core::Timer> m_active_refresh_timer;
 
-    TemporaryDocumentForFragmentParsing m_temporary_document_for_fragment_parsing { TemporaryDocumentForFragmentParsing::No };
+    bool m_temporary_document_for_fragment_parsing { false };
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#latest-entry
     RefPtr<HTML::SessionHistoryEntry> m_latest_entry;
@@ -1579,7 +1574,7 @@ private:
     bool m_cursor_blink_state { false };
 
     // NOTE: This is GC::Weak, not GC::Ptr, on purpose. We don't want the document to keep some old detached navigable alive.
-    GC::Weak<HTML::Navigable> m_navigable;
+    GC::Weak<HTML::LocalNavigable> m_navigable;
 
     Core::SharedVersion m_cookie_version { Core::INVALID_SHARED_VERSION };
     Optional<Core::SharedVersionIndex> m_cookie_version_index;

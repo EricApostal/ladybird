@@ -96,11 +96,11 @@ public:
 
     GC::Ref<HTML::TraversableNavigable> top_level_traversable() const;
 
-    HTML::Navigable& focused_navigable();
-    HTML::Navigable const& focused_navigable() const { return const_cast<Page*>(this)->focused_navigable(); }
+    HTML::LocalNavigable& focused_navigable();
+    HTML::LocalNavigable const& focused_navigable() const { return const_cast<Page*>(this)->focused_navigable(); }
 
-    void set_focused_navigable(Badge<EventHandler>, HTML::Navigable&);
-    void navigable_document_destroyed(Badge<DOM::Document>, HTML::Navigable&);
+    void set_focused_navigable(Badge<EventHandler>, HTML::LocalNavigable&);
+    void navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable&);
 
     void load(URL::URL const&, Bindings::NavigationHistoryBehavior = Bindings::NavigationHistoryBehavior::Auto);
     void load(URL::URL const&, Variant<Empty, String, HTML::POSTResource>,
@@ -325,7 +325,7 @@ private:
 
     GC::Ref<PageClient> m_client;
 
-    GC::Weak<HTML::Navigable> m_focused_navigable;
+    GC::Weak<HTML::LocalNavigable> m_focused_navigable;
 
     GC::Ptr<HTML::TraversableNavigable> m_top_level_traversable;
 
@@ -416,6 +416,16 @@ enum class HistoryTraversalPrecheck : u8 {
     SourceDocumentSandboxingAlreadyDone,
 };
 
+enum class NavigationTarget : u8 {
+    TopLevel,
+    IFrame,
+};
+
+enum class NavigationProcessDecision : u8 {
+    Local,
+    Remote,
+};
+
 class PageClient : public JS::Cell {
     GC_CELL(PageClient, JS::Cell);
 
@@ -426,8 +436,23 @@ public:
     virtual bool is_connection_open() const = 0;
     virtual bool has_focus() const { return true; }
     virtual bool has_active_devtools_client() const { return false; }
-    virtual bool is_url_suitable_for_same_process_navigation([[maybe_unused]] URL::URL const& current_url, [[maybe_unused]] URL::URL const& target_url) const { return true; }
+    // In Ladybird, Remote currently implies replacing the WebContent process.
+    virtual NavigationProcessDecision decide_navigation_process(
+        [[maybe_unused]] URL::URL const& current_url,
+        [[maybe_unused]] URL::URL const& target_url,
+        [[maybe_unused]] NavigationTarget target = NavigationTarget::TopLevel,
+        [[maybe_unused]] Optional<String> frame_id = {}) const
+    {
+        return NavigationProcessDecision::Local;
+    }
     virtual void request_new_process_for_navigation(URL::URL const&, Variant<Empty, String, HTML::POSTResource>, Bindings::NavigationHistoryBehavior) { }
+    virtual void request_new_process_for_child_frame_navigation(String const&, URL::URL const&, Variant<Empty, String, HTML::POSTResource>, Bindings::NavigationHistoryBehavior) { }
+    virtual void page_did_create_child_frame(String const&, String const&) { }
+    virtual void page_did_update_child_frame_viewport(String const&, CSSPixelRect) { }
+    virtual void page_did_commit_child_frame_navigation(String const&, URL::URL const&) { }
+    virtual void page_did_destroy_child_frame(String const&) { }
+    virtual Optional<Compositor::CompositorContextId> compositor_context_id_for_remote_child_frame(String const&) const { return {}; }
+    virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual Gfx::Palette palette() const = 0;
     virtual DevicePixelRect screen_rect() const = 0;
     virtual double zoom_level() const = 0;

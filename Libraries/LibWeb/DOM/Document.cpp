@@ -152,10 +152,10 @@
 #include <LibWeb/HTML/HashChangeEvent.h>
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/ListOfAvailableImages.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Location.h>
 #include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
-#include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/NavigationParams.h>
@@ -543,32 +543,18 @@ GC::Ref<Document> Document::create(JS::Realm& realm, URL::URL const& url)
     return realm.create<Document>(realm, url);
 }
 
-GC::Ref<Document> Document::create_for_fragment_parsing(JS::Realm& realm)
-{
-    return realm.create<Document>(realm, URL::about_blank(), TemporaryDocumentForFragmentParsing::Yes);
-}
-
-Document::Document(JS::Realm& realm, URL::URL const& url, TemporaryDocumentForFragmentParsing temporary_document_for_fragment_parsing)
+Document::Document(JS::Realm& realm, URL::URL const& url)
     : ParentNode(realm, *this, NodeType::DOCUMENT_NODE)
     , m_page(Bindings::principal_host_defined_page(realm))
     , m_style_computer(realm.heap().allocate<CSS::StyleComputer>(*this))
     , m_font_computer(realm.heap().allocate<CSS::FontComputer>(*this))
     , m_url(url)
     , m_fonts(CSS::FontFaceSet::create(realm))
-    , m_temporary_document_for_fragment_parsing(temporary_document_for_fragment_parsing)
     , m_editing_host_manager(EditingHostManager::create(realm, *this))
     , m_dynamic_view_transition_style_sheet(parse_css_stylesheet(CSS::Parser::ParsingParams(realm), ""sv, {}))
     , m_style_invalidator(realm.heap().allocate<CSS::Invalidation::StyleInvalidator>())
     , m_style_scope(*this)
 {
-    // https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm
-    // AD-HOC: The HTML fragment parsing algorithm stages nodes in a temporary document before returning them.
-    // Treat that document as disconnected so post-connection steps happen only after the fragment is inserted
-    // into the context document.
-    // Spec issue: https://github.com/whatwg/html/issues/11023
-    if (is_temporary_document_for_fragment_parsing())
-        set_is_connected(false);
-
     m_legacy_platform_object_flags = PlatformObject::LegacyPlatformObjectFlags {
         .supports_named_properties = true,
         .has_legacy_override_built_ins_interface_extended_attribute = true,
@@ -597,6 +583,17 @@ Document::Document(JS::Realm& realm, URL::URL const& url, TemporaryDocumentForFr
 }
 
 Document::~Document() = default;
+
+void Document::set_temporary_document_for_fragment_parsing(Badge<HTML::HTMLParser>)
+{
+    // https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm
+    // AD-HOC: The HTML fragment parsing algorithm stages nodes in a temporary document before returning them.
+    // Treat that document as disconnected so post-connection steps happen only after the fragment is inserted
+    // into the context document.
+    // Spec issue: https://github.com/whatwg/html/issues/11023
+    m_temporary_document_for_fragment_parsing = true;
+    set_is_connected(false);
+}
 
 void Document::set_style_invalidation_counter_dump_interval(Optional<u64> interval)
 {
@@ -1666,18 +1663,6 @@ static void relayout_svg_root(Layout::SVGSVGBox& svg_root)
     // Pre-populate the svg_root itself.
     if (auto paintable = svg_root.paintable_box())
         layout_state.populate_from_paintable(svg_root, *paintable);
-
-    // Pre-populate SVGGraphicsBox ancestors for get_parent_svg_transform().
-    for (auto* ancestor = svg_root.parent(); ancestor; ancestor = ancestor->parent()) {
-        if (auto const* svg_graphics_ancestor = as_if<Layout::SVGGraphicsBox>(*ancestor)) {
-            if (auto paintable = svg_graphics_ancestor->paintable_box())
-                layout_state.populate_from_paintable(*svg_graphics_ancestor, *paintable);
-        }
-        if (auto const* svg_svg_ancestor = as_if<Layout::SVGSVGBox>(*ancestor)) {
-            if (auto paintable = svg_svg_ancestor->paintable_box())
-                layout_state.populate_from_paintable(*svg_svg_ancestor, *paintable);
-        }
-    }
 
     // Pre-populate the viewport for position:fixed elements inside <foreignObject>.
     auto& viewport = svg_root.root();
@@ -3895,7 +3880,7 @@ void Document::dispatch_events_for_transition(GC::Ref<CSS::CSSTransition> transi
 
         Bindings::TransitionEventInit event_init {};
         event_init.bubbles = true;
-        event_init.property_name = MUST(String::from_utf8(transition->transition_property()));
+        event_init.property_name = transition->transition_property().to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
         event_init.elapsed_time = elapsed_time_output;
         event_init.pseudo_element = transition->owning_element()->pseudo_element().map([](auto it) {
                                                                                       return MUST(String::formatted("::{}", CSS::pseudo_element_name(it)));
@@ -5217,10 +5202,10 @@ GC::Ref<HTML::SourceSnapshotParams> Document::snapshot_source_snapshot_params() 
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#descendant-navigables
-Vector<GC::Root<HTML::Navigable>> Document::descendant_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::descendant_navigables()
 {
     // 1. Let navigables be new list.
-    Vector<GC::Root<HTML::Navigable>> navigables;
+    Vector<GC::Root<HTML::LocalNavigable>> navigables;
 
     // 2. Let navigableContainers be a list of all shadow-including descendants of document that are navigable containers, in shadow-including tree order.
     // 3. For each navigableContainer of navigableContainers:
@@ -5245,13 +5230,13 @@ Vector<GC::Root<HTML::Navigable>> Document::descendant_navigables()
     return navigables;
 }
 
-Vector<GC::Root<HTML::Navigable>> const Document::descendant_navigables() const
+Vector<GC::Root<HTML::LocalNavigable>> const Document::descendant_navigables() const
 {
     return const_cast<Document&>(*this).descendant_navigables();
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#inclusive-descendant-navigables
-Vector<GC::Root<HTML::Navigable>> Document::inclusive_descendant_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::inclusive_descendant_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
@@ -5262,7 +5247,7 @@ Vector<GC::Root<HTML::Navigable>> Document::inclusive_descendant_navigables()
         return {};
 
     // 1. Let navigables be « document's node navigable ».
-    Vector<GC::Root<HTML::Navigable>> navigables;
+    Vector<GC::Root<HTML::LocalNavigable>> navigables;
     navigables.append(*document_node_navigable);
 
     // 2. Extend navigables with document's descendant navigables.
@@ -5273,7 +5258,7 @@ Vector<GC::Root<HTML::Navigable>> Document::inclusive_descendant_navigables()
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#ancestor-navigables
-Vector<GC::Root<HTML::Navigable>> Document::ancestor_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::ancestor_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
@@ -5287,7 +5272,7 @@ Vector<GC::Root<HTML::Navigable>> Document::ancestor_navigables()
     auto navigable = document_node_navigable->parent();
 
     // 2. Let ancestors be an empty list.
-    Vector<GC::Root<HTML::Navigable>> ancestors;
+    Vector<GC::Root<HTML::LocalNavigable>> ancestors;
 
     // 3. While navigable is not null:
     while (navigable) {
@@ -5302,13 +5287,13 @@ Vector<GC::Root<HTML::Navigable>> Document::ancestor_navigables()
     return ancestors;
 }
 
-Vector<GC::Root<HTML::Navigable>> const Document::ancestor_navigables() const
+Vector<GC::Root<HTML::LocalNavigable>> const Document::ancestor_navigables() const
 {
     return const_cast<Document&>(*this).ancestor_navigables();
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#inclusive-ancestor-navigables
-Vector<GC::Root<HTML::Navigable>> Document::inclusive_ancestor_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::inclusive_ancestor_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
@@ -5329,21 +5314,21 @@ Vector<GC::Root<HTML::Navigable>> Document::inclusive_ancestor_navigables()
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigables
-Vector<GC::Root<HTML::Navigable>> Document::document_tree_child_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::document_tree_child_navigables()
 {
     // 1. If document's node navigable is null, then return the empty list.
     if (!navigable())
         return {};
 
     // 2. Let navigables be new list.
-    Vector<GC::Root<HTML::Navigable>> navigables;
+    Vector<GC::Root<HTML::LocalNavigable>> navigables;
 
     // 3. Let navigableContainers be a list of all descendants of document that are navigable containers, in tree order.
     // 4. For each navigableContainer of navigableContainers:
     //     1. If navigableContainer's content navigable is null, then continue.
     //     2. Append navigableContainer's content navigable to navigables.
     // OPTIMIZATION: Iterate all registered navigables to avoid a full tree traversal.
-    for (auto const& navigable : HTML::all_navigables()) {
+    for (auto const& navigable : HTML::all_local_navigables()) {
         auto container = navigable->container();
         if (!container || !is_ancestor_of(*container))
             continue;
@@ -5447,8 +5432,11 @@ void Document::destroy()
 
     // Not in the spec:
     for (auto& navigable_container : HTML::NavigableContainer::all_instances()) {
-        if (&navigable_container->document() == this && navigable_container->content_navigable())
-            navigable_container->content_navigable()->remove_from_all_navigables();
+        if (&navigable_container->document() == this && navigable_container->content_navigable()) {
+            auto& child_navigable = *navigable_container->content_navigable();
+            child_navigable.set_has_been_destroyed();
+            child_navigable.remove_from_all_local_navigables();
+        }
     }
 
     // 9. Set document's node navigable's active session history entry's document state's document to null.
@@ -5559,13 +5547,16 @@ void Document::destroy_a_document_and_its_descendants(GC::Ptr<GC::Function<void(
     // 4. For each childNavigable of childNavigables, queue a global task on the navigation and traversal task source
     //    given childNavigable's active window to perform the following steps:
     for (auto& child_navigable : child_navigables) {
-        queue_global_task(HTML::Task::Source::NavigationAndTraversal, *child_navigable->active_window(),
-            GC::create_function(heap(), [&heap = heap(), destruction_state, child_navigable] {
+        HTML::queue_a_task(HTML::Task::Source::NavigationAndTraversal, nullptr, nullptr,
+            GC::create_function(heap(), [&heap = heap(), destruction_state, child_navigable = child_navigable.ptr()] {
                 // 1. Let incrementDestroyed be an algorithm step which increments numberDestroyed.
                 auto increment_destroyed = GC::create_function(heap, [destruction_state] { destruction_state->did_process_child(); });
 
                 // 2. Destroy a document and its descendants given childNavigable's active document and incrementDestroyed.
-                child_navigable->active_document()->destroy_a_document_and_its_descendants(increment_destroyed);
+                if (auto active_document = child_navigable->active_document())
+                    active_document->destroy_a_document_and_its_descendants(increment_destroyed);
+                else
+                    increment_destroyed->function()();
             }));
     }
 
@@ -5952,8 +5943,11 @@ void Document::make_active()
     // 2. Set document's browsing context's WindowProxy's [[Window]] internal slot value to window.
     m_browsing_context->window_proxy()->set_window(window);
 
-    if (m_browsing_context->is_top_level()) {
+    auto current_navigable = this->navigable();
+    if (current_navigable && current_navigable->is_top_level_traversable()) {
         page().client().page_did_change_active_document_in_top_level_browsing_context(*this);
+    } else if (current_navigable) {
+        page().client().page_did_commit_child_frame_navigation(current_navigable->id(), url());
     }
 
     // 3. Set window's relevant settings object's execution ready flag.
@@ -8360,7 +8354,7 @@ WebIDL::ExceptionOr<GC::Root<DOM::Document>> Document::parse_html_unsafe(JS::VM&
         TrustedTypes::Script.to_string()));
 
     // 2. Let document be a new Document, whose content type is "text/html".
-    auto document = Document::create_for_fragment_parsing(realm);
+    auto document = Document::create(realm);
     document->set_content_type("text/html"_string);
 
     // 3. Set document's allow declarative shadow roots to true.
@@ -8503,12 +8497,12 @@ GC::Ptr<DOM::Document> Document::container_document() const
     return node_navigable->container_document();
 }
 
-GC::Ptr<HTML::Navigable> Document::navigable() const
+GC::Ptr<HTML::LocalNavigable> Document::navigable() const
 {
     return m_navigable.ptr();
 }
 
-void Document::set_navigable(GC::Ptr<HTML::Navigable> navigable)
+void Document::set_navigable(GC::Ptr<HTML::LocalNavigable> navigable)
 {
     if (m_navigable == navigable)
         return;
@@ -9290,11 +9284,8 @@ Optional<CSS::CustomPropertyRegistration const&> Document::get_registered_custom
 NonnullRefPtr<CSS::StyleValue const> Document::custom_property_initial_value(Utf16FlyString const& name) const
 {
     auto maybe_custom_property = get_registered_custom_property(name);
-    if (maybe_custom_property.has_value()) {
-        if (maybe_custom_property->initial_value)
-            return *maybe_custom_property->initial_value;
-        return CSS::GuaranteedInvalidStyleValue::create();
-    }
+    if (maybe_custom_property.has_value())
+        return CSS::compute_registered_custom_property_initial_value(*this, maybe_custom_property.value());
 
     // For non-registered properties, the initial value is the guaranteed-invalid value.
     // See: https://drafts.csswg.org/css-variables/#propdef-
@@ -9308,7 +9299,7 @@ void Document::did_change_custom_property_registrations()
     // Custom property registration changes can alter inheritance and initial values even when no selector matching
     // changes. Registrations only move when a stylesheet containing an @property rule is added/removed or when
     // CSS.registerProperty() is called, so a full document restyle is cheap enough in practice.
-    invalidate_style(DOM::StyleInvalidationReason::Other);
+    invalidate_style(DOM::StyleInvalidationReason::CustomPropertyRegistrationChange);
 }
 
 void Document::build_registered_properties_cache()

@@ -97,6 +97,7 @@ set(SOURCES
     CSS/CountersSet.cpp
     CSS/CounterStyle.cpp
     CSS/CounterStyleDefinition.cpp
+    CSS/CustomPropertyRegistration.cpp
     CSS/CSS.cpp
     CSS/CSSAnimation.cpp
     CSS/CSSConditionRule.cpp
@@ -283,6 +284,7 @@ set(SOURCES
     CSS/StyleValues/FunctionStyleValue.cpp
     CSS/StyleValues/FontSourceStyleValue.cpp
     CSS/StyleValues/FontStyleStyleValue.cpp
+    CSS/StyleValues/FrequencyStyleValue.cpp
     CSS/StyleValues/GridAutoFlowStyleValue.cpp
     CSS/StyleValues/GridTemplateAreaStyleValue.cpp
     CSS/StyleValues/GridTrackPlacementStyleValue.cpp
@@ -305,6 +307,7 @@ set(SOURCES
     CSS/StyleValues/RatioStyleValue.cpp
     CSS/StyleValues/RectStyleValue.cpp
     CSS/StyleValues/RepeatStyleStyleValue.cpp
+    CSS/StyleValues/ResolutionStyleValue.cpp
     CSS/StyleValues/ScrollbarColorStyleValue.cpp
     CSS/StyleValues/ShadowStyleValue.cpp
     CSS/StyleValues/ShorthandStyleValue.cpp
@@ -313,6 +316,7 @@ set(SOURCES
     CSS/StyleValues/SuperellipseStyleValue.cpp
     CSS/StyleValues/TextIndentStyleValue.cpp
     CSS/StyleValues/TextUnderlinePositionStyleValue.cpp
+    CSS/StyleValues/TimeStyleValue.cpp
     CSS/StyleValues/TransformationStyleValue.cpp
     CSS/StyleValues/TreeCountingFunctionStyleValue.cpp
     CSS/StyleValues/TupleStyleValue.cpp
@@ -619,6 +623,7 @@ set(SOURCES
     HTML/ImageData.cpp
     HTML/ImageRequest.cpp
     HTML/ListOfAvailableImages.cpp
+    HTML/LocalNavigable.cpp
     HTML/Location.cpp
     HTML/MediaError.cpp
     HTML/MediaTrackBase.cpp
@@ -627,7 +632,6 @@ set(SOURCES
     HTML/MessagePort.cpp
     HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
-    HTML/Navigable.cpp
     HTML/NavigableContainer.cpp
     HTML/NavigateEvent.cpp
     HTML/Navigation.cpp
@@ -1088,6 +1092,11 @@ set(SOURCES
     UserTiming/PerformanceMark.cpp
     UserTiming/PerformanceMeasure.cpp
     ViewTransition/ViewTransition.cpp
+    WebLocks/AbstractOperations.cpp
+    WebLocks/Lock.cpp
+    WebLocks/LockManager.cpp
+    WebLocks/LockRequest.cpp
+    WebLocks/NavigatorLocks.cpp
     WebAssembly/Global.cpp
     WebAssembly/Instance.cpp
     WebAssembly/Memory.cpp

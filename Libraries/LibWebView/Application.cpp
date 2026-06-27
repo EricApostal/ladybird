@@ -36,6 +36,7 @@
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/ProcessType.h>
+#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/Utilities.h>
@@ -188,7 +189,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool enable_test_mode = false;
     bool validate_dnssec_locally = false;
     bool log_all_js_exceptions = false;
-    bool disable_site_isolation = false;
+    auto site_isolation_mode = SiteIsolationMode::TopLevel;
     bool enable_idl_tracing = false;
     bool disable_http_memory_cache = false;
     bool disable_http_disk_cache = false;
@@ -264,7 +265,20 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 #endif
     args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.add_option(log_all_js_exceptions, "Log all JavaScript exceptions", "log-all-js-exceptions");
-    args_parser.add_option(disable_site_isolation, "Disable site isolation", "disable-site-isolation");
+    args_parser.add_option(Core::ArgsParser::Option {
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
+        .help_string = "Set site isolation mode. Mode may be 'disable', 'top-level' (default), or 'iframe'.",
+        .long_name = "site-isolation",
+        .value_name = "mode",
+        .accept_value = [&](StringView value) {
+            auto parsed_mode = site_isolation_mode_from_string(value);
+            if (!parsed_mode.has_value())
+                return false;
+
+            site_isolation_mode = *parsed_mode;
+            return true;
+        },
+    });
     args_parser.add_option(enable_idl_tracing, "Enable IDL tracing", "enable-idl-tracing");
     args_parser.add_option(disable_http_memory_cache, "Disable HTTP memory cache", "disable-http-memory-cache");
     args_parser.add_option(disable_http_disk_cache, "Disable HTTP disk cache", "disable-http-disk-cache");
@@ -373,7 +387,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     // Disable site isolation when debugging WebContent. Otherwise, the process swap may interfere with the gdb session.
     if (debug_process_types.contains_slow(ProcessType::WebContent))
-        disable_site_isolation = true;
+        site_isolation_mode = SiteIsolationMode::Disabled;
 
     m_browser_options = {
         .urls = sanitize_urls(raw_urls),
@@ -425,7 +439,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .user_agent_preset = move(user_agent_preset),
         .is_test_mode = enable_test_mode ? IsTestMode::Yes : IsTestMode::No,
         .log_all_js_exceptions = log_all_js_exceptions ? LogAllJSExceptions::Yes : LogAllJSExceptions::No,
-        .disable_site_isolation = disable_site_isolation ? DisableSiteIsolation::Yes : DisableSiteIsolation::No,
+        .site_isolation_mode = site_isolation_mode,
         .enable_idl_tracing = enable_idl_tracing ? EnableIDLTracing::Yes : EnableIDLTracing::No,
         .enable_http_memory_cache = disable_http_memory_cache ? EnableMemoryHTTPCache::No : EnableMemoryHTTPCache::Yes,
         .expose_experimental_interfaces = expose_experimental_interfaces ? ExposeExperimentalInterfaces::Yes : ExposeExperimentalInterfaces::No,
@@ -452,6 +466,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     if (m_web_content_options.file_scheme_urls_have_tuple_origins == FileSchemeUrlsHaveTupleOrigins::Yes)
         URL::set_file_scheme_urls_have_tuple_origins();
+
+    set_site_isolation_mode(m_web_content_options.site_isolation_mode);
 
     if (auto result = load_content_blocker_lists(); result.is_error()) {
         warnln("\033[31;1mUnable to load all content blocker lists:\033[0m {}", result.error());
@@ -702,6 +718,16 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process
     return create_web_content_client(view, allocate_page_id());
 }
 
+ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process()
+{
+    auto page_id = allocate_page_id();
+    auto client = TRY(create_web_content_client({}, page_id));
+    return ChildFrameWebContentProcess {
+        .client = move(client),
+        .page_id = page_id,
+    };
+}
+
 void Application::launch_spare_web_content_process()
 {
     // Spare WebContent processes inherit the active WebDriver endpoint, but they are not part of the
@@ -756,10 +782,57 @@ ErrorOr<void> Application::launch_services()
         if (auto history_database_path = m_history_database->database_path(); history_database_path.has_value())
             dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is enabled, using {}", history_database_path->string());
 
-        m_cookie_jar = TRY(CookieJar::create(*m_database));
-        m_history_store = TRY(HistoryStore::create(*m_history_database));
-        m_hsts_store = TRY(HSTSStore::create(*m_database));
-        m_storage_jar = TRY(StorageJar::create(*m_database));
+        // The browsing database is shared by several stores, so the decision to fall back is
+        // made for the file as a whole: if any store's schema is too new, none of them may
+        // modify the file. The check-only preflight never writes, so the file is untouched
+        // if any store then has to veto.
+        auto cookies_outcome = TRY(CookieJar::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
+        auto hsts_outcome = TRY(HSTSStore::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
+        auto storage_outcome = TRY(StorageJar::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
+
+        if (cookies_outcome == Database::MigrationOutcome::Success && hsts_outcome == Database::MigrationOutcome::Success && storage_outcome == Database::MigrationOutcome::Success) {
+            // Apply in order, stopping at the first store that finds the database too new
+            // (a concurrent process may have migrated it since the preflight).
+            cookies_outcome = TRY(CookieJar::migrate_schema(*m_database));
+            hsts_outcome = cookies_outcome == Database::MigrationOutcome::Success
+                ? TRY(HSTSStore::migrate_schema(*m_database))
+                : Database::MigrationOutcome::DatabaseTooNew;
+            storage_outcome = hsts_outcome == Database::MigrationOutcome::Success
+                ? TRY(StorageJar::migrate_schema(*m_database))
+                : Database::MigrationOutcome::DatabaseTooNew;
+        }
+
+        // If any store finds the shared file too new, including a concurrent process migrating it
+        // between the preflight and an apply above, none of them may persist this session, even if
+        // an earlier store already migrated. Otherwise, we would keep writing to a vetoed database.
+        if (cookies_outcome != Database::MigrationOutcome::Success || hsts_outcome != Database::MigrationOutcome::Success || storage_outcome != Database::MigrationOutcome::Success) {
+            warnln("Browsing database was created by a newer Ladybird version; cookies, web storage and HSTS policies will not be persisted this session");
+            cookies_outcome = Database::MigrationOutcome::DatabaseTooNew;
+            hsts_outcome = Database::MigrationOutcome::DatabaseTooNew;
+            storage_outcome = Database::MigrationOutcome::DatabaseTooNew;
+        }
+
+        if (cookies_outcome == Database::MigrationOutcome::Success)
+            m_cookie_jar = TRY(CookieJar::create(*m_database));
+        else
+            m_cookie_jar = CookieJar::create();
+
+        if (hsts_outcome == Database::MigrationOutcome::Success)
+            m_hsts_store = TRY(HSTSStore::create(*m_database));
+        else
+            m_hsts_store = HSTSStore::create();
+
+        if (storage_outcome == Database::MigrationOutcome::Success)
+            m_storage_jar = TRY(StorageJar::create(*m_database));
+        else
+            m_storage_jar = StorageJar::create();
+
+        if (TRY(HistoryStore::migrate_schema(*m_history_database)) == Database::MigrationOutcome::Success) {
+            m_history_store = TRY(HistoryStore::create(*m_history_database));
+        } else {
+            dbgln("History database was created by a newer Ladybird version; history will not be persisted this session");
+            m_history_store = HistoryStore::create();
+        }
     } else {
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is disabled, disabling browsing history");
 
@@ -1561,6 +1634,7 @@ void Application::initialize_actions()
     m_debug_menu->add_action(Action::create("Dump Layout Tree"sv, ActionID::DumpLayoutTree, debug_request("dump-layout-tree"sv)));
     m_debug_menu->add_action(Action::create("Dump Paint Tree"sv, ActionID::DumpPaintTree, debug_request("dump-paint-tree"sv)));
     m_debug_menu->add_action(Action::create("Dump Stacking Context Tree"sv, ActionID::DumpStackingContextTree, debug_request("dump-stacking-context-tree"sv)));
+    m_debug_menu->add_action(Action::create("Dump Site Isolation Process Tree"sv, ActionID::DumpSiteIsolationProcessTree, debug_request("dump-site-isolation-process-tree"sv)));
     m_debug_menu->add_action(Action::create("Dump Display List"sv, ActionID::DumpDisplayList, debug_request("dump-display-list"sv)));
     m_debug_menu->add_action(Action::create("Dump Style Sheets"sv, ActionID::DumpStyleSheets, debug_request("dump-style-sheets"sv)));
     m_debug_menu->add_action(Action::create("Dump All Resolved Styles"sv, ActionID::DumpStyles, debug_request("dump-all-resolved-styles"sv)));
@@ -1810,7 +1884,7 @@ Vector<DevTools::CSSProperty> Application::css_property_list() const
         auto property_id = static_cast<Web::CSS::PropertyID>(i);
 
         DevTools::CSSProperty property;
-        property.name = Web::CSS::string_from_property_id(property_id).to_string();
+        property.name = Web::CSS::string_from_property_id(property_id).to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
         property.is_inherited = Web::CSS::is_inherited_property(property_id);
         property_list.append(move(property));
     }

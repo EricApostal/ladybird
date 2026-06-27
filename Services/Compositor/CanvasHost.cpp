@@ -93,10 +93,7 @@ Optional<Web::Painting::CanvasId> CanvasHost::create_2d_context(Gfx::IntSize siz
 
 CanvasHost::CreateWebGLContextResult CanvasHost::create_webgl_context(Web::WebGL::WebGLVersion version, Gfx::IntSize size, bool depth, bool stencil, bool antialias)
 {
-    if (!m_skia_backend_context)
-        return {};
-
-    auto context = HostWebGLContext::create(*m_skia_backend_context, version, { .depth = depth, .stencil = stencil, .antialias = antialias }, size);
+    auto context = HostWebGLContext::create(m_skia_backend_context, version, { .depth = depth, .stencil = stencil, .antialias = antialias }, size);
     if (!context)
         return {};
 
@@ -147,7 +144,7 @@ void CanvasHost::execute_canvas_2d_commands(Web::Painting::CanvasId canvas_id, G
         present_canvas_2d_context(canvas_id, canvas_context);
 }
 
-void CanvasHost::execute_webgl_commands(Web::Painting::CanvasId canvas_id, ByteBuffer const& commands, Vector<Gfx::DecodedImageFrame> const& bitmaps)
+void CanvasHost::execute_webgl_commands(Web::Painting::CanvasId canvas_id, ReadonlyBytes commands, Vector<Gfx::DecodedImageFrame> const& bitmaps)
 {
     auto* context = this->context(canvas_id);
     VERIFY(context);
