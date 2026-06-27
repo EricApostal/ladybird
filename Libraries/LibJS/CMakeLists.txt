@@ -336,6 +336,9 @@ if (DEFINED ASMINT_ARCH)
         set(CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_ProgramDatabase "")
         set(CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_EditAndContinue "")
     endif()
+
+    set(ASMINTGEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/AsmIntGen")
+    set(ASMINTGEN_BIN "${ASMINTGEN_DIR}/target/release/asmintgen${CMAKE_EXECUTABLE_SUFFIX}")
     set(ASMINT_DSL "${CMAKE_CURRENT_SOURCE_DIR}/Bytecode/AsmInterpreter/asmint.asm")
     set(ASMINT_GENERATED_S "${CMAKE_CURRENT_BINARY_DIR}/Bytecode/AsmInterpreter/asmint_${ASMINT_ARCH}.S")
     set(ASM_OFFSETS_FILE "${CMAKE_CURRENT_BINARY_DIR}/Bytecode/AsmInterpreter/asm_offsets.conf")
@@ -383,11 +386,31 @@ if (DEFINED ASMINT_ARCH)
         COMMENT "Generating asm struct offsets"
     )
 
-    build_rust_binary(
-        MANIFEST_PATH AsmIntGen/Cargo.toml
-        CRATE_NAME asmintgen
-        BINARY_NAME asmintgen
-        OUTPUT_PATH_VAR ASMINTGEN_BIN
+    file(GLOB ASMINTGEN_RUST_SOURCES CONFIGURE_DEPENDS "${ASMINTGEN_DIR}/src/*.rs")
+    file(GLOB ASMINTGEN_BYTECODE_DEF_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/BytecodeDef/src/*.rs")
+    set(ASMINTGEN_SOURCES
+        "${ASMINTGEN_DIR}/Cargo.toml"
+        "${ASMINTGEN_DIR}/Cargo.lock"
+        "${CMAKE_CURRENT_SOURCE_DIR}/BytecodeDef/Cargo.toml"
+        ${ASMINTGEN_RUST_SOURCES}
+        ${ASMINTGEN_BYTECODE_DEF_SOURCES}
+    )
+    # NB: Clear linker-related env vars so cargo uses the default host
+    # linker. The CI may set CC/CXX or CARGO_TARGET_*_LINKER to a
+    # compiler that isn't available in all build configurations (e.g.
+    # clang-21 in GNU builds). asmintgen is a pure Rust host tool.
+    add_custom_command(
+        OUTPUT "${ASMINTGEN_BIN}"
+        COMMAND ${CMAKE_COMMAND} -E env
+            --unset=CC
+            --unset=CXX
+            --unset=CARGO_BUILD_TARGET
+            --unset=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
+            --unset=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            cargo build --release
+        WORKING_DIRECTORY "${ASMINTGEN_DIR}"
+        DEPENDS ${ASMINTGEN_SOURCES}
+        COMMENT "Building asmintgen"
     )
 
     set(BYTECODE_DEF "${CMAKE_CURRENT_SOURCE_DIR}/Bytecode/Bytecode.def")
