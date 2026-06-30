@@ -87,7 +87,7 @@ void Thread::start()
             {
                 // pthread_setname_np expects a 16-byte or shorter null-terminated C string.
                 auto thread_name = self->thread_name().substring(0, min(self->thread_name().length(), 15));
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
                 pthread_setname_np(thread_name.characters());
 #elif defined(AK_OS_OPENBSD)
                 pthread_set_name_np(pthread_self(), thread_name.characters());

@@ -27,7 +27,7 @@ set(GENERATED_SOURCES
     CompositorControlServerEndpoint.h
     CompositorWebContentClientEndpoint.h
     CompositorWebContentServerEndpoint.h
-    ${CMAKE_BINARY_DIR}/Libraries/LibWeb/WebGL/GLFunctions.cpp
+    ${ladybird_BINARY_DIR}/Libraries/LibWeb/WebGL/GLFunctions.cpp
     WebGLCommandReplayer.cpp
 )
 
@@ -49,6 +49,7 @@ target_include_directories(compositorservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Serv
 
 target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSandbox LibWebView)
 target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibSync LibWeb ${ANGLE_TARGETS})
+message(WARNING "DEBUG: ANGLE_TARGETS for Compositor is: '${ANGLE_TARGETS}'")
 
 if (APPLE)
     target_link_libraries(Compositor PRIVATE "-framework CoreGraphics" "-framework CoreVideo")

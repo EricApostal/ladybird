@@ -14,9 +14,13 @@
 
 #include <fcntl.h>
 
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #    include <LibIPC/TransportBootstrapMach.h>
 #    include <LibWebView/Application.h>
+#endif
+
+#if defined(AK_OS_IOS)
+#    include <LibWebView/ProcessIOS.h>
 #endif
 
 #if defined(AK_OS_WINDOWS)
@@ -39,8 +43,9 @@ Process::~Process()
         m_connection->shutdown();
 }
 
-ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(Core::ProcessSpawnOptions const& options, bool capture_output)
+ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output)
 {
+    (void)type;
     // Set up pipes for stdout/stderr capture if requested
     ProcessOutputCapture output_capture;
     Array<int, 2> stdout_pipe {};
@@ -64,16 +69,21 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(C
         spawn_options.file_actions.append(Core::FileAction::CloseFile { .fd = stderr_pipe[1] });
     }
 
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     auto port_a_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto port_a_send = TRY(port_a_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
     auto port_b_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
 
+#if defined(AK_OS_MACOS)
     Sync::MutexLocker child_registration_locker(Application::transport_bootstrap_server().child_registration_lock());
     auto process = TRY(Core::Process::spawn(spawn_options));
-
     Application::transport_bootstrap_server().register_child_transport(process.pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
+#elif defined(AK_OS_IOS)
+    auto process = TRY(spawn_browser_engine_process(type, IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) }, options));
+#else
+    auto process = TRY(Core::Process::spawn(spawn_options));
+#endif
 
     auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
 #else

@@ -37,11 +37,11 @@ target_link_libraries(LibImageDecoders PRIVATE
 target_include_directories(LibImageDecoders PRIVATE ${WUFFS_INCLUDE_DIR})
 
 set(generated_sources TIFFMetadata.h TIFFTagHandler.cpp)
-list(TRANSFORM generated_sources PREPEND "${CMAKE_BINARY_DIR}/Libraries/LibGfx/ImageFormats/")
+list(TRANSFORM generated_sources PREPEND "${ladybird_BINARY_DIR}/Libraries/LibGfx/ImageFormats/")
 
 add_custom_command(
         OUTPUT  ${generated_sources}
-        COMMAND ${Python3_EXECUTABLE} "${LADYBIRD_SOURCE_DIR}/Libraries/LibGfx/TIFFGenerator.py" -o "${CMAKE_BINARY_DIR}/Libraries/LibGfx/ImageFormats"
+        COMMAND ${Python3_EXECUTABLE} "${LADYBIRD_SOURCE_DIR}/Libraries/LibGfx/TIFFGenerator.py" -o "${ladybird_BINARY_DIR}/Libraries/LibGfx/ImageFormats"
         DEPENDS "${LADYBIRD_SOURCE_DIR}/Libraries/LibGfx/TIFFGenerator.py"
         VERBATIM
 )

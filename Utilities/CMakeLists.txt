@@ -56,7 +56,7 @@ if (NOT GIT_COMMIT_HASH)
 endif()
 
 # Write it to the build directory
-set(GIT_COMMIT_FILE "${CMAKE_BINARY_DIR}/COMMIT")
+set(GIT_COMMIT_FILE "${ladybird_BINARY_DIR}/COMMIT")
 file(WRITE "${GIT_COMMIT_FILE}" "${GIT_COMMIT_HASH}\n")
 
 if (NOT CMAKE_SKIP_INSTALL_RULES)

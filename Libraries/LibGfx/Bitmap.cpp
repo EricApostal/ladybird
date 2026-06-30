@@ -19,7 +19,7 @@
 #include <core/SkPixmap.h>
 #include <errno.h>
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 #    include <Accelerate/Accelerate.h>
 #endif
 
@@ -327,7 +327,7 @@ void Bitmap::set_alpha_type_destructive(AlphaType alpha_type)
         return;
     }
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     vImage_Buffer buf { .data = m_data, .height = vImagePixelCount(height()), .width = vImagePixelCount(width()), .rowBytes = pitch() };
     vImage_Error err;
     if (m_alpha_type == AlphaType::Unpremultiplied) {

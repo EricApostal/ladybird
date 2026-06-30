@@ -28,7 +28,7 @@
 #    include <gpu/vk/VulkanExtensions.h>
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 #    include <gpu/ganesh/GrBackendSurface.h>
 #    include <gpu/ganesh/mtl/GrMtlBackendContext.h>
 #    include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
@@ -37,7 +37,7 @@
 
 namespace Gfx {
 
-#if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
 static constexpr size_t skia_resource_cache_limit = 256 * MiB;
 #endif
 static constexpr auto skia_deferred_cleanup_interval = AK::Duration::from_seconds(1);
@@ -52,7 +52,7 @@ static auto& main_thread_context()
     return *context;
 }
 
-#if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
 static void invoke_async_flush_callback(void* context)
 {
     auto* callback = static_cast<Function<void()>*>(context);
@@ -130,7 +130,7 @@ void SkiaBackendContext::initialize_gpu_backend()
 
 RefPtr<SkiaBackendContext> SkiaBackendContext::create_independent_gpu_backend()
 {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     auto metal_context = get_metal_context();
     if (!metal_context)
         return { };
@@ -298,7 +298,7 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
 }
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 class SkiaMetalBackendContext final : public SkiaBackendContext {
     AK_MAKE_NONCOPYABLE(SkiaMetalBackendContext);
     AK_MAKE_NONMOVABLE(SkiaMetalBackendContext);

@@ -16,7 +16,7 @@
 #include <AK/Noncopyable.h>
 #include <LibCore/Export.h>
 
-#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 #    include <mach/mach.h>
 #else
 extern "C" {
@@ -47,7 +47,7 @@ public:
         CopySend = MACH_MSG_TYPE_COPY_SEND,
         MakeSend = MACH_MSG_TYPE_MAKE_SEND,
         MakeSendOnce = MACH_MSG_TYPE_MAKE_SEND_ONCE,
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
         CopyReceive = MACH_MSG_TYPE_COPY_RECEIVE,
         DisposeReceive = MACH_MSG_TYPE_DISPOSE_RECEIVE,
         DisposeSend = MACH_MSG_TYPE_DISPOSE_SEND,

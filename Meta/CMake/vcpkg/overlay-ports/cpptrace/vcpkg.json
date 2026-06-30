@@ -8,7 +8,7 @@
   "dependencies": [
     {
       "name": "libdwarf",
-      "platform": "(!windows | mingw) & !android"
+      "platform": "(!windows | mingw) & !android & !ios"
     },
     {
       "name": "vcpkg-cmake",

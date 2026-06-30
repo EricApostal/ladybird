@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Platform.h>
+#if defined(AK_OS_MACOS)
+
 #include <AK/Assertions.h>
 #include <AK/ByteString.h>
 #include <AK/Optional.h>
@@ -126,3 +129,4 @@ ErrorOr<TransportBootstrapMachServer::BootstrapRequestResult> TransportBootstrap
 }
 
 }
+#endif

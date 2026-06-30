@@ -12,6 +12,7 @@
 build*/
 Build*/
 target/
+vcpkg_installed/
 Toolchain/Tarballs
 Toolchain/Build
 Toolchain/Local

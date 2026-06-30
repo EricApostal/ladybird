@@ -23,7 +23,7 @@ using native_handle_t = native_handle;
 extern "C" __attribute__((weak)) native_handle_t const* AHardwareBuffer_getNativeHandle(AHardwareBuffer const*);
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 static Core::MachPort copy_send_right(Core::MachPort const& port)
 {
     auto result = mach_port_mod_refs(mach_task_self(), port.port(), MACH_PORT_RIGHT_SEND, +1);
@@ -52,7 +52,7 @@ static constexpr auto shared_image_bitmap_format = BitmapFormat::BGRA8888;
 static constexpr auto shared_image_alpha_type = AlphaType::Premultiplied;
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 SharedImage::SharedImage(Core::MachPort&& port)
     : m_port(move(port))
 {
@@ -132,7 +132,7 @@ AndroidAhbHandle duplicate_android_ahb_handle(VulkanImage const& vulkan_image)
 
 namespace IPC {
 
-#ifndef AK_OS_MACOS
+#if !defined(AK_OS_MACOS) && !defined(AK_OS_IOS) && !defined(AK_OS_IOS)
 enum class SharedImageBackingType : u8 {
     ShareableBitmap,
     LinuxDmaBuf,
@@ -200,7 +200,7 @@ ErrorOr<Gfx::AndroidAhbHandle> decode(Decoder& decoder)
 template<>
 ErrorOr<void> encode(Encoder& encoder, Gfx::SharedImage const& shared_image)
 {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     TRY(encoder.append_attachment(Attachment::from_mach_port(copy_send_right(shared_image.m_port), Core::MachPort::MessageRight::MoveSend)));
 #else
     return shared_image.m_data.visit(
@@ -228,7 +228,7 @@ ErrorOr<void> encode(Encoder& encoder, Gfx::SharedImage const& shared_image)
 template<>
 ErrorOr<Gfx::SharedImage> decode(Decoder& decoder)
 {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     auto attachment = decoder.attachments().dequeue();
     VERIFY(attachment.message_right() == Core::MachPort::MessageRight::MoveSend);
     return Gfx::SharedImage { attachment.release_mach_port() };

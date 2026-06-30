@@ -26,6 +26,10 @@ ladybird_generated_sources(requestserverservice)
 
 add_executable(RequestServer main.cpp)
 
+if (IOS)
+    # Let Xcode handle the packaging. We just need the raw binary.
+endif()
+
 target_include_directories(requestserverservice PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/../..)
 target_include_directories(requestserverservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Services/)
 

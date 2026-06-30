@@ -18,7 +18,7 @@
 #    include <LibGfx/VulkanContext.h>
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 #    include <LibGfx/MetalContext.h>
 #endif
 
@@ -44,7 +44,7 @@ public:
     static RefPtr<SkiaBackendContext> create_vulkan_context(const VulkanContext& vulkan_context);
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     static RefPtr<SkiaBackendContext> create_metal_context(NonnullRefPtr<MetalContext>);
 #endif
 

@@ -260,6 +260,18 @@ ErrorOr<Process> Process::spawn(StringView path, ReadonlySpan<StringView> argume
 
 void Process::terminate_immediately(int status)
 {
+#if defined(AK_OS_IOS)
+    // On every other platform, each Ladybird service (WebContent, RequestServer, ImageDecoder,
+    // Compositor, WebWorker) is its own OS process, and this is how that service process ends
+    // its own life — e.g. ConnectionFromClient::die() when its one client disconnects, or a
+    // PageClient "peer disconnected, exiting peacefully" path. On single-process iOS those
+    // services are threads sharing the app's one process (see ProcessIOS.mm), so _exit()ing here
+    // would silently kill the entire app over what is, for that thread, a routine event (e.g. the
+    // last tab closing). There's nothing useful to do instead: just let the thread return without
+    // taking the process down with it.
+    return;
+#endif
+
     _exit(status);
     VERIFY_NOT_REACHED();
 }

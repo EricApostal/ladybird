@@ -14,7 +14,7 @@ function(clang_plugin target_name)
 
     add_custom_target(${target_name}Target DEPENDS ${target_name})
 
-    set_property(GLOBAL APPEND PROPERTY CLANG_PLUGINS_COMPILE_OPTIONS_FOR_TESTS -fplugin=${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR}/lib${target_name}${CMAKE_SHARED_LIBRARY_SUFFIX})
+    set_property(GLOBAL APPEND PROPERTY CLANG_PLUGINS_COMPILE_OPTIONS_FOR_TESTS -fplugin=${ladybird_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR}/lib${target_name}${CMAKE_SHARED_LIBRARY_SUFFIX})
 
     add_lagom_library_install_rules(${target_name})
 

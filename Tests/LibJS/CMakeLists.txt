@@ -6,21 +6,21 @@ ladybird_testjs_test(test-js.cpp test-js LIBS LibGC)
 set_tests_properties(test-js PROPERTIES ENVIRONMENT "LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}")
 
 if (NOT WIN32)
-    add_custom_target(test-js-bytecode ALL DEPENDS test-js "${CMAKE_BINARY_DIR}/bin/test-js-bytecode")
+    add_custom_target(test-js-bytecode ALL DEPENDS test-js "${ladybird_BINARY_DIR}/bin/test-js-bytecode")
     add_custom_command(
-        OUTPUT "${CMAKE_BINARY_DIR}/bin/test-js-bytecode"
-        COMMAND "${CMAKE_COMMAND}" -E copy "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-bytecode.py" "${CMAKE_BINARY_DIR}/bin/test-js-bytecode"
+        OUTPUT "${ladybird_BINARY_DIR}/bin/test-js-bytecode"
+        COMMAND "${CMAKE_COMMAND}" -E copy "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-bytecode.py" "${ladybird_BINARY_DIR}/bin/test-js-bytecode"
         DEPENDS "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-bytecode.py"
     )
-    add_test(NAME test-js-bytecode COMMAND "${CMAKE_BINARY_DIR}/bin/test-js-bytecode")
+    add_test(NAME test-js-bytecode COMMAND "${ladybird_BINARY_DIR}/bin/test-js-bytecode")
     set_tests_properties(test-js-bytecode PROPERTIES ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 
-    add_custom_target(test-js-ast ALL DEPENDS js "${CMAKE_BINARY_DIR}/bin/test-js-ast")
+    add_custom_target(test-js-ast ALL DEPENDS js "${ladybird_BINARY_DIR}/bin/test-js-ast")
     add_custom_command(
-        OUTPUT "${CMAKE_BINARY_DIR}/bin/test-js-ast"
-        COMMAND "${CMAKE_COMMAND}" -E copy "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-ast.py" "${CMAKE_BINARY_DIR}/bin/test-js-ast"
+        OUTPUT "${ladybird_BINARY_DIR}/bin/test-js-ast"
+        COMMAND "${CMAKE_COMMAND}" -E copy "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-ast.py" "${ladybird_BINARY_DIR}/bin/test-js-ast"
         DEPENDS "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-ast.py"
     )
-    add_test(NAME test-js-ast COMMAND "${CMAKE_BINARY_DIR}/bin/test-js-ast")
+    add_test(NAME test-js-ast COMMAND "${ladybird_BINARY_DIR}/bin/test-js-ast")
     set_tests_properties(test-js-ast PROPERTIES ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 endif()

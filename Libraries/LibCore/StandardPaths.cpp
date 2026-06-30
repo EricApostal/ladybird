@@ -120,7 +120,7 @@ ByteString StandardPaths::videos_directory()
 
     StringBuilder builder;
     builder.append(home_directory());
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     builder.append("/Movies"sv);
 #else
     builder.append("/Videos"sv);
@@ -163,7 +163,7 @@ ByteString StandardPaths::config_directory()
         return LexicalPath::canonicalized_path(*config_directory);
 
     builder.append(home_directory());
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     builder.append("/Library/Preferences"sv);
 #elif defined(AK_OS_HAIKU)
     builder.append("/config/settings"sv);
@@ -219,7 +219,7 @@ ErrorOr<ByteString> StandardPaths::runtime_directory()
 
     StringBuilder builder;
 
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     builder.append(home_directory());
     builder.append("/Library/Application Support"sv);
 #elif defined(AK_OS_HAIKU)

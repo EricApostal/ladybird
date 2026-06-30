@@ -19,6 +19,10 @@
 #    include <LibGfx/Font/GlobalFontConfig.h>
 #endif
 
+#if defined(AK_OS_IOS)
+#    include <mutex>
+#endif
+
 namespace Gfx {
 
 // Key function for SystemFontProvider to emit the vtable here
@@ -32,7 +36,18 @@ FontDatabase& FontDatabase::the()
 
 SystemFontProvider& FontDatabase::install_system_font_provider(NonnullOwnPtr<SystemFontProvider> provider)
 {
+#if defined(AK_OS_IOS)
+    // Single-process iOS: every "service" (WebContent, Compositor, ...) runs as a thread in
+    // this one process and they all share this FontDatabase singleton, so several of them
+    // race to install a system font provider here. Only the first install wins; later callers
+    // get the existing provider instead of hitting the VERIFY below.
+    static std::mutex s_install_mutex;
+    std::lock_guard<std::mutex> lock(s_install_mutex);
+    if (m_system_font_provider)
+        return *m_system_font_provider;
+#else
     VERIFY(!m_system_font_provider);
+#endif
     m_system_font_provider = move(provider);
     return *m_system_font_provider;
 }
@@ -106,7 +121,7 @@ ErrorOr<Vector<String>> FontDatabase::font_directories()
         "/res/fonts"_string,
     } };
 
-#    elif defined(AK_OS_MACOS)
+#    elif defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     return Vector<String> { {
         "/System/Library/Fonts"_string,
         "/Library/Fonts"_string,

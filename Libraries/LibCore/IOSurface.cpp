@@ -7,11 +7,15 @@
 #include <AK/OwnPtr.h>
 #include <LibCore/IOSurface.h>
 
-#if !defined(AK_OS_MACOS)
-static_assert(false, "This file must only be used for macOS");
+#if !defined(AK_OS_MACOS) && !defined(AK_OS_IOS)
+static_assert(false, "This file must only be used for macOS or iOS");
 #endif
 
+#if defined(AK_OS_IOS)
+#import <IOSurface/IOSurfaceRef.h>
+#else
 #import <IOSurface/IOSurface.h>
+#endif
 
 namespace Core {
 

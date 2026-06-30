@@ -16,7 +16,7 @@
 #    include <android/hardware_buffer.h>
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 #    include <LibCore/IOSurface.h>
 #endif
 
@@ -37,7 +37,7 @@ public:
 
     NonnullRefPtr<Bitmap> bitmap() const { return m_bitmap; }
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     Core::IOSurfaceHandle const& iosurface_handle() const { return m_iosurface_handle; }
 #elif defined(USE_VULKAN_DMABUF_IMAGES)
     LinuxDmaBufHandle const* linux_dmabuf_handle() const { return m_linux_dmabuf_handle.has_value() ? &m_linux_dmabuf_handle.value() : nullptr; }
@@ -49,7 +49,7 @@ public:
 #endif
 
 private:
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     SharedImageBuffer(Core::IOSurfaceHandle&&, NonnullRefPtr<Bitmap>);
     Core::IOSurfaceHandle m_iosurface_handle;
 #else

@@ -34,7 +34,7 @@
 #else
 #    include <signal.h>
 #    include <unistd.h>
-#    if defined(AK_OS_MACOS)
+#    if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #        include <sys/ucontext.h>
 #    else
 #        include <ucontext.h>
@@ -175,7 +175,7 @@ static void compiled_fault_signal_handler(int signal, siginfo_t* info, void* con
     auto* uc = static_cast<ucontext_t*>(context);
 
     auto redirect_to_trampoline = [&] {
-#        if defined(AK_OS_MACOS)
+#        if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #            if ARCH(AARCH64)
         uc->uc_mcontext->__ss.__pc = reinterpret_cast<uintptr_t>(&wasm_compiled_fault_trampoline);
 #            elif ARCH(X86_64)
@@ -201,7 +201,7 @@ static void compiled_fault_signal_handler(int signal, siginfo_t* info, void* con
     }
 
     if (recovery && (signal == SIGILL || signal == SIGFPE)) {
-#        if defined(AK_OS_MACOS)
+#        if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #            if ARCH(AARCH64)
         auto pc = static_cast<FlatPtr>(uc->uc_mcontext->__ss.__pc);
 #            elif ARCH(X86_64)

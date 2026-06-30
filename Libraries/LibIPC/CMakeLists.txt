@@ -9,12 +9,13 @@ set(SOURCES
     TransportHandle.cpp
 )
 
-if (APPLE AND NOT IOS)
+if (APPLE)
     list(APPEND SOURCES
         AttachmentMachPort.cpp
         MachBootstrapListener.cpp
         TransportBootstrapMach.cpp
-        TransportMachPort.cpp)
+        TransportMachPort.cpp
+        TransportBootstrapIOS.mm)
 elseif (UNIX)
     list(APPEND SOURCES
         Attachment.cpp

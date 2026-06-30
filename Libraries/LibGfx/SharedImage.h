@@ -16,7 +16,7 @@
 #include <LibIPC/File.h>
 #include <LibIPC/Forward.h>
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 #    include <LibCore/MachPort.h>
 #endif
 
@@ -24,7 +24,7 @@ namespace Gfx {
 
 class SharedImageBuffer;
 
-#ifndef AK_OS_MACOS
+#if !defined(AK_OS_MACOS) && !defined(AK_OS_IOS) && !defined(AK_OS_IOS)
 struct LinuxDmaBufHandle {
     BitmapFormat bitmap_format;
     AlphaType alpha_type;
@@ -64,7 +64,7 @@ public:
     SharedImage& operator=(SharedImage&&) = default;
     ~SharedImage() = default;
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     explicit SharedImage(Core::MachPort&&);
 #else
     explicit SharedImage(ShareableBitmap);
@@ -75,7 +75,7 @@ public:
 #endif
 
 private:
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     Core::MachPort m_port;
 #else
     Variant<ShareableBitmap, LinuxDmaBufHandle
@@ -100,7 +100,7 @@ private:
 
 namespace IPC {
 
-#ifndef AK_OS_MACOS
+#if !defined(AK_OS_MACOS) && !defined(AK_OS_IOS) && !defined(AK_OS_IOS)
 template<>
 ErrorOr<void> encode(Encoder&, Gfx::LinuxDmaBufHandle const&);
 

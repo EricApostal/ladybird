@@ -12,7 +12,7 @@
 
 namespace Core {
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 
 class CORE_API ScopedAutoreleasePool {
     AK_MAKE_NONCOPYABLE(ScopedAutoreleasePool);

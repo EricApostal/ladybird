@@ -63,6 +63,10 @@ public:
     static ErrorOr<Process> spawn(StringView path, ReadonlySpan<ByteString> arguments);
     static ErrorOr<Process> spawn(StringView path, ReadonlySpan<StringView> arguments);
 
+#if defined(AK_OS_IOS)
+    static Process from_pid(pid_t pid) { return Process(pid); }
+#endif
+
     static ErrorOr<String> get_name();
 
     [[noreturn]] static void terminate_immediately(int status);

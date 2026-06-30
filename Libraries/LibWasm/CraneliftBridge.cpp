@@ -28,7 +28,7 @@
 #    include <unistd.h>
 #endif
 
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #    include <libkern/OSCacheControl.h>
 #    include <pthread.h>
 #endif
@@ -250,7 +250,11 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
         munmap(rw_mapping, rx_aligned_size);
         return false;
     }
+#if defined(AK_OS_IOS)
+    sys_icache_invalidate(rw_mapping, code_size);
+#else
     __builtin___clear_cache(static_cast<char*>(rw_mapping), static_cast<char*>(rw_mapping) + code_size);
+#endif
     auto* func_ptr = static_cast<u8 const*>(rw_mapping);
     auto* handle = new CodeMapping { rw_mapping, rx_aligned_size, {} };
 #endif
@@ -1173,8 +1177,8 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
     if (!mapping)
         return;
     ScopeGuard unmap = [mapping] { UnmapViewOfFile(mapping); };
-#elif defined(AK_OS_MACOS)
-    // macOS lacks memfd_create; use shm_open + shm_unlink for an anonymous fd.
+#elif defined(AK_OS_MACOS) || defined(AK_OS_IOS)
+    // macOS and iOS lack memfd_create; use shm_open + shm_unlink for an anonymous fd.
     char shm_name[] = "/libwasm-cranelift-XXXXXX";
     arc4random_buf(shm_name + 21, 6);
     for (int i = 21; i < 27; ++i)

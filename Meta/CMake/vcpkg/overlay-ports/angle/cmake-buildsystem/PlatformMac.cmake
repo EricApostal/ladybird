@@ -1,18 +1,38 @@
 find_package(ZLIB REQUIRED)
 
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    list(APPEND ANGLE_SOURCES
+        ${libangle_gpu_info_util_mac_sources}
+    )
+else()
+    list(APPEND ANGLE_SOURCES
+        ${libangle_gpu_info_util_ios_sources}
+        "src/gpu_info_util/SystemInfo_apple.mm"
+    )
+endif()
 list(APPEND ANGLE_SOURCES
-    ${libangle_gpu_info_util_mac_sources}
     ${libangle_gpu_info_util_sources}
     ${libangle_mac_sources}
 )
 
-list(APPEND ANGLEGLESv2_LIBRARIES
-    "-framework CoreGraphics"
-    "-framework Foundation"
-    "-framework IOKit"
-    "-framework IOSurface"
-    "-framework Quartz"
-)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    list(APPEND ANGLEGLESv2_LIBRARIES
+        "-framework CoreGraphics"
+        "-framework Foundation"
+        "-framework IOKit"
+        "-framework IOSurface"
+        "-framework Quartz"
+        "-framework QuartzCore"
+    )
+else()
+    list(APPEND ANGLEGLESv2_LIBRARIES
+        "-framework CoreGraphics"
+        "-framework Foundation"
+        "-framework IOSurface"
+        "-framework UIKit"
+        "-framework QuartzCore"
+    )
+endif()
 
 # Metal backend
 if(USE_METAL)
@@ -38,9 +58,15 @@ if(USE_OPENGL)
     list(APPEND ANGLE_SOURCES
         ${angle_translator_glsl_base_sources}
         ${angle_translator_glsl_sources}
+        ${angle_translator_glsl_apple_sources}
     )
     # Enable GLSL compiler output.
-    list(APPEND ANGLE_DEFINITIONS ANGLE_ENABLE_GLSL ANGLE_ENABLE_GL_DESKTOP_BACKEND ANGLE_ENABLE_APPLE_WORKAROUNDS)
+    list(APPEND ANGLE_DEFINITIONS ANGLE_ENABLE_GLSL ANGLE_ENABLE_GL_DESKTOP_BACKEND ANGLE_ENABLE_APPLE_WORKAROUNDS ANGLE_ENABLE_CGL)
+
+    # Still need to link with Metal as we call MTLCreateSystemDefaultDevice even if USE_METAL is not defined
+    list(APPEND ANGLEGLESv2_LIBRARIES
+        "-framework Metal"
+    )
 endif()
 
 if(USE_OPENGL OR ENABLE_WEBGL)

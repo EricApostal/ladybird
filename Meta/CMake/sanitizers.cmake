@@ -12,7 +12,7 @@ if (ENABLE_ADDRESS_SANITIZER)
         # FIXME: Windows on ARM
         link_libraries(clang_rt.asan_dynamic-x86_64.lib -wholearchive:clang_rt.asan_dynamic_runtime_thunk-x86_64.lib)
         get_clang_resource_dir(CLANG_RESOURCE_DIR)
-        file(COPY "${CLANG_RESOURCE_DIR}/lib/windows/clang_rt.asan_dynamic-x86_64.dll" DESTINATION "${CMAKE_BINARY_DIR}/bin")
+        file(COPY "${CLANG_RESOURCE_DIR}/lib/windows/clang_rt.asan_dynamic-x86_64.dll" DESTINATION "${ladybird_BINARY_DIR}/bin")
     else()
         add_cxx_compile_options(-fsanitize=address -fno-omit-frame-pointer)
         add_cxx_link_options(-fsanitize=address)

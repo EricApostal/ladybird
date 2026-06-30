@@ -21,6 +21,7 @@
 
 namespace WebView {
 
+#if !defined(AK_OS_IOS)
 static HashMap<int, RefPtr<UIProcessConnectionFromClient>>& connections()
 {
     static NeverDestroyed<HashMap<int, RefPtr<UIProcessConnectionFromClient>>> connections;
@@ -34,9 +35,13 @@ class UIProcessClient final
 private:
     explicit UIProcessClient(NonnullOwnPtr<IPC::Transport>);
 };
+#endif
 
-ErrorOr<BrowserProcess::ProcessDisposition> BrowserProcess::connect(Vector<ByteString> const& raw_urls, NewWindow new_window)
+ErrorOr<BrowserProcess::ProcessDisposition> BrowserProcess::connect([[maybe_unused]] Vector<ByteString> const& raw_urls, [[maybe_unused]] NewWindow new_window)
 {
+#if defined(AK_OS_IOS)
+    return ProcessDisposition::ContinueMainProcess;
+#else
     static constexpr auto process_name = "Ladybird"sv;
 
     auto [socket_path, pid_path] = TRY(Process::paths_for_process(process_name));
@@ -61,8 +66,10 @@ ErrorOr<BrowserProcess::ProcessDisposition> BrowserProcess::connect(Vector<ByteS
     TRY(m_pid_file->write_until_depleted(ByteString::number(Core::System::getpid())));
 
     return ProcessDisposition::ContinueMainProcess;
+#endif
 }
 
+#if !defined(AK_OS_IOS)
 #if defined(AK_OS_MACOS)
 ErrorOr<void> BrowserProcess::connect_as_client(pid_t pid, Vector<ByteString> const& raw_urls, NewWindow new_window)
 {
@@ -147,6 +154,7 @@ void BrowserProcess::accept_transport(NonnullOwnPtr<IPC::Transport> transport)
             this->on_new_window(raw_urls);
     };
 }
+#endif
 
 BrowserProcess::~BrowserProcess()
 {
@@ -157,9 +165,6 @@ BrowserProcess::~BrowserProcess()
     if (m_pid_file) {
         MUST(m_pid_file->truncate(0));
 #if defined(AK_OS_WINDOWS)
-        // NOTE: On Windows, System::open() duplicates the underlying OS file handle,
-        // so we need to explicitly close said handle, otherwise the unlink() call fails due
-        // to permission errors and we crash on shutdown.
         m_pid_file->close();
 #endif
         MUST(Core::System::unlink(m_pid_path));
@@ -169,6 +174,7 @@ BrowserProcess::~BrowserProcess()
         MUST(Core::System::unlink(m_socket_path));
 }
 
+#if !defined(AK_OS_IOS)
 UIProcessClient::UIProcessClient(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionToServer<UIProcessClientEndpoint, UIProcessServerEndpoint>(*this, move(transport))
 {
@@ -196,5 +202,6 @@ void UIProcessConnectionFromClient::create_new_window(Vector<ByteString> urls)
     if (on_new_window)
         on_new_window(sanitize_urls(urls));
 }
+#endif
 
 }

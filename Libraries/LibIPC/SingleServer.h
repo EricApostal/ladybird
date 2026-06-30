@@ -10,8 +10,11 @@
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibIPC/Transport.h>
 
-#if defined(AK_OS_MACOS)
+#if (defined(AK_OS_MACOS) || defined(AK_OS_IOS)) || defined(AK_OS_IOS)
 #    include <LibIPC/TransportBootstrapMach.h>
+#endif
+#if defined(AK_OS_IOS)
+#    include <LibIPC/TransportBootstrapIOS.h>
 #else
 #    include <LibCore/SystemServerTakeover.h>
 #endif
@@ -21,7 +24,12 @@ namespace IPC {
 template<typename ConnectionFromClientType, typename... Args>
 ErrorOr<NonnullRefPtr<ConnectionFromClientType>> take_over_accepted_client_from_system_server([[maybe_unused]] StringView mach_server_name, Args&&... args)
 {
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_IOS)
+    auto ports = TRY(bootstrap_transport_from_xpc());
+    return IPC::new_client_connection<ConnectionFromClientType>(
+        make<IPC::Transport>(move(ports.receive_right), move(ports.send_right)),
+        forward<Args>(args)...);
+#elif (defined(AK_OS_MACOS) || defined(AK_OS_IOS))
     auto ports = TRY(bootstrap_transport_from_mach_server(mach_server_name));
     return IPC::new_client_connection<ConnectionFromClientType>(
         make<IPC::Transport>(move(ports.receive_right), move(ports.send_right)),

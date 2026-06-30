@@ -375,6 +375,17 @@ private:
     bool m_has_queued_task_to_launch_spare_web_content_process { false };
     u64 m_next_page_or_compositor_context_id { 1 };
 
+#if defined(AK_OS_IOS)
+    // Single-process iOS keeps exactly one WebContent connection (thread) alive for the entire
+    // lifetime of the app — see Web::Bindings::initialize_main_thread_vm()'s
+    // VERIFY(!main_thread_vm_ptr()), a genuine process-wide singleton that makes a second
+    // WebContent thread fatal. The first call to launch_web_content_process() or
+    // launch_child_frame_web_content_process() creates this connection; every later call (a new
+    // tab, a cross-site process-swap navigation, an out-of-process iframe, ...) gets an
+    // additional page on it instead. See both functions in Application.cpp.
+    RefPtr<WebContentClient> m_ios_shared_web_content_client;
+#endif
+
     RefPtr<Database::Database> m_database;
     RefPtr<Database::Database> m_history_database;
     OwnPtr<CookieJar> m_cookie_jar;

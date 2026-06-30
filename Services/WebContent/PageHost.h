@@ -36,6 +36,7 @@ public:
     virtual ~PageHost();
 
     void initialize(u64 initial_page_id);
+    PageClient& create_additional_page(u64 page_id);
     Optional<PageClient&> page(u64 page_id);
     PageClient& create_page(u64 page_id);
     void remove_page(Badge<PageClient>, u64 page_id);

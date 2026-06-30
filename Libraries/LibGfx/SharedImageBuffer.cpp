@@ -40,7 +40,7 @@ struct NativeHandleLayout {
 };
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 static constexpr auto shared_image_buffer_format = BitmapFormat::BGRA8888;
 static constexpr auto shared_image_buffer_alpha_type = AlphaType::Premultiplied;
 
@@ -143,7 +143,7 @@ SharedImageBuffer::SharedImageBuffer(NonnullRefPtr<Bitmap> bitmap, AndroidAhbHan
 
 SharedImageBuffer SharedImageBuffer::create(IntSize size)
 {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     auto iosurface_handle = Core::IOSurfaceHandle::create(size.width(), size.height());
     auto bitmap = create_bitmap_from_iosurface(iosurface_handle);
     return SharedImageBuffer(move(iosurface_handle), move(bitmap));
@@ -154,7 +154,7 @@ SharedImageBuffer SharedImageBuffer::create(IntSize size)
 
 SharedImageBuffer SharedImageBuffer::import_from_shared_image(SharedImage shared_image)
 {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     auto iosurface_handle = Core::IOSurfaceHandle::from_mach_port(shared_image.m_port);
     auto bitmap = create_bitmap_from_iosurface(iosurface_handle);
     return SharedImageBuffer(move(iosurface_handle), move(bitmap));
@@ -185,7 +185,7 @@ SharedImageBuffer SharedImageBuffer::import_from_shared_image(SharedImage shared
 }
 
 SharedImageBuffer::SharedImageBuffer(SharedImageBuffer&& other)
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     : m_iosurface_handle(move(other.m_iosurface_handle))
     , m_bitmap(move(other.m_bitmap))
 #elif defined(USE_VULKAN_DMABUF_IMAGES)
@@ -205,7 +205,7 @@ SharedImageBuffer& SharedImageBuffer::operator=(SharedImageBuffer&& other)
 {
     if (this != &other) {
         m_bitmap = move(other.m_bitmap);
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
         m_iosurface_handle = move(other.m_iosurface_handle);
 #endif
 #ifdef USE_VULKAN_DMABUF_IMAGES
@@ -235,7 +235,7 @@ SharedImageBuffer::~SharedImageBuffer()
 
 SharedImage SharedImageBuffer::export_shared_image() const
 {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     return SharedImage { m_iosurface_handle.create_mach_port() };
 #else
 #    ifdef USE_VULKAN_AHB_IMAGES

@@ -1,0 +1,18 @@
+set(VCPKG_CMAKE_SYSTEM_NAME iOS)
+set(VCPKG_TARGET_ARCHITECTURE arm64)
+set(VCPKG_OSX_ARCHITECTURES arm64)
+set(VCPKG_CRT_LINKAGE dynamic)
+set(VCPKG_OSX_SYSROOT iphoneos)
+set(VCPKG_OSX_DEPLOYMENT_TARGET "17.4")
+
+list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS
+    "-DCMAKE_MACOSX_BUNDLE=OFF"
+)
+
+set(ENV{cross_compiling} "yes")
+set(ENV{ac_cv_prog_cc_cross} "yes")
+
+list(APPEND VCPKG_CONFIGURE_MAKE_OPTIONS "--build=x86_64-apple-darwin")
+list(APPEND VCPKG_MAKE_CONFIGURE_OPTIONS "--build=x86_64-apple-darwin")
+
+include(${CMAKE_CURRENT_LIST_DIR}/base.cmake)

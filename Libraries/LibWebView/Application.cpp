@@ -706,6 +706,18 @@ void Application::crash_compositor_process()
 
 ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process(ViewImplementation& view)
 {
+#if defined(AK_OS_IOS)
+    // See m_ios_shared_web_content_client's declaration. Once the one connection exists, every
+    // later "new WebContent process" request (a new tab, a cross-site process-swap navigation,
+    // ...) instead becomes an additional page on it.
+    if (m_ios_shared_web_content_client) {
+        auto page_id = allocate_page_id();
+        m_ios_shared_web_content_client->async_create_new_top_level_page(page_id);
+        m_ios_shared_web_content_client->register_view(page_id, view);
+        return *m_ios_shared_web_content_client;
+    }
+#endif
+
     if (m_spare_web_content_process) {
         auto web_content_client = m_spare_web_content_process.release_nonnull();
         launch_spare_web_content_process();
@@ -715,11 +727,32 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process
     }
 
     launch_spare_web_content_process();
-    return create_web_content_client(view, allocate_page_id());
+    auto client = TRY(create_web_content_client(view, allocate_page_id()));
+
+#if defined(AK_OS_IOS)
+    m_ios_shared_web_content_client = client;
+#endif
+
+    return client;
 }
 
 ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process()
 {
+#if defined(AK_OS_IOS)
+    // Out-of-process iframes normally get their own dedicated WebContent process; on single-process
+    // iOS they instead get an additional page on the one shared connection (see
+    // m_ios_shared_web_content_client's declaration). A child frame can only exist inside an
+    // already-loaded top-level page, so the shared connection is guaranteed to already exist here.
+    if (m_ios_shared_web_content_client) {
+        auto page_id = allocate_page_id();
+        m_ios_shared_web_content_client->async_create_new_top_level_page(page_id);
+        return ChildFrameWebContentProcess {
+            .client = *m_ios_shared_web_content_client,
+            .page_id = page_id,
+        };
+    }
+#endif
+
     auto page_id = allocate_page_id();
     auto client = TRY(create_web_content_client({}, page_id));
     return ChildFrameWebContentProcess {
@@ -730,6 +763,19 @@ ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_fram
 
 void Application::launch_spare_web_content_process()
 {
+#if defined(AK_OS_IOS)
+    // Single-process iOS keeps exactly one WebContent connection (thread) alive for the entire
+    // lifetime of the app (see WebView::spawn_browser_engine_process). Pre-warming a "spare"
+    // client here would start a second WebContent thread, which would immediately hit
+    // Web::Bindings::initialize_main_thread_vm()'s VERIFY(!main_thread_vm_ptr()) — that VM is a
+    // genuine process-wide singleton, not one-per-thread. New tabs/navigations/iframes on iOS
+    // instead get an additional page on the single existing connection (see
+    // m_ios_shared_web_content_client and launch_web_content_process/
+    // launch_child_frame_web_content_process above), so there's nothing for a spare process to
+    // help with here.
+    return;
+#endif
+
     // Spare WebContent processes inherit the active WebDriver endpoint, but they are not part of the
     // session and can race browser shutdown while bootstrapping.
     if (browser_options().webdriver_endpoint.has_value())

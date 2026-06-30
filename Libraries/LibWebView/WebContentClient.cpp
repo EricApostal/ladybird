@@ -203,6 +203,15 @@ void WebContentClient::unregister_embedded_page(u64 page_id)
 
 void WebContentClient::close_server_if_unused()
 {
+#if defined(AK_OS_IOS)
+    // Single-process iOS shares this one WebContentClient/connection across every tab, popup,
+    // and out-of-process iframe for the app's entire lifetime (see
+    // Application::launch_web_content_process and launch_child_frame_web_content_process). It
+    // must never be told to close itself just because it's briefly down to zero pages, e.g.
+    // between closing the last tab and opening a new one.
+    return;
+#endif
+
     if (!m_views.is_empty())
         return;
     if (!m_embedded_pages.is_empty())

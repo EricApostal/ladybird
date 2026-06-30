@@ -19,6 +19,11 @@ ErrorOr<void> apply_sandbox(Vector<ByteString> const& certificates)
 {
     TRY(Sandbox::configure_runtime());
 
+#if defined(AK_OS_IOS)
+    (void)certificates;
+    return {};
+#else
+
     Vector<Sandbox::SeatbeltPath> paths;
     auto cache_path = TRY(String::formatted("{}/Ladybird", Core::StandardPaths::cache_directory()));
     TRY(Core::Directory::create(cache_path.to_byte_string(), Core::Directory::CreateDirectories::Yes));
@@ -56,6 +61,7 @@ ErrorOr<void> apply_sandbox(Vector<ByteString> const& certificates)
     TRY(Sandbox::add_seatbelt_path_if_exists(paths, cache_path, Sandbox::SeatbeltPath::Access::ReadWrite));
 
     return Sandbox::apply_macos_sandbox(paths.span(), Sandbox::NetworkAccess::Allowed);
+#endif
 }
 
 }

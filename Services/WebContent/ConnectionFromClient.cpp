@@ -122,6 +122,16 @@ void ConnectionFromClient::initialize(u64 initial_page_id)
     m_page_host->initialize(initial_page_id);
 }
 
+void ConnectionFromClient::create_new_top_level_page(u64 page_id)
+{
+    // Used on single-process iOS, where every tab/cross-site-navigation/out-of-process-iframe has
+    // to live on the one WebContent connection that exists for the lifetime of the app (see
+    // WebView::Application::launch_web_content_process and launch_child_frame_web_content_process
+    // in Libraries/LibWebView/Application.cpp). Everywhere else, those each get an entirely new
+    // WebContent connection instead, so this is never called off of iOS.
+    m_page_host->create_additional_page(page_id);
+}
+
 void ConnectionFromClient::set_page_parent_context(u64 page_id, Optional<Web::Compositor::CompositorContextId> parent_context_id)
 {
     auto page = this->page(page_id);

@@ -14,7 +14,15 @@
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
 #include <LibHTTP/Cache/DiskCache.h>
-#include <LibIPC/SingleServer.h>
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
+#    include <LibIPC/Transport.h>
+#    include <LibIPC/TransportBootstrapMach.h>
+#endif
+#if defined(AK_OS_IOS)
+#    include <LibIPC/TransportBootstrapIOS.h>
+#elif !defined(AK_OS_WINDOWS)
+#    include <LibIPC/SingleServer.h>
+#endif
 #include <LibMain/Main.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/Resolver.h>
@@ -107,9 +115,22 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     // crashes from notifiers trying to unregister from already-destroyed thread data during process exit.
     RequestServer::ConnectionFromClient::ConnectionMap connections;
 
+#if defined(AK_OS_IOS)
+    auto transport_ports = TRY(IPC::bootstrap_transport_from_xpc());
+    auto client = RequestServer::ConnectionFromClient::construct(
+        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)),
+        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes, connections, disk_cache);
+#elif defined(AK_OS_MACOS)
+    auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
+    auto transport_ports = TRY(IPC::bootstrap_transport_from_server_port(browser_port));
+    auto client = RequestServer::ConnectionFromClient::construct(
+        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)),
+        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes, connections, disk_cache);
+#else
     auto client = TRY(IPC::take_over_accepted_client_from_system_server<RequestServer::ConnectionFromClient>(
         mach_server_name,
         RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes, connections, disk_cache));
+#endif
 
     return event_loop.exec();
 }

@@ -14,6 +14,22 @@
 
 #include <mach/mach.h>
 
+#if defined(AK_OS_IOS)
+#include <AK/Time.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <pthread.h>
+
+// Flag lives here in LibIPC so there's no reverse dependency on engine.cpp.
+// engine.cpp reads it via ladybird_is_ipc_wait_in_progress() to suppress
+// tick_ladybird() during synchronous IPC waits, preventing re-entrant IPC
+// calls that corrupt Compositor connection state.
+static bool s_ipc_wait_in_progress = false;
+
+extern "C" void ladybird_begin_ipc_wait() { s_ipc_wait_in_progress = true; }
+extern "C" void ladybird_end_ipc_wait()   { s_ipc_wait_in_progress = false; }
+extern "C" bool ladybird_is_ipc_wait_in_progress() { return s_ipc_wait_in_progress; }
+#endif
+
 namespace IPC {
 
 static constexpr size_t INLINE_MESSAGE_MAX_SIZE = 4096;
@@ -485,6 +501,30 @@ void TransportMachPort::close_after_sending_all_pending_messages()
 void TransportMachPort::wait_until_readable()
 {
     Sync::MutexLocker lock(m_incoming_mutex);
+#if defined(AK_OS_IOS)
+    // On iOS, service threads may call dispatch_sync(dispatch_get_main_queue(), ...)
+    // during startup (e.g. MTLCreateSystemDefaultDevice in the Compositor service).
+    // If this wait is called from the main thread we must periodically pump the
+    // CFRunLoop between timed waits so those dispatches can complete; otherwise
+    // the main thread blocks forever (deadlock).
+    if (pthread_main_np()) {
+        // Signal tick_ladybird() to skip Ladybird message dispatch while we
+        // pump CFRunLoop here. Without this, the observer can fire tick_ladybird()
+        // which processes WebContent IPC messages, triggering re-entrant synchronous
+        // IPC calls on this same connection and corrupting Compositor connection state.
+        ladybird_begin_ipc_wait();
+        while (m_incoming_messages.is_empty() && !m_peer_eof) {
+            m_incoming_cv.wait_for(AK::Duration::from_milliseconds(5));
+            if (!m_incoming_messages.is_empty() || m_peer_eof)
+                break;
+            lock.unlock();
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, false);
+            lock.lock();
+        }
+        ladybird_end_ipc_wait();
+        return;
+    }
+#endif
     while (m_incoming_messages.is_empty() && !m_peer_eof)
         m_incoming_cv.wait();
 }

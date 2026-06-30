@@ -38,6 +38,11 @@ ErrorOr<void> apply_sandbox(Optional<StringView> config_path)
 {
     TRY(Sandbox::configure_runtime());
 
+#if defined(AK_OS_IOS)
+    (void)config_path;
+    return {};
+#else
+
     auto executable_path = TRY(Core::System::current_executable_path());
     auto build_root = LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(executable_path)))));
 
@@ -80,6 +85,7 @@ ErrorOr<void> apply_sandbox(Optional<StringView> config_path)
     }
 
     return Sandbox::apply_macos_sandbox(paths.span(), Sandbox::NetworkAccess::Denied, executable_paths.span());
+#endif
 }
 
 }

@@ -60,12 +60,14 @@ public:
 
 private:
     void accept_transport(NonnullOwnPtr<IPC::Transport>);
+#if !defined(AK_OS_IOS)
 #if defined(AK_OS_MACOS)
     ErrorOr<void> connect_as_client(pid_t pid, Vector<ByteString> const& raw_urls, NewWindow new_window);
     ErrorOr<void> connect_as_server();
 #else
     ErrorOr<void> connect_as_client(ByteString const& socket_path, Vector<ByteString> const& raw_urls, NewWindow new_window);
     ErrorOr<void> connect_as_server(ByteString const& socket_path);
+#endif
 #endif
 
     RefPtr<Core::LocalServer> m_local_server;

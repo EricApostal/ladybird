@@ -44,10 +44,13 @@
 
 #include <openssl/thread.h>
 
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 #    include <LibIPC/Transport.h>
 #    include <LibIPC/TransportBootstrapMach.h>
-#else
+#endif
+#if defined(AK_OS_IOS)
+#    include <LibIPC/TransportBootstrapIOS.h>
+#elif !defined(AK_OS_WINDOWS)
 #    include <LibIPC/SingleServer.h>
 #endif
 
@@ -179,7 +182,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     // SDL is used for the Gamepad API.
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
         dbgln("Failed to initialize SDL3: {}", SDL_GetError());
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(AK_OS_IOS)
         return -1;
 #endif
     }
@@ -322,7 +325,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     if (!disable_sandbox)
         TRY(RendererSandbox::apply_sandbox(config_path));
 
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_IOS)
+    auto transport_ports = TRY(IPC::bootstrap_transport_from_xpc());
+    auto webcontent_client = WebContent::ConnectionFromClient::construct(
+        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)));
+#elif defined(AK_OS_MACOS)
     auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
     auto transport_ports = TRY(IPC::bootstrap_transport_from_server_port(browser_port));
     auto webcontent_client = WebContent::ConnectionFromClient::construct(

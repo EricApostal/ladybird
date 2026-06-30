@@ -431,7 +431,7 @@ if (DEFINED ASMINT_ARCH)
         list(APPEND ASMINT_EXTRA_FLAGS "--enable-assertions")
     endif()
     # All Apple Silicon chips are ARMv8.5+ which includes FEAT_JSCVT.
-    if ("${ASMINT_ARCH}" STREQUAL "aarch64" AND APPLE)
+    if ("${ASMINT_ARCH}" STREQUAL "aarch64" AND APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         list(APPEND ASMINT_EXTRA_FLAGS "--has-jscvt")
     endif()
 

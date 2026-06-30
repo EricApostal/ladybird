@@ -48,7 +48,7 @@ copy_res_folder(fonts)
 copy_res_folder(icons)
 copy_res_folder(themes)
 
-set(LADYBIRD_ANDROID_ASSETS_OUTPUT_PATH "${CMAKE_SOURCE_DIR}/UI/Android/src/main/assets/ladybird-assets.zip")
+set(LADYBIRD_ANDROID_ASSETS_OUTPUT_PATH "${ladybird_SOURCE_DIR}/UI/Android/src/main/assets/ladybird-assets.zip")
 if (DEFINED LADYBIRD_ANDROID_ASSETS_OUTPUT_PATH_OVERRIDE)
     set(LADYBIRD_ANDROID_ASSETS_OUTPUT_PATH "${LADYBIRD_ANDROID_ASSETS_OUTPUT_PATH_OVERRIDE}")
 endif()

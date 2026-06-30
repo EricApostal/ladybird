@@ -8,8 +8,14 @@
 
 #include <AK/Platform.h>
 
-#if !defined(AK_OS_MACOS)
+#if !(defined(AK_OS_MACOS) || defined(AK_OS_IOS))
 #    error "TransportMachPort is only available on macOS"
+#endif
+
+#if defined(AK_OS_IOS)
+extern "C" void ladybird_begin_ipc_wait();
+extern "C" void ladybird_end_ipc_wait();
+extern "C" bool ladybird_is_ipc_wait_in_progress();
 #endif
 
 #include <AK/Atomic.h>

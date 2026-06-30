@@ -31,6 +31,9 @@ install(TARGETS ${ladybird_helper_processes}
   RUNTIME
     COMPONENT ladybird_Runtime
     DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}
+  BUNDLE
+    COMPONENT ladybird_Runtime
+    DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}
 )
 
 include("${LADYBIRD_SOURCE_DIR}/Meta/CMake/get_linked_lagom_libraries.cmake")

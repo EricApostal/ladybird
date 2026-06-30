@@ -8,7 +8,7 @@
 
 #include <LibGfx/Font/Typeface.h>
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 #    include <CoreText/CoreText.h>
 #endif
 
@@ -59,7 +59,7 @@ private:
     NonnullOwnPtr<Impl> m_impl;
 
     static ErrorOr<RefPtr<TypefaceSkia>> typeface_from_skia_typeface(sk_sp<SkTypeface>, Optional<SystemUIFontKind> = {});
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     static ErrorOr<RefPtr<TypefaceSkia>> typeface_from_core_text_typeface(sk_sp<SkTypeface>, CTFontRef, SystemUIFontKind);
 #endif
 

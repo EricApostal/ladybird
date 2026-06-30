@@ -23,6 +23,10 @@ ErrorOr<void> apply_sandbox()
 {
     TRY(Sandbox::configure_runtime());
 
+#if defined(AK_OS_IOS)
+    return {};
+#else
+
     auto executable_path = TRY(Core::System::current_executable_path());
     auto build_root = LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(executable_path)))));
 
@@ -57,6 +61,7 @@ ErrorOr<void> apply_sandbox()
     };
 
     return Sandbox::apply_macos_sandbox(paths.span(), Sandbox::NetworkAccess::Denied, {}, metal_iokit_user_client_classes);
+#endif
 }
 
 }

@@ -6,7 +6,7 @@
 
 #pragma once
 
-#if !defined(AK_OS_MACOS)
+#if !defined(AK_OS_MACOS) && !defined(AK_OS_IOS)
 static_assert(false, "This file must only be used for macOS");
 #endif
 

@@ -244,9 +244,6 @@ void ViewImplementation::server_did_paint(Badge<WebContentClient>, i32 bitmap_id
         did_swap_bitmap = true;
     }
 
-    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received presented bitmap {} for page {} size={}x{} did_swap={} front={} back={}",
-        bitmap_id, page_id(), size.width(), size.height(), did_swap_bitmap, m_client_state.front_bitmap.id, m_client_state.back_bitmap.id);
-
     client().notify_presented_bitmap_ready_to_paint(page_id(), bitmap_id);
 
     if (did_swap_bitmap && on_ready_to_paint)

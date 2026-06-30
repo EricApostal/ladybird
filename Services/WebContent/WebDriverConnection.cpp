@@ -240,6 +240,11 @@ static bool fire_an_event(FlyString const& name, Optional<Web::DOM::Element&> ta
 
 ErrorOr<NonnullRefPtr<WebDriverConnection>> WebDriverConnection::connect(Web::PageClient& page_client, ByteString const& webdriver_endpoint)
 {
+#if defined(AK_OS_IOS)
+    (void)page_client;
+    (void)webdriver_endpoint;
+    return Error::from_string_literal("WebDriver is not supported on iOS");
+#else
     dbgln_if(WEBDRIVER_DEBUG, "Trying to connect to {}", webdriver_endpoint);
 #if defined(AK_OS_MACOS)
     auto transport_ports = TRY(IPC::bootstrap_transport_from_mach_server(webdriver_endpoint));
@@ -251,7 +256,7 @@ ErrorOr<NonnullRefPtr<WebDriverConnection>> WebDriverConnection::connect(Web::Pa
     page_client.page().set_should_block_pop_ups(false);
 
     dbgln_if(WEBDRIVER_DEBUG, "Connected to WebDriver");
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     auto transport = make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right));
 #else
     auto transport = TRY(IPC::Transport::from_socket(move(socket)));
@@ -259,6 +264,7 @@ ErrorOr<NonnullRefPtr<WebDriverConnection>> WebDriverConnection::connect(Web::Pa
     auto connection = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) WebDriverConnection(move(transport), page_client)));
     connection->async_did_set_window_handle(page_client.page().top_level_traversable()->window_handle());
     return connection;
+#endif
 }
 
 WebDriverConnection::WebDriverConnection(NonnullOwnPtr<IPC::Transport> transport, Web::PageClient& page_client)

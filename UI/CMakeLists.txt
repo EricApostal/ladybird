@@ -40,7 +40,7 @@ function(create_ladybird_bundle target_name)
     if (APPLE)
         set(resource_base_dir "$<TARGET_BUNDLE_DIR:${target_name}>/Contents/Resources")
     else()
-        set(resource_base_dir "${CMAKE_BINARY_DIR}/${IN_BUILD_PREFIX}${CMAKE_INSTALL_DATADIR}/Lagom")
+        set(resource_base_dir "${ladybird_BINARY_DIR}/${IN_BUILD_PREFIX}${CMAKE_INSTALL_DATADIR}/Lagom")
     endif()
 
     copy_resources_to_build(${resource_base_dir} ${target_name})
@@ -84,7 +84,7 @@ function(set_helper_process_properties)
         # Store helper processes in the same bundle directory as the main application
         set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:ladybird>")
     else()
-        set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${IN_BUILD_PREFIX}${CMAKE_INSTALL_LIBEXECDIR}")
+        set_target_properties(${targets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${ladybird_BINARY_DIR}/${IN_BUILD_PREFIX}${CMAKE_INSTALL_LIBEXECDIR}")
     endif()
 endfunction()
 

@@ -36,7 +36,10 @@ project(ladybird
         HOMEPAGE_URL "https://ladybird.org"
 )
 
-if (ANDROID OR IOS)
+# Fix for add_subdirectory: Ladybird uses ladybird_BINARY_DIR extensively assuming it is the root project.
+set(ladybird_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+
+if (ANDROID)
     set(BUILD_SHARED_LIBS OFF)
 endif()
 
@@ -109,9 +112,9 @@ set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LINKER_FLAGS}")
 include_directories(${LADYBIRD_SOURCE_DIR})
 include_directories(Libraries)
 include_directories(Services)
-include_directories(${CMAKE_BINARY_DIR})
-include_directories(${CMAKE_BINARY_DIR}/Libraries)
-include_directories(${CMAKE_BINARY_DIR}/Services)
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/Libraries)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/Services)
 
 include(lagom_install)
 

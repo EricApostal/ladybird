@@ -23,12 +23,12 @@
 #    include <ports/SkFontScanner_FreeType.h>
 #elif defined(AK_OS_WINDOWS)
 #    include <ports/SkTypeface_win.h>
-#else
+#elif !defined(AK_OS_MACOS) && !defined(AK_OS_IOS)
 #    include <ports/SkFontMgr_fontconfig.h>
 #    include <ports/SkFontScanner_FreeType.h>
 #endif
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 #    include <CoreText/CoreText.h>
 #    include <harfbuzz/hb-coretext.h>
 #    include <ports/SkFontMgr_mac_ct.h>
@@ -45,7 +45,7 @@ static auto& skia_font_manager()
 
 struct TypefaceSkia::Impl {
     Impl(sk_sp<SkTypeface> skia_typeface, std::unique_ptr<SkStreamAsset> stream = {}, Optional<SystemUIFontKind> system_ui_font_kind = {}
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
         ,
         CGFontRef cg_font = nullptr
 #endif
@@ -54,7 +54,7 @@ struct TypefaceSkia::Impl {
         , stream(move(stream))
         , system_ui_font_kind(move(system_ui_font_kind))
     {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
         if (cg_font) {
             this->cg_font = cg_font;
             CFRetain(this->cg_font);
@@ -64,7 +64,7 @@ struct TypefaceSkia::Impl {
 
     ~Impl()
     {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
         if (cg_font)
             CFRelease(cg_font);
 #endif
@@ -73,7 +73,7 @@ struct TypefaceSkia::Impl {
     sk_sp<SkTypeface> skia_typeface;
     std::unique_ptr<SkStreamAsset> stream;
     Optional<SystemUIFontKind> system_ui_font_kind;
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     CGFontRef cg_font { nullptr };
 #endif
 };
@@ -82,7 +82,7 @@ static SkFontMgr& font_manager()
 {
     auto& font_manager = skia_font_manager();
     if (!font_manager) {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
         if (Gfx::FontDatabase::the().system_font_provider_name() != "FontConfig"sv) {
             font_manager = SkFontMgr_New_CoreText(nullptr);
         }
@@ -91,7 +91,7 @@ static SkFontMgr& font_manager()
         font_manager = SkFontMgr_New_Android(nullptr, SkFontScanner_Make_FreeType());
 #elif defined(AK_OS_WINDOWS)
         font_manager = SkFontMgr_New_DirectWrite();
-#else
+#elif !defined(AK_OS_MACOS) && !defined(AK_OS_IOS)
         if (!font_manager) {
             font_manager = SkFontMgr_New_FontConfig(nullptr, SkFontScanner_Make_FreeType());
         }
@@ -125,7 +125,7 @@ static SkFontStyle::Slant slope_to_skia_slant(u8 slope)
     }
 }
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 static CTFontRef create_system_ui_font(SystemUIFontKind, float point_size, u8 slope);
 
 ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::typeface_from_core_text_typeface(sk_sp<SkTypeface> skia_typeface, CTFontRef ct_font, SystemUIFontKind system_ui_font_kind)
@@ -212,7 +212,7 @@ void TypefaceSkia::encode_font_data_for_ipc(IPC::Encoder& encoder) const
     MUST(encoder.encode(slope()));
 }
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
 // NB: These are the CoreText string values behind the public AppKit NSFontDescriptorSystemDesign constants.
 // Keeping them here avoids pulling Objective-C headers into this C++ file.
 static CFStringRef core_text_ui_font_design(SystemUIFontKind kind)
@@ -279,7 +279,7 @@ static CTFontRef create_system_ui_font(SystemUIFontKind kind, float point_size, 
 
 ErrorOr<RefPtr<TypefaceSkia>> TypefaceSkia::match_system_ui(SystemUIFontKind kind, float point_size, u16 weight, double width, u8 slope)
 {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     (void)weight;
     (void)width;
     auto ct_font = create_system_ui_font(kind, point_size, slope);
@@ -371,7 +371,7 @@ RefPtr<TypefaceSkia const> TypefaceSkia::clone_with_variations(Vector<FontVariat
         return typeface;
     }
 
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     if (impl().cg_font) {
         return adopt_ref(*new TypefaceSkia {
             make<TypefaceSkia::Impl>(move(skia_typeface), std::unique_ptr<SkStreamAsset> {}, impl().system_ui_font_kind, impl().cg_font),
@@ -393,7 +393,7 @@ SkTypeface const* TypefaceSkia::sk_typeface() const
 
 hb_face_t* TypefaceSkia::create_harfbuzz_face() const
 {
-#ifdef AK_OS_MACOS
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_IOS)
     if (impl().cg_font)
         return hb_coretext_face_create(impl().cg_font);
 #endif

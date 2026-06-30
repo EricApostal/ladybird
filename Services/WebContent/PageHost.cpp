@@ -29,6 +29,17 @@ void PageHost::initialize(u64 initial_page_id)
     Web::HTML::TraversableNavigable::create_a_fresh_top_level_traversable(first_page.page(), URL::about_blank());
 }
 
+PageClient& PageHost::create_additional_page(u64 page_id)
+{
+    // Like initialize(), but for a connection that already has at least one page. Used on
+    // single-process iOS to give a new browser tab its own top-level page on the one WebContent
+    // connection that exists for the whole app, instead of the new connection a new tab would
+    // get everywhere else (see ConnectionFromClient::create_new_top_level_page).
+    auto& page = create_page(page_id);
+    Web::HTML::TraversableNavigable::create_a_fresh_top_level_traversable(page.page(), URL::about_blank());
+    return page;
+}
+
 PageClient& PageHost::create_page(u64 page_id)
 {
     VERIFY(page_id > 0);

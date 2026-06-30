@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Platform.h>
+#if defined(AK_OS_MACOS)
+
 #include <AK/Debug.h>
 #include <LibIPC/MachBootstrapListener.h>
 #include <LibIPC/MachBootstrapMessages.h>
@@ -90,3 +93,4 @@ void MachBootstrapListener::thread_loop()
 }
 
 }
+#endif

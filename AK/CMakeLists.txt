@@ -80,7 +80,7 @@ endif()
 target_link_libraries(AK ${MIMALLOC_VISIBILITY} mimalloc)
 
 # FIXME: Make this generic for all imported shared library dependencies and apply globally
-if (BUILD_SHARED_LIBS AND NOT CMAKE_SKIP_INSTALL_RULES AND NOT "${VCPKG_INSTALLED_DIR}" STREQUAL "")
+if (BUILD_SHARED_LIBS AND NOT CMAKE_SKIP_INSTALL_RULES AND NOT "${VCPKG_INSTALLED_DIR}" STREQUAL "" AND NOT IOS)
     install(IMPORTED_RUNTIME_ARTIFACTS simdutf::simdutf
             LIBRARY COMPONENT Lagom_Runtime NAMELINK_COMPONENT Lagom_Development
             FRAMEWORK COMPONENT Lagom_Runtime

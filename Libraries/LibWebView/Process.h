@@ -14,8 +14,19 @@
 #include <LibIPC/Transport.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/ProcessType.h>
+#include <LibMain/Main.h>
+#include <AK/Error.h>
 
 namespace WebView {
+
+struct IOSServiceMains {
+    ErrorOr<int> (*webcontent)(Main::Arguments);
+    ErrorOr<int> (*request_server)(Main::Arguments);
+    ErrorOr<int> (*image_decoder)(Main::Arguments);
+    ErrorOr<int> (*compositor)(Main::Arguments);
+    ErrorOr<int> (*webworker)(Main::Arguments);
+};
+WEBVIEW_API void register_ios_service_mains(IOSServiceMains mains);
 
 struct ProcessOutputCapture {
     OwnPtr<Core::File> stdout_file;
@@ -68,7 +79,7 @@ private:
         NonnullOwnPtr<IPC::Transport> transport;
         ProcessOutputCapture output_capture;
     };
-    static ErrorOr<ProcessAndIPCTransport> spawn_and_connect_to_process(Core::ProcessSpawnOptions const& options, bool capture_output);
+    static ErrorOr<ProcessAndIPCTransport> spawn_and_connect_to_process(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output);
 
     Core::Process m_process;
     ProcessType m_type;
@@ -86,7 +97,7 @@ struct Process::ProcessAndClient {
 template<typename ClientType, typename... ClientArguments>
 ErrorOr<Process::ProcessAndClient<ClientType>> Process::spawn(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output, ClientArguments&&... client_arguments)
 {
-    auto [core_process, transport, output_capture] = TRY(spawn_and_connect_to_process(options, capture_output));
+    auto [core_process, transport, output_capture] = TRY(spawn_and_connect_to_process(type, options, capture_output));
     auto client = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) ClientType { move(transport), forward<ClientArguments>(client_arguments)... }));
 
     Process process { type, client, move(core_process) };

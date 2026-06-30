@@ -34,7 +34,7 @@ static constexpr MachPort::PortRight associated_port_right(MachPort::MessageRigh
     case MachPort::MessageRight::MakeSendOnce:
         return MachPort::PortRight::SendOnce;
 
-#if defined(AK_OS_MACOS)
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     case MachPort::MessageRight::CopyReceive:
     case MachPort::MessageRight::DisposeReceive:
         return MachPort::PortRight::Receive;

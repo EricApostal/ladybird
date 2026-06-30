@@ -35,6 +35,10 @@ endpoint WebContentServer
 {
     init_transport(int peer_pid) => (int peer_pid)
     initialize(u64 initial_page_id) =|
+    // Single-process iOS only: gives an additional top-level page (browser tab) to a connection
+    // that's already running, since iOS only ever has the one WebContent connection for the
+    // whole app (see ConnectionFromClient::create_new_top_level_page).
+    create_new_top_level_page(u64 page_id) =|
     close_server() =|
 
     get_window_handle(u64 page_id) => (String handle)

@@ -42,6 +42,11 @@ if(WIN32)
     ladybird_windows_bin(WebContent CONSOLE)
 endif()
 
+if(IOS)
+    # We still need it to be a BUNDLE on macOS, but for iOS we let Xcode do the appex packaging.
+    # So we don't set BUNDLE properties on iOS.
+endif()
+
 
 target_sources(webcontentservice PUBLIC FILE_SET server TYPE HEADERS
     BASE_DIRS ${LADYBIRD_SOURCE_DIR}/Services

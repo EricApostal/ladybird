@@ -3,7 +3,7 @@
   "dependencies": [
     {
       "name": "angle",
-      "platform": "osx",
+      "platform": "osx | ios",
       "features": [
         "metal"
       ]
@@ -51,14 +51,13 @@
         "webp",
         "theora",
         "vorbis",
-        "vpx",
         "zlib"
       ]
     },
     "fmt",
     {
       "name": "fontconfig",
-      "platform": "linux | bsd | osx"
+      "platform": "linux | bsd | osx | ios"
     },
     {
       "name": "harfbuzz",
@@ -70,7 +69,7 @@
     },
     {
       "name": "harfbuzz",
-      "platform": "osx",
+      "platform": "osx | ios",
       "features": [
         "coretext",
         "icu"
@@ -109,18 +108,17 @@
     },
     {
       "name": "libproxy",
-      "platform": "!(android | bsd)"
+      "platform": "!(android | bsd | ios)"
     },
     "libpsl",
     {
       "name": "libedit",
-      "platform": "!windows & !android"
+      "platform": "!windows & !android & !ios"
     },
     "libtommath",
     {
       "name": "libwebp",
       "features": [
-        "anim",
         "libwebpmux",
         "simd"
       ]
@@ -150,6 +148,16 @@
       "features": [
         "metal",
         "fontconfig",
+        "harfbuzz",
+        "icu"
+      ]
+    },
+    {
+      "name": "skia",
+      "platform": "ios",
+      "default-features": false,
+      "features": [
+        "metal",
         "harfbuzz",
         "icu"
       ]

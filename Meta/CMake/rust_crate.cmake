@@ -19,7 +19,7 @@ function(import_rust_crate)
     endif()
 
     # Don't assume we are the top-level cmake
-    set(rust_toolchain_file "${CMAKE_SOURCE_DIR}/rust-toolchain.toml")
+    set(rust_toolchain_file "${ladybird_SOURCE_DIR}/rust-toolchain.toml")
     if (DEFINED LADYBIRD_SOURCE_DIR)
         set(rust_toolchain_file "${LADYBIRD_SOURCE_DIR}/rust-toolchain.toml")
     endif()
@@ -100,7 +100,7 @@ function(build_rust_binary)
     endif()
 
     # Don't assume we are the top-level cmake
-    set(rust_toolchain_file "${CMAKE_SOURCE_DIR}/rust-toolchain.toml")
+    set(rust_toolchain_file "${ladybird_SOURCE_DIR}/rust-toolchain.toml")
     if (DEFINED LADYBIRD_SOURCE_DIR)
         set(rust_toolchain_file "${LADYBIRD_SOURCE_DIR}/rust-toolchain.toml")
     endif()
@@ -113,7 +113,7 @@ function(build_rust_binary)
 
     set(cargo_binary "${cargo_output_dir}/${ARG_BINARY_NAME}${CMAKE_EXECUTABLE_SUFFIX}")
     set(depfile "${cargo_output_dir}/${ARG_BINARY_NAME}.d")
-    set(output_binary "${CMAKE_BINARY_DIR}/bin/${ARG_OUTPUT_NAME}${CMAKE_EXECUTABLE_SUFFIX}")
+    set(output_binary "${ladybird_BINARY_DIR}/bin/${ARG_OUTPUT_NAME}${CMAKE_EXECUTABLE_SUFFIX}")
 
     add_custom_command(
         OUTPUT "${output_binary}"
@@ -164,6 +164,11 @@ function(_rust_crate_common_setup)
         set(rust_is_android_build TRUE)
     endif()
 
+    set(rust_is_ios_build FALSE)
+    if (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR IOS)
+        set(rust_is_ios_build TRUE)
+    endif()
+
     if (NOT DEFINED RUSTC_WRAPPER)
         set(RUSTC_WRAPPER "$ENV{RUSTC_WRAPPER}" CACHE FILEPATH "Path to a rustc wrapper program, e.g. sccache")
     endif()
@@ -191,6 +196,12 @@ function(_rust_crate_common_setup)
             else()
                 message(FATAL_ERROR "Unsupported Android ABI: ${android_abi}")
             endif()
+        elseif (rust_is_ios_build)
+            if (CMAKE_OSX_SYSROOT MATCHES ".*[Ss]imulator.*")
+                set(target_triple "aarch64-apple-ios-sim")
+            else()
+                set(target_triple "aarch64-apple-ios")
+            endif()
         else()
             execute_process(COMMAND "${RUST_RUSTC}" -vV OUTPUT_VARIABLE rustc_verbose)
             string(REGEX MATCH "host: ([^\n]+)" _ "${rustc_verbose}")
@@ -213,7 +224,7 @@ function(_rust_crate_common_setup)
         set(cargo_profile_dir "release")
     endif()
 
-    set(cargo_target_dir "${CMAKE_BINARY_DIR}/cargo/build")
+    set(cargo_target_dir "${ladybird_BINARY_DIR}/cargo/build")
     set(cargo_output_dir "${cargo_target_dir}/${RUST_TARGET_TRIPLE}/${cargo_profile_dir}")
 
     set(cargo_c_compiler "${CMAKE_C_COMPILER}")
