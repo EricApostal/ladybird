@@ -1,35 +1,36 @@
 find_package(ZLIB REQUIRED)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+# This file is shared by the "Mac" buildsystem port for both real macOS and iOS (there is no
+# separate PlatformIOS.cmake upstream); is_ios/is_mac come from CMakeLists.txt. iOS has no
+# desktop OpenGL/CGL backend, only Metal, and Quartz.framework doesn't exist on iOS.
+if(is_ios)
     list(APPEND ANGLE_SOURCES
-        ${libangle_gpu_info_util_mac_sources}
+        ${libangle_gpu_info_util_ios_sources}
+        ${libangle_gpu_info_util_sources}
+        ${libangle_mac_sources}
+    )
+
+    list(APPEND ANGLEGLESv2_LIBRARIES
+        "-framework CoreGraphics"
+        "-framework Foundation"
+        "-framework IOKit"
+        "-framework IOSurface"
+        "-framework UIKit"
+        "-framework QuartzCore"
     )
 else()
     list(APPEND ANGLE_SOURCES
-        ${libangle_gpu_info_util_ios_sources}
-        "src/gpu_info_util/SystemInfo_apple.mm"
+        ${libangle_gpu_info_util_mac_sources}
+        ${libangle_gpu_info_util_sources}
+        ${libangle_mac_sources}
     )
-endif()
-list(APPEND ANGLE_SOURCES
-    ${libangle_gpu_info_util_sources}
-    ${libangle_mac_sources}
-)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(APPEND ANGLEGLESv2_LIBRARIES
         "-framework CoreGraphics"
         "-framework Foundation"
         "-framework IOKit"
         "-framework IOSurface"
         "-framework Quartz"
-        "-framework QuartzCore"
-    )
-else()
-    list(APPEND ANGLEGLESv2_LIBRARIES
-        "-framework CoreGraphics"
-        "-framework Foundation"
-        "-framework IOSurface"
-        "-framework UIKit"
         "-framework QuartzCore"
     )
 endif()
@@ -53,8 +54,8 @@ if(USE_METAL)
     )
 endif()
 
-# OpenGL backend
-if(USE_OPENGL)
+# OpenGL backend (desktop GL via CGL) -- not available on iOS.
+if(USE_OPENGL AND NOT is_ios)
     list(APPEND ANGLE_SOURCES
         ${angle_translator_glsl_base_sources}
         ${angle_translator_glsl_sources}
@@ -69,7 +70,7 @@ if(USE_OPENGL)
     )
 endif()
 
-if(USE_OPENGL OR ENABLE_WEBGL)
+if((USE_OPENGL OR ENABLE_WEBGL) AND NOT is_ios)
     list(APPEND ANGLE_SOURCES
         ${gl_backend_sources}
 

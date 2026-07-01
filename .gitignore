@@ -29,6 +29,7 @@ output/
 .exrc
 .helix/
 .flatpak-builder/
+vcpkg_installed/
 
 # Environments
 .venv/

@@ -20,10 +20,11 @@ ErrorOr<void> apply_sandbox(Vector<ByteString> const& certificates)
     TRY(Sandbox::configure_runtime());
 
 #if defined(AK_OS_IOS)
+    // Seatbelt (LibSandbox's AK_OS_MACOS-gated add_seatbelt_path_if_exists/apply_macos_sandbox)
+    // doesn't exist on iOS; sandboxing there is done via App Sandbox entitlements instead.
     (void)certificates;
     return {};
 #else
-
     Vector<Sandbox::SeatbeltPath> paths;
     auto cache_path = TRY(String::formatted("{}/Ladybird", Core::StandardPaths::cache_directory()));
     TRY(Core::Directory::create(cache_path.to_byte_string(), Core::Directory::CreateDirectories::Yes));

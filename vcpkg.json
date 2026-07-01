@@ -51,6 +51,10 @@
         "webp",
         "theora",
         "vorbis",
+        {
+          "name": "vpx",
+          "platform": "!ios & !osx"
+        },
         "zlib"
       ]
     },
@@ -143,7 +147,7 @@
     "simdutf",
     {
       "name": "skia",
-      "platform": "osx",
+      "platform": "osx | ios",
       "default-features": false,
       "features": [
         "metal",

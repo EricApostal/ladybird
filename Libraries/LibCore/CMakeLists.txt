@@ -89,6 +89,9 @@ endif()
 
 if (APPLE)
     list(APPEND SOURCES IOSurface.cpp)
+endif()
+
+if (APPLE AND NOT IOS)
     list(APPEND SOURCES Platform/ScopedAutoreleasePoolMacOS.mm)
 endif()
 

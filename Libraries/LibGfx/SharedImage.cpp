@@ -75,14 +75,16 @@ SharedImage::SharedImage(AndroidAhbHandle&& ahb)
 }
 #    endif
 
+#    if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 SharedImage duplicate_shared_image(VulkanImage const& vulkan_image)
 {
-#    ifdef USE_VULKAN_AHB_IMAGES
+#        ifdef USE_VULKAN_AHB_IMAGES
     return SharedImage { duplicate_android_ahb_handle(vulkan_image) };
-#    else
+#        else
     return SharedImage { duplicate_linux_dmabuf_handle(vulkan_image) };
-#    endif
+#        endif
 }
+#    endif
 
 #    ifdef USE_VULKAN_DMABUF_IMAGES
 LinuxDmaBufHandle duplicate_linux_dmabuf_handle(VulkanImage const& vulkan_image)
