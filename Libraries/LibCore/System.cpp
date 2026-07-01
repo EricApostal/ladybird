@@ -15,6 +15,7 @@
 #include <LibCore/System.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -176,6 +177,27 @@ ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int opti
     // FIXME: Support more options on Linux.
     auto linux_options = ((options & O_CLOEXEC) > 0) ? MFD_CLOEXEC : 0;
     fd = memfd_create("", linux_options);
+#elif defined(AK_OS_IOS)
+    // shm_open(SHM_ANON, ...) returns ENOENT on real iOS devices even though the SHM_ANON macro
+    // is defined (it's inherited from the shared Darwin <sys/shm.h> header) -- POSIX shared
+    // memory just isn't available there under the App Sandbox. It works fine under the
+    // Simulator only because that runs on the host macOS kernel, which does support it. Fall
+    // back to a temp-file-backed mapping inside the app's own sandboxed tmp directory instead,
+    // unlinking it immediately so it never actually appears on disk.
+    {
+        char path[PATH_MAX];
+        char const* tmpdir = getenv("TMPDIR");
+        snprintf(path, sizeof(path), "%s/lb-shm-XXXXXX", tmpdir ? tmpdir : "/tmp");
+        fd = ::mkstemp(path);
+        if (fd >= 0) {
+            ::unlink(path);
+            if ((options & O_CLOEXEC) && ::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+                auto saved_errno = errno;
+                TRY(close(fd));
+                return Error::from_errno(saved_errno);
+            }
+        }
+    }
 #elif defined(SHM_ANON)
     fd = shm_open(SHM_ANON, O_RDWR | O_CREAT | options, 0600);
 #elif defined(AK_OS_BSD_GENERIC) || defined(AK_OS_HAIKU)
