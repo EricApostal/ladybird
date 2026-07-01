@@ -37,7 +37,7 @@ PageClient& PageHost::create_additional_page(u64 page_id)
     // connection that exists for the whole app, instead of the new connection a new tab would
     // get everywhere else (see ConnectionFromClient::create_new_top_level_page).
     auto& page = create_page(page_id);
-    Web::HTML::TraversableNavigable::create_a_fresh_top_level_traversable(page.page(), URL::about_blank());
+    Web::HTML::LocalTraversableNavigable::create_a_fresh_top_level_traversable(page.page(), URL::about_blank());
     return page;
 }
 
