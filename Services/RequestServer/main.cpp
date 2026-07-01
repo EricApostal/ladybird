@@ -20,9 +20,8 @@
 #endif
 #if defined(AK_OS_IOS)
 #    include <LibIPC/TransportBootstrapIOS.h>
-#elif !defined(AK_OS_WINDOWS)
-#    include <LibIPC/SingleServer.h>
 #endif
+#include <LibIPC/SingleServer.h>
 #include <LibMain/Main.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/Resolver.h>
@@ -117,12 +116,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
 #if defined(AK_OS_IOS)
     auto transport_ports = TRY(IPC::bootstrap_transport_from_xpc());
-    auto client = RequestServer::ConnectionFromClient::construct(
-        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)),
-        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes, connections, disk_cache);
-#elif defined(AK_OS_MACOS)
-    auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
-    auto transport_ports = TRY(IPC::bootstrap_transport_from_server_port(browser_port));
     auto client = RequestServer::ConnectionFromClient::construct(
         make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)),
         RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes, connections, disk_cache);

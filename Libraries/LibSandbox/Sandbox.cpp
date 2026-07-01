@@ -237,7 +237,6 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
     TRY(profile.try_append(R"~~~(
 (version 1)
 (deny default
-    (with send-signal SIGSYS)
     (with message "Ladybird macOS sandbox default deny"))
 
 (allow process-info*)
@@ -256,7 +255,6 @@ ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAcces
     (literal "/private/var/run/syslog"))
 
 (deny syscall-unix
-    (with send-signal SIGKILL)
     (with message "Ladybird macOS sandbox syscall deny"))
 
 (allow syscall-unix
