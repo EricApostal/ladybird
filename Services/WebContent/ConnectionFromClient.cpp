@@ -52,11 +52,11 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/Storage.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
 #include <LibWeb/Infra/Strings.h>
@@ -314,6 +314,12 @@ void ConnectionFromClient::reload(u64 page_id)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().reload();
+}
+
+void ConnectionFromClient::cancel_download(u64 page_id, u64 download_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->cancel_download(download_id);
 }
 
 void ConnectionFromClient::traverse_the_history_by_delta(u64 page_id, i32 delta)

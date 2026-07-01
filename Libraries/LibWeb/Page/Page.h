@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/JsonValue.h>
 #include <AK/Queue.h>
 #include <AK/Variant.h>
@@ -86,7 +87,7 @@ public:
     Compositor::CompositorHost& compositor_host();
     Compositor::CompositorHost const& compositor_host() const;
 
-    void set_top_level_traversable(GC::Ref<HTML::TraversableNavigable>);
+    void set_top_level_traversable(GC::Ref<HTML::LocalTraversableNavigable>);
 
     // FIXME: This is a hack.
     bool top_level_traversable_is_initialized() const;
@@ -94,7 +95,7 @@ public:
     HTML::BrowsingContext& top_level_browsing_context();
     HTML::BrowsingContext const& top_level_browsing_context() const;
 
-    GC::Ref<HTML::TraversableNavigable> top_level_traversable() const;
+    GC::Ref<HTML::LocalTraversableNavigable> top_level_traversable() const;
 
     HTML::LocalNavigable& focused_navigable();
     HTML::LocalNavigable const& focused_navigable() const { return const_cast<Page*>(this)->focused_navigable(); }
@@ -327,7 +328,7 @@ private:
 
     GC::Weak<HTML::LocalNavigable> m_focused_navigable;
 
-    GC::Ptr<HTML::TraversableNavigable> m_top_level_traversable;
+    GC::Ptr<HTML::LocalTraversableNavigable> m_top_level_traversable;
 
     bool m_is_scripting_enabled { true };
     bool m_should_block_pop_ups { true };
@@ -491,6 +492,28 @@ public:
     virtual void page_did_create_new_document(Web::DOM::Document&) { }
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) { }
     virtual void page_did_finish_loading(URL::URL const&) { }
+    virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
+    {
+        (void)suggested_filename;
+        (void)total_size;
+        (void)request_server_client_id;
+        (void)request_server_request_id;
+        (void)initial_data;
+        return {};
+    }
+    virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size)
+    {
+        (void)suggested_filename;
+        (void)total_size;
+        return {};
+    }
+    virtual void page_did_receive_download_data([[maybe_unused]] u64 download_id, [[maybe_unused]] ByteBuffer data) { }
+    virtual void page_did_finish_download([[maybe_unused]] u64 download_id) { }
+    virtual void page_did_fail_download([[maybe_unused]] u64 download_id, [[maybe_unused]] String const& error) { }
+    virtual void page_did_register_download_controller([[maybe_unused]] u64 download_id, [[maybe_unused]] GC::Ref<Fetch::Infrastructure::FetchController>) { }
+    virtual void page_did_register_download_reader([[maybe_unused]] u64 download_id, [[maybe_unused]] GC::Ref<Streams::ReadableStreamDefaultReader>) { }
+    virtual void page_did_unregister_download([[maybe_unused]] u64 download_id) { }
+    virtual bool page_is_download_canceled([[maybe_unused]] u64 download_id) const { return false; }
     virtual void page_did_request_cursor_change(Gfx::Cursor const&) { }
     virtual void page_did_request_context_menu(CSSPixelPoint, ContextMenuForInputEventsTarget) { }
     virtual void page_did_request_link_context_menu(CSSPixelPoint, URL::URL const&, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }

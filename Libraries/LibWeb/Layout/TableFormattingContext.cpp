@@ -77,7 +77,7 @@ CSSPixels TableFormattingContext::run_caption_layout(CSS::CaptionSide phase, Ava
                 inner_available_space = m_state.get(child_box).available_inner_space_or_constraints_from(caption_available_space);
             }
 
-            caption_context->run(inner_available_space);
+            caption_context->run(LayoutInput { inner_available_space });
 
             if (block_context) {
                 auto& caption_state = m_state.get_mutable(child_box);
@@ -164,19 +164,37 @@ void TableFormattingContext::compute_cell_measures(RowMeasurement row_measuremen
         CSSPixels border_left = use_collapsing_borders_model ? round(cell_state.border_left / 2) : computed_values.border_left().width;
         CSSPixels border_right = use_collapsing_borders_model ? round(cell_state.border_right / 2) : computed_values.border_right().width;
 
-        auto min_content_width = calculate_min_content_width(cell.box);
-        auto max_content_width = calculate_max_content_width(cell.box);
+        auto cell_intrinsic_width_offsets = padding_left + padding_right + border_left + border_right;
+
+        auto min_width = computed_values.min_width().to_px(containing_block_width);
+        auto width = computed_values.width().is_length() ? computed_values.width().to_px(containing_block_width) : 0;
+        auto max_width = computed_values.max_width().is_length() ? computed_values.max_width().to_px(containing_block_width) : CSSPixels::max();
+
+        if (computed_values.box_sizing() == CSS::BoxSizing::BorderBox) {
+            min_width -= cell_intrinsic_width_offsets;
+            width -= cell_intrinsic_width_offsets;
+            max_width -= cell_intrinsic_width_offsets;
+        }
+
+        CSSPixels min_content_width;
+        CSSPixels max_content_width;
+
+        // https://drafts.csswg.org/css-tables-3/#computing-column-measures
+        // For the purpose of measuring a column when laid out in fixed mode [...] the min-content and max-content width
+        // of cells is considered zero unless they are directly specified as a length-percentage, in which case they are
+        // resolved based on the table width (if it is definite, otherwise use 0).
+        if (use_fixed_mode_layout()) {
+            if (computed_values.width().is_length_percentage()) {
+                min_content_width = width;
+                max_content_width = width;
+            }
+        } else {
+            min_content_width = calculate_min_content_width(cell.box);
+            max_content_width = calculate_max_content_width(cell.box);
+        }
 
         // The outer min-content width of a table-cell is max(min-width, min-content width) adjusted by the cell intrinsic offsets.
-        auto min_width = computed_values.min_width().to_px(containing_block_width);
-        auto cell_intrinsic_width_offsets = padding_left + padding_right + border_left + border_right;
-        // For fixed mode, according to https://www.w3.org/TR/css-tables-3/#computing-column-measures:
-        // The min-content and max-content width of cells is considered zero unless they are directly specified as a length-percentage,
-        // in which case they are resolved based on the table width (if it is definite, otherwise use 0).
-        auto width_is_specified_length_or_percentage = computed_values.width().is_length() || computed_values.width().is_percentage();
-        if (!use_fixed_mode_layout() || width_is_specified_length_or_percentage) {
-            cell.outer_min_width = max(min_width, min_content_width) + cell_intrinsic_width_offsets;
-        }
+        cell.outer_min_width = max(min_width, min_content_width) + cell_intrinsic_width_offsets;
 
         if (row_measurement == RowMeasurement::Include) {
             auto min_content_height = calculate_min_content_height(cell.box, max_content_width);
@@ -205,16 +223,14 @@ void TableFormattingContext::compute_cell_measures(RowMeasurement row_measuremen
         }
 
         // See the explanation for height and max_height above.
-        auto width = computed_values.width().is_length() ? computed_values.width().to_px(containing_block_width) : 0;
-        auto max_width = computed_values.max_width().is_length() ? computed_values.max_width().to_px(containing_block_width) : CSSPixels::max();
-        if (use_fixed_mode_layout() && !width_is_specified_length_or_percentage) {
-            continue;
-        }
         if (m_columns[cell.column_index].is_constrained) {
             // The outer max-content width of a table-cell in a constrained column is
             // max(min-width, width, min-content width, min(max-width, width)) adjusted by the cell intrinsic offsets.
-            // NB: min(max-width, width) doesn't have any effect here, we can simplify the expression to max(min-width, width, min-content width).
-            cell.outer_max_width = max(min_width, max(width, min_content_width)) + cell_intrinsic_width_offsets;
+
+            // AD-HOC: The formula defined by the spec doesn't respect max-width. We use a different formula that
+            //         matches the behavior that is expected by WPT and is implemented by other browsers.
+            // FIXME: Open a spec issue about this.
+            cell.outer_max_width = max(min_width, min(max_width, max(width, min_content_width))) + cell_intrinsic_width_offsets;
         } else {
             // The outer max-content width of a table-cell in a non-constrained column is
             // max(min-width, width, min-content width, min(max-width, max-content width)) adjusted by the cell intrinsic offsets.
@@ -1032,7 +1048,7 @@ void TableFormattingContext::compute_table_height()
         // - the horizontal/vertical border-spacing times the amount of spanned visible columns/rows minus one
         // FIXME: Account for visibility.
         cell_state.set_content_width(span_width - cell_state.border_box_left() - cell_state.border_box_right() + (cell.column_span - 1) * border_spacing_horizontal());
-        if (auto independent_formatting_context = layout_inside(cell.box, m_layout_mode, cell_state.available_inner_space_or_constraints_from(*m_available_space))) {
+        if (auto independent_formatting_context = layout_inside(cell.box, m_layout_mode, LayoutInput { cell_state.available_inner_space_or_constraints_from(*m_available_space) })) {
             cell_state.set_content_height(independent_formatting_context->automatic_content_height());
             independent_formatting_context->parent_context_did_dimension_child_root_box();
         }
@@ -1128,7 +1144,7 @@ void TableFormattingContext::compute_table_height()
         }
 
         cell_state.set_content_width(span_width - cell_state.border_box_left() - cell_state.border_box_right() + (cell.column_span - 1) * border_spacing_horizontal());
-        if (auto independent_formatting_context = layout_inside(cell.box, m_layout_mode, cell_state.available_inner_space_or_constraints_from(*m_available_space))) {
+        if (auto independent_formatting_context = layout_inside(cell.box, m_layout_mode, LayoutInput { cell_state.available_inner_space_or_constraints_from(*m_available_space) })) {
             independent_formatting_context->parent_context_did_dimension_child_root_box();
         }
 
@@ -1776,8 +1792,9 @@ void TableFormattingContext::finish_grid_initialization(TableGrid const& table_g
     }
 }
 
-void TableFormattingContext::run_until_width_calculation(AvailableSpace const& available_space, RowMeasurement row_measurement)
+void TableFormattingContext::run_until_width_calculation(LayoutInput const& layout_input, RowMeasurement row_measurement)
 {
+    auto const& available_space = layout_input.available_space;
     m_available_space = available_space;
 
     // Determine the number of rows/columns the table requires.
@@ -1833,12 +1850,13 @@ void TableFormattingContext::parent_context_did_dimension_child_root_box()
     layout_absolutely_positioned_children();
 }
 
-void TableFormattingContext::run(AvailableSpace const& available_space)
+void TableFormattingContext::run(LayoutInput const& layout_input)
 {
+    auto const& available_space = layout_input.available_space;
     FORMATTING_CONTEXT_TRACE();
     m_available_space = available_space;
 
-    run_until_width_calculation(available_space);
+    run_until_width_calculation(layout_input);
 
     if (available_space.width.is_intrinsic_sizing_constraint() && !available_space.height.is_intrinsic_sizing_constraint()) {
         return;
@@ -1860,6 +1878,9 @@ void TableFormattingContext::run(AvailableSpace const& available_space)
 
     position_row_boxes();
     position_cell_boxes();
+
+    for (auto& cell : m_cells)
+        layout_absolutely_positioned_children(cell.box);
 
     m_state.get_mutable(table_box()).set_content_height(m_table_height);
 

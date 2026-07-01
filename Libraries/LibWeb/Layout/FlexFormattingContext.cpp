@@ -61,8 +61,9 @@ CSSPixels FlexFormattingContext::automatic_content_height() const
     return m_flex_container_state.content_height();
 }
 
-void FlexFormattingContext::run(AvailableSpace const& available_space)
+void FlexFormattingContext::run(LayoutInput const& layout_input)
 {
+    auto const& available_space = layout_input.available_space;
     // This implements https://www.w3.org/TR/css-flexbox-1/#layout-algorithm
 
     // OPTIMIZATION: If we're in intrinsic sizing layout, but the flex container is not the
@@ -238,7 +239,8 @@ void FlexFormattingContext::run(AvailableSpace const& available_space)
         // AD-HOC: Finally, layout the inside of all flex items.
         copy_dimensions_from_flex_items_to_boxes();
         for (auto& item : m_flex_items) {
-            if (auto independent_formatting_context = layout_inside(item.box, LayoutMode::Normal, item.used_values.available_inner_space_or_constraints_from(m_available_space_for_items->space)))
+            auto item_layout_input = LayoutInput { item.used_values.available_inner_space_or_constraints_from(m_available_space_for_items->space) };
+            if (auto independent_formatting_context = layout_inside(item.box, LayoutMode::Normal, item_layout_input))
                 independent_formatting_context->parent_context_did_dimension_child_root_box();
 
             compute_inset(item.box, content_box_rect(m_flex_container_state).size());
@@ -486,6 +488,24 @@ CSSPixels FlexFormattingContext::specified_cross_max_size(FlexItem const& item) 
     return cross_axis_is_horizontal()
         ? get_pixel_width(item, computed_cross_max_size(item.box))
         : get_pixel_height(item, computed_cross_max_size(item.box));
+}
+
+CSSPixels FlexFormattingContext::specified_main_max_size_for_intrinsic_contribution(FlexItem const& item, AvailableSize const& available_size) const
+{
+    auto const& computed_max_size = computed_main_max_size(item.box);
+    if (should_treat_main_max_size_as_none(item.box))
+        return CSSPixels::max();
+
+    if (computed_max_size.contains_percentage()) {
+        // If the box is replaced, a cyclic percentage in the value of any max size property is resolved against
+        // zero when calculating the min-content contribution in the corresponding axis.
+        if (item.box.is_replaced_box() && available_size.is_min_content())
+            return 0;
+
+        return CSSPixels::max();
+    }
+
+    return specified_main_max_size(item);
 }
 
 bool FlexFormattingContext::is_cross_auto(Box const& box) const
@@ -2018,10 +2038,10 @@ CSSPixels FlexFormattingContext::calculate_intrinsic_main_size_of_flex_container
                 auto result = item.flex_base_size + CSSPixels::nearest_value_for(product);
 
                 auto const& computed_min_size = this->computed_main_min_size(item.box);
-                auto const& computed_max_size = this->computed_main_max_size(item.box);
 
                 auto clamp_min = (!computed_min_size.is_auto() && !computed_min_size.contains_percentage()) ? specified_main_min_size(item) : automatic_minimum_size(item);
-                auto clamp_max = (!should_treat_main_max_size_as_none(item.box) && !computed_max_size.contains_percentage()) ? specified_main_max_size(item) : CSSPixels::max();
+                auto clamp_max = specified_main_max_size_for_intrinsic_contribution(
+                    item, m_available_space_for_items->main);
 
                 result = css_clamp(result, clamp_min, clamp_max);
 
@@ -2127,7 +2147,7 @@ CSSPixels FlexFormattingContext::calculate_main_min_content_contribution(FlexIte
     }();
 
     auto clamp_min = has_main_min_size(item.box) ? specified_main_min_size(item) : automatic_minimum_size(item);
-    auto clamp_max = has_main_max_size(item.box) ? specified_main_max_size(item) : CSSPixels::max();
+    auto clamp_max = specified_main_max_size_for_intrinsic_contribution(item, AvailableSize::make_min_content());
     auto clamped_inner_size = css_clamp(larger_size, clamp_min, clamp_max);
 
     return item.add_main_margin_box_sizes(clamped_inner_size);
@@ -2148,7 +2168,7 @@ CSSPixels FlexFormattingContext::calculate_main_max_content_contribution(FlexIte
     }();
 
     auto clamp_min = has_main_min_size(item.box) ? specified_main_min_size(item) : automatic_minimum_size(item);
-    auto clamp_max = has_main_max_size(item.box) ? specified_main_max_size(item) : CSSPixels::max();
+    auto clamp_max = specified_main_max_size_for_intrinsic_contribution(item, AvailableSize::make_max_content());
     auto clamped_inner_size = css_clamp(larger_size, clamp_min, clamp_max);
 
     return item.add_main_margin_box_sizes(clamped_inner_size);

@@ -619,11 +619,13 @@ set(SOURCES
     HTML/HTMLUListElement.cpp
     HTML/HTMLUnknownElement.cpp
     HTML/HTMLVideoElement.cpp
+    HTML/HyperlinkElementUtils.cpp
     HTML/ImageBitmap.cpp
     HTML/ImageData.cpp
     HTML/ImageRequest.cpp
     HTML/ListOfAvailableImages.cpp
     HTML/LocalNavigable.cpp
+    HTML/LocalTraversableNavigable.cpp
     HTML/Location.cpp
     HTML/MediaError.cpp
     HTML/MediaTrackBase.cpp
@@ -632,6 +634,7 @@ set(SOURCES
     HTML/MessagePort.cpp
     HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
+    HTML/Navigable.cpp
     HTML/NavigableContainer.cpp
     HTML/NavigateEvent.cpp
     HTML/Navigation.cpp
@@ -717,7 +720,6 @@ set(SOURCES
     HTML/ToggleEvent.cpp
     HTML/TokenizedFeatures.cpp
     HTML/TrackEvent.cpp
-    HTML/TraversableNavigable.cpp
     HTML/UniversalGlobalScope.cpp
     HTML/UserActivation.cpp
     HTML/UserNavigationInvolvement.cpp
@@ -827,6 +829,7 @@ set(SOURCES
     Loader/ProxyMappings.cpp
     Loader/ResourceLoader.cpp
     MathML/AttributeNames.cpp
+    MathML/MathMLAnchorElement.cpp
     MathML/MathMLElement.cpp
     MathML/MathMLMiElement.cpp
     MathML/MathMLMspaceElement.cpp
@@ -911,7 +914,6 @@ set(SOURCES
     Painting/SVGPathPaintable.cpp
     Painting/SVGSVGPaintable.cpp
     Painting/TableBordersPainting.cpp
-    Painting/TextPaintable.cpp
     Painting/VideoPaintable.cpp
     Painting/ViewportPaintable.cpp
     PerformanceTimeline/EntryTypes.cpp

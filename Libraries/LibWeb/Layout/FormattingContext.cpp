@@ -346,7 +346,7 @@ struct ReplacedFormattingContext : public FormattingContext {
     }
     virtual CSSPixels automatic_content_width() const override { return 0; }
     virtual CSSPixels automatic_content_height() const override { return 0; }
-    virtual void run(AvailableSpace const&) override { }
+    virtual void run(LayoutInput const&) override { }
 };
 
 // FIXME: This is a hack. Get rid of it.
@@ -357,7 +357,7 @@ struct DummyFormattingContext : public FormattingContext {
     }
     virtual CSSPixels automatic_content_width() const override { return 0; }
     virtual CSSPixels automatic_content_height() const override { return 0; }
-    virtual void run(AvailableSpace const&) override { }
+    virtual void run(LayoutInput const&) override { }
 };
 
 OwnPtr<FormattingContext> FormattingContext::create_independent_formatting_context_if_needed(LayoutState& state, LayoutMode layout_mode, Box const& child_box)
@@ -405,7 +405,7 @@ NonnullOwnPtr<FormattingContext> FormattingContext::create_independent_formattin
     return make<DummyFormattingContext>(state, layout_mode, child_box);
 }
 
-OwnPtr<FormattingContext> FormattingContext::layout_inside(Box const& child_box, LayoutMode layout_mode, AvailableSpace const& available_space)
+OwnPtr<FormattingContext> FormattingContext::layout_inside(Box const& child_box, LayoutMode layout_mode, LayoutInput const& layout_input)
 {
     {
         // OPTIMIZATION: If we're doing intrinsic sizing and `child_box` has definite size in both axes,
@@ -435,9 +435,9 @@ OwnPtr<FormattingContext> FormattingContext::layout_inside(Box const& child_box,
 
     auto independent_formatting_context = create_independent_formatting_context_if_needed(m_state, layout_mode, child_box);
     if (independent_formatting_context)
-        independent_formatting_context->run(available_space);
+        independent_formatting_context->run(layout_input);
     else
-        run(available_space);
+        run(layout_input);
 
     return independent_formatting_context;
 }
@@ -655,7 +655,7 @@ CSSPixels FormattingContext::compute_table_box_width_inside_table_wrapper(
 
     auto context = make<TableFormattingContext>(throwaway_state, LayoutMode::IntrinsicSizing, *table_box, this);
     context->run_until_width_calculation(
-        m_state.get(*table_box).available_inner_space_or_constraints_from(available_space),
+        LayoutInput { m_state.get(*table_box).available_inner_space_or_constraints_from(available_space) },
         TableFormattingContext::RowMeasurement::Skip);
 
     auto table_used_width = throwaway_state.get(*table_box).border_box_width();
@@ -689,7 +689,7 @@ CSSPixels FormattingContext::compute_table_box_height_inside_table_wrapper(Box c
 
     auto context = create_independent_formatting_context_if_needed(throwaway_state, LayoutMode::IntrinsicSizing, box);
     VERIFY(context);
-    context->run(m_state.get(box).available_inner_space_or_constraints_from(available_space));
+    context->run(LayoutInput { m_state.get(box).available_inner_space_or_constraints_from(available_space) });
 
     Optional<Box const&> table_box;
     box.for_each_in_subtree_of_type<Box>([&](Box const& child_box) {
@@ -1831,13 +1831,20 @@ void FormattingContext::resolve_anchor_insets(Box& box) const
 
 void FormattingContext::layout_absolutely_positioned_children()
 {
+    // TableFormattingContext handles cell abspos layout after vertical alignment.
+    if (context_box().display().is_table_cell())
+        return;
+    layout_absolutely_positioned_children(context_box());
+}
+
+void FormattingContext::layout_absolutely_positioned_children(Box const& box)
+{
     if (m_layout_mode != LayoutMode::Normal)
         return;
-    for (auto& child : context_box().contained_abspos_children()) {
+    for (auto& child : box.contained_abspos_children()) {
         if (!child)
             continue;
-        auto& box = as<Box>(*child);
-        layout_absolutely_positioned_element(box);
+        layout_absolutely_positioned_element(as<Box>(*child));
     }
 }
 
@@ -1908,7 +1915,7 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box)
             box_state.set_has_definite_height(true);
     }
 
-    auto independent_formatting_context = layout_inside(box, LayoutMode::Normal, box_state.available_inner_space_or_constraints_from(available_space));
+    auto independent_formatting_context = layout_inside(box, LayoutMode::Normal, LayoutInput { box_state.available_inner_space_or_constraints_from(available_space) });
 
     if (computed_values.height().is_auto()) {
         compute_height_for_absolutely_positioned_element(box, available_space, BeforeOrAfterInsideLayout::After);
@@ -2192,6 +2199,8 @@ CSSPixels FormattingContext::calculate_min_content_width(Layout::Box const& box)
         if (auto const& max_width = box.computed_values().max_width(); max_width.is_percentage())
             return max_width.to_px(0);
     }
+    if (auto transferred_width = calculate_transferred_width_for_replaced_element(box); transferred_width.has_value())
+        return transferred_width.value();
     if (auto auto_size = box.auto_content_box_size(); auto_size.has_width())
         return auto_size.width.value();
 
@@ -2217,16 +2226,45 @@ CSSPixels FormattingContext::calculate_min_content_width(Layout::Box const& box)
         ? AvailableSize::make_definite(box_state.content_height())
         : AvailableSize::make_indefinite();
 
-    context->run(AvailableSpace(available_width, available_height));
+    auto available_space = AvailableSpace(available_width, available_height);
+    context->run(LayoutInput { available_space });
 
     auto min_content_width = clamp_to_max_dimension_value(context->automatic_content_width());
     cache.emplace(min_content_width);
     return min_content_width;
 }
 
+// https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes
+// "size constraints in the opposite dimension will transfer through and can affect the auto size in the considered one"
+Optional<CSSPixels> FormattingContext::calculate_transferred_width_for_replaced_element(Layout::Box const& box) const
+{
+    if (!box.is_replaced_box() || !box.has_preferred_aspect_ratio())
+        return {};
+
+    // https://drafts.csswg.org/css2/#inline-replaced-width
+    // "'width' has a computed value of 'auto', 'height' has some other computed value, and the element does have an intrinsic ratio"
+    if (!box.computed_values().width().is_auto())
+        return {};
+
+    auto const& computed_height = box.computed_values().height();
+    if (computed_height.is_auto() || computed_height.is_intrinsic_sizing_constraint())
+        return {};
+
+    auto available_space = m_state.get(box).available_inner_space_or_constraints_from(
+        AvailableSpace(AvailableSize::make_max_content(), AvailableSize::make_indefinite()));
+    if (should_treat_height_as_auto(box, available_space))
+        return {};
+
+    // https://drafts.csswg.org/css2/#inline-replaced-width
+    // "(used height) * (intrinsic ratio)"
+    return compute_width_for_replaced_element(box, available_space);
+}
+
 CSSPixels FormattingContext::calculate_max_content_width(Layout::Box const& box) const
 {
     auto auto_size = box.auto_content_box_size();
+    if (auto transferred_width = calculate_transferred_width_for_replaced_element(box); transferred_width.has_value())
+        return transferred_width.value();
     if (!auto_size.has_width()) {
         // https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution
         // "If the box is non-replaced, then the entire value of any max size property or preferred size property
@@ -2285,7 +2323,8 @@ CSSPixels FormattingContext::calculate_max_content_width(Layout::Box const& box)
         ? AvailableSize::make_definite(box_state.content_height())
         : AvailableSize::make_indefinite();
 
-    context->run(AvailableSpace(available_width, available_height));
+    auto available_space = AvailableSpace(available_width, available_height);
+    context->run(LayoutInput { available_space });
 
     auto max_content_width = clamp_to_max_dimension_value(context->automatic_content_width());
     cache.emplace(max_content_width);
@@ -2323,7 +2362,8 @@ CSSPixels FormattingContext::calculate_min_content_height(Layout::Box const& box
 
     auto context = const_cast<FormattingContext*>(this)->create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box);
 
-    context->run(AvailableSpace(AvailableSize::make_definite(width), AvailableSize::make_min_content()));
+    auto available_space = AvailableSpace(AvailableSize::make_definite(width), AvailableSize::make_min_content());
+    context->run(LayoutInput { available_space });
 
     auto min_content_height = clamp_to_max_dimension_value(context->automatic_content_height());
     cache.emplace(min_content_height);
@@ -2358,7 +2398,8 @@ CSSPixels FormattingContext::calculate_max_content_height(Layout::Box const& box
 
     auto context = const_cast<FormattingContext*>(this)->create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box);
 
-    context->run(AvailableSpace(AvailableSize::make_definite(width), AvailableSize::make_max_content()));
+    auto available_space = AvailableSpace(AvailableSize::make_definite(width), AvailableSize::make_max_content());
+    context->run(LayoutInput { available_space });
 
     auto max_content_height = clamp_to_max_dimension_value(context->automatic_content_height());
     cache_slot.emplace(max_content_height);
@@ -2623,15 +2664,6 @@ bool FormattingContext::can_skip_is_anonymous_text_run(Box& box)
             return true;
     }
     return false;
-}
-
-CSSPixelRect FormattingContext::absolute_content_rect(Box const& box) const
-{
-    auto const& box_state = m_state.get(box);
-    CSSPixelRect rect { box_state.offset, box_state.content_size() };
-    for (auto* block = box_state.containing_block_used_values(); block; block = block->containing_block_used_values())
-        rect.translate_by(block->offset);
-    return rect;
 }
 
 Box const* FormattingContext::box_child_to_derive_baseline_from(Box const& box, BaselineSet baseline_set) const

@@ -153,6 +153,7 @@
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/ListOfAvailableImages.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Location.h>
 #include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
@@ -173,7 +174,6 @@
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/StorageEvent.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/Performance.h>
@@ -184,6 +184,8 @@
 #include <LibWeb/Layout/BlockFormattingContext.h>
 #include <LibWeb/Layout/SVGFormattingContext.h>
 #include <LibWeb/Layout/SVGSVGBox.h>
+#include <LibWeb/Layout/TextNode.h>
+#include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
@@ -573,7 +575,13 @@ Document::Document(JS::Realm& realm, URL::URL const& url)
             return;
 
         auto node = cursor_position->node();
-        if (node->unsafe_paintable()) {
+        if (auto* text = as_if<DOM::Text>(*node)) {
+            auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node());
+            if (!layout_text_node)
+                return;
+            m_cursor_blink_state = !m_cursor_blink_state;
+            layout_text_node->set_needs_repaint();
+        } else if (node->unsafe_paintable()) {
             m_cursor_blink_state = !m_cursor_blink_state;
             node->set_needs_repaint();
         }
@@ -1674,7 +1682,8 @@ static void relayout_svg_root(Layout::SVGSVGBox& svg_root)
     auto content_height = svg_state.content_height();
 
     Layout::SVGFormattingContext svg_context(layout_state, Layout::LayoutMode::Normal, svg_root, nullptr);
-    svg_context.run(Layout::AvailableSpace(Layout::AvailableSize::make_definite(content_width), Layout::AvailableSize::make_definite(content_height)));
+    auto available_space = Layout::AvailableSpace(Layout::AvailableSize::make_definite(content_width), Layout::AvailableSize::make_definite(content_height));
+    svg_context.run(Layout::LayoutInput { available_space });
     layout_state.commit(svg_root);
 
     svg_root.for_each_in_inclusive_subtree([](auto& node) {
@@ -1903,10 +1912,10 @@ void Document::update_layout(UpdateLayoutReason reason)
                 auto content_height = layout_state.get(*svg_root.containing_block()).content_height();
                 layout_state.get_mutable(svg_root).set_content_height(content_height);
                 Layout::SVGFormattingContext svg_formatting_context(layout_state, Layout::LayoutMode::Normal, svg_root, nullptr);
-                svg_formatting_context.run(available_space);
+                svg_formatting_context.run(Layout::LayoutInput { available_space });
             } else {
                 Layout::BlockFormattingContext root_formatting_context(layout_state, Layout::LayoutMode::Normal, *m_layout_root, nullptr);
-                root_formatting_context.run(available_space);
+                root_formatting_context.run(Layout::LayoutInput { available_space });
             }
         }
 
@@ -3697,11 +3706,13 @@ void Document::flush_autofocus_candidates()
         // 7. Let inclusiveAncestorDocuments be a list consisting of the active document of doc's inclusive ancestor navigables.
         GC::RootVector<GC::Ref<Document>> inclusive_ancestor_documents;
         inclusive_ancestor_documents.append(doc);
-        auto ancestor_navigable = doc_navigable->parent();
+        auto parent_navigable = doc_navigable->parent();
+        auto* ancestor_navigable = parent_navigable ? &as<HTML::LocalNavigable>(*parent_navigable) : nullptr;
         while (ancestor_navigable) {
             if (auto active = ancestor_navigable->active_document())
                 inclusive_ancestor_documents.append(*active);
-            ancestor_navigable = ancestor_navigable->parent();
+            parent_navigable = ancestor_navigable->parent();
+            ancestor_navigable = parent_navigable ? &as<HTML::LocalNavigable>(*parent_navigable) : nullptr;
         }
 
         // 8. If any Document in inclusiveAncestorDocuments has non-null target element, then continue.
@@ -5258,7 +5269,7 @@ Vector<GC::Root<HTML::LocalNavigable>> Document::inclusive_descendant_navigables
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#ancestor-navigables
-Vector<GC::Root<HTML::LocalNavigable>> Document::ancestor_navigables()
+GC::RootVector<GC::Ref<HTML::Navigable>> Document::ancestor_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
@@ -5272,7 +5283,7 @@ Vector<GC::Root<HTML::LocalNavigable>> Document::ancestor_navigables()
     auto navigable = document_node_navigable->parent();
 
     // 2. Let ancestors be an empty list.
-    Vector<GC::Root<HTML::LocalNavigable>> ancestors;
+    GC::RootVector<GC::Ref<HTML::Navigable>> ancestors;
 
     // 3. While navigable is not null:
     while (navigable) {
@@ -5287,13 +5298,13 @@ Vector<GC::Root<HTML::LocalNavigable>> Document::ancestor_navigables()
     return ancestors;
 }
 
-Vector<GC::Root<HTML::LocalNavigable>> const Document::ancestor_navigables() const
+GC::RootVector<GC::Ref<HTML::Navigable>> const Document::ancestor_navigables() const
 {
     return const_cast<Document&>(*this).ancestor_navigables();
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#inclusive-ancestor-navigables
-Vector<GC::Root<HTML::LocalNavigable>> Document::inclusive_ancestor_navigables()
+GC::RootVector<GC::Ref<HTML::Navigable>> Document::inclusive_ancestor_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
@@ -8210,7 +8221,7 @@ GC::Ref<WebIDL::Promise> Document::exit_fullscreen()
     auto docs = collect_documents_to_unfullscreen();
 
     // 5. Let topLevelDoc be doc’s node navigable’s top-level traversable’s active document.
-    auto top_level_doc = navigable()->top_level_traversable()->active_document();
+    auto top_level_doc = as<HTML::LocalTraversableNavigable>(*navigable()->top_level_traversable()).active_document();
 
     // 6. If topLevelDoc is in docs, and it is a simple fullscreen document, then set doc to topLevelDoc and resize to true.
     GC::Ref<Document> doc { *this };
@@ -8439,24 +8450,18 @@ Optional<CSSPixelRect> Document::current_caret_rect()
         return navigable->to_top_level_rect(viewport_rect);
     };
 
-    // Walk up to the nearest PaintableWithLines, which is where text fragments live.
-    Painting::PaintableWithLines const* paintable_with_lines = nullptr;
-    for (auto paintable = layout_node->first_paintable(); paintable; paintable = paintable->parent()) {
-        if (auto const* with_lines = as_if<Painting::PaintableWithLines>(*paintable)) {
-            paintable_with_lines = with_lines;
-            break;
-        }
-    }
-
-    if (paintable_with_lines) {
-        for (auto const& fragment : paintable_with_lines->fragments()) {
-            if (fragment.layout_node().dom_node() != &dom_node)
-                continue;
-            auto const offset = position->offset();
+    if (auto* text = as_if<DOM::Text>(dom_node)) {
+        Optional<CSSPixelRect> caret_rect;
+        auto const offset = position->offset();
+        Layout::TextOffsetMapping mapping { *text };
+        mapping.for_each_paintable_fragment([&](Painting::PaintableFragment const& fragment) {
             if (offset < fragment.dom_start_offset_in_node() || offset > fragment.dom_end_offset_in_node())
-                continue;
-            return to_viewport_rect(fragment.range_rect(Painting::Paintable::SelectionState::StartAndEnd, offset, offset));
-        }
+                return TraversalDecision::Continue;
+            caret_rect = fragment.range_rect(Painting::Paintable::SelectionState::StartAndEnd, offset, offset);
+            return TraversalDecision::Break;
+        });
+        if (caret_rect.has_value())
+            return to_viewport_rect(*caret_rect);
     }
 
     // Empty editable elements have no fragments; fall back to the padding-box corner.
@@ -8481,8 +8486,18 @@ void Document::reset_cursor_blink_cycle()
 
 void Document::set_cursor_position_needs_repaint()
 {
-    if (auto position = cursor_position())
-        position->node()->set_needs_repaint();
+    auto position = cursor_position();
+    if (!position)
+        return;
+
+    auto node = position->node();
+    if (auto* text = as_if<DOM::Text>(*node)) {
+        if (auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node()))
+            layout_text_node->set_needs_repaint();
+        return;
+    }
+
+    node->set_needs_repaint();
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#doc-container-document
