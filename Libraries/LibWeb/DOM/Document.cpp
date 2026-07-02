@@ -3604,6 +3604,8 @@ void Document::set_focused_area(GC::Ptr<Node> node)
 
     set_needs_repaint();
 
+    page().client().page_did_change_focused_editable_element();
+
     // Scroll the viewport if necessary to make the newly focused element visible.
     if (new_focused_element) {
         new_focused_element->queue_an_element_task(HTML::Task::Source::UserInteraction, [new_focused_element] {

@@ -472,6 +472,7 @@ public:
         VERIFY_NOT_REACHED();
     }
     virtual void request_frame() = 0;
+    virtual void page_did_change_focused_editable_element() { }
     virtual void page_did_change_title(Utf16String const&) { }
     virtual void page_did_change_url(URL::URL const&) { }
     virtual void page_did_request_refresh() { }

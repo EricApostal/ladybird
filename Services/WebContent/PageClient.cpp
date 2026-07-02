@@ -390,6 +390,16 @@ void PageClient::set_maximum_frames_per_second(double maximum_frames_per_second)
     m_maximum_frames_per_second = maximum_frames_per_second;
 }
 
+void PageClient::page_did_change_focused_editable_element()
+{
+    Optional<Web::DevicePixelRect> caret_rect;
+    if (auto document = page().focused_navigable().active_document()) {
+        if (auto rect = document->current_caret_rect(); rect.has_value())
+            caret_rect = page().enclosing_device_rect(*rect);
+    }
+    client().async_did_update_input_caret_rect(m_id, caret_rect);
+}
+
 void PageClient::page_did_request_cursor_change(Gfx::Cursor const& cursor)
 {
     client().async_did_request_cursor_change(m_id, cursor);

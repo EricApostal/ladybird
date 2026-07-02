@@ -1661,8 +1661,11 @@ void WebContentClient::did_finish_handling_input_event(u64 page_id, Web::EventRe
 
 void WebContentClient::did_update_input_caret_rect(u64 page_id, Optional<Web::DevicePixelRect> rect)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value())
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
         view->set_input_caret_rect({ }, rect);
+        if (view->on_input_caret_rect_change)
+            view->on_input_caret_rect_change(rect);
+    }
 }
 
 void WebContentClient::did_change_theme_color(u64 page_id, Gfx::Color color)
