@@ -36,7 +36,12 @@ public:
         Yes,
     };
 
+// iOS doesn't like 64gb here so we shall fall back
+#if defined(AK_OS_IOS)
+    static constexpr size_t default_cage_size = 4ull * GiB;
+#else
     static constexpr size_t default_cage_size = 64ull * GiB;
+#endif
     static_assert(is_power_of_two(default_cage_size));
     static constexpr size_t cage_offset_mask = default_cage_size - 1;
     static constexpr size_t invalid_offset = NumericLimits<size_t>::max();
