@@ -46,10 +46,26 @@ void CompositorConnection::destroy_context(Web::Compositor::CompositorContextId 
     async_destroy_context(context_id);
 }
 
-void CompositorConnection::update_display_list(Web::Compositor::CompositorContextId context_id, NonnullRefPtr<Web::Painting::DisplayList> const& display_list, Web::Painting::AccumulatedVisualContextTree const& visual_context_tree, Web::Painting::DisplayListResourceTransaction const& resource_transaction, Web::Painting::ScrollStateSnapshot const& scroll_state_snapshot)
+static constexpr size_t max_image_frames_per_message = 100;
+
+void CompositorConnection::update_display_list(Web::Compositor::CompositorContextId context_id, NonnullRefPtr<Web::Painting::DisplayList> const& display_list, Web::Painting::AccumulatedVisualContextTree const& visual_context_tree, Web::Painting::DisplayListResourceTransaction resource_transaction, Web::Painting::ScrollStateSnapshot const& scroll_state_snapshot)
 {
     if (!can_send_message_to_compositor())
         return;
+
+    auto image_frames = move(resource_transaction.image_frames);
+    for (size_t start = 0; start < image_frames.size(); start += max_image_frames_per_message) {
+        auto count = min(max_image_frames_per_message, image_frames.size() - start);
+        Vector<Web::Painting::DisplayListImageFrameResource> batch;
+        batch.ensure_capacity(count);
+        for (size_t i = 0; i < count; ++i)
+            batch.unchecked_append(move(image_frames[start + i]));
+        auto encoded_batch = MUST(Messages::CompositorWebContentServer::UpdateImageFrameResources::static_encode(context_id, batch));
+        if (post_message(encoded_batch).is_error()) {
+            did_lose_compositor();
+            return;
+        }
+    }
 
     auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateDisplayList::static_encode(context_id, display_list, visual_context_tree, resource_transaction, scroll_state_snapshot));
     if (post_message(encoded_message).is_error())
@@ -239,12 +255,13 @@ Web::WebGL::ReadPixelsResult CompositorConnection::read_webgl_pixels(Web::Painti
     };
 }
 
-void CompositorConnection::read_webgl_buffer_sub_data(Web::Painting::CanvasId canvas_id, Web::WebGL::GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer const& data)
+bool CompositorConnection::read_webgl_buffer_sub_data(Web::Painting::CanvasId canvas_id, Web::WebGL::GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer const& data)
 {
     if (!can_send_message_to_compositor())
-        return;
+        return false;
 
-    (void)send_sync<Messages::CompositorWebContentServer::WebglReadBufferSubData>(canvas_id, target, offset, size, data);
+    auto response = send_sync<Messages::CompositorWebContentServer::WebglReadBufferSubData>(canvas_id, target, offset, size, data);
+    return response->success();
 }
 
 void CompositorConnection::request_screenshot(Web::Compositor::CompositorContextId context_id, NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)

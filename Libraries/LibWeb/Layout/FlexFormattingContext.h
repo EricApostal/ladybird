@@ -139,7 +139,6 @@ private:
     CSSPixels specified_cross_max_size(FlexItem const&) const;
     CSSPixels specified_main_max_size_for_intrinsic_contribution(FlexItem const&,
         AvailableSize const&) const;
-    bool is_cross_auto(Box const&) const;
     CSSPixels specified_main_min_size(FlexItem const&) const;
     CSSPixels specified_cross_min_size(FlexItem const&) const;
     CSSPixels calculate_inner_flex_container_cross_min_size() const;
@@ -255,6 +254,9 @@ private:
     };
     Optional<AxisAgnosticAvailableSpace> m_available_space_for_items;
     Optional<AvailableSpace> m_available_space;
+    Optional<LayoutInput> m_layout_input;
+    ContainingBlockConstraints m_item_percentage_bases;
+    ContainingBlockConstraints item_containing_block_constraints() const;
 };
 
 }

@@ -50,6 +50,7 @@
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
+#include <LibWeb/CSS/UpdateStyle.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Attr.h>
@@ -59,6 +60,7 @@
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
+#include <LibWeb/DOM/SelectorQuery.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Geometry/DOMRect.h>
@@ -986,6 +988,15 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
 
     auto& style_computer = document().style_computer();
 
+    auto did_push_ancestors = false;
+    auto push_ancestors_if_needed = [&] {
+        if (did_push_ancestors)
+            return;
+        for (auto const* ancestor = this; ancestor; ancestor = ancestor->parent_or_shadow_host_element())
+            style_computer.push_ancestor(*ancestor);
+        did_push_ancestors = true;
+    };
+
     // Any document change that can cause this element's style to change, could also affect its pseudo-elements.
     auto recompute_pseudo_element_style = [&](CSS::PseudoElement pseudo_element, bool has_implicit_style = false) {
         auto pseudo_element_style = computed_properties(pseudo_element);
@@ -996,7 +1007,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
         if (!should_recompute)
             return;
 
-        style_computer.push_ancestor(*this);
+        push_ancestors_if_needed();
 
         auto new_pseudo_element_style = style_computer.compute_pseudo_element_style_if_needed({ *this, pseudo_element }, did_change_custom_properties);
 
@@ -1009,7 +1020,6 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
         }
 
         set_computed_properties(pseudo_element, move(new_pseudo_element_style));
-        style_computer.pop_ancestor(*this);
     };
 
     recompute_pseudo_element_style(CSS::PseudoElement::Before);
@@ -1020,6 +1030,11 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
         recompute_pseudo_element_style(CSS::PseudoElement::Backdrop);
     if (had_list_marker || m_computed_properties->display().is_list_item())
         recompute_pseudo_element_style(CSS::PseudoElement::Marker, true);
+
+    if (did_push_ancestors) {
+        for (auto const* ancestor = this; ancestor; ancestor = ancestor->parent_or_shadow_host_element())
+            style_computer.pop_ancestor(*ancestor);
+    }
 
     return invalidation;
 }
@@ -1370,14 +1385,14 @@ GC::Ptr<ShadowRoot> Element::shadow_root_for_bindings() const
 WebIDL::ExceptionOr<bool> Element::matches(StringView selectors) const
 {
     // 1. Let s be the result of parse a selector from selectors.
-    auto const& maybe_selectors = document().parse_or_cache_selector_list(selectors);
+    auto query = document().selector_query_for(selectors);
 
     // 2. If s is failure, then throw a "SyntaxError" DOMException.
-    if (!maybe_selectors.has_value())
+    if (!query)
         return WebIDL::SyntaxError::create(realm(), "Failed to parse selector"_utf16);
 
     // 3. If the result of match a selector against an element, using s, this, and scoping root this, returns success, then return true; otherwise, return false.
-    for (auto const& s : maybe_selectors.value()) {
+    for (auto const& s : query->selectors()) {
         SelectorEngine::MatchContext context;
         if (SelectorEngine::matches(s, *this, nullptr, context, static_cast<ParentNode const*>(this)))
             return true;
@@ -1389,10 +1404,10 @@ WebIDL::ExceptionOr<bool> Element::matches(StringView selectors) const
 WebIDL::ExceptionOr<DOM::Element const*> Element::closest(StringView selectors) const
 {
     // 1. Let s be the result of parse a selector from selectors.
-    auto const& maybe_selectors = document().parse_or_cache_selector_list(selectors);
+    auto query = document().selector_query_for(selectors);
 
     // 2. If s is failure, then throw a "SyntaxError" DOMException.
-    if (!maybe_selectors.has_value())
+    if (!query)
         return WebIDL::SyntaxError::create(realm(), "Failed to parse selector"_utf16);
 
     auto matches_selectors = [this](CSS::SelectorList const& selector_list, Element const* element) {
@@ -1405,7 +1420,7 @@ WebIDL::ExceptionOr<DOM::Element const*> Element::closest(StringView selectors) 
         return false;
     };
 
-    auto const& selector_list = maybe_selectors.value();
+    auto const& selector_list = query->selectors();
 
     // 3. Let elements be this’s inclusive ancestors that are elements, in reverse tree order.
     for (auto* element = this; element; element = element->parent_element()) {
@@ -2597,7 +2612,7 @@ WebIDL::ExceptionOr<void> Element::set_outer_html(TrustedTypes::TrustedHTMLOrStr
     auto fragment = TRY(as<Element>(*parent).parse_fragment(compliant_string.to_utf8_but_should_be_ported_to_utf16()));
 
     // 6. Replace this with fragment within this's parent.
-    TRY(parent->replace_child(fragment, *this));
+    TRY(this->parent()->replace_child(fragment, *this));
 
     return {};
 }

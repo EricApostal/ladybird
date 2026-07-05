@@ -226,6 +226,7 @@ private:
     virtual WebView::StorageSetResult page_did_set_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, String const& bottle_key, String const& value) override;
     virtual void page_did_remove_storage_item(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, String const& bottle_key) override;
     virtual Vector<String> page_did_request_storage_keys(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key) override;
+    virtual u64 page_did_request_storage_usage(String const& storage_key) override;
     virtual void page_did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key) override;
     virtual void page_did_broadcast_storage_change(Web::StorageAPI::StorageEndpointType storage_endpoint, String const& url, Optional<String> const& key, Optional<String> const& old_value, Optional<String> const& new_value) override;
     virtual void page_did_update_indexed_database(String const& url, Web::IndexedDB::TransactionChanges const&) override;
@@ -234,7 +235,6 @@ private:
     virtual void page_did_request_activate_tab() override;
     virtual void page_did_close_top_level_traversable() override;
     virtual void page_did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
-    virtual void page_did_update_navigation_buttons_state(bool back_enabled, bool forward_enabled) override;
     virtual bool should_report_session_history_updates() const override;
     virtual void page_did_update_session_history(Vector<Web::HTML::SessionHistoryEntryDescriptor> const&, Vector<i32> const& used_steps, size_t current_used_step_index) override;
     virtual String page_did_request_ui_process_session_history_for_testing() override;

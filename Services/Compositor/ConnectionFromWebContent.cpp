@@ -88,6 +88,12 @@ void ConnectionFromWebContent::update_display_list(Web::Compositor::CompositorCo
     m_compositor_state->update_display_list(context_id, move(display_list), move(visual_context_tree), move(resource_transaction), move(scroll_state_snapshot));
 }
 
+void ConnectionFromWebContent::update_image_frame_resources(Web::Compositor::CompositorContextId context_id, Vector<Web::Painting::DisplayListImageFrameResource> image_frames)
+{
+    verify_context_is_owned_by_this_connection(context_id);
+    m_compositor_state->update_image_frame_resources(context_id, move(image_frames));
+}
+
 void ConnectionFromWebContent::update_visual_context_tree(Web::Compositor::CompositorContextId context_id, Web::Painting::AccumulatedVisualContextTree visual_context_tree)
 {
     verify_context_is_owned_by_this_connection(context_id);
@@ -172,14 +178,14 @@ Messages::CompositorWebContentServer::WebglReadPixelsResponse ConnectionFromWebC
     return { result.length, result.columns, result.rows };
 }
 
-void ConnectionFromWebContent::webgl_read_buffer_sub_data(Web::Painting::CanvasId canvas_id, u32 target, i64 offset, i64 size, Core::AnonymousBuffer data)
+Messages::CompositorWebContentServer::WebglReadBufferSubDataResponse ConnectionFromWebContent::webgl_read_buffer_sub_data(Web::Painting::CanvasId canvas_id, u32 target, i64 offset, i64 size, Core::AnonymousBuffer data)
 {
     if (size < 0 || (size > 0 && (!data.is_valid() || data.size() < static_cast<size_t>(size)))) {
         did_misbehave("WebContent sent an invalid WebGL buffer readback target");
-        return;
+        return { false };
     }
 
-    m_canvas_host.webgl_read_buffer_sub_data(canvas_id, target, offset, size, move(data));
+    return { m_canvas_host.webgl_read_buffer_sub_data(canvas_id, target, offset, size, move(data)) };
 }
 
 void ConnectionFromWebContent::invalidate_wheel_event_listener_state(Web::Compositor::CompositorContextId context_id, u64 generation)

@@ -44,6 +44,7 @@ private:
     virtual void update_visual_context_tree(Web::Compositor::CompositorContextId, Web::Painting::AccumulatedVisualContextTree) override;
     virtual void update_scroll_state(Web::Compositor::CompositorContextId, Web::Painting::ScrollStateSnapshot) override;
     virtual void update_video_frame(Web::Compositor::CompositorContextId, Web::Painting::VideoFrameResourceId, NonnullRefPtr<Media::VideoFrame const>) override;
+    virtual void update_image_frame_resources(Web::Compositor::CompositorContextId, Vector<Web::Painting::DisplayListImageFrameResource>) override;
     virtual void clear_video_frame(Web::Compositor::CompositorContextId, Web::Painting::VideoFrameResourceId) override;
     virtual Messages::CompositorWebContentServer::CreateCanvas2dContextResponse create_canvas_2d_context(Gfx::IntSize, bool) override;
     virtual void update_canvas_2d_commands(Web::Painting::CanvasId, Gfx::CanvasCommandList, bool commit) override;
@@ -55,7 +56,7 @@ private:
     virtual void webgl_present_canvas(Web::Painting::CanvasId canvas_id, bool preserve_drawing_buffer) override;
     virtual Messages::CompositorWebContentServer::WebglSyncCallResponse webgl_sync_call(Web::Painting::CanvasId canvas_id, ByteBuffer request) override;
     virtual Messages::CompositorWebContentServer::WebglReadPixelsResponse webgl_read_pixels(Web::Painting::CanvasId canvas_id, i32 x, i32 y, i32 width, i32 height, u32 format, u32 type, i32 buf_size, Core::AnonymousBuffer pixels) override;
-    virtual void webgl_read_buffer_sub_data(Web::Painting::CanvasId canvas_id, u32 target, i64 offset, i64 size, Core::AnonymousBuffer data) override;
+    virtual Messages::CompositorWebContentServer::WebglReadBufferSubDataResponse webgl_read_buffer_sub_data(Web::Painting::CanvasId canvas_id, u32 target, i64 offset, i64 size, Core::AnonymousBuffer data) override;
     virtual void invalidate_wheel_event_listener_state(Web::Compositor::CompositorContextId, u64 generation) override;
     virtual Messages::CompositorWebContentServer::AsyncScrollByResponse async_scroll_by(Web::Compositor::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::Compositor::AsyncScrollOperationTracking) override;
     virtual Messages::CompositorWebContentServer::ShouldDeferMainThreadPresentForAsyncScrollResponse should_defer_main_thread_present_for_async_scroll(Web::Compositor::CompositorContextId) override;

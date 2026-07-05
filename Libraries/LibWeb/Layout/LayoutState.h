@@ -147,9 +147,7 @@ struct LayoutState {
 
         NodeWithStyle const& node() const { return *m_node; }
         NodeWithStyle& node() { return const_cast<NodeWithStyle&>(*m_node); }
-        void set_node(NodeWithStyle const&, UsedValues const* containing_block_used_values);
-
-        UsedValues const* containing_block_used_values() const { return m_containing_block_used_values; }
+        void set_node(NodeWithStyle const&, Optional<CSSPixels> percentage_basis_width = {}, Optional<CSSPixels> percentage_basis_height = {});
 
         CSSPixels content_width() const { return m_content_width; }
         CSSPixels content_height() const { return m_content_height; }
@@ -177,18 +175,6 @@ struct LayoutState {
         void set_content_offset(CSSPixelPoint new_offset) { offset = new_offset; }
         void set_content_x(CSSPixels x) { offset.set_x(x); }
         void set_content_y(CSSPixels y) { offset.set_y(y); }
-
-        // Offset from ICB (viewport) content edge to this box's content edge.
-        // Computed lazily by walking the containing block chain.
-        // For pre-populated nodes (partial relayout), returns the cached value from paintable absolute position.
-        CSSPixelPoint cumulative_offset() const
-        {
-            if (m_cumulative_offset.has_value())
-                return *m_cumulative_offset;
-            if (m_containing_block_used_values)
-                return m_containing_block_used_values->cumulative_offset() + offset;
-            return offset;
-        }
 
         // offset from top-left corner of content area of box's containing block to top-left corner of box's content area
         CSSPixelPoint offset;
@@ -320,13 +306,6 @@ struct LayoutState {
             return move(m_rare->flex_layout_data);
         }
 
-        void set_grid_area_size(CSSPixelSize grid_area_size) { ensure_rare_data().grid_area_size = grid_area_size; }
-        Optional<CSSPixelSize> const& grid_area_size() const
-        {
-            static Optional<CSSPixelSize> const empty;
-            return m_rare ? m_rare->grid_area_size : empty;
-        }
-
         void set_static_position_rect(StaticPositionRect const& static_position_rect) { ensure_rare_data().static_position_rect = static_position_rect; }
         CSSPixelPoint static_position() const
         {
@@ -358,7 +337,6 @@ struct LayoutState {
                 , computed_svg_path(other.computed_svg_path)
                 , grid_template_columns(other.grid_template_columns)
                 , grid_template_rows(other.grid_template_rows)
-                , grid_area_size(other.grid_area_size)
                 , override_borders_data(other.override_borders_data)
                 , computed_svg_transforms(other.computed_svg_transforms)
                 , static_position_rect(other.static_position_rect)
@@ -376,7 +354,6 @@ struct LayoutState {
             OwnPtr<FlexLayoutData> flex_layout_data;
             RefPtr<CSS::GridTrackSizeListStyleValue const> grid_template_columns;
             RefPtr<CSS::GridTrackSizeListStyleValue const> grid_template_rows;
-            Optional<CSSPixelSize> grid_area_size;
             Optional<Painting::PaintableBox::BordersDataWithElementKind> override_borders_data;
             Optional<Painting::SVGGraphicsPaintable::ComputedTransforms> computed_svg_transforms;
             Optional<StaticPositionRect> static_position_rect;
@@ -391,7 +368,6 @@ struct LayoutState {
         }
 
         Layout::NodeWithStyle const* m_node { nullptr };
-        UsedValues const* m_containing_block_used_values { nullptr };
         Optional<CSSPixelPoint> m_cumulative_offset;
 
         CSSPixels m_content_width { 0 };
@@ -418,6 +394,8 @@ struct LayoutState {
     UsedValues& get_mutable(NodeWithStyle const&);
     UsedValues const& get(NodeWithStyle const&) const;
 
+    UsedValues& create(NodeWithStyle const&, Optional<CSSPixels> percentage_basis_width, Optional<CSSPixels> percentage_basis_height);
+
     UsedValues& populate_from_paintable(NodeWithStyle const&, Painting::PaintableBox const&);
     UsedValues& populate_node_from(LayoutState const& source, NodeWithStyle const& node);
 
@@ -425,8 +403,13 @@ struct LayoutState {
     UsedValues* try_get_mutable(NodeWithStyle const&);
     UsedValues const* try_get(Node const&) const;
 
+    // Offset from ICB (viewport) content edge to this box's content edge.
+    // For pre-populated nodes (partial relayout), returns the cached value from paintable absolute position.
+    [[nodiscard]] CSSPixelPoint cumulative_offset(UsedValues const&) const;
+
+    bool has_subtree_root() const { return m_subtree_root != nullptr; }
+
 private:
-    UsedValues& ensure_used_values_for(NodeWithStyle const&);
     void resolve_relative_positions();
 
     PagedStore<UsedValues> m_used_values_store;

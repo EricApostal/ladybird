@@ -7,6 +7,8 @@
  */
 
 #include <AK/NeverDestroyed.h>
+#include <AK/Utf16StringBuilder.h>
+#include <AK/Variant.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibWeb/CSS/ComputedProperties.h>
@@ -36,8 +38,10 @@
 #include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
+#include <LibWeb/HTML/HTMLParagraphElement.h>
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/HistoryHandlingBehavior.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -2451,6 +2455,14 @@ void LocalNavigable::begin_navigation(NavigateParams params)
     // 12-13. Determine historyHandling for this navigation.
     history_handling = determine_history_handling_for_navigation(history_handling, url, active_document, initiator_origin_snapshot);
 
+    // FIXME: Revisit the following once the dust settles on our Navigation rewrites — specifically, whether the "the UI
+    //        process seeds the new process's active session-history entry with the target URL *before* its document has
+    //        loaded" behavior is actually a mistake that the following is just working around (papering over).
+    // AD-HOC: In addition to the spec requirements here, we also require the active document's URL (ignoring fragments)
+    //         to match. That's because: After a cross-site process swap, the UI process seeds the new process's active
+    //         session-history entry with the target URL *before* its document has loaded. So, doing just the session-
+    //         history-entry check alone would misclassify a fresh cross-document navigation as a same-document fragment
+    //         navigation — and completely skip loading the document. See issue #10312.
     // 14. If all of the following are true:
     //     - documentResource is null;
     //     - response is null;
@@ -2460,6 +2472,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
     if (document_resource.has<Empty>()
         && !response
         && url.equals(active_session_history_entry()->url(), URL::ExcludeFragment::Yes)
+        && url.equals(active_document.url(), URL::ExcludeFragment::Yes)
         && url.fragment().has_value()) {
         // 1. Navigate to a fragment given navigable, url, historyHandling, userInvolvement, sourceElement, navigationAPIState, and navigationId.
         navigate_to_a_fragment(url, to_history_handling_behavior(history_handling), user_involvement, source_element, navigation_api_state, navigation_id);
@@ -2565,6 +2578,12 @@ void LocalNavigable::begin_navigation(NavigateParams params)
         // 1. Let unloadPromptCanceled be the result of checking if unloading is user-canceled for navigable's active document's inclusive descendant navigables.
         traversable_navigable()->check_if_unloading_is_canceled(this->active_document()->inclusive_descendant_navigables(),
             GC::create_function(heap(), [this, source_snapshot_params, target_snapshot_params, csp_navigation_type, document_resource, url, navigation_id, referrer_policy, initiator_origin_snapshot, response, history_handling, initiator_base_url_snapshot, user_involvement, params = move(params)](LocalTraversableNavigable::CheckIfUnloadingIsCanceledResult unload_prompt_canceled) mutable {
+                // AD-HOC: Not in the spec but we should not navigate a navigable that has been destroyed.
+                if (has_been_destroyed()) {
+                    set_delaying_load_events(false);
+                    return;
+                }
+
                 // 2. If unloadPromptCanceled is not "continue", or navigable's ongoing navigation is no longer navigationId:
                 if (unload_prompt_canceled != LocalTraversableNavigable::CheckIfUnloadingIsCanceledResult::Continue) {
                     // FIXME: 1. Invoke WebDriver BiDi navigation failed with navigable and a new WebDriver BiDi navigation status whose id is navigationId, status is "canceled", and url is url.
@@ -3860,37 +3879,97 @@ bool LocalNavigable::is_focused() const
     return &m_page->focused_navigable() == this;
 }
 
-static String visible_text_in_range(DOM::Range const& range)
+namespace {
+
+struct RequiredLineBreakCount {
+    int count { 0 };
+};
+
+// Range-clipped variant of the HTML rendered-text collection steps — to serialize a selection for the clipboard. This
+// skips nodes with no layout box, and skips user-select:none content, and inserts line breaks at block boundaries.
+void collect_clipboard_text(DOM::Node const& node, DOM::Range const& range, Vector<Variant<Utf16String, RequiredLineBreakCount>>& items)
 {
-    // NOTE: This is an adaption of Range stringification — but we skip over DOM nodes that don't have a corresponding
-    //       layout node, and over nodes whose used value of user-select is 'none'. The latter implements
-    //       https://drafts.csswg.org/css-ui/#valdef-user-select-none — applied at the clipboard-extraction boundary.
-    StringBuilder builder;
+    if (!range.intersects_node(const_cast<DOM::Node&>(node)))
+        return;
 
-    auto is_user_select_none = [](DOM::Node const& node) {
-        auto const* layout = node.layout_node();
-        return layout && layout->user_select_used_value() == CSS::UserSelect::None;
-    };
-
-    if (range.start_container() == range.end_container() && is<DOM::Text>(*range.start_container())) {
-        if (!range.start_container()->layout_node() || is_user_select_none(*range.start_container()))
-            return String {};
-        return static_cast<DOM::Text const&>(*range.start_container()).data().substring_view(range.start_offset(), range.end_offset() - range.start_offset()).to_utf8_but_should_be_ported_to_utf16();
-    }
-
-    if (is<DOM::Text>(*range.start_container()) && range.start_container()->layout_node() && !is_user_select_none(*range.start_container()))
-        builder.append(static_cast<DOM::Text const&>(*range.start_container()).data().substring_view(range.start_offset()));
-
-    range.for_each_contained([&](GC::Ref<DOM::Node> node) {
-        if (is<DOM::Text>(*node) && node->layout_node() && !is_user_select_none(*node))
-            builder.append(static_cast<DOM::Text const&>(*node).data());
+    node.for_each_child([&](DOM::Node const& child) {
+        collect_clipboard_text(child, range, items);
         return IterationDecision::Continue;
     });
 
-    if (is<DOM::Text>(*range.end_container()) && range.end_container()->layout_node() && !is_user_select_none(*range.end_container()))
-        builder.append(static_cast<DOM::Text const&>(*range.end_container()).data().substring_view(0, range.end_offset()));
+    auto const* layout_node = node.layout_node();
+    if (!layout_node)
+        return;
 
-    return MUST(builder.to_string());
+    if (auto const* text = as_if<DOM::Text>(node)) {
+        if (layout_node->user_select_used_value() == CSS::UserSelect::None)
+            return;
+        Utf16String data;
+        if (&node == range.start_container().ptr() && &node == range.end_container().ptr())
+            data = MUST(text->substring_data(range.start_offset(), range.end_offset() - range.start_offset()));
+        else if (&node == range.start_container().ptr())
+            data = MUST(text->substring_data(range.start_offset(), text->length_in_utf16_code_units() - range.start_offset()));
+        else if (&node == range.end_container().ptr())
+            data = MUST(text->substring_data(0, range.end_offset()));
+        else
+            data = text->data();
+        items.append(move(data));
+        return;
+    }
+
+    if (is<HTMLBRElement>(node)) {
+        items.append("\n"_utf16);
+        return;
+    }
+
+    auto display = layout_node->computed_values().display();
+    if (display.is_table_cell() && node.next_sibling())
+        items.append("\t"_utf16);
+    if (display.is_table_row() && node.next_sibling())
+        items.append("\n"_utf16);
+
+    if (is<HTMLParagraphElement>(node)) {
+        items.prepend(RequiredLineBreakCount { 2 });
+        items.append(RequiredLineBreakCount { 2 });
+    } else if (display.is_block_outside() || display.is_table_caption()) {
+        items.prepend(RequiredLineBreakCount { 1 });
+        items.append(RequiredLineBreakCount { 1 });
+    }
+}
+
+}
+
+static String visible_text_in_range(DOM::Range const& range)
+{
+    Vector<Variant<Utf16String, RequiredLineBreakCount>> items;
+    collect_clipboard_text(range.common_ancestor_container(), range, items);
+
+    items.remove_all_matching([](auto& item) {
+        return item.visit(
+            [](Utf16String const& string) { return string.is_empty(); },
+            [](RequiredLineBreakCount const&) { return false; });
+    });
+    while (!items.is_empty() && items.first().has<RequiredLineBreakCount>())
+        items.take_first();
+    while (!items.is_empty() && items.last().has<RequiredLineBreakCount>())
+        items.take_last();
+
+    Utf16StringBuilder builder;
+    for (size_t i = 0; i < items.size(); ++i) {
+        items[i].visit(
+            [&](Utf16String const& string) { builder.append(string); },
+            [&](RequiredLineBreakCount const& line_break) {
+                int max_line_breaks = line_break.count;
+                size_t j = i + 1;
+                while (j < items.size() && items[j].has<RequiredLineBreakCount>()) {
+                    max_line_breaks = max(max_line_breaks, items[j].get<RequiredLineBreakCount>().count);
+                    ++j;
+                }
+                i = j - 1;
+                builder.append_repeated_ascii('\n', max_line_breaks);
+            });
+    }
+    return builder.to_string().to_utf8();
 }
 
 String LocalNavigable::selected_text() const
@@ -4177,6 +4256,7 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
 
     Painting::ScrollStateSnapshot scroll_state_snapshot { document_paintable->scroll_state_snapshot() };
     if (should_record_display_list) {
+        m_compositor_display_list_visual_context_tree_version = display_list->compatible_visual_context_tree_version();
         compositor_context().update_display_list(*display_list, visual_context_tree.release_value(), move(resource_transaction), move(scroll_state_snapshot));
         document_paintable->did_update_visual_context_tree_in_compositor();
         m_display_list_resource_storage.retain_only(display_list_resources);
@@ -4185,6 +4265,7 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
         m_compositor_display_list_paint_config = paint_config;
     } else {
         if (visual_context_tree_needs_compositor_update) {
+            VERIFY(document_paintable->visual_context_tree().version() == m_compositor_display_list_visual_context_tree_version);
             compositor_context().update_visual_context_tree(document_paintable->visual_context_tree());
             document_paintable->did_update_visual_context_tree_in_compositor();
         }

@@ -140,8 +140,10 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     m_arguments = arguments;
 
 #if !defined(AK_OS_WINDOWS)
-    // Increase the open file limit, as the default limits on Linux cause us to run out of file descriptors with around 15 tabs open.
-    if (auto result = Core::System::set_resource_limits(RLIMIT_NOFILE, 8192); result.is_error())
+    // Raise the open file limit well above the platform default. Each decoded image is backed by its own shared-memory
+    // file descriptor — so a document with thousands of images (or many open tabs) otherwise exhausts the descriptor
+    // table, and aborts when the next descriptor is sent over IPC.
+    if (auto result = Core::System::set_resource_limits(RLIMIT_NOFILE, 65536); result.is_error())
         warnln("Unable to increase open file limit: {}", result.error());
 #endif
 
@@ -594,16 +596,9 @@ void Application::register_compositor_context(WebContentClient& web_content_clie
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
         return;
-    VERIFY(m_compositor_client);
 
-    auto web_content_connection_id = web_content_client.compositor_connection_id({ });
-    if (!web_content_connection_id.has_value()) {
-        MUST(connect_web_content_to_compositor(web_content_client));
-        web_content_connection_id = web_content_client.compositor_connection_id({ });
-    }
-    VERIFY(web_content_connection_id.has_value());
-
-    m_compositor_client->create_context(context_id, page_id, *web_content_connection_id);
+    if (auto result = try_register_compositor_context(web_content_client, context_id, page_id); result.is_error())
+        dbgln("Unable to register Compositor context: {}", result.error());
 }
 
 ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web_content_client, Web::Compositor::CompositorContextId context_id, Optional<u64> page_id)

@@ -757,11 +757,12 @@ WebIDL::ExceptionOr<GC::Ptr<ImageData>> CanvasRenderingContext2D::get_image_data
     // NOTE: Internally we must use premultiplied alpha, but ImageData should hold unpremultiplied alpha. This conversion
     //       might result in a loss of precision, but is according to spec.
     //       See: https://html.spec.whatwg.org/multipage/canvas.html#premultiplied-alpha-and-the-2d-rendering-context
+    auto image_data_bitmap = TRY_OR_THROW_OOM(realm().vm(), image_data->bitmap());
     VERIFY(snapshot.bitmap().alpha_type() == Gfx::AlphaType::Premultiplied);
-    VERIFY(image_data->bitmap().alpha_type() == Gfx::AlphaType::Unpremultiplied);
+    VERIFY(image_data_bitmap->alpha_type() == Gfx::AlphaType::Unpremultiplied);
 
-    auto painter = Gfx::Painter::create(image_data->bitmap());
-    painter->draw_bitmap(image_data->bitmap().rect().to_type<float>(), snapshot, snapshot.rect(), Gfx::ScalingMode::NearestNeighbor, {}, 1, Gfx::CompositingAndBlendingOperator::SourceOver);
+    auto painter = Gfx::Painter::create(*image_data_bitmap);
+    painter->draw_bitmap(image_data_bitmap->rect().to_type<float>(), snapshot, snapshot.rect(), Gfx::ScalingMode::NearestNeighbor, {}, 1, Gfx::CompositingAndBlendingOperator::SourceOver);
 
     // 7. Set the pixels values of imageData for areas of the source rectangle that are outside of the output bitmap to transparent black.
     // NOTE: No-op, already done during creation.
@@ -854,10 +855,13 @@ WebIDL::ExceptionOr<void> CanvasRenderingContext2D::put_pixels_from_an_image_dat
     //       snapshot is shareable so that flushing to the Compositor passes the pixels
     //       by file descriptor instead of copying them again.
     auto source_rect = Gfx::IntRect { dirty_x, dirty_y, dirty_width, dirty_height };
-    auto const& source_bitmap = image_data.bitmap();
-    auto bitmap_snapshot = MUST(Gfx::Bitmap::create_shareable(source_bitmap.format(), source_bitmap.alpha_type(), source_rect.size()));
+    auto source_bitmap_or_error = image_data.bitmap();
+    if (source_bitmap_or_error.is_error())
+        return WebIDL::InvalidStateError::create(image_data.realm(), "ImageData's underlying buffer is detached or out-of-bounds"_utf16);
+    auto source_bitmap = source_bitmap_or_error.release_value();
+    auto bitmap_snapshot = MUST(Gfx::Bitmap::create_shareable(source_bitmap->format(), source_bitmap->alpha_type(), source_rect.size()));
     for (int y = 0; y < source_rect.height(); ++y)
-        __builtin_memcpy(bitmap_snapshot->scanline(y), source_bitmap.scanline(source_rect.y() + y) + source_rect.x(), static_cast<size_t>(source_rect.width()) * sizeof(Gfx::RawPixel));
+        __builtin_memcpy(bitmap_snapshot->scanline(y), source_bitmap->scanline(source_rect.y() + y) + source_rect.x(), static_cast<size_t>(source_rect.width()) * sizeof(Gfx::RawPixel));
     canvas_command_list.append(Gfx::CanvasCommands::Save {});
     canvas_command_list.append(Gfx::CanvasCommands::SetTransform { .transform = {} });
     canvas_command_list.append(Gfx::CanvasCommands::DrawBitmap {
@@ -1063,6 +1067,17 @@ static bool is_point_in_path_internal(Gfx::Path path, Gfx::AffineTransform const
     return path.contains(point, parse_fill_rule(fill_rule));
 }
 
+static bool image_provider_is_usable_for_canvas(Layout::ImageProvider const& image_provider)
+{
+    if (!image_provider.is_image_available())
+        return false;
+
+    auto intrinsic_width = image_provider.intrinsic_width();
+    auto intrinsic_height = image_provider.intrinsic_height();
+    return intrinsic_width.has_value() && intrinsic_height.has_value()
+        && *intrinsic_width > 0 && *intrinsic_height > 0;
+}
+
 bool CanvasRenderingContext2D::is_point_in_path(double x, double y, StringView fill_rule)
 {
     return is_point_in_path_internal(path(), drawing_state().transform, x, y, fill_rule);
@@ -1084,13 +1099,9 @@ WebIDL::ExceptionOr<CanvasImageSourceUsability> check_usability_of_image(CanvasI
             if (image_element->current_request().state() == HTML::ImageRequest::State::Broken)
                 return WebIDL::InvalidStateError::create(image_element->realm(), "Image element state is broken"_utf16);
 
-            // If image is not fully decodable, then return bad.
-            auto current_image_frame = image_element->current_image_frame();
-            if (!current_image_frame.has_value())
-                return { CanvasImageSourceUsability::Bad };
-
-            // If image has an intrinsic width or intrinsic height (or both) equal to zero, then return bad.
-            if (current_image_frame->width() == 0 || current_image_frame->height() == 0)
+            // If image is not fully decodable, or has an intrinsic width or intrinsic height
+            // (or both) equal to zero, then return bad.
+            if (!image_provider_is_usable_for_canvas(*image_element))
                 return { CanvasImageSourceUsability::Bad };
             return Optional<CanvasImageSourceUsability> {};
         },
@@ -1098,13 +1109,9 @@ WebIDL::ExceptionOr<CanvasImageSourceUsability> check_usability_of_image(CanvasI
         [](GC::Ref<SVG::SVGImageElement> image_element) -> WebIDL::ExceptionOr<Optional<CanvasImageSourceUsability>> {
             // FIXME: If image's current request's state is broken, then throw an "InvalidStateError" DOMException.
 
-            // If image is not fully decodable, then return bad.
-            auto current_image_frame = image_element->current_image_frame();
-            if (!current_image_frame.has_value())
-                return { CanvasImageSourceUsability::Bad };
-
-            // If image has an intrinsic width or intrinsic height (or both) equal to zero, then return bad.
-            if (current_image_frame->width() == 0 || current_image_frame->height() == 0)
+            // If image is not fully decodable, or has an intrinsic width or intrinsic height
+            // (or both) equal to zero, then return bad.
+            if (!image_provider_is_usable_for_canvas(*image_element))
                 return { CanvasImageSourceUsability::Bad };
             return Optional<CanvasImageSourceUsability> {};
         },

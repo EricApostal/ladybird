@@ -502,7 +502,6 @@ void LocalTraversableNavigable::reset_session_history_for_testing(GC::Ref<GC::Fu
             page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
         }
 
-        page().client().page_did_update_navigation_buttons_state(false, false);
         signal->resolve({});
         on_complete->function()();
     }));
@@ -1558,9 +1557,6 @@ void ApplyHistoryStepState::complete()
         }
 
         VERIFY(m_traversable->m_session_history_entries.size() > 0);
-        auto back_enabled = m_traversable->can_go_back();
-        auto forward_enabled = m_traversable->can_go_forward();
-        m_traversable->page().client().page_did_update_navigation_buttons_state(back_enabled, forward_enabled);
         m_traversable->page().client().page_did_change_url(m_traversable->current_session_history_entry()->url());
     }
 
@@ -2052,7 +2048,13 @@ Vector<NonnullRefPtr<SessionHistoryEntry>> LocalTraversableNavigable::get_sessio
     auto i = starting_index - 1;
 
     // 7. While i > 0:
-    while (i > 0) {
+    // AD-HOC: Spec bug. We instead implement 'While i >= 0' — because following the spec as written leads to dropping
+    //         rawEntries[0] from entriesForNavigationAPI whenever startingIndex > 0. When that first entry is same-
+    //         origin, a later same-document traversal back to it makes 'getting the navigation API entry index' return
+    //         -1, and trips the assert in 'update the navigation API entries for a same-document navigation'. The same-
+    //         origin check below already excludes a cross-origin initial entry — so descending to index 0 is safe.
+    //         https://github.com/whatwg/html/issues/12644
+    while (i >= 0) {
         auto& entry = raw_entries[static_cast<unsigned>(i)];
         if (!entry->step_value().has_value()) {
             --i;
@@ -2455,7 +2457,6 @@ bool LocalTraversableNavigable::try_to_synchronously_commit_same_document_naviga
     }
 
     VERIFY(session_history_entries().size() > 0);
-    page().client().page_did_update_navigation_buttons_state(can_go_back(), can_go_forward());
     page().client().page_did_change_url(current_session_history_entry()->url());
     return true;
 }

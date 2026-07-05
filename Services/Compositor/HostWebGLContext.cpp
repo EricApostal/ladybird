@@ -61,6 +61,10 @@ ErrorOr<void> HostWebGLContext::execute_commands(ReadonlyBytes bytes, Vector<Gfx
             return tex_image2d_from_bitmap(command, bitmaps);
         } else if constexpr (IsSame<Command, Commands::TexSubImage2DFromBitmap>) {
             return tex_sub_image2d_from_bitmap(command, bitmaps);
+        } else if constexpr (IsSame<Command, Commands::TexImage3DFromBitmap>) {
+            return tex_image3d_from_bitmap(command, bitmaps);
+        } else if constexpr (IsSame<Command, Commands::TexSubImage3DFromBitmap>) {
+            return tex_sub_image3d_from_bitmap(command, bitmaps);
         } else {
             return replay_webgl_command(*m_gl_context, m_objects, command, payload);
         }
@@ -111,6 +115,20 @@ ErrorOr<void> HostWebGLContext::tex_sub_image2d_from_bitmap(Commands::TexSubImag
 {
     auto converted = TRY(convert_bitmap_for_upload(bitmaps, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
     m_gl_context->tex_sub_image2d_robust_angle(command.target, command.level, command.xoffset, command.yoffset, converted.width, converted.height, command.format, command.type, converted.buffer.size(), converted.buffer.data());
+    return {};
+}
+
+ErrorOr<void> HostWebGLContext::tex_image3d_from_bitmap(Commands::TexImage3DFromBitmap const& command, Vector<Gfx::DecodedImageFrame> const& bitmaps)
+{
+    auto converted = TRY(convert_bitmap_for_upload(bitmaps, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
+    m_gl_context->tex_image3d_robust_angle(command.target, command.level, command.internalformat, converted.width, converted.height, command.depth, 0, command.format, command.type, converted.buffer.size(), converted.buffer.data());
+    return {};
+}
+
+ErrorOr<void> HostWebGLContext::tex_sub_image3d_from_bitmap(Commands::TexSubImage3DFromBitmap const& command, Vector<Gfx::DecodedImageFrame> const& bitmaps)
+{
+    auto converted = TRY(convert_bitmap_for_upload(bitmaps, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
+    m_gl_context->tex_sub_image3d_robust_angle(command.target, command.level, command.xoffset, command.yoffset, command.zoffset, converted.width, converted.height, command.depth, command.format, command.type, converted.buffer.size(), converted.buffer.data());
     return {};
 }
 
@@ -184,7 +202,7 @@ ReadPixelsResult HostWebGLContext::read_pixels_robust_angle(GLint x, GLint y, GL
     };
 }
 
-void HostWebGLContext::read_buffer_sub_data(GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer data)
+bool HostWebGLContext::read_buffer_sub_data(GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer data)
 {
     VERIFY(size >= 0);
     VERIFY(static_cast<size_t>(size) <= data.size());
@@ -194,7 +212,9 @@ void HostWebGLContext::read_buffer_sub_data(GLenum target, Web::WebGL::GLintptr 
     if (auto* mapped = m_gl_context->map_buffer_range(target, offset, size, GL_MAP_READ_BIT)) {
         __builtin_memcpy(data.data<void>(), mapped, static_cast<size_t>(size));
         m_gl_context->unmap_buffer(target);
+        return true;
     }
+    return false;
 }
 
 ErrorOr<void> HostWebGLContext::set_drawing_buffer_size(int width, int height)

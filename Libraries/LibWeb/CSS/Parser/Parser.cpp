@@ -13,7 +13,6 @@
  */
 
 #include <AK/Debug.h>
-#include <LibGfx/DecodedImageFrame.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/CSS/CSSFontFeatureValuesRule.h>
 #include <LibWeb/CSS/CSSFunctionDeclarations.h>
@@ -502,6 +501,62 @@ OwnPtr<BooleanExpression> Parser::parse_container_query_condition(TokenStream<Co
     return parse_boolean_expression(tokens, MatchResult::Unknown, [this](auto& tokens) {
         return parse_container_query_feature(tokens);
     });
+}
+
+OwnPtr<BooleanExpression> Parser::parse_style_query(TokenStream<ComponentValue>& tokens, MatchResult result_for_general_enclosed)
+{
+    return parse_boolean_expression(tokens, result_for_general_enclosed, [this](auto& tokens) {
+        return parse_style_feature(tokens);
+    });
+}
+
+// https://drafts.csswg.org/css-conditional-5/#typedef-style-feature
+OwnPtr<BooleanExpression> Parser::parse_style_feature(TokenStream<ComponentValue>& tokens)
+{
+    // <style-feature> = <style-feature-plain> | <style-feature-boolean> | <style-range>
+    // FIXME: <style-range>
+
+    auto parse_style_feature_name = [](FlyString const& name) -> Optional<PropertyNameAndID> {
+        // The <style-feature-name> can be either a supported CSS property or a valid <custom-property-name>.
+        // NB: This is the same as what's allowed by PropertyNameAndID.
+        return PropertyNameAndID::from_name(Utf16FlyString::from_utf8(name));
+    };
+
+    // <style-feature-plain> = <style-feature-name> : <style-feature-value>
+    {
+        auto transaction = tokens.begin_transaction();
+        tokens.discard_whitespace();
+        m_rule_context.append(RuleContext::Style);
+        auto declaration = consume_a_declaration(tokens, Nested::No, SaveOriginalText::Yes);
+        m_rule_context.take_last();
+        if (declaration.has_value()) {
+            tokens.discard_whitespace();
+            if (tokens.has_next_token() || declaration->important == Important::Yes)
+                return nullptr;
+
+            auto style_feature_name = parse_style_feature_name(declaration->name);
+            if (!style_feature_name.has_value())
+                return nullptr;
+
+            transaction.commit();
+            return StyleFeature::create_plain(style_feature_name.release_value(), move(declaration->value));
+        }
+    }
+
+    // <style-feature-boolean> = <style-feature-name>
+    auto transaction = tokens.begin_transaction();
+    tokens.discard_whitespace();
+    auto const& token = tokens.consume_a_token();
+    tokens.discard_whitespace();
+    if (tokens.has_next_token() || !token.is(Token::Type::Ident))
+        return nullptr;
+
+    auto style_feature_name = parse_style_feature_name(token.token().ident());
+    if (!style_feature_name.has_value())
+        return nullptr;
+
+    transaction.commit();
+    return StyleFeature::create_boolean(style_feature_name.release_value());
 }
 
 OwnPtr<BooleanExpression> Parser::parse_container_query_feature(TokenStream<ComponentValue>& tokens)
@@ -2180,8 +2235,8 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
 
         // 3. If size is auto, and img is not null, and img is being rendered, and img allows auto-sizes,
         //    then set size to the concrete object size width of img, in CSS pixels.
-        // FIXME: "img is being rendered" - we just see if it has a bitmap for now
-        if (size->has_auto() && img && img->current_image_frame().has_value() && img->allows_auto_sizes()) {
+        // FIXME: "img is being rendered" - we just see if it has image data for now
+        if (size->has_auto() && img && img->is_image_available() && img->allows_auto_sizes()) {
             // FIXME: The spec doesn't seem to tell us how to determine the concrete size of an <img>, so use the default sizing algorithm.
             //        Should this use some of the methods from FormattingContext?
             auto concrete_size = run_default_sizing_algorithm(

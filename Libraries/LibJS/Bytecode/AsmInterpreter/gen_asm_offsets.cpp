@@ -10,6 +10,7 @@
 #include <AK/Format.h>
 #include <AK/StringBase.h>
 #include <AK/Utf16StringData.h>
+#include <LibGC/PrimitiveStorage.h>
 #include <LibJS/Bytecode/Builtins.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/PropertyNameIterator.h>
@@ -175,6 +176,7 @@ int main()
     EMIT_OFFSET(VM_INTERPRETER_STACK, VM, m_interpreter_stack);
     EMIT_OFFSET(VM_STACK_INFO, VM, m_stack_info);
     EMIT_OFFSET(VM_EXECUTION_GENERATION, VM, m_execution_generation);
+    EMIT_OFFSET(VM_PRIMITIVE_STORAGE_CAGE_BASE, VM, m_primitive_storage_cage_base);
     outln("const VM_INTERPRETER_STACK_TOP = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_top));
 #if defined(HAS_ADDRESS_SANITIZER)
     outln("const VM_STACK_SPACE_LIMIT = {}", 96 * KiB);
@@ -358,7 +360,9 @@ int main()
     EMIT_OFFSET(TYPED_ARRAY_ARRAY_LENGTH, TypedArrayBase, m_array_length);
     EMIT_OFFSET(TYPED_ARRAY_BYTE_OFFSET, TypedArrayBase, m_byte_offset);
     EMIT_OFFSET(TYPED_ARRAY_KIND, TypedArrayBase, m_kind);
-    EMIT_OFFSET(TYPED_ARRAY_CACHED_DATA_PTR, TypedArrayBase, m_data);
+    EMIT_OFFSET(TYPED_ARRAY_CACHED_DATA_OFFSET, TypedArrayBase, m_cached_data_offset);
+    outln("const TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID = 0x{:X}", static_cast<size_t>(TypedArrayBase::invalid_cached_data_offset));
+    outln("const PRIMITIVE_STORAGE_CAGE_OFFSET_MASK = 0x{:X}", static_cast<size_t>(GC::PrimitiveStorage::cage_offset_mask));
 
     // ByteLength (Variant<Auto, Detached, u32>) layout
     outln("\n# ByteLength layout");

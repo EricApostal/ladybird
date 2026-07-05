@@ -10,16 +10,18 @@
 #include <LibWeb/Layout/InlineFormattingContext.h>
 #include <LibWeb/Layout/InlineLevelIterator.h>
 #include <LibWeb/Layout/InlineNode.h>
+#include <LibWeb/Layout/ListItemBox.h>
 #include <LibWeb/Layout/ListItemMarkerBox.h>
 #include <LibWeb/Layout/ReplacedBox.h>
 
 namespace Web::Layout {
 
-InlineLevelIterator::InlineLevelIterator(Layout::InlineFormattingContext& inline_formatting_context, Layout::LayoutState& layout_state, Layout::BlockContainer const& containing_block, LayoutState::UsedValues const& containing_block_used_values, LayoutMode layout_mode)
+InlineLevelIterator::InlineLevelIterator(Layout::InlineFormattingContext& inline_formatting_context, Layout::LayoutState& layout_state, Layout::BlockContainer const& containing_block, LayoutState::UsedValues const& containing_block_used_values, LayoutInput const& layout_input, LayoutMode layout_mode)
     : m_inline_formatting_context(inline_formatting_context)
     , m_layout_state(layout_state)
     , m_containing_block(containing_block)
     , m_containing_block_used_values(containing_block_used_values)
+    , m_layout_input(layout_input)
     , m_next_node(containing_block.first_child())
     , m_layout_mode(layout_mode)
 {
@@ -53,7 +55,10 @@ void InlineLevelIterator::enter_node_with_box_model_metrics(Layout::NodeWithStyl
 
     // FIXME: It's really weird that *this* is where we assign box model metrics for these layout nodes..
 
-    auto& used_values = m_layout_state.get_mutable(node);
+    auto& used_values = is<ListItemMarkerBox>(node)
+        ? m_layout_state.get_mutable(node)
+        : m_layout_state.create(node, m_layout_input.containing_block_constraints.percentage_basis_width, m_layout_input.containing_block_constraints.percentage_basis_height);
+
     auto const& computed_values = node.computed_values();
 
     used_values.margin_top = computed_values.margin().top().to_px_or_zero(m_containing_block_used_values.content_width());
@@ -397,7 +402,11 @@ Optional<InlineLevelIterator::Item> InlineLevelIterator::generate_next_item()
     }
 
     auto const& box = as<Layout::Box>(*m_current_node);
-    auto const& box_state = m_layout_state.get(box);
+    auto const& box_state = [&]() -> LayoutState::UsedValues const& {
+        if (!m_box_model_node_stack.is_empty() && m_box_model_node_stack.last() == &box)
+            return m_layout_state.get_mutable(box);
+        return m_layout_state.create(box, m_layout_input.containing_block_constraints.percentage_basis_width, m_layout_input.containing_block_constraints.percentage_basis_height);
+    }();
     m_inline_formatting_context.dimension_box_on_line(box, m_layout_mode);
 
     auto item = Item {

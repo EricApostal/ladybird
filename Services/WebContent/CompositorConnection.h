@@ -40,7 +40,7 @@ public:
     void set_parent_context(Web::Compositor::CompositorContextId, Optional<Web::Compositor::CompositorContextId>);
     void stop_presenting_to_client(Web::Compositor::CompositorContextId);
     void destroy_context(Web::Compositor::CompositorContextId);
-    void update_display_list(Web::Compositor::CompositorContextId, NonnullRefPtr<Web::Painting::DisplayList> const&, Web::Painting::AccumulatedVisualContextTree const&, Web::Painting::DisplayListResourceTransaction const&, Web::Painting::ScrollStateSnapshot const&);
+    void update_display_list(Web::Compositor::CompositorContextId, NonnullRefPtr<Web::Painting::DisplayList> const&, Web::Painting::AccumulatedVisualContextTree const&, Web::Painting::DisplayListResourceTransaction, Web::Painting::ScrollStateSnapshot const&);
     void update_visual_context_tree(Web::Compositor::CompositorContextId, Web::Painting::AccumulatedVisualContextTree const&);
     void update_scroll_state(Web::Compositor::CompositorContextId, Web::Painting::ScrollStateSnapshot const&);
     void update_video_frame(Web::Compositor::CompositorContextId, Web::Painting::VideoFrameResourceId, NonnullRefPtr<Media::VideoFrame const> const&);
@@ -62,7 +62,7 @@ public:
     void present_webgl_canvas(Web::Painting::CanvasId, bool preserve_drawing_buffer);
     ByteBuffer webgl_sync_call(Web::Painting::CanvasId, ByteBuffer request);
     Web::WebGL::ReadPixelsResult read_webgl_pixels(Web::Painting::CanvasId, Web::WebGL::GLint x, Web::WebGL::GLint y, Web::WebGL::GLsizei width, Web::WebGL::GLsizei height, Web::WebGL::GLenum format, Web::WebGL::GLenum type, Web::WebGL::GLsizei buf_size, Core::AnonymousBuffer const& pixels);
-    void read_webgl_buffer_sub_data(Web::Painting::CanvasId, Web::WebGL::GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer const& data);
+    bool read_webgl_buffer_sub_data(Web::Painting::CanvasId, Web::WebGL::GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer const& data);
 
     Function<void(u64 page_id, Web::MouseEvent)> on_mouse_event;
     Function<void()> on_compositor_lost;

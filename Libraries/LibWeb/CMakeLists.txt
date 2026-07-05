@@ -328,6 +328,7 @@ set(SOURCES
     CSS/Time.cpp
     CSS/TransitionEvent.cpp
     CSS/URL.cpp
+    CSS/UpdateStyle.cpp
     CSS/ValueType.cpp
     CSS/VisualViewport.cpp
     DOM/AbortController.cpp
@@ -377,6 +378,7 @@ set(SOURCES
     DOM/PseudoElement.cpp
     DOM/QualifiedName.cpp
     DOM/Range.cpp
+    DOM/SelectorQuery.cpp
     DOM/ShadowRoot.cpp
     DOM/Slot.cpp
     DOM/SlotRegistry.cpp
@@ -1059,6 +1061,7 @@ set(SOURCES
     SVG/SVGStopElement.cpp
     SVG/SVGStyleElement.cpp
     SVG/SVGSVGElement.cpp
+    SVG/SVGSwitchElement.cpp
     SVG/SVGSymbolElement.cpp
     SVG/SVGTextContentElement.cpp
     SVG/SVGTextElement.cpp
