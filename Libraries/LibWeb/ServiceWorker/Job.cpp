@@ -8,11 +8,13 @@
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibURL/URL.h>
+#include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Response.h>
+#include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
@@ -21,8 +23,12 @@
 #include <LibWeb/HTML/Scripting/Script.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/SecureContexts/AbstractOperations.h>
+#include <LibWeb/ServiceWorker/EventNames.h>
 #include <LibWeb/ServiceWorker/Job.h>
 #include <LibWeb/ServiceWorker/Registration.h>
+#include <LibWeb/ServiceWorker/ServiceWorker.h>
+#include <LibWeb/ServiceWorker/ServiceWorkerAgent.h>
+#include <LibWeb/ServiceWorker/ServiceWorkerRegistration.h>
 #include <LibWeb/WebIDL/Promise.h>
 
 namespace Web::ServiceWorker {
@@ -35,6 +41,10 @@ static void reject_job_promise(GC::Ref<Job>, Utf16String message);
 static void register_(JS::VM&, GC::Ref<Job>);
 static void update(JS::VM&, GC::Ref<Job>);
 static void unregister(JS::VM&, GC::Ref<Job>);
+static void run_service_worker(JS::VM&, GC::Ref<Job>, Registration&, ServiceWorkerRecord&, ServiceWorkerRecord* newest_worker);
+static void install(JS::VM&, GC::Ref<Job>, Registration&, ServiceWorkerRecord&);
+static void activate(GC::Ref<Job>, Registration&, ServiceWorkerRecord&);
+static void update_worker_state(GC::Ref<Job>, ServiceWorkerRecord&, Bindings::ServiceWorkerState);
 
 GC_DEFINE_ALLOCATOR(Job);
 
@@ -429,22 +439,29 @@ static void update(JS::VM& vm, GC::Ref<Job> job)
             return;
         }
 
-        // FIXME: Actually create service worker
         // 10. Let worker be a new service worker.
+        auto& worker = registration.create_new_worker();
+
         // 11. Set worker’s script url to job’s script url, worker’s script resource to script, worker’s type to job’s worker type, and worker’s script resource map to updatedResourceMap.
+        worker.script_url = job->script_url;
+        worker.worker_type = job->worker_type;
+        // FIXME: worker's script resource / script resource map are not tracked - WorkerHost::run_service_worker()
+        //        performs its own fetch instead of reusing `script`/`state`'s updated_resource_map() (see the
+        //        FIXME on that function for why). `state`/`script` are therefore unused past this point.
         (void)state;
+        (void)script;
+
         // 12. Append url to worker’s set of used scripts.
         // 13. Set worker’s script resource’s policy container to policyContainer.
+        // FIXME: Not tracked, see above.
+
         // 14. Let forceBypassCache be true if job’s force bypass cache flag is set, and false otherwise.
+        // FIXME: Not threaded through to WorkerHost::run_service_worker()'s own internal fetch.
+
         // 15. Let runResult be the result of running the Run Service Worker algorithm with worker and forceBypassCache.
-        // 16. If runResult is failure or an abrupt completion, then:
-        // 17. Else, invoke Install algorithm with job, worker, and registration as its arguments.
-        if (job->client) {
-            auto& realm = job->client->realm();
-            auto context = HTML::TemporaryExecutionContext(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
-            WebIDL::reject_promise(realm, *job->job_promise, vm.throw_completion<JS::InternalError>(JS::ErrorType::NotImplemented, "Run Service Worker"_utf16).value());
-            finish_job(vm, job);
-        }
+        // 16. If runResult is failure or an abrupt completion, then: [handled inside run_service_worker()]
+        // 17. Else, invoke Install algorithm with job, worker, and registration as its arguments. [likewise]
+        run_service_worker(vm, job, registration, worker, newest_worker);
     });
 
     // 7. Switching on job’s worker type, run these substeps with the following options:
@@ -462,6 +479,141 @@ static void update(JS::VM& vm, GC::Ref<Job> job)
         (void)HTML::fetch_module_worker_script_graph(job->script_url, *job->client, Fetch::Infrastructure::Request::Destination::ServiceWorker, *job->client, perform_the_fetch_hook, on_fetch_complete);
         break;
     }
+}
+
+// https://w3c.github.io/ServiceWorker/#run-service-worker-algorithm
+// AD-HOC: Spawns (or reuses) the WebWorker process agent for `worker` via ServiceWorkerAgent, rather than
+//         running the worker in-process. See ServiceWorkerAgent's class comment and
+//         WorkerHost::run_service_worker()'s FIXME for why this can't yet reuse the script resource `update()`
+//         already fetched (`script`/`state` in the caller).
+static void run_service_worker(JS::VM& vm, GC::Ref<Job> job, Registration& registration, ServiceWorkerRecord& worker, ServiceWorkerRecord* newest_worker)
+{
+    // FIXME: Soft Update has no client; there is currently no way to run a service worker without one.
+    if (!job->client) {
+        finish_job(vm, job);
+        return;
+    }
+
+    auto agent = ServiceWorkerAgent::create(*job->client, worker.script_url, registration.scope_url(), worker.worker_type, registration.storage_key());
+    worker.agent = GC::Root { *agent };
+
+    agent->on_script_load_failed([&vm, job, &registration, &worker, newest_worker] {
+        // 16. If runResult is failure or an abrupt completion, then:
+        update_worker_state(job, worker, Bindings::ServiceWorkerState::Redundant);
+
+        // 1. Invoke Reject Job Promise with job and TypeError.
+        reject_job_promise<JS::TypeError>(job, "Run Service Worker failed"_utf16);
+
+        // 2. If newestWorker is null, then remove registration map[...].
+        if (newest_worker == nullptr)
+            Registration::remove(registration.storage_key(), registration.scope_url());
+
+        // 3. Invoke Finish Job with job.
+        finish_job(vm, job);
+    });
+
+    agent->on_script_loaded([&vm, job, &registration, &worker] {
+        // 17. Else, invoke Install algorithm with job, worker, and registration as its arguments.
+        install(vm, job, registration, worker);
+    });
+}
+
+// https://w3c.github.io/ServiceWorker/#installation-algorithm
+static void install(JS::VM& vm, GC::Ref<Job> job, Registration& registration, ServiceWorkerRecord& worker)
+{
+    // 3. Set registration's update via cache mode to job's update via cache mode.
+    registration.set_update_via_cache(job->update_via_cache);
+
+    // 4./5. Run Update Registration State / Update Worker State passing "installing" and worker.
+    registration.set_installing_worker(&worker);
+    update_worker_state(job, worker, Bindings::ServiceWorkerState::Installing);
+
+    // 6. Assert job's job promise is not null. Invoke Resolve Job Promise with job and registration.
+    // NOTE: This resolves register()'s promise once installation has *started*, not once it (or activation)
+    //       completes - scripts observe those via registration.installing/.waiting/.active and statechange
+    //       events instead, matching real browser behavior.
+    resolve_job_promise(job, registration);
+
+    // FIXME: updatefound event dispatch to matching ServiceWorkerRegistration objects is not implemented.
+
+    if (!worker.agent) {
+        // ServiceWorkerAgent construction itself didn't fail (run_service_worker() already handles that via
+        // on_script_load_failed) - this shouldn't be reachable, but treat it the same way as an install
+        // failure below rather than dereferencing a null agent.
+        registration.set_installing_worker(nullptr);
+        update_worker_state(job, worker, Bindings::ServiceWorkerState::Redundant);
+        finish_job(vm, job);
+        return;
+    }
+
+    worker.agent->dispatch_extendable_event(EventNames::install, [&vm, job, &registration, &worker](bool completed_without_error) {
+        if (!completed_without_error) {
+            // Install Failed steps.
+            registration.set_installing_worker(nullptr);
+            update_worker_state(job, worker, Bindings::ServiceWorkerState::Redundant);
+            finish_job(vm, job);
+            return;
+        }
+
+        registration.set_waiting_worker(&worker);
+        registration.set_installing_worker(nullptr);
+        update_worker_state(job, worker, Bindings::ServiceWorkerState::Installed);
+
+        finish_job(vm, job);
+
+        // https://w3c.github.io/ServiceWorker/#try-activate-algorithm
+        // AD-HOC: Simplified - this is only ever reached for a freshly-installed worker of a registration
+        //         that has no prior active worker (Try Activate's "registration's active worker is null"
+        //         condition is always true here), so Activate always runs immediately.
+        activate(job, registration, worker);
+    });
+}
+
+// https://w3c.github.io/ServiceWorker/#activation-algorithm
+// AD-HOC: Simplified per the same "no prior active worker" assumption as Try Activate's caller above - steps
+//         dealing with terminating/replacing a prior active worker, matching clients, and "Notify Controller
+//         Change" are not implemented.
+static void activate(GC::Ref<Job> job, Registration& registration, ServiceWorkerRecord& worker)
+{
+    registration.set_active_worker(&worker);
+    registration.set_waiting_worker(nullptr);
+    update_worker_state(job, worker, Bindings::ServiceWorkerState::Activating);
+
+    // FIXME: ServiceWorkerContainer::ready()'s promise is resolved by its own polling of active_worker(),
+    //        not by this algorithm's "activate-resolve-ready-step" - see that function's own comment.
+
+    if (!worker.agent) {
+        update_worker_state(job, worker, Bindings::ServiceWorkerState::Activated);
+        return;
+    }
+
+    worker.agent->dispatch_extendable_event(EventNames::activate, [job, &worker](bool) {
+        // FIXME: Does not implement ExtendableEvent::waitUntil()'s lifetime-extension semantics - activation
+        //        always proceeds to "activated" regardless of whether the event's listeners threw.
+        update_worker_state(job, worker, Bindings::ServiceWorkerState::Activated);
+    });
+}
+
+// https://w3c.github.io/ServiceWorker/#update-worker-state-algorithm
+// FIXME: The spec updates the ServiceWorker wrapper (and fires statechange) for *every* environment settings
+//        object that has ever observed this worker, each via its own queued task. This only updates/fires for
+//        job's own client, synchronously, since that's the only settings object reachable from here - this is
+//        enough for the common case (the page that called register() watching its own registration/worker),
+//        e.g. real-world bootstrap code like Flutter's flutter.js, which waits on a statechange event on the
+//        ServiceWorker object returned by registration.installing/.waiting to reach "activated".
+static void update_worker_state(GC::Ref<Job> job, ServiceWorkerRecord& worker, Bindings::ServiceWorkerState new_state)
+{
+    worker.state = new_state;
+
+    if (!job->client)
+        return;
+
+    auto& realm = job->client->realm();
+    HTML::TemporaryExecutionContext const context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
+
+    auto service_worker_object = job->client->get_service_worker_object(&worker);
+    service_worker_object->set_service_worker_state(new_state);
+    service_worker_object->dispatch_event(DOM::Event::create(realm, HTML::EventNames::statechange));
 }
 
 static void unregister(JS::VM& vm, GC::Ref<Job> job)
@@ -530,20 +682,25 @@ static void finish_job(JS::VM& vm, GC::Ref<Job> job)
 }
 
 // https://w3c.github.io/ServiceWorker/#resolve-job-promise-algorithm
-static void resolve_job_promise(GC::Ref<Job> job, Optional<Registration const&>, JS::Value value)
+static void resolve_job_promise(GC::Ref<Job> job, Optional<Registration const&> registration, JS::Value value)
 {
     // 1. If job’s client is not null, queue a task, on job’s client's responsible event loop using the DOM manipulation task source, to run the following substeps:
     if (job->client) {
         auto& realm = job->client->realm();
-        HTML::queue_a_task(HTML::Task::Source::DOMManipulation, job->client->responsible_event_loop(), nullptr, GC::create_function(realm.heap(), [&realm, job, value] {
+        HTML::queue_a_task(HTML::Task::Source::DOMManipulation, job->client->responsible_event_loop(), nullptr, GC::create_function(realm.heap(), [&realm, job, value, registration] {
             HTML::TemporaryExecutionContext const context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
-            // FIXME: Resolve to a ServiceWorkerRegistration platform object
             // 1. Let convertedValue be null.
+            JS::Value converted_value = JS::js_null();
             // 2. If job’s job type is either register or update, set convertedValue to the result of
             //    getting the service worker registration object that represents value in job’s client.
-            // 3. Else, set convertedValue to value, in job’s client's Realm.
+            if ((job->job_type == Job::Type::Register || job->job_type == Job::Type::Update) && registration.has_value()) {
+                converted_value = job->client->get_service_worker_registration_object(*registration);
+            } else {
+                // 3. Else, set convertedValue to value, in job’s client's Realm.
+                converted_value = value;
+            }
             // 4. Resolve job’s job promise with convertedValue.
-            WebIDL::resolve_promise(realm, *job->job_promise, value);
+            WebIDL::resolve_promise(realm, *job->job_promise, converted_value);
         }));
     }
 
@@ -556,15 +713,20 @@ static void resolve_job_promise(GC::Ref<Job> job, Optional<Registration const&>,
         // 2. Queue a task, on equivalentJob’s client's responsible event loop using the DOM manipulation task source,
         //    to run the following substeps:
         auto& realm = equivalent_job->client->realm();
-        HTML::queue_a_task(HTML::Task::Source::DOMManipulation, equivalent_job->client->responsible_event_loop(), nullptr, GC::create_function(realm.heap(), [&realm, equivalent_job, value] {
+        HTML::queue_a_task(HTML::Task::Source::DOMManipulation, equivalent_job->client->responsible_event_loop(), nullptr, GC::create_function(realm.heap(), [&realm, equivalent_job, value, registration] {
             HTML::TemporaryExecutionContext const context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
-            // FIXME: Resolve to a ServiceWorkerRegistration platform object
             // 1. Let convertedValue be null.
+            JS::Value converted_value = JS::js_null();
             // 2. If equivalentJob’s job type is either register or update, set convertedValue to the result of
             //    getting the service worker registration object that represents value in equivalentJob’s client.
-            // 3. Else, set convertedValue to value, in equivalentJob’s client's Realm.
+            if ((equivalent_job->job_type == Job::Type::Register || equivalent_job->job_type == Job::Type::Update) && registration.has_value()) {
+                converted_value = equivalent_job->client->get_service_worker_registration_object(*registration);
+            } else {
+                // 3. Else, set convertedValue to value, in equivalentJob’s client's Realm.
+                converted_value = value;
+            }
             // 4. Resolve equivalentJob’s job promise with convertedValue.
-            WebIDL::resolve_promise(realm, *equivalent_job->job_promise, value);
+            WebIDL::resolve_promise(realm, *equivalent_job->job_promise, converted_value);
         }));
     }
 }

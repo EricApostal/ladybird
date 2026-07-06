@@ -21,7 +21,7 @@ class HTMLCanvasElement final : public HTMLElement {
 public:
     static constexpr bool OVERRIDES_FINALIZE = true;
 
-    using RenderingContext = Variant<GC::Ref<CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty>;
+    using RenderingContext = Variant<GC::Ref<CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, GC::Ref<ImageBitmapRenderingContext>, Empty>;
 
     virtual ~HTMLCanvasElement() override;
 
@@ -50,12 +50,13 @@ public:
     void prepare_for_compositing();
     void notify_compositor_backing_storage_lost();
     void set_canvas_content_dirty();
-    GC::Ptr<HTML::CanvasRenderingContext2D> canvas_rendering_context_2d() const
-    {
-        if (auto const* context = m_context.get_pointer<GC::Ref<HTML::CanvasRenderingContext2D>>())
-            return *context;
-        return nullptr;
-    }
+
+    // NOTE: This also returns the internal 2D context an ImageBitmapRenderingContext delegates its
+    //       backing-store/painting operations to (see ImageBitmapRenderingContext's class comment) - this
+    //       means canvas_id(), get_bitmap_from_surface(), ensure_backing_storage(), and
+    //       notify_compositor_backing_storage_lost() (which are all implemented in terms of this accessor)
+    //       transparently work for canvases whose active context is "bitmaprenderer" too.
+    GC::Ptr<HTML::CanvasRenderingContext2D> canvas_rendering_context_2d() const;
 
     Optional<Painting::CanvasId> canvas_id() const;
 
@@ -80,13 +81,14 @@ private:
     virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
     virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
+    JS::ThrowCompletionOr<HasOrCreatedContext> create_bitmap_renderer_context(JS::Value options);
     template<typename ContextType>
     JS::ThrowCompletionOr<HasOrCreatedContext> create_webgl_context(JS::Value options);
     WebGL::WebGLRenderingContextBase* webgl_context() const;
     void reset_context_to_default_state();
     void notify_context_about_canvas_size_change();
 
-    Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty> m_context;
+    RenderingContext m_context;
     bool m_canvas_content_dirty { false };
 };
 

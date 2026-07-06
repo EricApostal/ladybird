@@ -6,12 +6,16 @@
 
 #pragma once
 
+#include <LibWeb/Bindings/ServiceWorkerGlobalScope.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 
 namespace Web::ServiceWorker {
 
 // https://w3c.github.io/ServiceWorker/#serviceworkerglobalscope
-class ServiceWorkerGlobalScope : public HTML::WorkerGlobalScope {
+class WEB_API ServiceWorkerGlobalScope
+    : public HTML::WorkerGlobalScope
+    , public Bindings::ServiceWorkerGlobalScopeGlobalMixin {
     WEB_PLATFORM_OBJECT(ServiceWorkerGlobalScope, HTML::WorkerGlobalScope);
     GC_DECLARE_ALLOCATOR(ServiceWorkerGlobalScope);
 
@@ -35,13 +39,20 @@ public:
 
     [[nodiscard]] GC::Ref<CookieStore::CookieStore> cookie_store();
 
+    [[nodiscard]] GC::Ref<Clients> clients();
+
+    // https://w3c.github.io/ServiceWorker/#dom-serviceworkerglobalscope-skipwaiting
+    GC::Ref<WebIDL::Promise> skip_waiting();
+
 protected:
     explicit ServiceWorkerGlobalScope(JS::Realm&, GC::Ref<Web::Page>);
 
 private:
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual void initialize_web_interfaces_impl() override;
 
     GC::Ptr<CookieStore::CookieStore> m_cookie_store;
+    GC::Ptr<Clients> m_clients;
 };
 
 }

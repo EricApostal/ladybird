@@ -258,6 +258,7 @@ private:
     virtual void page_did_change_audio_play_state(Web::HTML::AudioPlayState) override;
     virtual Web::HTML::WorkerAgentId start_worker_agent(Web::HTML::WorkerAgentStartRequest&&) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
+    virtual void dispatch_extendable_event(Web::HTML::WorkerAgentId, String event_name) override;
     virtual void page_did_mutate_dom(FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node> previous_sibling, GC::Ptr<Web::DOM::Node> next_sibling, Optional<String> const& attribute_name) override;
     virtual void flush_pending_dom_mutations() override;
     virtual void page_did_take_screenshot(Gfx::ShareableBitmap const& screenshot) override;

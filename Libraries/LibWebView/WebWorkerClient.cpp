@@ -77,6 +77,11 @@ void WebWorkerClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web:
     WorkerProcessManager::the().close_worker_agent(*this, agent_id, owner_token);
 }
 
+void WebWorkerClient::did_dispatch_extendable_event(String event_name, bool completed_without_error)
+{
+    WorkerProcessManager::the().worker_did_dispatch_extendable_event(m_agent_id, move(event_name), completed_without_error);
+}
+
 WebWorkerClient::WebWorkerClient(NonnullOwnPtr<IPC::Transport> transport, Web::HTML::WorkerAgentId agent_id)
     : IPC::ConnectionToServer<WebWorkerClientEndpoint, WebWorkerServerEndpoint>(*this, move(transport))
     , m_agent_id(agent_id)

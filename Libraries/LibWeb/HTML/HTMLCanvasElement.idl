@@ -1,4 +1,4 @@
-typedef (CanvasRenderingContext2D or WebGLRenderingContext or WebGL2RenderingContext) RenderingContext;
+typedef (CanvasRenderingContext2D or WebGLRenderingContext or WebGL2RenderingContext or ImageBitmapRenderingContext) RenderingContext;
 
 // https://html.spec.whatwg.org/multipage/semantics.html#htmlcanvaselement
 [Exposed=Window]

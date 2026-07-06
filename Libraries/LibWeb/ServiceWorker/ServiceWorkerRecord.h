@@ -6,9 +6,11 @@
 
 #pragma once
 
+#include <LibGC/Root.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/ServiceWorker.h>
 #include <LibWeb/Bindings/Worker.h>
+#include <LibWeb/Forward.h>
 
 namespace Web::ServiceWorker {
 
@@ -32,6 +34,11 @@ struct ServiceWorkerRecord {
     // https://w3c.github.io/ServiceWorker/#dfn-classic-scripts-imported-flag
     // A service worker has an associated classic scripts imported flag. It is initially unset.
     bool classic_scripts_imported { false };
+
+    // AD-HOC: Handle to the running agent (WebWorker process proxy) once "Run Service Worker" has succeeded.
+    //         Null until then. Held as a GC::Root (rather than GC::Ptr) since ServiceWorkerRecord is a plain
+    //         struct, not a JS::Cell, and has no visit_edges() of its own to keep a GC::Ptr reachable.
+    GC::Root<ServiceWorkerAgent> agent;
 
     // FIXME: A lot more fields after this...
 };

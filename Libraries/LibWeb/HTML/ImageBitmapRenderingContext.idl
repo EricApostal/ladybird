@@ -1,0 +1,12 @@
+// https://html.spec.whatwg.org/multipage/canvas.html#the-imagebitmaprenderingcontext-interface
+// FIXME: canvas is only ever an HTMLCanvasElement here (not the spec's (HTMLCanvasElement or OffscreenCanvas)
+//        union) - OffscreenCanvas.getContext("bitmaprenderer") is not wired up.
+[Exposed=Window]
+interface ImageBitmapRenderingContext {
+    [SameObject] readonly attribute HTMLCanvasElement canvas;
+    undefined transferFromImageBitmap(ImageBitmap? bitmap);
+};
+
+dictionary ImageBitmapRenderingContextSettings {
+    boolean alpha = true;
+};

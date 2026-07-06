@@ -98,6 +98,23 @@ void ConnectionFromClient::connect_shared_worker(Web::HTML::TransferDataEncoder 
     m_worker_host->connect_shared_worker(move(message_port), move(outside_settings));
 }
 
+void ConnectionFromClient::start_service_worker(URL::URL script_url, Web::Bindings::WorkerType worker_type, Web::HTML::SerializedEnvironmentSettingsObject outside_settings)
+{
+    m_worker_host = make_ref_counted<WorkerHost>(script_url, worker_type, String {});
+    m_worker_host->run_service_worker(page(), move(script_url), worker_type, outside_settings);
+}
+
+void ConnectionFromClient::dispatch_extendable_event(String event_name)
+{
+    if (!m_worker_host) {
+        async_did_dispatch_extendable_event(move(event_name), false);
+        return;
+    }
+
+    bool completed_without_error = m_worker_host->dispatch_extendable_event(event_name);
+    async_did_dispatch_extendable_event(move(event_name), completed_without_error);
+}
+
 void ConnectionFromClient::handle_file_return(i32 error, Optional<IPC::File> file, i32 request_id)
 {
     auto file_request = m_requested_files.take(request_id);

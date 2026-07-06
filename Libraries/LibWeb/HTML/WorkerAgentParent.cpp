@@ -158,8 +158,7 @@ void WorkerAgentParent::dispatch_worker_exception(String message, String filenam
 
 WorkerAgentOwnerToken WorkerAgentParent::next_owner_token()
 {
-    static WorkerAgentOwnerToken s_next_owner_token = 0;
-    return ++s_next_owner_token;
+    return next_worker_agent_owner_token();
 }
 
 void WorkerAgentParent::finalize()

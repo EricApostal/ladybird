@@ -1,11 +1,11 @@
 // https://w3c.github.io/ServiceWorker/#serviceworkerglobalscope
 [Global=(Worker,ServiceWorker), Exposed=ServiceWorker, SecureContext]
 interface ServiceWorkerGlobalScope : WorkerGlobalScope {
-    [FIXME, SameObject] readonly attribute Clients clients;
+    [SameObject] readonly attribute Clients clients;
     [FIXME, SameObject] readonly attribute ServiceWorkerRegistration registration;
     [FIXME, SameObject] readonly attribute ServiceWorker serviceWorker;
 
-    [FIXME, NewObject] Promise<undefined> skipWaiting();
+    [NewObject] Promise<undefined> skipWaiting();
 
     attribute EventHandler oninstall;
     attribute EventHandler onactivate;

@@ -18,4 +18,6 @@ endpoint WebWorkerClient {
     did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) =|
     start_worker_agent(Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id)
     close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
+
+    did_dispatch_extendable_event(String event_name, bool completed_without_error) =|
 }

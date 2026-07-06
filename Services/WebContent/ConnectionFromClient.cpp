@@ -59,6 +59,7 @@
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
+#include <LibWeb/ServiceWorker/ServiceWorkerAgent.h>
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/FlexLayoutData.h>
 #include <LibWeb/Layout/GridLayoutData.h>
@@ -2418,12 +2419,16 @@ void ConnectionFromClient::broadcast_channel_message(Web::HTML::BroadcastChannel
 
 void ConnectionFromClient::did_worker_agent_finish_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
+    // NOTE: owner_token unambiguously identifies at most one of these two registries (see
+    //       next_worker_agent_owner_token()); each call is a harmless no-op against the other.
     Web::HTML::WorkerAgentParent::did_finish_loading_worker_script(owner_token);
+    Web::ServiceWorker::ServiceWorkerAgent::did_finish_loading_worker_script(owner_token);
 }
 
 void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_fail_loading_worker_script(owner_token);
+    Web::ServiceWorker::ServiceWorkerAgent::did_fail_loading_worker_script(owner_token);
 }
 
 void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, String message, String filename, u32 lineno, u32 colno)
@@ -2434,6 +2439,11 @@ void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAg
 void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_close_worker(owner_token);
+}
+
+void ConnectionFromClient::did_dispatch_extendable_event(Web::HTML::WorkerAgentOwnerToken owner_token, String event_name, bool completed_without_error)
+{
+    Web::ServiceWorker::ServiceWorkerAgent::did_dispatch_extendable_event(owner_token, move(event_name), completed_without_error);
 }
 
 // https://html.spec.whatwg.org/multipage/speculative-loading.html#nav-traversal-ui:close-a-top-level-traversable

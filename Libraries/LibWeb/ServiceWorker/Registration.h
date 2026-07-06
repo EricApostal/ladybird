@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
 #include <AK/Time.h>
 #include <AK/Traits.h>
@@ -53,6 +54,17 @@ public:
     ServiceWorkerRecord* waiting_worker() const { return m_waiting_worker; }
     ServiceWorkerRecord* active_worker() const { return m_active_worker; }
 
+    void set_installing_worker(ServiceWorkerRecord* worker) { m_installing_worker = worker; }
+    void set_waiting_worker(ServiceWorkerRecord* worker) { m_waiting_worker = worker; }
+    void set_active_worker(ServiceWorkerRecord* worker) { m_active_worker = worker; }
+
+    // https://w3c.github.io/ServiceWorker/#register-algorithm, step 10: "Let worker be a new service worker."
+    // AD-HOC: Nothing previously constructed a ServiceWorkerRecord, so nothing owned one either. Registration
+    //         (which already owns this worker's lifetime conceptually via installing/waiting/active) is the
+    //         natural owner; the returned reference's address is stable even if this Registration is moved
+    //         (e.g. by registration_map()'s hash table), since it points at a separately heap-allocated object.
+    ServiceWorkerRecord& create_new_worker();
+
     bool is_stale() const;
 
 private:
@@ -65,6 +77,10 @@ private:
     ServiceWorkerRecord* m_installing_worker { nullptr }; // https://w3c.github.io/ServiceWorker/#dfn-installing-worker
     ServiceWorkerRecord* m_waiting_worker { nullptr };    // https://w3c.github.io/ServiceWorker/#dfn-waiting-worker
     ServiceWorkerRecord* m_active_worker { nullptr };     // https://w3c.github.io/ServiceWorker/#dfn-active-worker
+
+    // Owns every ServiceWorkerRecord ever created for this registration; m_installing/waiting/active_worker
+    // point into this (or are null). Old redundant workers are intentionally not pruned - out of scope FIXME.
+    Vector<NonnullOwnPtr<ServiceWorkerRecord>> m_workers;
 
     Optional<MonotonicTime> m_last_update_check_time;                                                               // https://w3c.github.io/ServiceWorker/#dfn-last-update-check-time
     Bindings::ServiceWorkerUpdateViaCache m_update_via_cache_mode = Bindings::ServiceWorkerUpdateViaCache::Imports; // https://w3c.github.io/ServiceWorker/#dfn-update-via-cache

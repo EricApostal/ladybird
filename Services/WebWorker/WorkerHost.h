@@ -27,6 +27,17 @@ public:
     void run(GC::Ref<Web::Page>, Web::HTML::TransferDataEncoder message_port_data, Web::HTML::SerializedEnvironmentSettingsObject const&, Web::Bindings::RequestCredentials, bool is_shared);
     void connect_shared_worker(Web::HTML::TransferDataEncoder message_port_data, Web::HTML::SerializedEnvironmentSettingsObject);
 
+    // https://w3c.github.io/ServiceWorker/#run-service-worker-algorithm
+    // NOTE: Unlike the spec, this performs its own script fetch rather than reusing the script resource
+    //       already fetched by the Update algorithm - see the AD-HOC comment on this function's definition.
+    void run_service_worker(GC::Ref<Web::Page>, URL::URL script_url, Web::Bindings::WorkerType, Web::HTML::SerializedEnvironmentSettingsObject const&);
+
+    // Dispatches an ExtendableEvent (install/activate) at the running ServiceWorkerGlobalScope. Returns whether
+    // the event completed without an uncaught exception.
+    // FIXME: Does not implement waitUntil()'s lifetime-extension semantics; "completed" just means the event's
+    //        listeners ran to completion synchronously.
+    bool dispatch_extendable_event(FlyString const& event_name);
+
 private:
     struct PendingSharedWorkerConnection {
         Web::HTML::TransferDataEncoder message_port_data;

@@ -25,6 +25,9 @@
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Loader/ResourceLoader.h>
+#include <LibWeb/Bindings/ExtendableEvent.h>
+#include <LibWeb/ServiceWorker/ExtendableEvent.h>
+#include <LibWeb/ServiceWorker/ServiceWorkerGlobalScope.h>
 #include <WebWorker/PageHost.h>
 #include <WebWorker/WorkerHost.h>
 
@@ -386,6 +389,146 @@ void WorkerHost::flush_pending_shared_worker_connections()
     auto pending_connections = move(m_pending_shared_worker_connections);
     for (auto& connection : pending_connections)
         connect_shared_worker_impl(move(connection.message_port_data), connection.outside_settings, ShouldAppendOwner::Yes);
+}
+
+// https://w3c.github.io/ServiceWorker/#run-service-worker-algorithm
+// AD-HOC: The spec's "Run Service Worker" reuses the script resource already fetched by the Update
+//         algorithm in the WebContent process, rather than fetching it again. JS::Script does not retain
+//         retrievable source text after parsing (it compiles away to bytecode), so there is no API to hand
+//         that already-fetched script across the process boundary without duplicating fetch-response-body
+//         handling. Pragmatically, this performs its own fetch instead, mirroring run()'s classic-worker
+//         fetch flow above (minus the is_shared-specific port/owner-set-construction logic) - a real spec
+//         divergence (a second network round trip, typically served from cache), but this WorkerHost's
+//         global scope is only ever created once, so there is no "already running" early-return case to
+//         combine with, and this still exercises the same, already-working fetch machinery as the other two
+//         worker flavors.
+void WorkerHost::run_service_worker(GC::Ref<Web::Page> page, URL::URL script_url, Web::Bindings::WorkerType worker_type, Web::HTML::SerializedEnvironmentSettingsObject const& outside_settings_snapshot)
+{
+    m_is_shared = false;
+    m_type = worker_type;
+
+    auto owner = relevant_owner_to_add(outside_settings_snapshot);
+    auto unsafe_worker_creation_time = Web::HighResolutionTime::unsafe_shared_current_time();
+
+    auto realm_execution_context = Web::Bindings::create_a_new_javascript_realm(
+        Web::Bindings::main_thread_vm(),
+        [page](JS::Realm& realm) -> JS::Object* {
+            return realm.heap().allocate<Web::ServiceWorker::ServiceWorkerGlobalScope>(realm, page);
+        },
+        nullptr);
+
+    GC::Ref<Web::HTML::WorkerGlobalScope> worker_global_scope = as<Web::HTML::WorkerGlobalScope>(realm_execution_context->realm->global_object());
+    m_worker_global_scope = worker_global_scope;
+    worker_global_scope->set_url(script_url);
+
+    // AD-HOC: Populate owner_set so that HTML::is_secure_context() (which reads owner_set[0] for any
+    //         WorkerGlobalScope-derived global) has something to inherit from. Service workers don't have a
+    //         "constructor owner" the way dedicated/shared workers do; this just carries the registering
+    //         client's secure-context status through, matching the spec's clientOrigin-derived reasoning.
+    worker_global_scope->owner_set().append(owner);
+
+    auto inside_settings = Web::HTML::WorkerEnvironmentSettingsObject::setup(page, move(realm_execution_context), outside_settings_snapshot, unsafe_worker_creation_time);
+    m_inside_settings = inside_settings;
+
+    auto& console_object = *inside_settings->realm().intrinsics().console_object();
+    m_console = console_object.heap().allocate<Web::HTML::WorkerDebugConsoleClient>(console_object.console());
+    VERIFY(m_console);
+    console_object.console().set_client(*m_console);
+
+    // IMPLEMENTATION DEFINED: We need an object to represent the fetch response's client, matching run()'s
+    // identical workaround above.
+    auto outside_settings = inside_settings->realm().create<Web::HTML::EnvironmentSettingsSnapshot>(inside_settings->realm(), inside_settings->realm_execution_context().copy(), outside_settings_snapshot);
+
+    auto perform_fetch_function = [inside_settings, worker_global_scope](GC::Ref<Web::Fetch::Infrastructure::Request> request, Web::HTML::TopLevelModule is_top_level, Web::Fetch::Infrastructure::FetchAlgorithms::ProcessResponseConsumeBodyFunction process_custom_fetch_response) -> Web::WebIDL::ExceptionOr<void> {
+        auto& realm = inside_settings->realm();
+        auto& vm = realm.vm();
+
+        Web::Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+
+        if (is_top_level == Web::HTML::TopLevelModule::No) {
+            fetch_algorithms_input.process_response_consume_body = move(process_custom_fetch_response);
+            Web::Fetch::Fetching::fetch(realm, request, Web::Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
+            return {};
+        }
+
+        request->set_reserved_client(GC::Ptr<Web::HTML::EnvironmentSettingsObject>(inside_settings));
+
+        auto process_custom_fetch_response_function = GC::create_function(vm.heap(), move(process_custom_fetch_response));
+
+        fetch_algorithms_input.process_response_consume_body = [worker_global_scope, process_custom_fetch_response_function, inside_settings](auto response, auto body_bytes) {
+            auto& vm = inside_settings->vm();
+
+            worker_global_scope->set_url(response->url().value_or({}));
+            inside_settings->creation_url = worker_global_scope->url();
+            worker_global_scope->initialize_policy_container(response, inside_settings);
+
+            if (worker_global_scope->run_csp_initialization() == Web::ContentSecurityPolicy::Directives::Directive::Result::Blocked)
+                response = Web::Fetch::Infrastructure::Response::network_error(vm, "Blocked by Content Security Policy"_string);
+
+            process_custom_fetch_response_function->function()(response, body_bytes);
+        };
+        Web::Fetch::Fetching::fetch(realm, request, Web::Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
+        return {};
+    };
+    auto perform_fetch = Web::HTML::create_perform_the_fetch_hook(inside_settings->heap(), move(perform_fetch_function));
+
+    RefPtr<WorkerHost> protected_this { *this };
+    auto on_complete_function = [protected_this, page, inside_settings, worker_global_scope, url = script_url](GC::Ptr<Web::HTML::Script> script) mutable {
+        auto& realm = inside_settings->realm();
+
+        if (!script || !script->error_to_rethrow().is_null()) {
+            as<WebWorker::PageHost>(page->client()).did_fail_loading_worker_script();
+            inside_settings->discard_environment();
+            auto reason = script ? script->error_to_rethrow().to_utf16_string_without_side_effects().to_utf8() : "script was null"_string;
+            dbgln("WorkerHost (service worker): Unable to fetch script {} because {}", url, reason);
+            return;
+        }
+
+        worker_global_scope->set_location(realm.create<Web::HTML::WorkerLocation>(*worker_global_scope));
+
+        inside_settings->execution_ready = true;
+
+        if (auto* classic_script = as_if<Web::HTML::ClassicScript>(*script))
+            (void)classic_script->run();
+        else
+            (void)as<Web::HTML::ModuleScript>(*script).run();
+
+        as<WebWorker::PageHost>(page->client()).did_finish_loading_worker_script(Web::HTML::is_secure_context(*inside_settings));
+
+        // 15. Event loop: Run the responsible event loop specified by inside settings until it is destroyed.
+        inside_settings->responsible_event_loop().schedule();
+    };
+    auto on_complete = Web::HTML::create_on_fetch_script_complete(inside_settings->vm().heap(), move(on_complete_function));
+
+    if (worker_type == Web::Bindings::WorkerType::Classic) {
+        if (auto err = Web::HTML::fetch_classic_worker_script(script_url, outside_settings, Web::Fetch::Infrastructure::Request::Destination::ServiceWorker, inside_settings, perform_fetch, on_complete); err.is_error()) {
+            dbgln("Failed to run service worker script");
+            TODO();
+        }
+    } else {
+        if (auto err = Web::HTML::fetch_module_worker_script_graph(script_url, outside_settings, Web::Fetch::Infrastructure::Request::Destination::ServiceWorker, inside_settings, perform_fetch, on_complete); err.is_error()) {
+            dbgln("Failed to run service worker script");
+            TODO();
+        }
+    }
+}
+
+bool WorkerHost::dispatch_extendable_event(FlyString const& event_name)
+{
+    if (!m_worker_global_scope || !m_inside_settings)
+        return false;
+
+    auto& realm = m_inside_settings->realm();
+    Web::HTML::TemporaryExecutionContext const context(realm, Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
+
+    auto event = Web::ServiceWorker::ExtendableEvent::create(realm, event_name);
+    bool not_cancelled = m_worker_global_scope->dispatch_event(event);
+    (void)not_cancelled;
+
+    // FIXME: This does not wait for any promises passed to event.waitUntil() to settle (see
+    //        ExtendableEvent::wait_until()'s FIXME) - "completed" here just means dispatch_event() returned,
+    //        i.e. the event's listeners ran to completion without an uncaught exception propagating out.
+    return true;
 }
 
 }

@@ -289,11 +289,14 @@ ParseResult<Limits> Limits::parse(ConstrainedStream& stream)
     ScopeLogger<WASM_BINPARSER_DEBUG> logger("Limits"sv);
     auto flag = TRY_READ(stream, u8, ParseError::ExpectedKindTag);
 
-    // Proposal 'memory64': flags 0/1 refer to 32-bit limits, flags 4/5 refer to 64-bit limits.
-    if (flag & ~0b00000101)
+    // Proposals 'memory64' (bit 2) and 'threads' (bit 1, "shared") extend the limits flags byte beyond the
+    // core spec's bit 0 ("has max"). See Limits::is_shared()'s FIXME for what "shared" does and doesn't do
+    // here.
+    if (flag & ~0b00000111)
         return with_eof_check(stream, ParseError::InvalidTag);
 
     auto address_type = (flag & 0b00000100) ? AddressType::I64 : AddressType::I32;
+    bool shared = (flag & 0b00000010) != 0;
 
     auto min_or_error = stream.read_value<LEB128<u64>>();
     if (min_or_error.is_error())
@@ -308,7 +311,7 @@ ParseResult<Limits> Limits::parse(ConstrainedStream& stream)
         max = value_or_error.release_value();
     }
 
-    return Limits { address_type, min, move(max) };
+    return Limits { address_type, min, move(max), shared };
 }
 
 ParseResult<MemoryType> MemoryType::parse(ConstrainedStream& stream)

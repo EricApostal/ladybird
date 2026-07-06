@@ -25,6 +25,12 @@ endpoint WebWorkerServer {
     connect_shared_worker(Web::HTML::TransferDataEncoder message_port,
                           Web::HTML::SerializedEnvironmentSettingsObject outside_settings) =|
 
+    start_service_worker(URL::URL script_url,
+                         Web::Bindings::WorkerType worker_type,
+                         Web::HTML::SerializedEnvironmentSettingsObject outside_settings) =|
+
+    dispatch_extendable_event(String event_name) =|
+
     close_worker() =|
 
     did_worker_agent_finish_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) =|

@@ -148,6 +148,12 @@ void Registration::remove(StorageAPI::StorageKey const& key, URL::URL const& sco
     (void)registration_map().remove({ key, scope.serialize(URL::ExcludeFragment::Yes).to_byte_string() });
 }
 
+ServiceWorkerRecord& Registration::create_new_worker()
+{
+    m_workers.append(make<ServiceWorkerRecord>());
+    return *m_workers.last();
+}
+
 // https://w3c.github.io/ServiceWorker/#get-newest-worker
 ServiceWorkerRecord* Registration::newest_worker() const
 {

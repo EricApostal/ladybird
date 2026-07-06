@@ -1,0 +1,16 @@
+// https://w3c.github.io/ServiceWorker/#extendableevent-interface
+[Exposed=ServiceWorker]
+interface ExtendableEvent : Event {
+    constructor(DOMString type, optional ExtendableEventInit eventInitDict = {});
+
+    // FIXME: This does not track the promise or extend the event's lifetime; it only performs the
+    //        "must be called during active dispatch" validation described by the Add Lifetime Promise algorithm.
+    //        The parameter is typed `any` rather than the spec's `Promise<any>` to avoid a pre-existing codegen
+    //        bug: Promise<T> as an argument type (as opposed to a return type) hits a code path in the bindings
+    //        generator that is missing an #include for JS::new_promise_capability. Since this method doesn't do
+    //        anything with the value besides the active-dispatch check, `any` is an acceptable simplification.
+    undefined waitUntil(any f);
+};
+
+dictionary ExtendableEventInit : EventInit {
+};

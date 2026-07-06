@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/String.h>
 #include <LibIPC/Forward.h>
 #include <LibURL/URL.h>
@@ -32,7 +33,16 @@ struct WEB_API WorkerAgentStartRequest {
     StorageAPI::StorageKey storage_key;
     bool caller_is_secure_context { false };
     WorkerAgentOwnerToken owner_token { 0 };
+
+    // Only used when agent_type is ServiceWorker, to key the reuse/dedup table by registration scope
+    // (rather than by (storage key, url, name) like SharedWorker).
+    Optional<URL::URL> scope_url;
 };
+
+// Shared across all owner-token allocators (WorkerAgentParent, ServiceWorkerAgent, ...) so that a given
+// WorkerAgentOwnerToken value unambiguously identifies at most one owner within the process, even though
+// completion notifications (e.g. did_worker_agent_finish_loading_script) are routed to every registry.
+WEB_API WorkerAgentOwnerToken next_worker_agent_owner_token();
 
 }
 

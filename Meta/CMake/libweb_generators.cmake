@@ -364,6 +364,7 @@ function (generate_js_bindings target)
         IntrinsicDefinitions.cpp IntrinsicDefinitions.h
         DedicatedWorkerExposedInterfaces.cpp DedicatedWorkerExposedInterfaces.h
         SharedWorkerExposedInterfaces.cpp SharedWorkerExposedInterfaces.h
+        ServiceWorkerExposedInterfaces.cpp ServiceWorkerExposedInterfaces.h
         WindowExposedInterfaces.cpp WindowExposedInterfaces.h)
     list(TRANSFORM exposed_interface_sources PREPEND "Bindings/")
     target_sources(${target} PRIVATE ${exposed_interface_sources})

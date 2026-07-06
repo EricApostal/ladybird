@@ -22,6 +22,7 @@
 #include <LibWeb/HTML/Canvas/SerializeBitmap.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
+#include <LibWeb/HTML/ImageBitmapRenderingContext.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
@@ -156,6 +157,9 @@ void HTMLCanvasElement::reset_context_to_default_state()
         [](GC::Ref<WebGL::WebGL2RenderingContext>& context) {
             context->reset_to_default_state();
         },
+        [](GC::Ref<ImageBitmapRenderingContext>& context) {
+            context->internal_2d_context()->reset_to_default_state();
+        },
         [](Empty) {
             // Do nothing.
         });
@@ -206,6 +210,9 @@ void HTMLCanvasElement::notify_context_about_canvas_size_change()
         },
         [&](GC::Ref<WebGL::WebGL2RenderingContext>& context) {
             context->set_size(bitmap_size_for_canvas());
+        },
+        [&](GC::Ref<ImageBitmapRenderingContext>& context) {
+            context->internal_2d_context()->set_size(bitmap_size_for_canvas());
         },
         [](Empty) {
             // Do nothing.
@@ -264,6 +271,15 @@ JS::ThrowCompletionOr<HTMLCanvasElement::HasOrCreatedContext> HTMLCanvasElement:
     return HasOrCreatedContext::Yes;
 }
 
+JS::ThrowCompletionOr<HTMLCanvasElement::HasOrCreatedContext> HTMLCanvasElement::create_bitmap_renderer_context(JS::Value options)
+{
+    if (!m_context.has<Empty>())
+        return m_context.has<GC::Ref<ImageBitmapRenderingContext>>() ? HasOrCreatedContext::Yes : HasOrCreatedContext::No;
+
+    m_context = TRY(ImageBitmapRenderingContext::create(realm(), *this, options));
+    return HasOrCreatedContext::Yes;
+}
+
 template<typename ContextType>
 JS::ThrowCompletionOr<HTMLCanvasElement::HasOrCreatedContext> HTMLCanvasElement::create_webgl_context(JS::Value options)
 {
@@ -312,6 +328,13 @@ JS::ThrowCompletionOr<HTMLCanvasElement::RenderingContext> HTMLCanvasElement::ge
         return Empty {};
     }
 
+    if (type == "bitmaprenderer"sv) {
+        if (TRY(create_bitmap_renderer_context(options)) == HasOrCreatedContext::Yes)
+            return m_context.get<GC::Ref<ImageBitmapRenderingContext>>();
+
+        return Empty {};
+    }
+
     return Empty {};
 }
 
@@ -339,6 +362,7 @@ bool HTMLCanvasElement::is_origin_clean() const
 {
     return m_context.visit(
         [](GC::Ref<CanvasRenderingContext2D> const& context) { return context->origin_clean(); },
+        [](GC::Ref<ImageBitmapRenderingContext> const& context) { return context->internal_2d_context()->origin_clean(); },
         // FIXME: WebGL and WebGL2 contexts do not track the origin-clean flag yet.
         [](auto const&) { return true; });
 }
@@ -416,6 +440,15 @@ WebIDL::ExceptionOr<void> HTMLCanvasElement::to_blob(GC::Ref<WebIDL::CallbackTyp
     return {};
 }
 
+GC::Ptr<HTML::CanvasRenderingContext2D> HTMLCanvasElement::canvas_rendering_context_2d() const
+{
+    if (auto const* context = m_context.get_pointer<GC::Ref<HTML::CanvasRenderingContext2D>>())
+        return *context;
+    if (auto const* context = m_context.get_pointer<GC::Ref<ImageBitmapRenderingContext>>())
+        return (*context)->internal_2d_context();
+    return nullptr;
+}
+
 WebGL::WebGLRenderingContextBase* HTMLCanvasElement::webgl_context() const
 {
     return m_context.visit(
@@ -481,6 +514,9 @@ void HTMLCanvasElement::prepare_for_compositing()
         },
         [](GC::Ref<WebGL::WebGL2RenderingContext>& context) {
             context->prepare_for_compositing();
+        },
+        [](GC::Ref<ImageBitmapRenderingContext>& context) {
+            context->internal_2d_context()->prepare_for_compositing();
         },
         [](Empty) {
             // Do nothing.

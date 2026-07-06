@@ -30,6 +30,15 @@ public:
         bool operator==(SharedWorkerKey const&) const = default;
     };
 
+    // https://w3c.github.io/ServiceWorker/#run-service-worker-algorithm
+    // Keys the reuse table by registration scope (rather than by (storage key, url, name) like SharedWorker).
+    struct ServiceWorkerAgentKey {
+        Web::StorageAPI::StorageKey storage_key;
+        URL::URL scope_url;
+
+        bool operator==(ServiceWorkerAgentKey const&) const = default;
+    };
+
     Web::HTML::WorkerAgentId start_worker_agent(WebContentClient&, u64 page_id, Web::HTML::WorkerAgentStartRequest);
     Web::HTML::WorkerAgentId start_worker_agent(WebWorkerClient&, Web::HTML::WorkerAgentStartRequest);
 
@@ -37,6 +46,9 @@ public:
     void close_worker_agent(WebWorkerClient&, Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken);
     void remove_web_content_owner(WebContentClient&);
     void remove_web_worker_owner(WebWorkerClient&);
+
+    void dispatch_extendable_event(Web::HTML::WorkerAgentId, String event_name);
+    void worker_did_dispatch_extendable_event(Web::HTML::WorkerAgentId, String event_name, bool completed_without_error);
 
     void broadcast_channel_message_from_web_content(Web::HTML::BroadcastChannelMessage const&);
 
@@ -65,6 +77,7 @@ private:
     void notify_worker_script_load_failure(Owner const&);
     void notify_worker_exception(Owner const&, String const& message, String const& filename, u32 lineno, u32 colno);
     void notify_worker_close(Owner const&);
+    void notify_worker_dispatched_extendable_event(Owner const&, String const& event_name, bool completed_without_error);
 
     void worker_did_finish_loading_script(Web::HTML::WorkerAgentId, bool worker_is_secure_context);
     void worker_did_fail_loading_script(Web::HTML::WorkerAgentId);
@@ -87,12 +100,14 @@ private:
         Optional<bool> worker_is_secure_context;
         bool closing { false };
         Optional<SharedWorkerKey> shared_worker_key;
+        Optional<ServiceWorkerAgentKey> service_worker_key;
         Vector<Owner> owners;
     };
 
     Web::HTML::WorkerAgentId m_next_agent_id { 0 };
     HashMap<Web::HTML::WorkerAgentId, WorkerAgent> m_agents;
     HashMap<SharedWorkerKey, Web::HTML::WorkerAgentId> m_shared_workers;
+    HashMap<ServiceWorkerAgentKey, Web::HTML::WorkerAgentId> m_service_worker_agents;
 };
 
 }
@@ -104,6 +119,14 @@ struct Traits<WebView::WorkerProcessManager::SharedWorkerKey> : public DefaultTr
     static unsigned hash(WebView::WorkerProcessManager::SharedWorkerKey const& key)
     {
         return pair_int_hash(pair_int_hash(Traits<Web::StorageAPI::StorageKey>::hash(key.storage_key), Traits<URL::URL>::hash(key.url)), key.name.hash());
+    }
+};
+
+template<>
+struct Traits<WebView::WorkerProcessManager::ServiceWorkerAgentKey> : public DefaultTraits<WebView::WorkerProcessManager::ServiceWorkerAgentKey> {
+    static unsigned hash(WebView::WorkerProcessManager::ServiceWorkerAgentKey const& key)
+    {
+        return pair_int_hash(Traits<Web::StorageAPI::StorageKey>::hash(key.storage_key), Traits<URL::URL>::hash(key.scope_url));
     }
 };
 

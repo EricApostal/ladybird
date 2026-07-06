@@ -236,7 +236,7 @@ def main() -> int:
     )
     output_files.extend([intrinsic_definitions_header_path, intrinsic_definitions_implementation_path])
 
-    for class_name in ("Window", "DedicatedWorker", "SharedWorker"):
+    for class_name in ("Window", "DedicatedWorker", "SharedWorker", "ServiceWorker"):
         exposed_interface_header_path = output_directory / f"{class_name}ExposedInterfaces.h"
         write_generated_file(exposed_interface_header_path, write_exposed_interface_header, class_name)
         output_files.append(exposed_interface_header_path)
@@ -245,6 +245,7 @@ def main() -> int:
         ("Window", interface_sets.window_exposed),
         ("DedicatedWorker", interface_sets.dedicated_worker_exposed),
         ("SharedWorker", interface_sets.shared_worker_exposed),
+        ("ServiceWorker", interface_sets.service_worker_exposed),
     ]
     for class_name, exposed_interfaces in exposed_interface_implementations:
         exposed_interface_implementation_path = output_directory / f"{class_name}ExposedInterfaces.cpp"

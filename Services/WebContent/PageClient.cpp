@@ -1163,6 +1163,11 @@ void PageClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML
     client().async_close_worker_agent(m_id, agent_id, owner_token);
 }
 
+void PageClient::dispatch_extendable_event(Web::HTML::WorkerAgentId agent_id, String event_name)
+{
+    client().async_dispatch_extendable_event(m_id, agent_id, move(event_name));
+}
+
 void PageClient::page_did_mutate_dom(FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node>, GC::Ptr<Web::DOM::Node>, Optional<String> const& attribute_name)
 {
     Optional<WebView::Mutation::Type> mutation;

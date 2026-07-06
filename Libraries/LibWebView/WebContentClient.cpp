@@ -1809,6 +1809,11 @@ void WebContentClient::close_worker_agent(u64, Web::HTML::WorkerAgentId agent_id
     WorkerProcessManager::the().close_worker_agent(*this, agent_id, owner_token);
 }
 
+void WebContentClient::dispatch_extendable_event(u64, Web::HTML::WorkerAgentId agent_id, String event_name)
+{
+    WorkerProcessManager::the().dispatch_extendable_event(agent_id, move(event_name));
+}
+
 Optional<ViewImplementation&> WebContentClient::view_for_page_id(u64 page_id, SourceLocation location)
 {
     // Don't bother logging anything for the spare WebContent process. It will only receive a load notification for about:blank.

@@ -45,6 +45,7 @@ public:
     virtual void did_post_broadcast_channel_message(Web::HTML::BroadcastChannelMessage) override;
     virtual Messages::WebWorkerClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
+    virtual void did_dispatch_extendable_event(String event_name, bool completed_without_error) override;
 
 private:
     virtual void die() override;

@@ -810,6 +810,7 @@ class HTMLUListElement;
 class HTMLUnknownElement;
 class HTMLVideoElement;
 class ImageBitmap;
+class ImageBitmapRenderingContext;
 class ImageData;
 class ImageRequest;
 class ListOfAvailableImages;
@@ -1117,8 +1118,12 @@ namespace Web::ServiceWorker {
 
 class Cache;
 class CacheStorage;
+class Clients;
+class ExtendableEvent;
 class ServiceWorker;
+class ServiceWorkerAgent;
 class ServiceWorkerContainer;
+struct ServiceWorkerRecord;
 class ServiceWorkerRegistration;
 
 }

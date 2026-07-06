@@ -106,6 +106,28 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
         }
     }
 
+    // https://w3c.github.io/ServiceWorker/#run-service-worker-algorithm
+    // "If there exists a service worker that runs and is not stopped that this method could reuse..."
+    // AD-HOC: Reuse is keyed by registration scope, mirroring the SharedWorker reuse block above.
+    if (request.agent_type == Web::Bindings::AgentType::ServiceWorker && request.scope_url.has_value()) {
+        ServiceWorkerAgentKey key {
+            .storage_key = request.storage_key,
+            .scope_url = *request.scope_url,
+        };
+
+        if (auto existing_agent_id = m_service_worker_agents.get(key); existing_agent_id.has_value()) {
+            auto maybe_agent = m_agents.find(*existing_agent_id);
+            if (maybe_agent != m_agents.end() && !maybe_agent->value.closing) {
+                auto& agent = maybe_agent->value;
+                agent.owners.append(owner);
+                notify_worker_script_load_success(owner);
+                return agent.id;
+            }
+
+            m_service_worker_agents.remove(key);
+        }
+    }
+
     // 11.6. Otherwise, in parallel, run a worker given worker, urlRecord, outsideSettings, outsidePort,
     //       and options.
     // AD-HOC: For DedicatedWorker there is no shared worker manager step; we always launch a fresh
@@ -134,6 +156,7 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
         .extended_lifetime = request.extended_lifetime,
         .worker_is_secure_context = request.caller_is_secure_context,
         .shared_worker_key = {},
+        .service_worker_key = {},
         .owners = move(owners),
     };
 
@@ -146,8 +169,21 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, W
         m_shared_workers.set(*agent.shared_worker_key, agent_id);
     }
 
+    if (request.agent_type == Web::Bindings::AgentType::ServiceWorker && request.scope_url.has_value()) {
+        agent.service_worker_key = ServiceWorkerAgentKey {
+            .storage_key = request.storage_key,
+            .scope_url = *request.scope_url,
+        };
+        m_service_worker_agents.set(*agent.service_worker_key, agent_id);
+    }
+
     m_agents.set(agent_id, move(agent));
-    client->async_start_worker(request.url, request.type, request.credentials, request.name, move(request.outside_port), request.outside_settings, request.agent_type);
+
+    if (request.agent_type == Web::Bindings::AgentType::ServiceWorker) {
+        client->async_start_service_worker(request.url, request.type, request.outside_settings);
+    } else {
+        client->async_start_worker(request.url, request.type, request.credentials, request.name, move(request.outside_port), request.outside_settings, request.agent_type);
+    }
 
     return agent_id;
 }
@@ -262,6 +298,21 @@ void WorkerProcessManager::notify_worker_close(Owner const& owner)
         });
 }
 
+void WorkerProcessManager::notify_worker_dispatched_extendable_event(Owner const& owner, String const& event_name, bool completed_without_error)
+{
+    owner.client.visit(
+        [&](WebContentOwner const& web_content_owner) {
+            if (web_content_owner.client)
+                web_content_owner.client->async_did_dispatch_extendable_event(owner.token, event_name, completed_without_error);
+        },
+        [&](WebWorkerOwner const&) {
+            // FIXME: Service workers cannot currently be owned by a nested WebWorker process (only a
+            //        WebContent page registers a service worker), so this path is not expected to be hit.
+            //        If nested-worker-owned service workers are ever supported, WebWorkerServer.ipc needs
+            //        its own did_dispatch_extendable_event message analogous to did_worker_agent_finish_loading_script.
+        });
+}
+
 void WorkerProcessManager::worker_did_finish_loading_script(Web::HTML::WorkerAgentId agent_id, bool worker_is_secure_context)
 {
     auto maybe_agent = m_agents.find(agent_id);
@@ -330,6 +381,25 @@ void WorkerProcessManager::worker_did_die(Web::HTML::WorkerAgentId agent_id)
     worker_did_close(agent_id);
 }
 
+void WorkerProcessManager::dispatch_extendable_event(Web::HTML::WorkerAgentId agent_id, String event_name)
+{
+    auto maybe_agent = m_agents.find(agent_id);
+    if (maybe_agent == m_agents.end())
+        return;
+
+    maybe_agent->value.client->async_dispatch_extendable_event(move(event_name));
+}
+
+void WorkerProcessManager::worker_did_dispatch_extendable_event(Web::HTML::WorkerAgentId agent_id, String event_name, bool completed_without_error)
+{
+    auto maybe_agent = m_agents.find(agent_id);
+    if (maybe_agent == m_agents.end())
+        return;
+
+    for (auto const& owner : maybe_agent->value.owners)
+        notify_worker_dispatched_extendable_event(owner, event_name, completed_without_error);
+}
+
 void WorkerProcessManager::worker_did_request_file(Web::HTML::WorkerAgentId agent_id, ByteString path, i32 request_id)
 {
     auto maybe_agent = m_agents.find(agent_id);
@@ -373,6 +443,9 @@ void WorkerProcessManager::remove_agent(Web::HTML::WorkerAgentId agent_id)
 
     if (agent.shared_worker_key.has_value())
         m_shared_workers.remove(*agent.shared_worker_key);
+
+    if (agent.service_worker_key.has_value())
+        m_service_worker_agents.remove(*agent.service_worker_key);
 
     agent.closing = true;
     if (agent.client->is_open())

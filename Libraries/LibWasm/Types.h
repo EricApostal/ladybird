@@ -432,10 +432,11 @@ enum class AddressType : u8 {
 // https://webassembly.github.io/spec/core/bikeshed/#limits%E2%91%A5
 class Limits {
 public:
-    explicit Limits(AddressType address_type, u64 min, Optional<u64> max = {})
+    explicit Limits(AddressType address_type, u64 min, Optional<u64> max = {}, bool shared = false)
         : m_address_type(address_type)
         , m_min(min)
         , m_max(move(max))
+        , m_shared(shared)
     {
     }
 
@@ -446,6 +447,14 @@ public:
     auto address_type() const { return m_address_type; }
     auto min() const { return m_min; }
     auto& max() const { return m_max; }
+    // https://webassembly.github.io/threads/core/binary/types.html#limits
+    // FIXME: This is parsed and stored, but not otherwise acted upon - memory instances are not actually
+    //        backed by shared storage, and the atomic instructions/operations the threads proposal adds are
+    //        not implemented, so code that actually relies on cross-agent shared memory will not behave
+    //        correctly. This only prevents modules that merely *declare* a shared memory (which some
+    //        toolchains, e.g. dart2wasm, do defensively/for forward compatibility even when a specific build
+    //        never spawns any threads) from being rejected outright at parse time.
+    bool is_shared() const { return m_shared; }
     bool is_subset_of(Limits other) const
     {
         return m_min >= other.min()
@@ -459,6 +468,7 @@ private:
     AddressType m_address_type { AddressType::I32 };
     u64 m_min { 0 };
     Optional<u64> m_max;
+    bool m_shared { false };
 };
 
 // https://webassembly.github.io/spec/core/bikeshed/#memory-types%E2%91%A4

@@ -623,6 +623,7 @@ set(SOURCES
     HTML/HTMLVideoElement.cpp
     HTML/HyperlinkElementUtils.cpp
     HTML/ImageBitmap.cpp
+    HTML/ImageBitmapRenderingContext.cpp
     HTML/ImageData.cpp
     HTML/ImageRequest.cpp
     HTML/ListOfAvailableImages.cpp
@@ -943,11 +944,14 @@ set(SOURCES
     Selection/Selection.cpp
     ServiceWorker/Cache.cpp
     ServiceWorker/CacheStorage.cpp
+    ServiceWorker/Clients.cpp
     ServiceWorker/EventNames.cpp
+    ServiceWorker/ExtendableEvent.cpp
     ServiceWorker/Job.cpp
     ServiceWorker/NameToCacheMap.cpp
     ServiceWorker/Registration.cpp
     ServiceWorker/ServiceWorker.cpp
+    ServiceWorker/ServiceWorkerAgent.cpp
     ServiceWorker/ServiceWorkerContainer.cpp
     ServiceWorker/ServiceWorkerGlobalScope.cpp
     ServiceWorker/ServiceWorkerRecord.cpp
