@@ -501,6 +501,9 @@ CSSPixels FormattingContext::greatest_child_width(Box const& box) const
 
 CSSPixels FormattingContext::line_box_physical_width(Box const& box, LineBox const& line_box)
 {
+    if (line_box.has_block_level_box())
+        return line_box.inline_length();
+
     if (box.computed_values().writing_mode() == CSS::WritingMode::HorizontalTb)
         return line_box.width();
 
@@ -601,8 +604,13 @@ CSSPixels FormattingContext::compute_auto_height_for_block_formatting_context_ro
         // the top content edge and the bottom of the bottommost line box.
         auto const& line_boxes = m_state.get(root).line_boxes;
         top = 0;
-        if (!line_boxes.is_empty())
+        if (!line_boxes.is_empty()) {
             bottom = line_boxes.last().bottom();
+            // A trailing interrupting block's bottom margin cannot collapse out of a BFC root,
+            // so it contributes to the root's auto height. The line box bottom excludes it.
+            if (line_boxes.last().has_block_level_box())
+                bottom = max(CSSPixels(0), bottom.value() + line_boxes.last().block_level_box_bottom_margin());
+        }
     } else {
         // If it has block-level children, the height is the distance between
         // the top margin-edge of the topmost block-level child box
@@ -1554,6 +1562,15 @@ void FormattingContext::compute_height_for_absolutely_positioned_non_replaced_el
         return height;
     };
 
+    // Intrinsic (fit-content/min-content/max-content) heights depend on the box's own used width,
+    // which was already resolved above, not on the width of the containing block. Absolutely
+    // positioned boxes routinely have a used width narrower than their containing block (e.g. a
+    // fixed-position dialog sized to 400px inside a 1300px viewport), and measuring their content
+    // at the containing block width lets text that should wrap stay on one line, underestimating
+    // the height. Feed the box's own width to the intrinsic-height calculations.
+    auto available_space_for_intrinsic_height = available_space;
+    available_space_for_intrinsic_height.width = AvailableSize::make_definite(state.content_width());
+
     // Compute the height based on box type and CSS properties:
     // https://www.w3.org/TR/css-sizing-3/#box-sizing
     auto used_height = try_compute_height([&] -> CSS::LengthOrAuto {
@@ -1561,14 +1578,14 @@ void FormattingContext::compute_height_for_absolutely_positioned_non_replaced_el
             return CSS::Length::make_px(compute_table_box_height_inside_table_wrapper(box, available_space, containing_block_constraints));
         if (should_treat_height_as_auto(box, available_space, containing_block_constraints))
             return CSS::LengthOrAuto::make_auto();
-        return CSS::Length::make_px(calculate_inner_height(box, available_space, box.computed_values().height(), containing_block_constraints));
+        return CSS::Length::make_px(calculate_inner_height(box, available_space_for_intrinsic_height, box.computed_values().height(), containing_block_constraints));
     }());
 
     // If the tentative used height is greater than 'max-height', the rules above are applied again,
     // but this time using the computed value of 'max-height' as the computed value for 'height'.
     auto const& computed_max_height = box.computed_values().max_height();
     if (!used_height.is_auto() && !computed_max_height.is_none()) {
-        auto max_height = calculate_inner_height(box, available_space, computed_max_height, containing_block_constraints);
+        auto max_height = calculate_inner_height(box, available_space_for_intrinsic_height, computed_max_height, containing_block_constraints);
         if (used_height.to_px_or_zero() > max_height)
             used_height = try_compute_height(CSS::Length::make_px(max_height));
     }
@@ -1577,7 +1594,7 @@ void FormattingContext::compute_height_for_absolutely_positioned_non_replaced_el
     // but this time using the value of 'min-height' as the computed value for 'height'.
     auto const& computed_min_height = box.computed_values().min_height();
     if (!used_height.is_auto() && !computed_min_height.is_auto()) {
-        auto min_height = calculate_inner_height(box, available_space, computed_min_height, containing_block_constraints);
+        auto min_height = calculate_inner_height(box, available_space_for_intrinsic_height, computed_min_height, containing_block_constraints);
         if (used_height.to_px_or_zero() < min_height)
             used_height = try_compute_height(CSS::Length::make_px(min_height));
     }
@@ -1641,8 +1658,69 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
         return {};
 
     Optional<CSSPixelRect> bounding_rect;
-    auto union_rect = [&](CSSPixelRect const& rect) {
-        bounding_rect = bounding_rect.has_value() ? bounding_rect->united(rect) : rect;
+    Optional<CSSPixelRect> empty_bounding_rect;
+    auto union_rect = [](Optional<CSSPixelRect>& destination, CSSPixelRect const& rect) {
+        if (!destination.has_value()) {
+            destination = rect;
+            return;
+        }
+        auto left = min(destination->left(), rect.left());
+        auto top = min(destination->top(), rect.top());
+        auto right = max(destination->right(), rect.right());
+        auto bottom = max(destination->bottom(), rect.bottom());
+        destination = CSSPixelRect { left, top, right - left, bottom - top };
+    };
+    auto add_fragment_rect = [&](CSSPixelRect const& rect) {
+        if (rect.is_empty()) {
+            union_rect(empty_bounding_rect, rect);
+            return;
+        }
+        union_rect(bounding_rect, rect);
+    };
+    auto make_physical_rect = [](CSS::WritingMode writing_mode, CSSPixels inline_start, CSSPixels block_start, CSSPixels inline_size, CSSPixels block_size) {
+        if (writing_mode == CSS::WritingMode::HorizontalTb)
+            return CSSPixelRect { { inline_start, block_start }, { inline_size, block_size } };
+        return CSSPixelRect { { block_start, inline_start }, { block_size, inline_size } };
+    };
+    auto add_atomic_inline_fragment_rect = [&](Box const& box_child, LayoutState::UsedValues const& child_used_values) {
+        if (!child_used_values.containing_line_box_fragment.has_value())
+            return;
+
+        auto const* containing_block = box_child.containing_block();
+        auto const* containing_block_used_values = containing_block ? state.try_get(*containing_block) : nullptr;
+        auto const* abspos_containing_block_used_values = state.try_get(abspos_containing_block);
+        if (!containing_block_used_values || !abspos_containing_block_used_values)
+            return;
+
+        auto const& containing_line_box_fragment = child_used_values.containing_line_box_fragment.value();
+        if (containing_line_box_fragment.line_box_index >= containing_block_used_values->line_boxes.size())
+            return;
+
+        auto const& line_box = containing_block_used_values->line_boxes[containing_line_box_fragment.line_box_index];
+        if (containing_line_box_fragment.fragment_index >= line_box.fragments().size())
+            return;
+
+        auto const& fragment = line_box.fragments()[containing_line_box_fragment.fragment_index];
+        auto const containing_block_offset = state.cumulative_offset(*containing_block_used_values)
+            - state.cumulative_offset(*abspos_containing_block_used_values);
+        auto const writing_mode = fragment.writing_mode();
+        auto const is_horizontal = writing_mode == CSS::WritingMode::HorizontalTb;
+        auto const inline_axis_border_box_start = fragment.inline_offset() - (is_horizontal ? child_used_values.border_box_left() : child_used_values.border_box_top());
+        auto const inline_axis_border_box_extent = is_horizontal
+            ? child_used_values.border_box_width()
+            : child_used_values.border_box_height();
+        auto const block_axis_line_height = inline_node.computed_values().line_height();
+        auto const block_axis_start = [&] {
+            if (box_child.computed_values().block_axis_is_reverse())
+                return fragment.block_offset() + child_used_values.border_box_right() - block_axis_line_height;
+            return fragment.block_offset() - (is_horizontal ? child_used_values.border_box_top() : child_used_values.border_box_left());
+        }();
+        add_fragment_rect(make_physical_rect(writing_mode,
+            inline_axis_border_box_start,
+            block_axis_start,
+            inline_axis_border_box_extent,
+            block_axis_line_height)
+                .translated(containing_block_offset));
     };
 
     // Walk outer_block's subtree in pre-order, threading the running offset from
@@ -1655,8 +1733,11 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
         if (used_values && !used_values->line_boxes.is_empty()) {
             for (auto const& line_box : used_values->line_boxes) {
                 for (auto const& fragment : line_box.fragments()) {
-                    if (auto const* dom = fragment.layout_node().dom_node(); dom && inline_dom_node->is_inclusive_ancestor_of(*dom))
-                        union_rect({ fragment.offset() + offset, fragment.size() });
+                    if (fragment.is_atomic_inline())
+                        continue;
+                    if (auto const* dom = fragment.layout_node().dom_node(); dom && inline_dom_node->is_inclusive_ancestor_of(*dom)) {
+                        add_fragment_rect({ fragment.offset() + offset, fragment.size() });
+                    }
                 }
             }
         }
@@ -1671,6 +1752,11 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
                 auto const* dom = box_child->dom_node();
                 if (!dom || !inline_dom_node->is_inclusive_ancestor_of(*dom))
                     continue;
+                if (box_child->is_atomic_inline()) {
+                    if (child_used_values)
+                        add_atomic_inline_fragment_rect(*box_child, *child_used_values);
+                    continue;
+                }
                 // child_offset addresses the box's content area; the border-box origin sits
                 // (border-left + padding-left, border-top + padding-top) before that.
                 if (child_used_values) {
@@ -1678,7 +1764,7 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
                         child_used_values->border_left + child_used_values->padding_left,
                         child_used_values->border_top + child_used_values->padding_top,
                     };
-                    union_rect({ border_box_origin, { child_used_values->border_box_width(), child_used_values->border_box_height() } });
+                    add_fragment_rect({ border_box_origin, { child_used_values->border_box_width(), child_used_values->border_box_height() } });
                 }
             }
             self(*child, child_offset);
@@ -1692,6 +1778,8 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
     }
     walk(*outer_block, outer_offset);
 
+    if (!bounding_rect.has_value())
+        bounding_rect = empty_bounding_rect;
     if (!bounding_rect.has_value())
         return {};
 
@@ -2237,9 +2325,20 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box)
     auto const* static_position_cb = box.static_position_containing_block();
     auto actual_containing_block = box.containing_block();
     if (static_position_cb && static_position_cb != actual_containing_block) {
-        auto offset = m_state.cumulative_offset(m_state.get(*static_position_cb))
-            - m_state.cumulative_offset(m_state.get(*actual_containing_block));
-        static_position += offset;
+        // The offset between the static position containing block and the actual containing block only depends on
+        // boxes at or below the point where their containing block chains merge. Accumulate offsets up to that
+        // point instead of comparing ICB-relative offsets: containing blocks above the merge point may be outside
+        // the scope of the current layout (e.g. during intrinsic sizing) and have no used values at all.
+        auto const* merge_point = static_position_cb;
+        while (merge_point != actual_containing_block && !merge_point->is_ancestor_of(*actual_containing_block))
+            merge_point = merge_point->containing_block();
+        auto offset_relative_to_merge_point = [&](Box const& descendant) {
+            CSSPixelPoint offset;
+            for (auto const* node = &descendant; node != merge_point; node = node->containing_block())
+                offset += m_state.get(*node).offset;
+            return offset;
+        };
+        static_position += offset_relative_to_merge_point(*static_position_cb) - offset_relative_to_merge_point(*actual_containing_block);
     }
 
     // Horizontal axis
@@ -2291,7 +2390,7 @@ void FormattingContext::compute_height_for_absolutely_positioned_replaced_elemen
     // If 'margin-top' or 'margin-bottom' is specified as 'auto' its used value is determined by the rules below.
     // 2. If both 'top' and 'bottom' have the value 'auto', replace 'top' with the element's static position.
     if (top.is_auto() && bottom.is_auto()) {
-        top = CSS::Length::make_px(static_position.x());
+        top = CSS::Length::make_px(static_position.y());
     }
 
     // 3. If 'bottom' is 'auto', replace any 'auto' on 'margin-top' or 'margin-bottom' with '0'.
@@ -2906,25 +3005,70 @@ bool FormattingContext::can_skip_is_anonymous_text_run(Box& box)
     return false;
 }
 
-Box const* FormattingContext::box_child_to_derive_baseline_from(Box const& box, BaselineSet baseline_set) const
+void FormattingContext::compute_and_store_baselines(LayoutState::UsedValues& used_values) const
 {
-    if (!box.has_children() || box.children_are_inline())
-        return nullptr;
-    // Find the first/last in-flow child that has a baseline (either directly via line boxes, or via its descendants).
-    auto deriving_first_baseline = baseline_set == BaselineSet::First;
-    for (auto child = deriving_first_baseline ? box.first_child() : box.last_child(); child;
-        child = deriving_first_baseline ? child->next_sibling() : child->previous_sibling()) {
-        auto const* child_box = as_if<Box>(*child);
-        if (!child_box)
-            continue;
-        if (child_box->is_out_of_flow(*this))
-            continue;
-        if (auto const* child_state = m_state.try_get(*child_box); child_state && !child_state->line_boxes.is_empty())
-            return child_box;
-        if (box_child_to_derive_baseline_from(*child_box, baseline_set))
-            return child_box;
+    // NOTE: This may run more than once for the same UsedValues (e.g. table cells are laid out twice),
+    //       so reset both baselines before deriving them anew.
+    used_values.first_baseline = {};
+    used_values.last_baseline = {};
+
+    auto const& box = as<Box>(used_values.node());
+
+    if (!used_values.line_boxes.is_empty()) {
+        auto baseline_for_line_box = [&](LineBox const& line_box, BaselineSet baseline_set) -> CSSPixels {
+            if (!line_box.has_block_level_box()) {
+                auto line_box_top = line_box.bottom() - line_box.block_length();
+                return line_box_top + line_box.baseline();
+            }
+
+            VERIFY(line_box.fragments().size() == 1);
+            auto const& block_child = as<Box>(line_box.fragments().first().layout_node());
+            auto const& block_child_state = m_state.get(block_child);
+            auto child_offset_from_margin_edge = block_child_state.offset.y() - block_child_state.margin_box_top();
+            return child_offset_from_margin_edge + box_baseline(block_child, baseline_set);
+        };
+
+        auto first_line_box = used_values.line_boxes.first_matching([](auto& line_box) { return !line_box.is_empty(); });
+        used_values.first_baseline = baseline_for_line_box(first_line_box.value_or(used_values.line_boxes.first()), BaselineSet::First);
+        auto last_line_box = used_values.line_boxes.last_matching([](auto& line_box) { return !line_box.is_empty(); });
+        used_values.last_baseline = baseline_for_line_box(last_line_box.value_or(used_values.line_boxes.last()), BaselineSet::Last);
+        return;
     }
-    return nullptr;
+
+    if (!box.has_children() || box.children_are_inline())
+        return;
+
+    // Derive baselines from the first/last in-flow child that has a baseline set of its own.
+    // https://drafts.csswg.org/css-flexbox-1/#flex-baselines
+    // Otherwise, if the flex container has at least one flex item, the flex container's first/last main-axis baseline
+    // set is generated from the alignment baseline of the startmost/endmost flex item.
+    // https://drafts.csswg.org/css-grid-1/#grid-baselines
+    // Otherwise, the grid container's first (last) baseline set is generated from the alignment baseline of the first
+    // (last) grid item in row-major grid order.
+    // FIXME: This does not yet select the spec-defined startmost/endmost flex item, or the first/last grid item in
+    //        row-major grid order.
+    auto baseline_from_children = [&](BaselineSet baseline_set) -> Optional<CSSPixels> {
+        auto deriving_first_baseline = baseline_set == BaselineSet::First;
+        for (auto child = deriving_first_baseline ? box.first_child() : box.last_child(); child;
+            child = deriving_first_baseline ? child->next_sibling() : child->previous_sibling()) {
+            auto const* child_box = as_if<Box>(*child);
+            if (!child_box)
+                continue;
+            if (child_box->is_out_of_flow(*this))
+                continue;
+            auto const* child_state = m_state.try_get(*child_box);
+            if (!child_state)
+                continue;
+            auto const& child_baseline = deriving_first_baseline ? child_state->first_baseline : child_state->last_baseline;
+            if (!child_baseline.has_value())
+                continue;
+            auto child_offset_from_margin_edge = child_state->offset.y() - child_state->margin_box_top();
+            return child_offset_from_margin_edge + box_baseline(*child_box, baseline_set);
+        }
+        return {};
+    };
+    used_values.first_baseline = baseline_from_children(BaselineSet::First);
+    used_values.last_baseline = baseline_from_children(BaselineSet::Last);
 }
 
 CSSPixels FormattingContext::box_baseline(Box const& box, BaselineSet baseline_set) const
@@ -2980,34 +3124,17 @@ CSSPixels FormattingContext::box_baseline(Box const& box, BaselineSet baseline_s
     bool has_visible_overflow = overflow_x == CSS::Overflow::Visible && overflow_y == CSS::Overflow::Visible;
     bool derive_baseline_from_content = baseline_set == BaselineSet::First || is_flex_or_grid_container || has_visible_overflow;
 
-    if (derive_baseline_from_content && !box_state.line_boxes.is_empty()) {
-        auto const& line_box = baseline_set == BaselineSet::First ? box_state.line_boxes.first() : box_state.line_boxes.last();
-        auto line_box_top = line_box.bottom() - line_box.block_length();
-        return box_state.margin_box_top() + line_box_top + line_box.baseline();
-    }
-
-    // Derive baseline from block children if this box derives its baseline from its content.
-    // https://drafts.csswg.org/css-flexbox-1/#flex-baselines
-    // Otherwise, if the flex container has at least one flex item, the flex container's first/last main-axis baseline
-    // set is generated from the alignment baseline of the startmost/endmost flex item.
-    // https://drafts.csswg.org/css-grid-1/#grid-baselines
-    // Otherwise, the grid container's first (last) baseline set is generated from the alignment baseline of the first
-    // (last) grid item in row-major grid order.
-    // FIXME: This does not yet select the spec-defined startmost/endmost flex item, or the first/last grid item in
-    //        row-major grid order.
-    // AD-HOC: We also derive baseline from children for <input> elements. Per the HTML spec, inputs have
-    //         `overflow: clip !important`, so CSS2 says to use bottom margin edge. However, the internal shadow tree
-    //         baseline should determine the control's baseline for proper alignment with adjacent text.
+    // AD-HOC: We also use the content-derived baseline for <input> elements with block children. Per the HTML spec,
+    //         inputs have `overflow: clip !important`, so CSS2 says to use bottom margin edge. However, the internal
+    //         shadow tree baseline should determine the control's baseline for proper alignment with adjacent text.
     //         https://html.spec.whatwg.org/multipage/rendering.html#form-controls
-    if (auto const* child_box = box_child_to_derive_baseline_from(box, baseline_set)) {
-        if (derive_baseline_from_content || is<HTML::HTMLInputElement>(box.dom_node())) {
-            auto const& child_box_state = m_state.get(*child_box);
-            auto child_offset_from_margin_edge = child_box_state.offset.y() - child_box_state.margin_box_top();
-            return box_state.margin_box_top() + child_offset_from_margin_edge + box_baseline(*child_box, baseline_set);
-        }
-    }
+    bool input_derives_from_children = is<HTML::HTMLInputElement>(box.dom_node()) && !box.children_are_inline();
 
-    // If none of the children have a baseline set, the bottom margin edge of the box is used.
+    auto const& content_baseline = baseline_set == BaselineSet::First ? box_state.first_baseline : box_state.last_baseline;
+    if (content_baseline.has_value() && (derive_baseline_from_content || input_derives_from_children))
+        return box_state.margin_box_top() + *content_baseline;
+
+    // If the box has no baseline set, the bottom margin edge of the box is used.
     return box_state.margin_box_height();
 }
 

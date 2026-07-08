@@ -52,6 +52,8 @@ namespace Web::Painting {
 
 class AccumulatedVisualContextTree;
 class BackingStore;
+class Canvas2DCommandStream;
+struct Canvas2DCommandStreamSegment;
 class ChromeWidget;
 class CanvasSurfaceRegistry;
 class DevicePixelConverter;
@@ -422,6 +424,7 @@ class URL;
 class URLStyleValue;
 class VisualViewport;
 
+enum class FeatureComparison : u8;
 enum class FontFeatureValueType : u8;
 enum class Keyword : u16;
 enum class MediaFeatureID : u8;
@@ -1041,7 +1044,7 @@ class CheckBoxPaintable;
 class FieldSetPaintable;
 class MediaPaintable;
 class Paintable;
-class PaintableBox;
+class Paintable;
 class PaintableWithLines;
 class ScrollStateSnapshot;
 class StackingContext;

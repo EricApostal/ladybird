@@ -24,6 +24,7 @@
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/CSS/StyleSheetList.h>
+#include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -43,7 +44,7 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Viewport.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebView/SiteIsolation.h>
@@ -94,15 +95,16 @@ void PageClient::set_should_report_session_history_updates_in_test_mode(bool sho
     s_should_report_session_history_updates_in_test_mode = should_report;
 }
 
-GC::Ref<PageClient> PageClient::create(JS::VM& vm, PageHost& page_host, u64 id)
+GC::Ref<PageClient> PageClient::create(JS::VM& vm, PageHost& page_host, u64 id, Optional<Web::HTML::NavigableId> pending_root_navigable_id)
 {
-    return vm.heap().allocate<PageClient>(page_host, id);
+    return vm.heap().allocate<PageClient>(page_host, id, pending_root_navigable_id);
 }
 
-PageClient::PageClient(PageHost& owner, u64 id)
+PageClient::PageClient(PageHost& owner, u64 id, Optional<Web::HTML::NavigableId> pending_root_navigable_id)
     : m_owner(owner)
     , m_page(Web::Page::create(Web::Bindings::main_thread_vm(), *this))
     , m_id(id)
+    , m_pending_root_navigable_id(pending_root_navigable_id)
 {
     m_page->set_async_scrolling_enabled(s_async_scrolling_enabled);
     setup_palette();
@@ -185,7 +187,18 @@ bool PageClient::is_connection_open() const
     return client().is_open();
 }
 
-Web::NavigationProcessDecision PageClient::decide_navigation_process(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget target, Optional<String> frame_id) const
+Web::HTML::NavigableId PageClient::allocate_navigable_id()
+{
+    if (m_pending_root_navigable_id.has_value()) {
+        auto id = *m_pending_root_navigable_id;
+        m_pending_root_navigable_id.clear();
+        return id;
+    }
+
+    return m_owner.allocate_navigable_id();
+}
+
+Web::NavigationProcessDecision PageClient::decide_navigation_process(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget target, Optional<Web::HTML::NavigableId> frame_id) const
 {
     if (target != Web::NavigationTarget::TopLevel)
         return client().decide_navigation_process(m_id, move(frame_id), current_url, target_url, target);
@@ -203,47 +216,47 @@ void PageClient::request_new_process_for_navigation(URL::URL const& url, Variant
     client().async_did_request_new_process_for_navigation(m_id, url, move(document_resource), history_handling);
 }
 
-void PageClient::request_new_process_for_child_frame_navigation(String const& frame_id, URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
+void PageClient::request_new_process_for_child_frame_navigation(Web::HTML::NavigableId frame_id, URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
     client().async_did_request_new_process_for_child_frame_navigation(m_id, frame_id, url, move(document_resource), history_handling);
 }
 
-void PageClient::page_did_create_child_frame(String const& parent_frame_id, String const& frame_id)
+void PageClient::page_did_create_child_frame(Web::HTML::NavigableId parent_frame_id, Web::HTML::NavigableId frame_id)
 {
     client().async_did_create_child_frame(m_id, parent_frame_id, frame_id);
 }
 
-void PageClient::page_did_update_child_frame_viewport(String const& frame_id, Web::CSSPixelRect viewport_rect)
+void PageClient::page_did_update_child_frame_viewport(Web::HTML::NavigableId frame_id, Web::CSSPixelRect viewport_rect)
 {
     client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().client().device_pixel_ratio());
 }
 
-void PageClient::page_did_commit_child_frame_navigation(String const& frame_id, URL::URL const& url)
+void PageClient::page_did_commit_child_frame_navigation(Web::HTML::NavigableId frame_id, URL::URL const& url)
 {
     client().async_did_commit_child_frame_navigation(m_id, frame_id, url);
 }
 
-void PageClient::page_did_destroy_child_frame(String const& frame_id)
+void PageClient::page_did_destroy_child_frame(Web::HTML::NavigableId frame_id)
 {
     m_remote_child_frame_compositor_contexts.remove(frame_id);
     client().async_did_destroy_child_frame(m_id, frame_id);
 }
 
-void PageClient::set_remote_child_frame_compositor_context(String frame_id, Optional<Web::Compositor::CompositorContextId> context_id)
+void PageClient::set_remote_child_frame_compositor_context(Web::HTML::NavigableId frame_id, Optional<Web::Compositor::CompositorContextId> context_id)
 {
     if (context_id.has_value())
-        m_remote_child_frame_compositor_contexts.set(move(frame_id), *context_id);
+        m_remote_child_frame_compositor_contexts.set(frame_id, *context_id);
     else
         m_remote_child_frame_compositor_contexts.remove(frame_id);
     request_frame();
 }
 
-Optional<Web::Compositor::CompositorContextId> PageClient::compositor_context_id_for_remote_child_frame(String const& frame_id) const
+Optional<Web::Compositor::CompositorContextId> PageClient::compositor_context_id_for_remote_child_frame(Web::HTML::NavigableId frame_id) const
 {
     return m_remote_child_frame_compositor_contexts.get(frame_id);
 }
 
-void PageClient::run_iframe_load_event_steps(String const& frame_id)
+void PageClient::run_iframe_load_event_steps(Web::HTML::NavigableId frame_id)
 {
     auto active_document = page().top_level_traversable()->active_document();
     if (!active_document)
@@ -329,7 +342,12 @@ void PageClient::compositor_process_lost()
 
 void PageClient::compositor_process_reconnected()
 {
-    dbgln("[WebContent] PageClient {} replaying render state after compositor connect/reconnect", m_id);
+    // Drop canvas commands recorded for the previous Compositor process: the
+    // new process allocates canvas ids from scratch, so flushing stale
+    // segments could target the wrong canvas.
+    if (auto* compositor_host = m_owner.compositor_host())
+        compositor_host->discard_canvas_2d_stream();
+
     page().top_level_traversable()->repaint_after_compositor_process_reconnect();
     page().notify_all_canvas_elements_of_lost_backing_storage();
     page().prepare_canvas_contexts_for_compositing();
@@ -340,6 +358,33 @@ void PageClient::compositor_process_reconnected()
 Queue<Web::QueuedInputEvent>& PageClient::input_event_queue()
 {
     return client().input_event_queue();
+}
+
+void PageClient::did_handle_input_event(u64 page_id, Web::InputEvent const& event)
+{
+    auto should_update_input_method_state = event.visit(
+        [](Web::KeyEvent const&) {
+            return true;
+        },
+        [](Web::MouseEvent const& mouse_event) {
+            switch (mouse_event.type) {
+            case Web::MouseEvent::Type::MouseDown:
+            case Web::MouseEvent::Type::MouseUp:
+                return true;
+            case Web::MouseEvent::Type::MouseMove:
+                return mouse_event.buttons != Web::UIEvents::MouseButton::None;
+            case Web::MouseEvent::Type::MouseLeave:
+            case Web::MouseEvent::Type::MouseWheel:
+                return false;
+            }
+            VERIFY_NOT_REACHED();
+        },
+        [](auto const&) {
+            return false;
+        });
+
+    if (should_update_input_method_state)
+        client().update_input_method_state(page_id);
 }
 
 void PageClient::report_finished_handling_input_event(u64 page_id, Web::EventResult event_was_handled)

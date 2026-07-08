@@ -7,7 +7,9 @@
 #include <LibTest/TestCase.h>
 
 #include <QApplication>
+#include <QMouseEvent>
 #include <QWidget>
+#include <QWindow>
 #include <UI/Qt/NativeWindowContainer.h>
 
 namespace {
@@ -44,6 +46,19 @@ struct TestWindow {
     QWidget& host;
     QWidget& container;
     QWidget& sibling;
+};
+
+class FocusEventRecorder final : public QObject {
+public:
+    QEvent::Type last_focus_event { QEvent::None };
+
+private:
+    virtual bool eventFilter(QObject*, QEvent* event) override
+    {
+        if (event->type() == QEvent::FocusIn || event->type() == QEvent::FocusOut)
+            last_focus_event = event->type();
+        return false;
+    }
 };
 
 }
@@ -96,6 +111,67 @@ TEST_CASE(focus_is_not_stolen_from_other_widgets)
 
     Ladybird::set_native_window_container_visible(widgets.host, widgets.container, false);
     EXPECT_EQ(QApplication::focusWidget(), &widgets.sibling);
+}
+
+TEST_CASE(container_focus_events_are_forwarded_to_the_host)
+{
+    application();
+    TestWindow widgets;
+
+    QWindow native_window;
+    Ladybird::install_native_window_container_focus_forwarding(widgets.host, native_window, widgets.container);
+
+    FocusEventRecorder recorder;
+    widgets.host.installEventFilter(&recorder);
+
+    widgets.host.setFocus();
+    QApplication::processEvents();
+
+    Ladybird::set_native_window_container_visible(widgets.host, widgets.container, true);
+    EXPECT_EQ(QApplication::focusWidget(), &widgets.container);
+    EXPECT_EQ(recorder.last_focus_event, QEvent::FocusIn);
+
+    widgets.sibling.setFocus();
+    EXPECT_EQ(recorder.last_focus_event, QEvent::FocusOut);
+
+    widgets.container.setFocus();
+    EXPECT_EQ(recorder.last_focus_event, QEvent::FocusIn);
+
+    Ladybird::set_native_window_container_visible(widgets.host, widgets.container, false);
+    EXPECT_EQ(QApplication::focusWidget(), &widgets.host);
+    EXPECT_EQ(recorder.last_focus_event, QEvent::FocusIn);
+}
+
+TEST_CASE(native_window_mouse_press_focuses_the_container)
+{
+    application();
+    TestWindow widgets;
+
+    QWindow native_window;
+    Ladybird::install_native_window_container_focus_forwarding(widgets.host, native_window, widgets.container);
+
+    FocusEventRecorder recorder;
+    widgets.host.installEventFilter(&recorder);
+
+    Ladybird::set_native_window_container_visible(widgets.host, widgets.container, true);
+    widgets.sibling.setFocus();
+    QApplication::processEvents();
+    EXPECT_EQ(QApplication::focusWidget(), &widgets.sibling);
+
+    recorder.last_focus_event = QEvent::None;
+
+    QMouseEvent mouse_press {
+        QEvent::MouseButtonPress,
+        QPointF { 1, 1 },
+        QPointF { 1, 1 },
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier
+    };
+    QApplication::sendEvent(&native_window, &mouse_press);
+
+    EXPECT_EQ(QApplication::focusWidget(), &widgets.container);
+    EXPECT_EQ(recorder.last_focus_event, QEvent::FocusIn);
 }
 
 TEST_CASE(visibility_changes_are_idempotent)

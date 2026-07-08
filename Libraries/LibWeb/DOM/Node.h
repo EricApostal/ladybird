@@ -158,6 +158,7 @@ public:
     virtual bool is_svg_gradient_element() const { return false; }
     virtual bool is_svg_pattern_element() const { return false; }
     virtual bool is_svg_clip_path_element() const { return false; }
+    virtual bool is_svg_image_element() const { return false; }
     virtual bool is_svg_text_content_element() const { return false; }
 
     bool in_a_document_tree() const;
@@ -202,8 +203,10 @@ public:
     virtual bool is_html_slot_element() const { return false; }
     virtual bool is_html_embed_element() const { return false; }
     virtual bool is_html_object_element() const { return false; }
+    virtual bool is_html_canvas_element() const { return false; }
     virtual bool is_html_form_element() const { return false; }
     virtual bool is_html_image_element() const { return false; }
+    virtual bool is_html_video_element() const { return false; }
     virtual bool is_html_iframe_element() const { return false; }
     virtual bool is_html_div_element() const { return false; }
     virtual bool is_html_span_element() const { return false; }
@@ -336,13 +339,13 @@ public:
     Layout::Node const* unsafe_layout_node() const { return m_layout_node.ptr(); }
     Layout::Node* unsafe_layout_node() { return m_layout_node.ptr(); }
 
-    RefPtr<Painting::PaintableBox const> paintable_box() const;
-    RefPtr<Painting::PaintableBox> paintable_box();
+    RefPtr<Painting::Paintable const> paintable_box() const;
+    RefPtr<Painting::Paintable> paintable_box();
     RefPtr<Painting::Paintable const> paintable() const;
     RefPtr<Painting::Paintable> paintable();
 
-    RefPtr<Painting::PaintableBox const> unsafe_paintable_box() const;
-    RefPtr<Painting::PaintableBox> unsafe_paintable_box();
+    RefPtr<Painting::Paintable const> unsafe_paintable_box() const;
+    RefPtr<Painting::Paintable> unsafe_paintable_box();
     RefPtr<Painting::Paintable const> unsafe_paintable() const;
     RefPtr<Painting::Paintable> unsafe_paintable();
 

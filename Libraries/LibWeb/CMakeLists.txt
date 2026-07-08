@@ -637,6 +637,7 @@ set(SOURCES
     HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
     HTML/Navigable.cpp
+    HTML/NavigableId.cpp
     HTML/NavigableContainer.cpp
     HTML/NavigateEvent.cpp
     HTML/Navigation.cpp
@@ -877,6 +878,7 @@ set(SOURCES
     Painting/BorderRadiusCornerClipper.cpp
     Painting/BordersData.cpp
     Painting/BoxModelMetrics.cpp
+    Painting/Canvas2DCommandStream.cpp
     Painting/CanvasPaintable.cpp
     Painting/CheckBoxPaintable.cpp
     Painting/DisplayList.cpp
@@ -893,7 +895,6 @@ set(SOURCES
     Painting/MarkerPaintable.cpp
     Painting/NavigableContainerViewportPaintable.cpp
     Painting/Paintable.cpp
-    Painting/PaintableBox.cpp
     Painting/PaintStyle.cpp
     Painting/PaintableFragment.cpp
     Painting/PaintableWithLines.cpp

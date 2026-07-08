@@ -9,6 +9,7 @@
 #include <AK/Function.h>
 #include <LibURL/URL.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/PrivateBrowsing.h>
 #include <UI/Qt/BrowserWindow.h>
 
 #include <QApplication>
@@ -33,9 +34,12 @@ public:
     virtual ~Application() override;
 
     Function<void(URL::URL)> on_open_file;
-    BrowserWindow& new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& = {}, BrowserWindow::IsPopupWindow is_popup_window = BrowserWindow::IsPopupWindow::No, Tab* parent_tab = nullptr, Optional<u64> page_index = {});
+
+    BrowserWindow& new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& = {}, BrowserWindow::IsPopupWindow is_popup_window = BrowserWindow::IsPopupWindow::No, WebView::IsPrivate = WebView::IsPrivate::No, Tab* parent_tab = nullptr, Optional<u64> page_index = {});
+    WindowConfiguration configuration_for_new_window() const;
     void open_new_tab();
-    void open_new_window();
+    void open_new_window(WebView::IsPrivate);
+    void restart_private_browsing_session();
     void focus_location_editor();
     void reopen_recently_closed_tab();
     void open_file();
@@ -59,10 +63,11 @@ private:
     virtual Core::EventLoop& create_platform_event_loop() override;
 
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
+    virtual bool activate_tab_with_url(URL::URL const&) const override;
+
     virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override;
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
-    virtual bool activate_tab_with_url(URL::URL const&) const override;
-    virtual void open_url_in_new_window(URL::URL const& url) override;
+    virtual void open_url_in_new_window(URL::URL const&, WebView::IsPrivate) override;
 
     virtual Optional<ByteString> ask_user_for_download_path(ByteString const& file) const override;
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const override;
@@ -79,15 +84,19 @@ private:
 
     virtual bool supports_vertical_tabs() const override { return true; }
     virtual bool supports_server_side_window_decorations() const override { return true; }
+    virtual bool supports_private_browsing_windows() const override { return true; }
+
+    virtual Vector<WebView::BookmarkItem::Bookmark> bookmarks_for_all_tabs() const override;
     virtual void update_tabs_display() const override;
 
     virtual void rebuild_bookmarks_menu() const override;
     virtual void show_bookmark_context_menu(Gfx::IntPoint, Optional<WebView::BookmarkItem const&>, Optional<String const&> target_folder_id) override;
     virtual Optional<BookmarkID> bookmark_item_id_for_context_menu() const override;
-    virtual NonnullRefPtr<BookmarkPromise> display_add_bookmark_dialog() const override;
+    virtual NonnullRefPtr<AddBookmarkPromise> display_add_bookmark_dialog(Optional<String const&> target_folder_id = {}) const override;
     virtual NonnullRefPtr<BookmarkPromise> display_edit_bookmark_dialog(WebView::BookmarkItem::Bookmark const& current_bookmark) const override;
-    virtual NonnullRefPtr<BookmarkFolderPromise> display_add_bookmark_folder_dialog() const override;
+    virtual NonnullRefPtr<BookmarkFolderPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}) const override;
     virtual NonnullRefPtr<BookmarkFolderPromise> display_edit_bookmark_folder_dialog(WebView::BookmarkItem::Folder const& current_folder) const override;
+    virtual String suggested_bookmark_all_tabs_folder_title() const override;
 
     virtual void on_devtools_enabled() const override;
     virtual void on_devtools_disabled() const override;

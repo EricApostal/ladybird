@@ -14,7 +14,7 @@
 #include <LibGfx/Point.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LineBox.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/SVGGraphicsPaintable.h>
 
 namespace Web::Layout {
@@ -98,6 +98,18 @@ public:
         return page->entries[index & PageMask];
     }
 
+    void remove(u32 index)
+    {
+        auto page_index = index >> PageBits;
+        if (page_index >= m_pages.size())
+            return;
+        auto& page = m_pages[page_index];
+        if (!page)
+            return;
+        // NB: The entry is only unlinked here; its destructor runs when the allocator is destroyed.
+        page->entries[index & PageMask] = nullptr;
+    }
+
     T& allocate(u32 index)
     {
         auto page_index = index >> PageBits;
@@ -170,7 +182,7 @@ struct LayoutState {
         // the constraint is used in that axis instead.
         AvailableSpace available_inner_space_or_constraints_from(AvailableSpace const& outer_space) const;
 
-        void materialize_from_paintable(Painting::PaintableBox const&);
+        void materialize_from_paintable(Painting::Paintable const&);
 
         void set_content_offset(CSSPixelPoint new_offset) { offset = new_offset; }
         void set_content_x(CSSPixels x) { offset.set_x(x); }
@@ -204,6 +216,13 @@ struct LayoutState {
 
         Vector<LineBox> line_boxes;
 
+        // Baselines of this box's in-flow content, relative to the box's content-box top edge.
+        // Populated eagerly by the formatting context that lays out this box's children.
+        // An empty Optional means the box has no baseline set (https://drafts.csswg.org/css-align-3/#baseline-export);
+        // consumers synthesize a baseline from the margin box instead.
+        Optional<CSSPixels> first_baseline;
+        Optional<CSSPixels> last_baseline;
+
         CSSPixels margin_box_left() const { return margin_left + border_left_collapsed() + padding_left; }
         CSSPixels margin_box_right() const { return margin_right + border_right_collapsed() + padding_right; }
         CSSPixels margin_box_top() const { return margin_top + border_top_collapsed() + padding_top; }
@@ -225,13 +244,6 @@ struct LayoutState {
 
         Optional<LineBoxFragmentCoordinate> containing_line_box_fragment;
 
-        void set_inline_end_static_position_rect(StaticPositionRect const& static_position_rect) { ensure_rare_data().inline_end_static_position_rect = static_position_rect; }
-        Optional<StaticPositionRect> const& inline_end_static_position_rect() const
-        {
-            static Optional<StaticPositionRect> const empty;
-            return m_rare ? m_rare->inline_end_static_position_rect : empty;
-        }
-
         void add_floating_descendant(Box const& box) { ensure_rare_data().floating_descendants.set(&box); }
         HashTable<Box const*> const& floating_descendants() const
         {
@@ -239,17 +251,17 @@ struct LayoutState {
             return m_rare ? m_rare->floating_descendants : empty;
         }
 
-        void set_override_borders_data(Painting::PaintableBox::BordersDataWithElementKind const& override_borders_data) { ensure_rare_data().override_borders_data = override_borders_data; }
-        Optional<Painting::PaintableBox::BordersDataWithElementKind> const& override_borders_data() const
+        void set_override_borders_data(Painting::Paintable::BordersDataWithElementKind const& override_borders_data) { ensure_rare_data().override_borders_data = override_borders_data; }
+        Optional<Painting::Paintable::BordersDataWithElementKind> const& override_borders_data() const
         {
-            static Optional<Painting::PaintableBox::BordersDataWithElementKind> const empty;
+            static Optional<Painting::Paintable::BordersDataWithElementKind> const empty;
             return m_rare ? m_rare->override_borders_data : empty;
         }
 
-        void set_table_cell_coordinates(Painting::PaintableBox::TableCellCoordinates const& table_cell_coordinates) { ensure_rare_data().table_cell_coordinates = table_cell_coordinates; }
-        Optional<Painting::PaintableBox::TableCellCoordinates> const& table_cell_coordinates() const
+        void set_table_cell_coordinates(Painting::Paintable::TableCellCoordinates const& table_cell_coordinates) { ensure_rare_data().table_cell_coordinates = table_cell_coordinates; }
+        Optional<Painting::Paintable::TableCellCoordinates> const& table_cell_coordinates() const
         {
-            static Optional<Painting::PaintableBox::TableCellCoordinates> const empty;
+            static Optional<Painting::Paintable::TableCellCoordinates> const empty;
             return m_rare ? m_rare->table_cell_coordinates : empty;
         }
 
@@ -348,16 +360,15 @@ struct LayoutState {
             }
 
             HashTable<Box const*> floating_descendants;
-            Optional<Painting::PaintableBox::TableCellCoordinates> table_cell_coordinates;
+            Optional<Painting::Paintable::TableCellCoordinates> table_cell_coordinates;
             Optional<Gfx::Path> computed_svg_path;
             OwnPtr<GridLayoutData> grid_layout_data;
             OwnPtr<FlexLayoutData> flex_layout_data;
             RefPtr<CSS::GridTrackSizeListStyleValue const> grid_template_columns;
             RefPtr<CSS::GridTrackSizeListStyleValue const> grid_template_rows;
-            Optional<Painting::PaintableBox::BordersDataWithElementKind> override_borders_data;
+            Optional<Painting::Paintable::BordersDataWithElementKind> override_borders_data;
             Optional<Painting::SVGGraphicsPaintable::ComputedTransforms> computed_svg_transforms;
             Optional<StaticPositionRect> static_position_rect;
-            Optional<StaticPositionRect> inline_end_static_position_rect;
         };
 
         RareData& ensure_rare_data()
@@ -396,7 +407,11 @@ struct LayoutState {
 
     UsedValues& create(NodeWithStyle const&, Optional<CSSPixels> percentage_basis_width, Optional<CSSPixels> percentage_basis_height);
 
-    UsedValues& populate_from_paintable(NodeWithStyle const&, Painting::PaintableBox const&);
+    // Discards used values created for the descendants of `root` by an earlier layout pass, so an
+    // intentional second layout of the subtree can create them anew.
+    void discard_used_values_for_descendants(Box const& root);
+
+    UsedValues& populate_from_paintable(NodeWithStyle const&, Painting::Paintable const&);
     UsedValues& populate_node_from(LayoutState const& source, NodeWithStyle const& node);
 
     UsedValues const* try_get(NodeWithStyle const&) const;

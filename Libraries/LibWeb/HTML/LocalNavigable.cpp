@@ -66,7 +66,6 @@
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/Paintable.h>
-#include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
@@ -740,8 +739,7 @@ void LocalNavigable::set_current_session_history_entry(RefPtr<SessionHistoryEntr
 // https://html.spec.whatwg.org/multipage/document-sequences.html#initialize-the-navigable
 void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<LocalNavigable> parent, GC::Ref<DOM::Document> document)
 {
-    static int next_id = 0;
-    set_id(String::number(next_id++));
+    set_id(page().client().allocate_navigable_id());
 
     // 1. Assert: documentState's document is non-null.
     // NOTE: DocumentState no longer owns the document; it is passed separately and owned by the LocalNavigable.
@@ -2622,7 +2620,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                 auto& page_client = active_browsing_context()->page().client();
                 auto is_top_level_navigation = is_top_level_traversable();
                 auto target = is_top_level_navigation ? NavigationTarget::TopLevel : NavigationTarget::IFrame;
-                auto frame_id = is_top_level_navigation ? Optional<String> {} : Optional<String> { id() };
+                auto frame_id = is_top_level_navigation ? Optional<NavigableId> {} : Optional<NavigableId> { id() };
                 auto process_decision = page_client.decide_navigation_process(this->active_document()->url(), url, target, move(frame_id));
                 if (process_decision == NavigationProcessDecision::Remote && is_top_level_navigation) {
                     page_client.request_new_process_for_navigation(url, document_resource, history_handling);
@@ -3534,13 +3532,9 @@ CSSPixelPoint LocalNavigable::to_top_level_position(CSSPixelPoint a_position)
         if (!paintable)
             return {};
 
-        if (auto const* paintable_box = as_if<Painting::PaintableBox>(*paintable)) {
-            auto point = paintable_box->absolute_position();
-            point.translate_by(position);
-            position = paintable_box->transform_rect_to_viewport({ point, { 0, 0 } }).location();
-        } else {
-            position.translate_by(paintable->box_type_agnostic_position());
-        }
+        auto point = paintable->absolute_position();
+        point.translate_by(position);
+        position = paintable->transform_rect_to_viewport({ point, { 0, 0 } }).location();
 
         auto parent = ancestor->parent();
         ancestor = parent ? &as<LocalNavigable>(*parent) : nullptr;
@@ -4054,8 +4048,13 @@ void LocalNavigable::set_marked_text_from_input_method(Utf16String const& text)
     replace_input_method_marked_text(text);
 }
 
-void LocalNavigable::commit_text_from_input_method(Utf16String const& text)
+void LocalNavigable::commit_text_from_input_method(Utf16String const& text, i32 replacement_start, i32 replacement_length)
 {
+    if ((replacement_start != 0 || replacement_length != 0) && apply_input_method_commit_replacement(text, replacement_start, replacement_length)) {
+        m_input_method_composition_node = nullptr;
+        return;
+    }
+
     // The input method has committed text and finished the composition. Replace the marked text with the committed
     // text, then end the composition — so the text becomes ordinary editable content.
     replace_input_method_marked_text(text);
@@ -4084,15 +4083,19 @@ void LocalNavigable::replace_input_method_marked_text(Utf16String const& text)
         return;
     }
 
-    // Drop a stale composition start (for example, if the editable content was replaced out from under us).
-    if (m_input_method_composition_node && !m_input_method_composition_node->is_connected())
+    // Drop a stale composition start (for example, if the editable content was replaced out from under us, or focus moved
+    // to a different editable).
+    if (m_input_method_composition_node && (!m_input_method_composition_node->is_connected() || document->active_input_events_target(m_input_method_composition_node) != target))
         m_input_method_composition_node = nullptr;
 
     // The caret is the end of the marked text. Read it while the selection is still collapsed. Forming the marked-text
     // selection below would otherwise make cursor_position() return null for form controls.
     auto caret = document->cursor_position();
-    if (!caret)
+    if (!caret) {
+        if (!m_input_method_composition_node)
+            target->handle_insert(UIEvents::InputTypes::insertText, text);
         return;
+    }
 
     if (m_input_method_composition_node) {
         // A composition is already in progress. Select the existing marked text [composition start, caret] — so that
@@ -4106,6 +4109,62 @@ void LocalNavigable::replace_input_method_marked_text(Utf16String const& text)
     }
 
     target->handle_insert(UIEvents::InputTypes::insertText, text);
+}
+
+bool LocalNavigable::apply_input_method_commit_replacement(Utf16String const& text, i32 replacement_start, i32 replacement_length)
+{
+    if (replacement_length < 0)
+        return false;
+
+    auto document = active_document();
+    if (!document || !document->is_fully_active()) {
+        m_input_method_composition_node = nullptr;
+        return true;
+    }
+    auto* target = document->active_input_events_target();
+    if (!target) {
+        m_input_method_composition_node = nullptr;
+        return true;
+    }
+
+    if (m_input_method_composition_node && (!m_input_method_composition_node->is_connected() || document->active_input_events_target(m_input_method_composition_node) != target))
+        m_input_method_composition_node = nullptr;
+
+    auto caret = document->cursor_position();
+    if (!caret) {
+        if (!m_input_method_composition_node) {
+            target->handle_insert(UIEvents::InputTypes::insertText, text);
+            return true;
+        }
+        return false;
+    }
+
+    auto preedit_start_node = m_input_method_composition_node ? m_input_method_composition_node : caret->node();
+    auto preedit_start_offset = m_input_method_composition_node ? m_input_method_composition_offset : caret->offset();
+    if (!preedit_start_node || preedit_start_node != caret->node())
+        return false;
+
+    size_t replacement_start_offset = preedit_start_offset;
+    if (replacement_start < 0) {
+        auto offset_delta = static_cast<size_t>(-static_cast<i64>(replacement_start));
+        if (offset_delta > preedit_start_offset)
+            return false;
+        replacement_start_offset -= offset_delta;
+    } else {
+        auto offset_delta = static_cast<size_t>(replacement_start);
+        if (offset_delta > NumericLimits<size_t>::max() - replacement_start_offset)
+            return false;
+        replacement_start_offset += offset_delta;
+    }
+
+    auto replacement_length_as_size = static_cast<size_t>(replacement_length);
+    if (replacement_start_offset > preedit_start_node->length() || replacement_length_as_size > preedit_start_node->length() - replacement_start_offset)
+        return false;
+
+    target->set_selection_anchor(*preedit_start_node, replacement_start_offset);
+    target->set_selection_focus(*preedit_start_node, replacement_start_offset + replacement_length_as_size);
+    target->handle_insert(UIEvents::InputTypes::insertText, text);
+    return true;
 }
 
 // https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block
@@ -4219,7 +4278,6 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
     if (!has_compositor_context())
         return false;
 
-    m_needs_repaint = false;
     auto document = active_document();
     if (!document)
         return false;
@@ -4300,6 +4358,8 @@ void LocalNavigable::paint_next_frame()
     };
     if (should_defer_main_thread_present_for_async_scroll())
         return;
+
+    m_needs_repaint = false;
 
     if (!record_display_list_and_scroll_state(paint_config))
         return;

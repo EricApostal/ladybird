@@ -68,7 +68,7 @@ public:
     String selected_text_for_clipboard();
 
     void set_marked_text_from_input_method(Utf16String const& text);
-    void commit_text_from_input_method(Utf16String const& text);
+    void commit_text_from_input_method(Utf16String const& text, WebIDL::Long replacement_start, WebIDL::Long replacement_length);
     void unmark_text_from_input_method();
     GC::Ptr<Geometry::DOMRect> current_caret_rect();
 
@@ -106,6 +106,8 @@ public:
     void set_device_pixel_ratio(double ratio);
 
     bool headless();
+
+    bool needs_repaint();
 
     String dump_display_list();
     String dump_accessibility_tree();

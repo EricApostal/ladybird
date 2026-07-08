@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16StringBuilder.h>
+#include <LibGfx/TextLayout.h>
 #include <LibWeb/CSS/StyleValues/PositionStyleValue.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
@@ -15,6 +17,48 @@
 #include <LibWeb/Platform/FontPlugin.h>
 
 namespace Web::Painting {
+
+static void paint_alt_text(DisplayListRecordingContext& context, Layout::Node const& layout_node, Gfx::IntRect const& content_rect, String const& alt_text, Color color)
+{
+    auto const& font = layout_node.font(context);
+    auto const metrics = font.pixel_metrics();
+    auto line_height = metrics.ascent + metrics.descent;
+    if (line_height <= 0)
+        return;
+
+    float baseline_y = content_rect.y() + metrics.ascent;
+    Utf16String line;
+    auto draw_line = [&] {
+        if (line.is_empty())
+            return;
+        auto glyph_run = Gfx::shape_text({}, 0, line.utf16_view(), font, Gfx::GlyphRun::TextType::Ltr);
+        context.display_list_recorder().draw_glyph_run({ static_cast<float>(content_rect.x()), baseline_y }, *glyph_run, color, content_rect, 1.0, Gfx::Orientation::Horizontal);
+        baseline_y += line_height;
+        line = {};
+    };
+
+    Utf16String::from_utf8(alt_text).for_each_split_view(' ', SplitBehavior::Nothing, [&](Utf16View const& word) {
+        Utf16StringBuilder builder;
+        builder.append(line);
+        if (!line.is_empty())
+            builder.append_ascii(' ');
+        builder.append(word);
+
+        auto candidate_line = builder.to_string();
+        if (line.is_empty() || font.width(candidate_line) <= content_rect.width()) {
+            line = move(candidate_line);
+            return IterationDecision::Continue;
+        }
+
+        draw_line();
+        builder.clear();
+        builder.append(word);
+        line = builder.to_string();
+        return IterationDecision::Continue;
+    });
+
+    draw_line();
+}
 
 NonnullRefPtr<ImagePaintable> ImagePaintable::create(Layout::SVGImageBox const& layout_box)
 {
@@ -30,7 +74,7 @@ NonnullRefPtr<ImagePaintable> ImagePaintable::create(Layout::ImageBox const& lay
 }
 
 ImagePaintable::ImagePaintable(Layout::Box const& layout_box, Layout::ImageProvider const& image_provider, bool renders_as_alt_text, String alt_text, bool is_svg_image)
-    : PaintableBox(layout_box)
+    : Paintable(layout_box)
     , m_renders_as_alt_text(renders_as_alt_text)
     , m_alt_text(move(alt_text))
     , m_image_provider(image_provider)
@@ -40,7 +84,7 @@ ImagePaintable::ImagePaintable(Layout::Box const& layout_box, Layout::ImageProvi
 
 void ImagePaintable::reset_for_relayout()
 {
-    PaintableBox::reset_for_relayout();
+    Paintable::reset_for_relayout();
 
     if (!m_is_svg_image) {
         m_renders_as_alt_text = !m_image_provider.is_image_available();
@@ -56,7 +100,7 @@ void ImagePaintable::paint(DisplayListRecordingContext& context, PaintPhase phas
     if (!is_visible())
         return;
 
-    PaintableBox::paint(context, phase);
+    Paintable::paint(context, phase);
 
     if (phase == PaintPhase::Foreground) {
         auto image_rect = absolute_rect();
@@ -65,7 +109,10 @@ void ImagePaintable::paint(DisplayListRecordingContext& context, PaintPhase phas
         if (renders_as_alt_text) {
             if (!m_alt_text.is_empty()) {
                 auto enclosing_rect = context.enclosing_device_rect(image_rect).to_type<int>();
-                context.display_list_recorder().draw_text(enclosing_rect, Utf16String::from_utf8(m_alt_text), layout_node().font(context), Gfx::TextAlignment::Center, computed_values().color());
+                context.display_list_recorder().save();
+                context.display_list_recorder().add_clip_rect(enclosing_rect);
+                paint_alt_text(context, layout_node(), enclosing_rect, m_alt_text, computed_values().color());
+                context.display_list_recorder().restore();
             }
         } else if (auto decoded_image_data = m_image_provider.decoded_image_data()) {
             ScopedCornerRadiusClip corner_clip { context, image_rect_device_pixels, normalized_border_radii_data(ShrinkRadiiForBorders::Yes) };

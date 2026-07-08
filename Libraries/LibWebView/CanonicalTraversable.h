@@ -7,15 +7,19 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/HashFunctions.h>
+#include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
+#include <AK/WeakPtr.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/VisibilityState.h>
+#include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/SessionHistory.h>
 
@@ -198,8 +202,18 @@ struct PageLoadPreparation {
     bool should_update_navigation_action_state { false };
 };
 
-class WEBVIEW_API CanonicalTraversable final {
+class WEBVIEW_API CanonicalTraversable final
+    : public CanonicalNavigable {
 public:
+    CanonicalTraversable();
+
+    virtual bool is_top_level_traversable() const override { return true; }
+
+    CanonicalNavigable& insert(WebContentClient& reporting_client, u64 page_id, Web::HTML::NavigableId parent_frame_id, Web::HTML::NavigableId frame_id, CanonicalNavigable& fallback_parent);
+    Optional<CanonicalNavigable&> find(Web::HTML::NavigableId frame_id);
+    Optional<CanonicalNavigable const&> find(Web::HTML::NavigableId frame_id) const;
+    void remove(CanonicalNavigable&);
+
     TraversableSessionHistory const& session_history() const { return m_session_history; }
 
     Web::HTML::VisibilityState system_visibility_state() const { return m_system_visibility_state; }
@@ -242,9 +256,11 @@ public:
 
 private:
     void abandon_pending_web_content_session_history_seed();
+    void remove_from_index(CanonicalNavigable&);
     WebContentSessionHistoryUpdateResult update_session_history_from_web_content(Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32> used_steps, size_t current_used_step_index, bool pending_step_after_fallback_load_was_restored, bool seed_web_content_on_invalid_snapshot, URL::URL const& current_url);
     WebContentSessionHistoryUpdateResult adopt_web_content_session_history_after_rejected_seed(Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32> used_steps, size_t current_used_step_index, URL::URL const& current_url);
 
+    HashMap<Web::HTML::NavigableId, WeakPtr<CanonicalNavigable>> m_navigable_index;
     TraversableSessionHistory m_session_history;
     Web::HTML::VisibilityState m_system_visibility_state { Web::HTML::VisibilityState::Hidden };
     bool m_current_web_content_session_history_matches_mirror { false };

@@ -58,8 +58,9 @@ Optional<ViewImplementation&> ViewImplementation::find_view_by_id(u64 id)
     return {};
 }
 
-ViewImplementation::ViewImplementation()
-    : m_document_cookie_version_buffer(Core::create_shared_version_buffer())
+ViewImplementation::ViewImplementation(IsPrivate is_private)
+    : m_is_private(is_private)
+    , m_document_cookie_version_buffer(Core::create_shared_version_buffer())
     , m_view_id(s_view_count++)
 {
     all_views().set(m_view_id, this);
@@ -88,6 +89,9 @@ ViewImplementation::~ViewImplementation()
 
     if (m_client_state.client)
         m_client_state.client->unregister_view(m_client_state.page_index);
+
+    if (m_is_private == IsPrivate::Yes)
+        Application::the().maybe_close_private_browsing_session();
 }
 
 WebContentClient& ViewImplementation::client()
@@ -115,6 +119,7 @@ void ViewImplementation::set_url(URL::URL url)
 
     auto previous_host = current_host();
     m_url = move(url);
+    m_top_level_traversable.did_commit_navigation(m_url);
     update_bookmark_action();
 
     if (current_host() != previous_host)
@@ -131,9 +136,10 @@ void ViewImplementation::set_favicon(Badge<WebContentClient>, Gfx::Bitmap const&
     }
 
     if (m_favicon_base64_png.has_value()) {
-        Application::bookmark_store().update_favicon(m_url, *m_favicon_base64_png);
+        if (m_is_private == IsPrivate::No)
+            Application::bookmark_store().update_favicon(m_url, *m_favicon_base64_png);
         if (!m_should_suppress_history_for_current_load)
-            Application::history_store().update_favicon(m_url, *m_favicon_base64_png);
+            Application::history_store(m_is_private).update_favicon(m_url, *m_favicon_base64_png);
     }
 
     if (on_favicon_change)
@@ -333,7 +339,7 @@ Vector<ViewImplementation::SessionHistoryTraversalMenuItem> ViewImplementation::
 
     Vector<SessionHistoryTraversalMenuItem> items;
     auto append_item = [&](size_t target_step_index, TraversableSessionHistory::Entry const& target_entry) {
-        auto history_entry = Application::history_store().entry_for_url(target_entry.url);
+        auto history_entry = Application::history_store(m_is_private).entry_for_url(target_entry.url);
         auto url = target_entry.url.serialize();
         auto title = history_entry.has_value() && history_entry->title.has_value() && !history_entry->title->is_empty()
             ? move(*history_entry->title)
@@ -377,7 +383,9 @@ void ViewImplementation::zoom_in()
         return;
     m_zoom_level = round_to<int>((m_zoom_level + ZOOM_STEP) * 100) / 100.0;
     update_zoom();
-    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::zoom_out()
@@ -386,7 +394,9 @@ void ViewImplementation::zoom_out()
         return;
     m_zoom_level = round_to<int>((m_zoom_level - ZOOM_STEP) * 100) / 100.0;
     update_zoom();
-    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::set_zoom(double zoom_level)
@@ -400,7 +410,9 @@ void ViewImplementation::reset_zoom()
     m_zoom_level = 1.0;
     update_zoom();
     client().async_reset_zoom(m_client_state.page_index);
-    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::enqueue_input_event(Web::InputEvent event)
@@ -476,10 +488,10 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentClient>
 {
     auto event = m_pending_input_events.dequeue();
 
-    if (event_result == Web::EventResult::Handled)
+    if (event_result == Web::EventResult::Handled || event_result == Web::EventResult::Cancelled)
         return;
 
-    // Here we handle events that were not consumed or cancelled by the WebContent. Propagate the event back
+    // Here we handle events that were not consumed by the WebContent. Propagate the event back
     // to the concrete view implementation.
     event.visit(
         [this](Web::KeyEvent const& event) {
@@ -1074,9 +1086,9 @@ void ViewImplementation::set_marked_text_from_input_method(Utf16String const& te
     client().async_set_marked_text_from_input_method(page_id(), text);
 }
 
-void ViewImplementation::commit_text_from_input_method(Utf16String const& text)
+void ViewImplementation::commit_text_from_input_method(Utf16String const& text, i32 replacement_start, i32 replacement_length)
 {
-    client().async_commit_text_from_input_method(page_id(), text);
+    client().async_commit_text_from_input_method(page_id(), text, replacement_start, replacement_length);
 }
 
 void ViewImplementation::unmark_text_from_input_method()
@@ -1086,15 +1098,15 @@ void ViewImplementation::unmark_text_from_input_method()
 
 Optional<Web::DevicePixelRect> ViewImplementation::get_input_caret_rect()
 {
-    // Returns the most-recent caret position pushed by WebContent (see set_input_caret_rect). Deliberately makes no
-    // synchronous IPC request: This is read from inside AppKit text-input callbacks — where blocking can re-enter the
+    // Returns the most-recent caret position pushed by WebContent (see set_input_method_state). Deliberately makes no
+    // synchronous IPC request: This is read from inside AppKit text-input callbacks, where blocking can re-enter the
     // run loop and deadlock the input method.
-    return m_input_caret_rect;
+    return m_input_method_state.caret_rect;
 }
 
-void ViewImplementation::set_input_caret_rect(Badge<WebContentClient>, Optional<Web::DevicePixelRect> rect)
+void ViewImplementation::set_input_method_state(Badge<WebContentClient>, InputMethodState state)
 {
-    m_input_caret_rect = rect;
+    m_input_method_state = move(state);
 }
 
 void ViewImplementation::retrieved_clipboard_entries(u64 request_id, ReadonlySpan<Web::Clipboard::SystemClipboardItem> items)
@@ -1129,6 +1141,20 @@ void ViewImplementation::did_change_audio_play_state(Badge<WebContentClient>, We
     }
 
     if (state_changed && on_audio_play_state_changed)
+        on_audio_play_state_changed(m_audio_play_state);
+}
+
+void ViewImplementation::reset_page_media_state()
+{
+    auto const should_notify_audio_play_state_changed = m_audio_play_state != Web::HTML::AudioPlayState::Paused
+        || m_number_of_elements_playing_audio != 0
+        || m_mute_state != Web::HTML::MuteState::Unmuted;
+
+    m_audio_play_state = Web::HTML::AudioPlayState::Paused;
+    m_number_of_elements_playing_audio = 0;
+    m_mute_state = Web::HTML::MuteState::Unmuted;
+
+    if (should_notify_audio_play_state_changed && on_audio_play_state_changed)
         on_audio_play_state_changed(m_audio_play_state);
 }
 
@@ -1793,6 +1819,8 @@ void ViewImplementation::handle_web_content_process_crash(LoadErrorPage load_err
     }
 
     ++m_crash_count;
+    reset_page_media_state();
+
     constexpr size_t max_reasonable_crash_count = 5U;
     if (m_crash_count >= max_reasonable_crash_count) {
         if (!headless_mode) {
@@ -2046,12 +2074,7 @@ void ViewImplementation::initialize_context_menus()
     m_navigate_forward_action->set_enabled(false);
 
     m_toggle_bookmark_action = Action::create("Toggle Bookmark"sv, ActionID::ToggleBookmarkViaToolbar, [this]() {
-        auto& bookmark_store = Application::bookmark_store();
-
-        if (auto bookmark = bookmark_store.find_bookmark_by_url(url()); bookmark.has_value())
-            bookmark_store.remove_item(bookmark->id);
-        else
-            bookmark_store.add_bookmark(url(), title().to_utf8(), favicon_base64_png());
+        Application::the().toggle_bookmark_for_view(*this);
     });
     update_bookmark_action();
 
@@ -2098,8 +2121,21 @@ void ViewImplementation::initialize_context_menus()
     m_open_in_new_tab_action = Action::create("Open in New Tab"sv, ActionID::OpenInNewTab, [this]() {
         Application::the().open_url_in_new_tab(m_context_menu_url, Web::HTML::ActivateTab::No);
     });
-    m_open_in_new_window_action = Action::create("Open in New Window"sv, ActionID::OpenInNewWindow, [this]() {
-        Application::the().open_url_in_new_window(m_context_menu_url);
+    if (m_is_private == IsPrivate::No) {
+        m_open_in_new_window_action = Action::create("Open in New Window"sv, ActionID::OpenInNewWindow, [this]() {
+            Application::the().open_url_in_new_window(m_context_menu_url, IsPrivate::No);
+        });
+    }
+    if (application.supports_private_browsing_windows()) {
+        m_open_in_new_private_window_action = Action::create("Open in New Private Window"sv, ActionID::OpenInNewPrivateWindow, [this]() {
+            Application::the().open_url_in_new_window(m_context_menu_url, IsPrivate::Yes);
+        });
+    }
+    m_download_linked_file_action = Action::create("Download Linked File"sv, ActionID::DownloadLinkedFile, [this]() {
+        download_context_menu_url(PromptForPath::No);
+    });
+    m_download_linked_file_as_action = Action::create("Download Linked File As..."sv, ActionID::DownloadLinkedFileAs, [this]() {
+        download_context_menu_url(PromptForPath::Yes);
     });
     m_copy_url_action = Action::create("Copy URL"sv, ActionID::CopyURL, [this]() {
         Application::the().insert_clipboard_entry({ url_text_to_copy(m_context_menu_url), "text/plain"_string });
@@ -2109,11 +2145,7 @@ void ViewImplementation::initialize_context_menus()
         load(m_context_menu_url);
     });
     m_save_image_action = Action::create("Save Image As..."sv, ActionID::SaveImage, [this]() {
-        auto download_path = Application::the().path_for_downloaded_file(m_context_menu_url.basename());
-        if (download_path.is_error())
-            return;
-
-        Application::the().file_downloader().download_file(m_context_menu_url, download_path.release_value());
+        download_context_menu_url(PromptForPath::Yes);
     });
     m_copy_image_action = Action::create("Copy Image"sv, ActionID::CopyImage, [this]() {
         if (!m_image_context_menu_bitmap.has_value())
@@ -2183,7 +2215,14 @@ void ViewImplementation::initialize_context_menus()
 
     m_link_context_menu = Menu::create("Link Context Menu"sv);
     m_link_context_menu->add_action(*m_open_in_new_tab_action);
-    m_link_context_menu->add_action(*m_open_in_new_window_action);
+    if (m_open_in_new_window_action)
+        m_link_context_menu->add_action(*m_open_in_new_window_action);
+    if (m_open_in_new_private_window_action)
+        m_link_context_menu->add_action(*m_open_in_new_private_window_action);
+    m_link_context_menu->add_separator();
+    m_link_context_menu->add_action(*m_download_linked_file_action);
+    m_link_context_menu->add_action(*m_download_linked_file_as_action);
+    m_link_context_menu->add_separator();
     m_link_context_menu->add_action(*m_copy_url_action);
 
     m_image_context_menu = Menu::create("Image Context Menu"sv);
@@ -2257,6 +2296,17 @@ void ViewImplementation::did_request_link_context_menu(Badge<WebContentClient>, 
 
     if (m_link_context_menu->on_activation)
         m_link_context_menu->on_activation(to_widget_position(content_position));
+}
+
+void ViewImplementation::download_context_menu_url(PromptForPath prompt_for_path)
+{
+    auto download_path = prompt_for_path == PromptForPath::Yes
+        ? Application::the().path_for_downloaded_file(m_context_menu_url.basename())
+        : Application::the().default_path_for_downloaded_file(m_context_menu_url.basename());
+    if (download_path.is_error())
+        return;
+
+    Application::the().file_downloader().download_file(is_private(), m_context_menu_url, download_path.release_value());
 }
 
 void ViewImplementation::did_request_image_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position, URL::URL url, Optional<Gfx::ShareableBitmap> bitmap)

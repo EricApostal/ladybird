@@ -18,6 +18,11 @@ public:
 
     RefPtr<Layout::Node> build(DOM::Node&);
 
+    enum class AppendOrPrepend {
+        Append,
+        Prepend,
+    };
+
 private:
     struct Context {
         bool has_svg_root = false;
@@ -55,15 +60,10 @@ private:
     Vector<NonnullRefPtr<Box>> generate_missing_parents(NodeWithStyle& root);
     void missing_cells_fixup(Vector<NonnullRefPtr<Box>> const&);
 
-    enum class AppendOrPrepend {
-        Append,
-        Prepend,
-    };
     void insert_node_into_inline_or_block_ancestor(Layout::Node&, CSS::Display, AppendOrPrepend);
     RefPtr<NodeWithStyle> create_pseudo_element_if_needed(DOM::Element&, CSS::PseudoElement, Optional<AppendOrPrepend>);
     RefPtr<NodeWithStyle> create_content_replacement_if_needed(DOM::Element&, CSS::ComputedProperties const&) const;
     static void create_first_letter_wrapper_if_needed(DOM::Element&, Layout::BlockContainer&);
-    void restructure_block_node_in_inline_parent(NodeWithStyleAndBoxModelMetrics&);
 
     RefPtr<Layout::Node> m_layout_root;
     Vector<Layout::NodeWithStyle*> m_ancestor_stack;

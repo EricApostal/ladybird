@@ -43,7 +43,7 @@
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
@@ -69,10 +69,8 @@ Node::~Node()
 
 static void invalidate_paint_caches(Node& node)
 {
-    for (auto& paintable : node.paintables()) {
-        if (auto* paintable_box = as_if<Painting::PaintableBox>(*paintable))
-            paintable_box->invalidate_paint_cache();
-    }
+    for (auto& paintable : node.paintables())
+        paintable->invalidate_paint_cache();
 }
 
 void Node::prepare_for_detach_from_layout_tree()
@@ -719,7 +717,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_font_list(computed_style.computed_font_list(document().font_computer()));
     computed_values.set_font_size(computed_style.font_size());
     computed_values.set_font_weight(computed_style.font_weight());
-    computed_values.set_line_height(computed_style.line_height());
+    computed_values.set_line_height(computed_style.line_height(document().font_computer()));
     computed_values.set_font_variant_emoji(computed_style.font_variant_emoji());
 
     // NOTE: color must be set after color-scheme to ensure currentColor can be resolved in other properties (e.g. background-color).
@@ -1104,9 +1102,6 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_resize(computed_style.resize());
 
     propagate_style_to_anonymous_wrappers();
-
-    if (auto* box_node = as_if<NodeWithStyleAndBoxModelMetrics>(*this))
-        box_node->propagate_style_along_continuation(computed_style);
 
     rebuild_image_observers();
 }
@@ -1567,7 +1562,9 @@ bool Node::has_layout_containment() const
         return false;
 
     // - if its principal box is an internal ruby box or a non-atomic inline-level box
-    // FIXME: Implement this.
+    // FIXME: Also check for internal ruby boxes.
+    if (display().is_inline_outside() && display().is_flow_inside() && !is_replaced_box())
+        return false;
 
     if (computed_values().contain().layout_containment)
         return true;
@@ -1615,7 +1612,9 @@ bool Node::has_paint_containment() const
         return false;
 
     // - if its principal box is an internal ruby box or a non-atomic inline-level box
-    // FIXME: Implement this
+    // FIXME: Also check for internal ruby boxes.
+    if (display().is_inline_outside() && display().is_flow_inside() && !is_replaced_box())
+        return false;
 
     if (computed_values().contain().paint_containment)
         return true;
@@ -1629,9 +1628,10 @@ bool Node::has_paint_containment() const
     return false;
 }
 
-bool NodeWithStyleAndBoxModelMetrics::should_create_inline_continuation() const
+bool NodeWithStyleAndBoxModelMetrics::is_inline_flow_interrupting_block() const
 {
-    // This node must have an inline parent.
+    // This node remains a layout child of its inline-flow parent. InlineLevelIterator emits it as a BlockLevelBox item
+    // so the inline formatting context can lay it out as an interrupting block.
     if (!parent())
         return false;
     auto const& parent_display = parent()->display();
@@ -1642,7 +1642,7 @@ bool NodeWithStyleAndBoxModelMetrics::should_create_inline_continuation() const
     if (display().is_inline_outside() || is_out_of_flow())
         return false;
 
-    // This node must not have `display: contents`; inline continuation gets handled by its children.
+    // This node must not have `display: contents`; interrupting block handling gets delegated to its children.
     if (display().is_contents())
         return false;
 
@@ -1654,29 +1654,20 @@ bool NodeWithStyleAndBoxModelMetrics::should_create_inline_continuation() const
     if (is<SVG::SVGForeignObjectElement>(parent()->dom_node()))
         return false;
 
-    // Non-root SVG elements and foreign object boxes should never be split.
+    // Non-root SVG elements and foreign object boxes should not interrupt inline flow.
     if (is_svg_box() || is_svg_foreign_object_box())
         return false;
 
-    // Nested SVG roots should never be split, but a top-level SVG root inside an HTML inline element should be.
+    // Nested SVG roots should not interrupt inline flow, but a top-level SVG root inside an HTML inline element should.
     if (is_svg_svg_box() && (parent()->is_svg_box() || parent()->is_svg_svg_box()))
         return false;
 
     // Replaced boxes with children (e.g. media elements with shadow DOM controls)
-    // have their own formatting context; don't split them.
+    // have their own formatting context; don't let their children interrupt inline flow.
     if (parent()->is_replaced_box_with_children())
         return false;
 
     return true;
-}
-
-void NodeWithStyleAndBoxModelMetrics::propagate_style_along_continuation(CSS::ComputedProperties const& computed_style) const
-{
-    auto continuation = continuation_of_node();
-    while (continuation && continuation->is_anonymous())
-        continuation = continuation->continuation_of_node();
-    if (continuation)
-        continuation->apply_style(computed_style);
 }
 
 void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason)

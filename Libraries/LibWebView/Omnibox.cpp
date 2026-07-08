@@ -12,7 +12,8 @@ namespace WebView {
 // Wraps the real autocomplete machinery (history store, search engine, remote suggestions).
 class AutocompleteSuggestionProvider final : public OmniboxSuggestionProvider {
 public:
-    AutocompleteSuggestionProvider()
+    AutocompleteSuggestionProvider(IsPrivate is_private)
+        : m_autocomplete(is_private)
     {
         m_autocomplete.on_autocomplete_query_complete = [this](auto suggestions, auto result_kind) {
             if (on_suggestions)
@@ -124,8 +125,16 @@ static Optional<size_t> index_of_suggestion(String const& suggestion_text, Vecto
     });
 }
 
-Omnibox::Omnibox()
-    : Omnibox(make<AutocompleteSuggestionProvider>())
+static Optional<size_t> index_of_exact_search_suggestion(String const& query, Vector<AutocompleteSuggestion> const& suggestions)
+{
+    return suggestions.find_first_index_if([&](auto const& suggestion) {
+        return suggestion.source == AutocompleteSuggestionSource::Search
+            && suggestion_matches_query_exactly(query, suggestion.text);
+    });
+}
+
+Omnibox::Omnibox(IsPrivate is_private)
+    : Omnibox(make<AutocompleteSuggestionProvider>(is_private))
 {
 }
 
@@ -347,6 +356,11 @@ Optional<size_t> Omnibox::update_completion_for_suggestions(Vector<AutocompleteS
 
     if (suggestions.is_empty())
         return {};
+
+    if (!suggestions.first().can_be_automatically_selected) {
+        restore_query_display();
+        return index_of_exact_search_suggestion(m_query, suggestions);
+    }
 
     // A literal URL always wins: no completion, restore the typed text.
     if (suggestions.first().source == AutocompleteSuggestionSource::LiteralURL) {

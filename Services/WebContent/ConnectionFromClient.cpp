@@ -12,6 +12,7 @@
 #include <AK/Debug.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
+#include <AK/Math.h>
 #include <AK/OwnPtr.h>
 #include <AK/QuickSort.h>
 #include <LibCore/Process.h>
@@ -51,6 +52,7 @@
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
+#include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -117,19 +119,9 @@ Messages::WebContentServer::InitTransportResponse ConnectionFromClient::init_tra
     VERIFY_NOT_REACHED();
 }
 
-void ConnectionFromClient::initialize(u64 initial_page_id)
+void ConnectionFromClient::initialize(u64 initial_page_id, Web::HTML::NavigableId root_navigable_id, Web::HTML::NavigableIdAllocator navigable_id_allocator)
 {
-    m_page_host->initialize(initial_page_id);
-}
-
-void ConnectionFromClient::create_new_top_level_page(u64 page_id)
-{
-    // Used on single-process iOS, where every tab/cross-site-navigation/out-of-process-iframe has
-    // to live on the one WebContent connection that exists for the lifetime of the app (see
-    // WebView::Application::launch_web_content_process and launch_child_frame_web_content_process
-    // in Libraries/LibWebView/Application.cpp). Everywhere else, those each get an entirely new
-    // WebContent connection instead, so this is never called off of iOS.
-    m_page_host->create_additional_page(page_id);
+    m_page_host->initialize(initial_page_id, root_navigable_id, navigable_id_allocator);
 }
 
 void ConnectionFromClient::set_page_parent_context(u64 page_id, Optional<Web::Compositor::CompositorContextId> parent_context_id)
@@ -144,13 +136,13 @@ void ConnectionFromClient::set_page_parent_context(u64 page_id, Optional<Web::Co
     compositor_context.set_parent_context(parent_context_id);
 }
 
-void ConnectionFromClient::set_remote_child_frame_compositor_context(u64 page_id, String frame_id, Optional<Web::Compositor::CompositorContextId> context_id)
+void ConnectionFromClient::set_remote_child_frame_compositor_context(u64 page_id, Web::HTML::NavigableId frame_id, Optional<Web::Compositor::CompositorContextId> context_id)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->set_remote_child_frame_compositor_context(move(frame_id), context_id);
+        page->set_remote_child_frame_compositor_context(frame_id, context_id);
 }
 
-void ConnectionFromClient::run_iframe_load_event_steps(u64 page_id, String frame_id)
+void ConnectionFromClient::run_iframe_load_event_steps(u64 page_id, Web::HTML::NavigableId frame_id)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->run_iframe_load_event_steps(frame_id);
@@ -876,17 +868,16 @@ void ConnectionFromClient::inspect_dom_node(u64 page_id, WebView::DOMNodePropert
 
     auto serialize_layout = [&](Web::Layout::Node const* layout_node) {
         auto first_paintable = layout_node ? layout_node->first_paintable() : nullptr;
-        if (!layout_node || !layout_node->is_box() || !first_paintable || !first_paintable->is_paintable_box()) {
-            return JsonObject { };
+        if (!layout_node || !layout_node->is_box() || !first_paintable) {
+            return JsonObject {};
         }
 
-        auto const& paintable_box = as<Web::Painting::PaintableBox>(*first_paintable);
-        auto const& box_model = paintable_box.box_model();
+        auto const& box_model = first_paintable->box_model();
 
         JsonObject serialized;
 
-        serialized.set("width"sv, paintable_box.content_width().to_double());
-        serialized.set("height"sv, paintable_box.content_height().to_double());
+        serialized.set("width"sv, first_paintable->content_width().to_double());
+        serialized.set("height"sv, first_paintable->content_height().to_double());
 
         serialized.set("padding-top"sv, box_model.padding.top.to_double());
         serialized.set("padding-right"sv, box_model.padding.right.to_double());
@@ -2087,43 +2078,78 @@ void ConnectionFromClient::paste(u64 page_id, Utf16String text)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().focused_navigable().paste(text);
+    update_input_method_state(page_id);
 }
 
 void ConnectionFromClient::set_marked_text_from_input_method(u64 page_id, Utf16String text)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().focused_navigable().set_marked_text_from_input_method(text);
-    update_input_method_caret_rect(page_id);
+    update_input_method_state(page_id);
 }
 
-void ConnectionFromClient::commit_text_from_input_method(u64 page_id, Utf16String text)
+void ConnectionFromClient::commit_text_from_input_method(u64 page_id, Utf16String text, i32 replacement_start, i32 replacement_length)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->page().focused_navigable().commit_text_from_input_method(text);
-    update_input_method_caret_rect(page_id);
+        page->page().focused_navigable().commit_text_from_input_method(text, replacement_start, replacement_length);
+    update_input_method_state(page_id);
 }
 
 void ConnectionFromClient::unmark_text_from_input_method(u64 page_id)
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().focused_navigable().unmark_text_from_input_method();
+    update_input_method_state(page_id);
 }
 
-void ConnectionFromClient::update_input_method_caret_rect(u64 page_id)
+static constexpr size_t maximum_input_method_surrounding_text_length = 1024;
+
+void ConnectionFromClient::update_input_method_state(u64 page_id)
 {
     auto page = this->page(page_id);
     if (!page.has_value())
         return;
 
-    // Push the updated caret position to the UI — so platform input methods can place their overlays. We deliberately
-    // push this asynchronously — rather than answering a synchronous request from inside an AppKit text-input callback.
-    // Blocking there re-enters the run loop — and can deadlock input-method server <-> UI <-> WebContent message flow.
+    // Push the updated input state to the UI, so platform input methods can place their overlays. We deliberately
+    // push this asynchronously instead of answering a synchronous request from inside an AppKit text-input callback.
+    // Blocking there re-enters the run loop and can deadlock input-method server <-> UI <-> WebContent message flow.
     Optional<Web::DevicePixelRect> caret_rect;
+    bool is_enabled = false;
+    i32 cursor_position = 0;
+    i32 anchor_position = 0;
+    Utf16String text_before_cursor;
+    Utf16String text_after_cursor;
+
     if (auto document = page->page().focused_navigable().active_document()) {
         if (auto rect = document->current_caret_rect(); rect.has_value())
             caret_rect = page->page().enclosing_device_rect(*rect);
+
+        if (auto const* text_control = as_if<Web::HTML::FormAssociatedTextControlElement>(document->focused_area().ptr())) {
+            if (text_control->selection_start_binding().has_value()) {
+                auto value = text_control->relevant_value();
+                auto selection_start = text_control->selection_start();
+                auto selection_end = text_control->selection_end();
+                auto cursor = text_control->selection_direction_state() == Web::HTML::SelectionDirection::Backward ? selection_start : selection_end;
+                auto anchor = cursor == selection_start ? selection_end : selection_start;
+                auto value_length = value.length_in_code_units();
+                auto text_before_start = cursor > maximum_input_method_surrounding_text_length ? cursor - maximum_input_method_surrounding_text_length : 0;
+                auto text_after_length = min(value_length - cursor, maximum_input_method_surrounding_text_length);
+
+                auto const& html_element = text_control->text_control_to_html_element();
+                if (auto const* input_element = as_if<Web::HTML::HTMLInputElement>(html_element))
+                    is_enabled = input_element->is_mutable();
+                else if (auto const* text_area_element = as_if<Web::HTML::HTMLTextAreaElement>(html_element))
+                    is_enabled = text_area_element->is_mutable();
+
+                cursor_position = AK::clamp_to<i32>(cursor);
+                anchor_position = AK::clamp_to<i32>(anchor);
+                text_before_cursor = Utf16String::from_utf16(value.substring_view(text_before_start, cursor - text_before_start));
+                text_after_cursor = Utf16String::from_utf16(value.substring_view(cursor, text_after_length));
+            }
+        }
     }
-    async_did_update_input_caret_rect(page_id, caret_rect);
+
+    async_did_update_input_method_state(page_id, caret_rect, is_enabled, cursor_position, anchor_position, move(text_before_cursor), move(text_after_cursor));
 }
 
 void ConnectionFromClient::set_content_blockers(u64 page_id, Core::AnonymousBuffer patterns_buffer)

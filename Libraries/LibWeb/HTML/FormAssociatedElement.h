@@ -257,7 +257,7 @@ public:
     virtual GC::Ptr<DOM::Element> text_control_scroll_container() = 0;
 
     virtual void handle_insert(FlyString const& input_type, Utf16String const&) override;
-    virtual void handle_delete(FlyString const& input_type) override;
+    virtual void handle_delete(FlyString const& input_type, DispatchInputEvent = DispatchInputEvent::Yes) override;
     virtual void select_all() override;
     virtual void set_selection_anchor(GC::Ref<DOM::Node>, size_t offset) override;
     virtual void set_selection_focus(GC::Ref<DOM::Node>, size_t offset) override;
@@ -302,8 +302,8 @@ template<>
 inline bool Node::fast_is<HTML::FormAssociatedTextControlElement>() const { return is_html_input_element() || is_html_textarea_element(); }
 
 template<>
-HTML::FormAssociatedTextControlElement* Node::fast_as<HTML::FormAssociatedTextControlElement>();
+WEB_API HTML::FormAssociatedTextControlElement* Node::fast_as<HTML::FormAssociatedTextControlElement>();
 template<>
-HTML::FormAssociatedTextControlElement const* Node::fast_as<HTML::FormAssociatedTextControlElement>() const;
+WEB_API HTML::FormAssociatedTextControlElement const* Node::fast_as<HTML::FormAssociatedTextControlElement>() const;
 
 }

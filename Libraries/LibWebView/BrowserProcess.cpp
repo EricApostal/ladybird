@@ -9,6 +9,7 @@
 #include <LibCore/Process.h>
 #include <LibCore/Socket.h>
 #include <LibCore/System.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibIPC/Transport.h>
 #if defined(AK_OS_MACOS)
@@ -165,13 +166,15 @@ BrowserProcess::~BrowserProcess()
     if (m_pid_file) {
         MUST(m_pid_file->truncate(0));
 #if defined(AK_OS_WINDOWS)
+        // NOTE: On Windows, be conservative and close the pid file's handle before
+        // removing the file; removal of an open file requires cooperative sharing modes.
         m_pid_file->close();
 #endif
-        MUST(Core::System::unlink(m_pid_path));
+        MUST(FileSystem::remove(m_pid_path, FileSystem::RecursionMode::Disallowed));
     }
 
     if (!m_socket_path.is_empty())
-        MUST(Core::System::unlink(m_socket_path));
+        MUST(FileSystem::remove(m_socket_path, FileSystem::RecursionMode::Disallowed));
 }
 
 #if !defined(AK_OS_IOS)

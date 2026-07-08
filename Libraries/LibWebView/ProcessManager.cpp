@@ -6,9 +6,8 @@
 
 #include <AK/String.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/System.h>
+#include <LibCore/Process.h>
 #include <LibWebView/ProcessManager.h>
-#include <signal.h>
 
 namespace WebView {
 
@@ -148,22 +147,8 @@ void ProcessManager::force_exit_after_timeout(pid_t pid, int timeout_ms)
         if (!process.has_value())
             return;
 
-        // Single-process iOS hands out negative, synthetic pids for "services" that are really
-        // just threads inside our own process (see WebView::spawn_browser_engine_process). There
-        // is no real process there to signal, and a real pid is never negative, so there's
-        // nothing to do here beyond noting that the service appears unresponsive.
-        if (pid <= 0) {
-            dbgln("{} service thread {} appears unresponsive, but it cannot be force-killed since it isn't a real process", process_name_from_type(process->type()), pid);
-            return;
-        }
-
-#if defined(AK_OS_WINDOWS)
-        constexpr auto signal = SIGTERM;
-#else
-        constexpr auto signal = SIGKILL;
-#endif
         dbgln("Force-killing unresponsive {} process {}", process_name_from_type(process->type()), pid);
-        auto result = Core::System::kill(pid, signal);
+        auto result = Core::Process::terminate_process(pid, Core::Process::TerminationMode::Forceful);
         if (result.is_error())
             dbgln("Failed to force-kill process {}: {}", pid, result.error());
     });

@@ -107,10 +107,11 @@ static Layout::Node& insertion_parent_for_inline_node(Layout::NodeWithStyle& lay
     return last_child_creating_anonymous_wrapper_if_needed(layout_parent);
 }
 
-static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layout_parent, Layout::Node& layout_node)
+static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layout_parent, Layout::Node& layout_node, TreeBuilder::AppendOrPrepend mode)
 {
-    // Inline is fine for in-flow block children; we'll maintain the (non-)inline invariant after insertion.
-    if (!layout_node.is_anonymous() && layout_parent.is_inline() && layout_parent.display().is_flow_inside() && !layout_node.is_out_of_flow())
+    // Inline is fine for in-flow block children (interrupting blocks) and for out-of-flow children;
+    // the inline formatting context emits items for both.
+    if (!layout_node.is_anonymous() && layout_parent.is_inline() && layout_parent.display().is_flow_inside())
         return layout_parent;
 
     // Make sure we're not inserting into an inline node, since those do not support block nodes.
@@ -122,10 +123,13 @@ static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layo
     if (!has_inline_or_in_flow_block_children(*new_parent))
         return *new_parent;
 
-    // If the block is out-of-flow and is not a pseudo element,
-    if (layout_node.is_out_of_flow() && !layout_node.is_generated_for_pseudo_element()) {
-        // And the parent's last child is an anonymous block, join that anonymous block.
-        if (!new_parent->display().is_flex_inside()
+    // If the block is out-of-flow,
+    if (layout_node.is_out_of_flow()) {
+        // And we're appending while the parent's last child is an anonymous block, join that
+        // anonymous block. Prepended boxes (e.g. an absolutely positioned ::before) belong at the
+        // very start of the parent, not at the start of its trailing inline run.
+        if (mode == TreeBuilder::AppendOrPrepend::Append
+            && !new_parent->display().is_flex_inside()
             && !new_parent->display().is_grid_inside()
             && !new_parent->last_child()->is_generated_for_pseudo_element()
             && new_parent->last_child()->is_anonymous()
@@ -161,25 +165,10 @@ static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layo
 
 void TreeBuilder::insert_node_into_inline_or_block_ancestor(Layout::Node& node, CSS::Display display, AppendOrPrepend mode)
 {
-    // Find the nearest ancestor that can host the node.
-    auto& nearest_insertion_ancestor = [&]() -> NodeWithStyle& {
-        for (auto& ancestor : m_ancestor_stack.in_reverse()) {
-            if (ancestor->is_svg_foreign_object_box())
-                return *ancestor;
-
-            auto const& ancestor_display = ancestor->display();
-
-            // Out-of-flow nodes cannot be hosted in inline flow nodes.
-            if (node.is_out_of_flow() && ancestor_display.is_inline_outside() && ancestor_display.is_flow_inside())
-                continue;
-
-            return *ancestor;
-        }
-        VERIFY_NOT_REACHED();
-    }();
+    auto& nearest_insertion_ancestor = *m_ancestor_stack.last();
 
     auto& insertion_point = display.is_inline_outside() ? insertion_parent_for_inline_node(nearest_insertion_ancestor)
-                                                        : insertion_parent_for_block_node(nearest_insertion_ancestor, node);
+                                                        : insertion_parent_for_block_node(nearest_insertion_ancestor, node, mode);
 
     if (mode == AppendOrPrepend::Prepend)
         insertion_point.prepend_child(node);
@@ -190,8 +179,9 @@ void TreeBuilder::insert_node_into_inline_or_block_ancestor(Layout::Node& node, 
         // After inserting an inline-level box into a parent, mark the parent as having inline children.
         insertion_point.set_children_are_inline(true);
     } else if (node.is_in_flow()) {
-        // After inserting an in-flow block-level box into a parent, mark the parent as having non-inline children.
-        insertion_point.set_children_are_inline(false);
+        // Inline-flow parents keep their inline children flag; their IFC may contain interrupting blocks.
+        if (!insertion_point.display().is_inline_outside() || !insertion_point.display().is_flow_inside())
+            insertion_point.set_children_are_inline(false);
     }
 }
 
@@ -615,161 +605,6 @@ RefPtr<NodeWithStyle> TreeBuilder::create_content_replacement_if_needed(DOM::Ele
     return create_content_image_box(element.document(), element, style, image);
 }
 
-// Block nodes inside inline nodes are allowed, but to maintain the invariant that either all layout children are
-// inline or non-inline, we need to rearrange the tree a bit. All inline ancestors up to the node we've inserted are
-// wrapped in an anonymous block, which is inserted into the nearest non-inline ancestor. We then recreate the inline
-// ancestors in another anonymous block inserted after the node so we can continue adding children.
-//
-// Effectively, we try to turn this:
-//
-//     InlineNode 1
-//       TextNode 1
-//       InlineNode N
-//         TextNode N
-//         BlockContainer (node)
-//
-// Into this:
-//
-//     BlockContainer (anonymous "before")
-//       InlineNode 1
-//         TextNode 1
-//         InlineNode N
-//           TextNode N
-//     BlockContainer (anonymous "middle") continuation
-//       BlockContainer (node)
-//     BlockContainer (anonymous "after")
-//       InlineNode 1 continuation
-//         InlineNode N
-//
-// To be able to reconstruct their relation after restructuring, layout nodes keep track of their continuation. The
-// top-most inline node of the "after" wrapper points to the "middle" wrapper, which points to the top-most inline node
-// of the "before" wrapper. All other inline nodes in the "after" wrapper point to their counterparts in the "before"
-// wrapper, to make it easier to create the right paintables since a DOM::Node only has a single Layout::Node.
-//
-// Appending then continues in the "after" tree. If a new block node is then inserted, we can reuse the "middle" wrapper
-// if no inline siblings exist for node or its ancestors, and leave the existing "after" wrapper alone. Otherwise, we
-// create new wrappers and extend the continuation chain.
-//
-// Inspired by: https://webkit.org/blog/115/webcore-rendering-ii-blocks-and-inlines/
-void TreeBuilder::restructure_block_node_in_inline_parent(NodeWithStyleAndBoxModelMetrics& node)
-{
-    // Mark parent as inline again
-    auto& parent = *node.parent();
-    VERIFY(!parent.children_are_inline());
-    parent.set_children_are_inline(true);
-
-    // Find nearest ancestor that establishes a BFC (block container) and is not display: contents or anonymous.
-    auto& nearest_block_ancestor = [&] -> NodeWithStyle& {
-        for (auto* ancestor = parent.parent(); ancestor; ancestor = ancestor->parent()) {
-            if (is<BlockContainer>(*ancestor) && !ancestor->display().is_contents() && !ancestor->is_anonymous())
-                return *ancestor;
-        }
-        VERIFY_NOT_REACHED();
-    }();
-    nearest_block_ancestor.set_children_are_inline(false);
-
-    // Find the topmost inline ancestor.
-    RefPtr<NodeWithStyleAndBoxModelMetrics> topmost_inline_ancestor;
-    for (auto* ancestor = &parent; ancestor; ancestor = ancestor->parent()) {
-        if (ancestor == &nearest_block_ancestor)
-            break;
-        if (ancestor->is_inline())
-            topmost_inline_ancestor = static_cast<NodeWithStyleAndBoxModelMetrics*>(ancestor);
-    }
-    VERIFY(topmost_inline_ancestor);
-
-    // We need to host the topmost inline ancestor and its previous siblings in an anonymous "before" wrapper. If an
-    // inline wrapper does not already exist, we create a new one and add it to the nearest block ancestor.
-    RefPtr<Node> before_wrapper;
-    if (auto last_child = nearest_block_ancestor.last_child(); last_child && last_child->is_anonymous() && last_child->children_are_inline()) {
-        before_wrapper = last_child;
-    } else {
-        before_wrapper = nearest_block_ancestor.create_anonymous_wrapper();
-
-        before_wrapper->set_children_are_inline(true);
-        nearest_block_ancestor.append_child(*before_wrapper);
-    }
-    if (topmost_inline_ancestor->parent() != before_wrapper.ptr()) {
-        RefPtr<Node> inline_to_move = topmost_inline_ancestor;
-        while (inline_to_move) {
-            auto next = inline_to_move->previous_sibling();
-            inline_to_move->remove();
-            before_wrapper->insert_before(*inline_to_move, before_wrapper->first_child());
-            inline_to_move = next;
-        }
-    }
-
-    // If we are part of an existing continuation and all inclusive ancestors have no previous siblings, we can reuse
-    // the existing middle wrapper. Otherwiser, we create a new middle wrapper to contain the block node and add it to
-    // the nearest block ancestor.
-    bool needs_new_continuation = true;
-    RefPtr<NodeWithStyleAndBoxModelMetrics> middle_wrapper;
-    if (topmost_inline_ancestor->continuation_of_node()) {
-        needs_new_continuation = false;
-        for (RefPtr<Node> ancestor = node; ancestor != topmost_inline_ancestor; ancestor = ancestor->parent()) {
-            if (ancestor->previous_sibling()) {
-                needs_new_continuation = true;
-                break;
-            }
-        }
-        if (!needs_new_continuation)
-            middle_wrapper = topmost_inline_ancestor->continuation_of_node();
-    }
-    if (!middle_wrapper) {
-        middle_wrapper = static_cast<NodeWithStyleAndBoxModelMetrics&>(*nearest_block_ancestor.create_anonymous_wrapper());
-        nearest_block_ancestor.append_child(*middle_wrapper);
-        middle_wrapper->set_continuation_of_node({}, topmost_inline_ancestor);
-    }
-
-    // Move the block node to the middle wrapper.
-    node.remove();
-    middle_wrapper->append_child(node);
-
-    // If we need a new continuation, recreate inline ancestors in another anonymous block so we can continue adding new
-    // nodes. We don't need to do this if we are within an existing continuation and there were no previous siblings in
-    // any inclusive ancestor of node in the after wrapper.
-    if (needs_new_continuation) {
-        auto after_wrapper = nearest_block_ancestor.create_anonymous_wrapper();
-        RefPtr<Node> current_parent = after_wrapper;
-        for (RefPtr<Node> inline_node = topmost_inline_ancestor;
-            inline_node && is<DOM::Element>(inline_node->dom_node()); inline_node = inline_node->last_child()) {
-            auto& element = static_cast<DOM::Element&>(*inline_node->dom_node());
-
-            auto style = element.computed_properties();
-            auto new_layout_node = element.create_layout_node(*style);
-            if (!new_layout_node)
-                break;
-            auto* new_inline_node = as_if<NodeWithStyleAndBoxModelMetrics>(*new_layout_node);
-            if (!new_inline_node)
-                break;
-            if (inline_node == topmost_inline_ancestor) {
-                // The topmost inline ancestor points to the middle wrapper, which in turns points to the original node.
-                new_inline_node->set_continuation_of_node({}, middle_wrapper);
-                topmost_inline_ancestor = *new_inline_node;
-            } else {
-                // We need all other inline nodes to point to their original node so we can walk the continuation chain
-                // in LayoutState and create the right paintables.
-                new_inline_node->set_continuation_of_node({}, &static_cast<NodeWithStyleAndBoxModelMetrics&>(*inline_node));
-            }
-
-            current_parent->append_child(*new_inline_node);
-            current_parent = *new_inline_node;
-
-            // Replace the node in the ancestor stack with the new node.
-            auto& node_with_style = static_cast<NodeWithStyle&>(*inline_node);
-            if (auto stack_index = m_ancestor_stack.find_first_index(&node_with_style); stack_index.has_value())
-                m_ancestor_stack[stack_index.release_value()] = new_inline_node;
-
-            // Stop recreating nodes when we've reached node's parent.
-            if (inline_node == &parent)
-                break;
-        }
-
-        after_wrapper->set_children_are_inline(true);
-        nearest_block_ancestor.append_child(after_wrapper);
-    }
-}
-
 static bool is_ignorable_whitespace(Layout::Node const& node)
 {
     if (auto* text_node = as_if<TextNode>(node); text_node && text_node->text_for_rendering().is_ascii_whitespace())
@@ -1129,13 +964,6 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
     if (should_create_layout_node) {
         update_layout_tree_after_children(dom_node, *layout_node, context, element_has_content_visibility_hidden);
         wrap_in_button_layout_tree_if_needed(dom_node, *layout_node);
-
-        // If we completely finished inserting a block level element into an inline parent, we need to fix up the tree so
-        // that we can maintain the invariant that all children are either inline or non-inline. We can't do this earlier,
-        // because the restructuring adds new children after this node that become part of the ancestor stack.
-        if (auto node_with_metrics = as_if<NodeWithStyleAndBoxModelMetrics>(*layout_node);
-            node_with_metrics && node_with_metrics->should_create_inline_continuation())
-            restructure_block_node_in_inline_parent(*node_with_metrics);
     }
 
     // https://www.w3.org/TR/css-contain-2/#containment-style

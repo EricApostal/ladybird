@@ -122,8 +122,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #else
     auto client = TRY(IPC::take_over_accepted_client_from_system_server<RequestServer::ConnectionFromClient>(
         mach_server_name,
-        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes, connections, disk_cache));
-#endif
+        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes,
+        RequestServer::IsPrivate::No,
+        connections,
+        disk_cache));
 
     return event_loop.exec();
 }

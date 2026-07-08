@@ -48,6 +48,7 @@
 #include <LibWebView/DOMNodeProperties.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/PageInfo.h>
+#include <LibWebView/PrivateBrowsing.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/StorageSetResult.h>
@@ -66,7 +67,12 @@ public:
     static void for_each_view(Function<IterationDecision(ViewImplementation&)>);
     static Optional<ViewImplementation&> find_view_by_id(u64);
 
+    IsPrivate is_private() const { return m_is_private; }
+
     u64 view_id() const { return m_view_id; }
+
+    CanonicalTraversable& traversable() { return m_top_level_traversable; }
+    CanonicalTraversable const& traversable() const { return m_top_level_traversable; }
 
     void set_url(Badge<WebContentClient>, URL::URL url) { set_url(move(url)); }
     URL::URL const& url() const { return m_url; }
@@ -224,11 +230,21 @@ public:
 
     // Used by platform input methods to drive marked/preedit-text composition, and to query the on-screen caret
     // position for placing IME overlays.
+    struct InputMethodState {
+        bool is_enabled { false };
+        i32 cursor_position { 0 };
+        i32 anchor_position { 0 };
+        Utf16String text_before_cursor;
+        Utf16String text_after_cursor;
+        Optional<Web::DevicePixelRect> caret_rect;
+    };
+
     void set_marked_text_from_input_method(Utf16String const& text);
-    void commit_text_from_input_method(Utf16String const& text);
+    void commit_text_from_input_method(Utf16String const& text, i32 replacement_start = 0, i32 replacement_length = 0);
     void unmark_text_from_input_method();
     Optional<Web::DevicePixelRect> get_input_caret_rect();
-    void set_input_caret_rect(Badge<WebContentClient>, Optional<Web::DevicePixelRect>);
+    InputMethodState const& input_method_state() const { return m_input_method_state; }
+    void set_input_method_state(Badge<WebContentClient>, InputMethodState);
 
     Web::HTML::MuteState page_mute_state() const { return m_mute_state; }
     void toggle_page_mute_state();
@@ -378,7 +394,7 @@ protected:
     static constexpr auto ZOOM_MAX_LEVEL = 5.0;
     static constexpr auto ZOOM_STEP = 0.1;
 
-    ViewImplementation();
+    explicit ViewImplementation(IsPrivate = IsPrivate::No);
 
     u64 page_id() const;
 
@@ -421,6 +437,7 @@ protected:
         Yes,
     };
     virtual void initialize_client(CreateNewClient = CreateNewClient::Yes);
+    void reset_page_media_state();
 
     enum class LoadErrorPage {
         No,
@@ -439,6 +456,11 @@ protected:
     void update_bookmark_action();
 
     void initialize_context_menus();
+    enum class PromptForPath : u8 {
+        No,
+        Yes,
+    };
+    void download_context_menu_url(PromptForPath);
 
     struct SharedBitmap {
         i32 id { -1 };
@@ -454,6 +476,8 @@ protected:
         u64 page_index { 0 };
         bool has_usable_bitmap { false };
     } m_client_state;
+
+    IsPrivate m_is_private { IsPrivate::No };
 
     URL::URL m_url;
     Utf16String m_title;
@@ -485,6 +509,9 @@ protected:
 
     RefPtr<Action> m_open_in_new_tab_action;
     RefPtr<Action> m_open_in_new_window_action;
+    RefPtr<Action> m_open_in_new_private_window_action;
+    RefPtr<Action> m_download_linked_file_action;
+    RefPtr<Action> m_download_linked_file_as_action;
     RefPtr<Action> m_copy_url_action;
     URL::URL m_context_menu_url;
 
@@ -541,8 +568,8 @@ protected:
     u64 m_next_webdriver_navigation_completion_request_id { 0 };
     HashMap<u64, OwnPtr<WebDriverNavigationCompletionRequest>> m_pending_webdriver_navigation_completion_requests;
 
-    // Most recent caret position pushed by WebContent, Used for placing platform IME overlays without a sync IPC.
-    Optional<Web::DevicePixelRect> m_input_caret_rect;
+    // Most recent input-method state pushed by WebContent. Used for platform IME callbacks without a sync IPC.
+    InputMethodState m_input_method_state;
 
     Web::ViewportIsFullscreen m_is_fullscreen { Web::ViewportIsFullscreen::No };
 

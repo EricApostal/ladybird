@@ -4,13 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/Layout/BlockFormattingContext.h>
 #include <LibWeb/Layout/LineBuilder.h>
 #include <LibWeb/Layout/TextNode.h>
 
 namespace Web::Layout {
 
-LineBuilder::LineBuilder(InlineFormattingContext& context, LayoutState& layout_state, LayoutState::UsedValues& containing_block_used_values, CSS::Direction direction, CSS::WritingMode writing_mode)
+LineBuilder::LineBuilder(InlineFormattingContext& context, LayoutState& layout_state, LayoutState::UsedValues& containing_block_used_values, CSSPixels containing_block_width, CSS::Direction direction, CSS::WritingMode writing_mode)
     : m_context(context)
     , m_layout_state(layout_state)
     , m_containing_block_used_values(containing_block_used_values)
@@ -18,7 +19,7 @@ LineBuilder::LineBuilder(InlineFormattingContext& context, LayoutState& layout_s
     , m_writing_mode(writing_mode)
 {
     auto text_indent = m_context.containing_block().computed_values().text_indent();
-    m_text_indent = text_indent.length_percentage.to_px(m_containing_block_used_values.content_width());
+    m_text_indent = text_indent.length_percentage.to_px(containing_block_width);
     m_text_indent_each_line = text_indent.each_line;
     m_text_indent_hanging = text_indent.hanging;
     begin_new_line(false);
@@ -81,6 +82,7 @@ void LineBuilder::begin_new_line(bool increment_y, bool is_first_break_in_sequen
 
     if (should_indent)
         line_box.m_inline_length += m_text_indent;
+    m_current_line_committed_pending_margin = false;
 }
 
 LineBox& LineBuilder::ensure_last_line_box()
@@ -93,6 +95,8 @@ LineBox& LineBuilder::ensure_last_line_box()
 
 void LineBuilder::append_box(Box const& box, CSSPixels leading_size, CSSPixels trailing_size, CSSPixels leading_margin, CSSPixels trailing_margin)
 {
+    prepare_to_append_inline_content();
+
     auto& box_state = m_layout_state.get_mutable(box);
     auto& line_box = ensure_last_line_box();
     line_box.add_fragment(box, 0, 0, leading_size, trailing_size, leading_margin, trailing_margin,
@@ -114,6 +118,8 @@ void LineBuilder::append_box(Box const& box, CSSPixels leading_size, CSSPixels t
 
 void LineBuilder::append_text_chunk(TextNode const& text_node, size_t offset_in_node, size_t length_in_node, CSSPixels leading_size, CSSPixels trailing_size, CSSPixels leading_margin, CSSPixels trailing_margin, CSSPixels content_width, CSSPixels content_height, RefPtr<Gfx::GlyphRun> glyph_run)
 {
+    prepare_to_append_inline_content();
+
     auto& line_box = ensure_last_line_box();
     line_box.add_fragment(text_node, offset_in_node, length_in_node, leading_size, trailing_size, leading_margin,
         trailing_margin, content_width, content_height, 0, 0, move(glyph_run));
@@ -121,9 +127,100 @@ void LineBuilder::append_text_chunk(TextNode const& text_node, size_t offset_in_
     m_max_height_on_current_line = max(m_max_height_on_current_line, line_box.block_length());
 }
 
-void LineBuilder::append_static_position_marker(Box const& box)
+void LineBuilder::append_static_position_marker(Box const& box, bool preceded_by_inline_box_start_edges)
 {
-    ensure_last_line_box().add_static_position_marker(box);
+    ensure_last_line_box().add_static_position_marker(box, preceded_by_inline_box_start_edges);
+}
+
+void LineBuilder::prepare_to_append_inline_content()
+{
+    if (m_current_line_committed_pending_margin)
+        return;
+
+    auto& line_box = ensure_last_line_box();
+    if (line_box.has_block_level_box())
+        return;
+
+    auto margin_before_line = m_context.parent().commit_pending_margin_before_inline_content();
+    if (margin_before_line != 0) {
+        m_current_block_offset += margin_before_line;
+        recalculate_available_space();
+    }
+    m_current_line_committed_pending_margin = true;
+    m_pending_margin_follows_block_level_box = false;
+}
+
+void LineBuilder::commit_pending_margin_before_float()
+{
+    // Floats are placed at the current block offset without committing pending margins (which may still collapse
+    // with following block-level siblings). But a margin left pending by an interrupting block must be committed,
+    // or the float would sit higher than the inline content that will share its line.
+    if (m_pending_margin_follows_block_level_box)
+        prepare_to_append_inline_content();
+}
+
+void LineBuilder::finish_current_line_before_block_level_box()
+{
+    auto& line_boxes = m_containing_block_used_values.line_boxes;
+    if (line_boxes.is_empty() || line_boxes.last().is_empty())
+        return;
+
+    auto& last_line_box = ensure_last_line_box();
+    last_line_box.m_has_break = true;
+    // The interrupting block ends the inline flow here, so this line is "the last line before a forced break"
+    // for text-align purposes and must not be stretched by justification.
+    last_line_box.m_has_forced_break = true;
+
+    m_last_line_needs_update = true;
+    update_last_line();
+
+    line_boxes.append(LineBox(m_direction, m_writing_mode));
+    begin_new_line(true);
+}
+
+void LineBuilder::append_block_level_box(Box const& box, CSSPixels block_bottom, CSSPixels block_bottom_margin)
+{
+    auto& box_state = m_layout_state.get_mutable(box);
+    auto& line_box = ensure_last_line_box();
+    VERIFY(line_box.fragments().is_empty());
+
+    // The fragment stores logical (inline/block) coordinates, while the box state carries physical ones.
+    auto is_horizontal = m_writing_mode == CSS::WritingMode::HorizontalTb;
+    auto inline_offset = is_horizontal ? box_state.offset.x() : box_state.offset.y();
+    auto block_offset = is_horizontal ? box_state.offset.y() : box_state.offset.x();
+    auto inline_length = is_horizontal ? box_state.content_width() : box_state.content_height();
+    auto block_length = is_horizontal ? box_state.content_height() : box_state.content_width();
+
+    line_box.m_fragments.append(LineBoxFragment { box, 0, 0, inline_offset, block_offset,
+        inline_length, block_length, box_state.border_box_top(), m_direction, m_writing_mode, {} });
+    line_box.m_inline_length = is_horizontal ? box_state.margin_box_width() : box_state.margin_box_height();
+    line_box.m_block_length = 0;
+    line_box.m_bottom = block_bottom;
+    line_box.m_baseline = 0;
+    line_box.m_has_block_level_box = true;
+    line_box.m_block_level_box_bottom_margin = block_bottom_margin;
+    line_box.m_has_break = true;
+    // The interrupting block also ends the inline flow after itself; any content that follows starts on a fresh line.
+    line_box.m_has_forced_break = true;
+
+    box_state.containing_line_box_fragment = LineBoxFragmentCoordinate {
+        .line_box_index = m_containing_block_used_values.line_boxes.size() - 1,
+        .fragment_index = 0,
+    };
+
+    // Static position markers recorded on this line will never go through update_last_line(), so anchor them
+    // at the flow position the interrupting block starts at.
+    for (auto& marker : line_box.static_position_markers())
+        marker.block_offset += m_current_block_offset;
+
+    m_pending_margin_follows_block_level_box = true;
+    m_current_block_offset = block_bottom;
+    m_max_height_on_current_line = 0;
+    m_last_line_needs_update = false;
+    m_should_advance_to_last_line_box_bottom = false;
+
+    m_containing_block_used_values.line_boxes.append(LineBox(m_direction, m_writing_mode));
+    begin_new_line(false);
 }
 
 CSSPixels LineBuilder::ceiling_for_float_to_be_inserted_here(Box const& box)
@@ -138,9 +235,16 @@ CSSPixels LineBuilder::ceiling_for_float_to_be_inserted_here(Box const& box)
     auto const& current_line = ensure_last_line_box();
     auto current_line_width = current_line.width() - current_line.get_trailing_whitespace_width();
 
+    // A float interrupting an unbreakable run cannot let the remainder of the run overflow across it;
+    // the remainder must also fit beside the float for the float to stay on this line.
+    auto width_needed_beside_float = current_line_width;
+    if (!current_line.is_empty_or_ends_in_whitespace())
+        width_needed_beside_float += m_unbreakable_run_width_interrupted_by_float;
+    m_unbreakable_run_width_interrupted_by_float = 0;
+
     // If there's already inline content on the current line, check if the new float can fit
     // alongside the content. If not, place it on the next line.
-    if (current_line_width > 0 && (current_line_width + width) > m_available_width_for_current_line)
+    if (current_line_width > 0 && (width_needed_beside_float + width) > m_available_width_for_current_line)
         candidate_block_offset += current_line.height();
 
     return max(candidate_block_offset, m_context.vertical_float_clearance());
@@ -174,6 +278,14 @@ void LineBuilder::update_last_line()
         return;
 
     auto& line_box = line_boxes.last();
+
+    if (line_box.has_block_level_box()) {
+        m_should_advance_to_last_line_box_bottom = false;
+        return;
+    }
+
+    if (!line_box.fragments().is_empty())
+        prepare_to_append_inline_content();
 
     auto text_align = m_context.containing_block().computed_values().text_align();
     auto direction = m_context.containing_block().computed_values().direction();
@@ -412,6 +524,16 @@ void LineBuilder::update_last_line()
 
         uppermost_box_top = min(uppermost_box_top, top_of_inline_box);
         lowermost_box_bottom = max(lowermost_box_bottom, bottom_of_inline_box);
+
+        // FIXME: Also anchor text fragment boxes to the font baseline in vertical writing modes.
+        if (fragment.layout_node().is_text_node() && m_writing_mode == CSS::WritingMode::HorizontalTb) {
+            auto const& font_metrics = fragment.layout_node().first_available_font().pixel_metrics();
+            auto const font_box_height = CSS::ComputedProperties::normal_line_height(font_metrics);
+            auto const font_baseline = baseline_for_font(font_metrics, font_box_height);
+            fragment.set_block_offset(fragment.block_offset() + fragment.baseline() - font_baseline);
+            fragment.set_baseline(font_baseline);
+            fragment.set_block_length(font_box_height);
+        }
     }
 
     for (auto& marker : line_box.static_position_markers()) {

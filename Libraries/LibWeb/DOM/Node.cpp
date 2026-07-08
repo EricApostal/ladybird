@@ -74,7 +74,6 @@
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/Paintable.h>
-#include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
 #include <LibWeb/XLink/AttributeNames.h>
@@ -1806,15 +1805,6 @@ void Node::clear_layout_node_paintables()
         return;
 
     m_layout_node->clear_paintables();
-
-    // NB: Block-in-inline splitting can create multiple layout nodes for a single DOM node. Only the last one is stored
-    //     in m_layout_node so we need to clear the paintables for the continued nodes as well
-    auto* node_with_metrics = as_if<Layout::NodeWithStyleAndBoxModelMetrics>(*m_layout_node);
-    if (!node_with_metrics)
-        return;
-
-    for (auto* continuation = node_with_metrics->continuation_of_node(); continuation; continuation = continuation->continuation_of_node())
-        continuation->clear_paintables();
 }
 
 void Node::removed_from(IsSubtreeRoot, Node*, Node&)
@@ -2771,32 +2761,24 @@ RefPtr<Painting::Paintable> Node::unsafe_paintable()
     return m_paintable.strong_ref();
 }
 
-RefPtr<Painting::PaintableBox const> Node::paintable_box() const
+RefPtr<Painting::Paintable const> Node::paintable_box() const
 {
-    if (auto p = paintable(); p && p->is_paintable_box())
-        return static_cast<Painting::PaintableBox const&>(*p);
-    return nullptr;
+    return paintable();
 }
 
-RefPtr<Painting::PaintableBox> Node::paintable_box()
+RefPtr<Painting::Paintable> Node::paintable_box()
 {
-    if (auto p = paintable(); p && p->is_paintable_box())
-        return static_cast<Painting::PaintableBox&>(*p);
-    return nullptr;
+    return paintable();
 }
 
-RefPtr<Painting::PaintableBox const> Node::unsafe_paintable_box() const
+RefPtr<Painting::Paintable const> Node::unsafe_paintable_box() const
 {
-    if (auto paintable = m_paintable.strong_ref(); paintable && paintable->is_paintable_box())
-        return static_cast<Painting::PaintableBox const&>(*paintable);
-    return nullptr;
+    return m_paintable.strong_ref();
 }
 
-RefPtr<Painting::PaintableBox> Node::unsafe_paintable_box()
+RefPtr<Painting::Paintable> Node::unsafe_paintable_box()
 {
-    if (auto paintable = m_paintable.strong_ref(); paintable && paintable->is_paintable_box())
-        return static_cast<Painting::PaintableBox&>(*paintable);
-    return nullptr;
+    return m_paintable.strong_ref();
 }
 
 // https://dom.spec.whatwg.org/#queue-a-mutation-record

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, the Ladybird developers.
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -126,9 +126,9 @@ Messages::CompositorWebContentServer::CreateCanvas2dContextResponse ConnectionFr
     return { true, *canvas_id };
 }
 
-void ConnectionFromWebContent::update_canvas_2d_commands(Web::Painting::CanvasId canvas_id, Gfx::CanvasCommandList commands, bool commit)
+void ConnectionFromWebContent::update_canvas_2d_stream(Vector<Web::Painting::Canvas2DCommandStreamSegment> segments)
 {
-    m_canvas_host.execute_canvas_2d_commands(canvas_id, commands, commit);
+    m_canvas_host.execute_canvas_2d_stream(segments);
 }
 
 void ConnectionFromWebContent::destroy_canvas_context(Web::Painting::CanvasId canvas_id)

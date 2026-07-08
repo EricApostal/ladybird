@@ -69,6 +69,7 @@ static QWidget* initial_web_content_view_parent([[maybe_unused]] QWidget* window
 
 WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client, size_t page_index, WebContentViewInitialState initial_state)
     : WebContentViewBase(initial_web_content_view_parent(window))
+    , WebView::ViewImplementation(initial_state.is_private)
 {
 #ifdef LADYBIRD_QT_USE_METAL_RHI_WIDGET
     // Keep the QRhiWidget out of the top-level QWidget backing store. If it is
@@ -96,6 +97,7 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
     m_device_pixel_ratio = devicePixelRatio();
     m_maximum_frames_per_second = initial_state.maximum_frames_per_second;
     m_display_id = initial_state.display_id;
+
     set_page_background_color_to_system_canvas(is_using_dark_system_theme(*this));
 
     QObject::connect(qGuiApp, &QGuiApplication::screenRemoved, [this](QScreen*) {
@@ -431,8 +433,7 @@ static bool is_browser_reserved_shortcut(QKeyEvent const& event)
 {
     // Browser chrome shortcuts that manage tabs, windows, or focus should not wait for
     // WebContent to decide whether the page wants to suppress them.
-    if (event.matches(QKeySequence::StandardKey::AddTab)
-        || event.matches(QKeySequence::StandardKey::Close)
+    if (event.matches(QKeySequence::StandardKey::Close)
         || event.matches(QKeySequence::StandardKey::New)
         || event.matches(QKeySequence::StandardKey::Quit))
         return true;
@@ -440,7 +441,11 @@ static bool is_browser_reserved_shortcut(QKeyEvent const& event)
     auto const modifiers = event.modifiers() & (Qt::ControlModifier | Qt::ShiftModifier | Qt::AltModifier | Qt::MetaModifier);
     auto const key = event.key();
 
+    if (modifiers == Qt::ControlModifier && key == Qt::Key_T)
+        return true;
     if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && key == Qt::Key_T)
+        return true;
+    if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && key == Qt::Key_N)
         return true;
 
     if (modifiers == Qt::ControlModifier && (key == Qt::Key_L || key == Qt::Key_Tab || key == Qt::Key_PageDown))
@@ -450,6 +455,9 @@ static bool is_browser_reserved_shortcut(QKeyEvent const& event)
         return true;
 
 #if defined(AK_OS_MACOS)
+    if (modifiers == Qt::ControlModifier && key == Qt::Key_H)
+        return true;
+
     if (modifiers == Qt::MetaModifier && key == Qt::Key_Tab)
         return true;
 
@@ -495,16 +503,54 @@ void WebContentView::inputMethodEvent(QInputMethodEvent* event)
         return;
     }
 
-    if (!event->commitString().isEmpty()) {
-        QKeyEvent keyEvent(QEvent::KeyPress, 0, Qt::NoModifier, event->commitString());
-        keyPressEvent(&keyEvent);
-    }
+    if (!event->commitString().isEmpty() || event->replacementLength() != 0)
+        commit_text_from_input_method(utf16_string_from_qstring(event->commitString()), event->replacementStart(), event->replacementLength());
+
+    set_marked_text_from_input_method(utf16_string_from_qstring(event->preeditString()));
     event->accept();
 }
 
-QVariant WebContentView::inputMethodQuery(Qt::InputMethodQuery) const
+static Optional<QRectF> input_method_rect_for_caret(Optional<Web::DevicePixelRect> const& caret_rect, double device_pixel_ratio)
 {
-    return QVariant();
+    if (!caret_rect.has_value())
+        return {};
+
+    return QRectF {
+        caret_rect->x().value() / device_pixel_ratio,
+        caret_rect->y().value() / device_pixel_ratio,
+        max(caret_rect->width().value() / device_pixel_ratio, 1.0),
+        max(caret_rect->height().value() / device_pixel_ratio, 1.0),
+    };
+}
+
+QVariant WebContentView::inputMethodQuery(Qt::InputMethodQuery query) const
+{
+    auto const& state = input_method_state();
+
+    switch (query) {
+    case Qt::ImEnabled:
+        return state.is_enabled;
+    case Qt::ImCursorRectangle:
+    case Qt::ImAnchorRectangle:
+        if (auto rect = input_method_rect_for_caret(state.caret_rect, device_pixel_ratio()); rect.has_value())
+            return *rect;
+        return WebContentViewBase::inputMethodQuery(query);
+    case Qt::ImAbsolutePosition:
+    case Qt::ImCursorPosition:
+        return state.cursor_position;
+    case Qt::ImAnchorPosition:
+        return state.anchor_position;
+    case Qt::ImTextBeforeCursor:
+        return qstring_from_utf16_string(state.text_before_cursor);
+    case Qt::ImTextAfterCursor:
+        return qstring_from_utf16_string(state.text_after_cursor);
+    case Qt::ImSurroundingText:
+        return qstring_from_utf16_string(state.text_before_cursor) + qstring_from_utf16_string(state.text_after_cursor);
+    case Qt::ImReadOnly:
+        return !state.is_enabled;
+    default:
+        return WebContentViewBase::inputMethodQuery(query);
+    }
 }
 
 void WebContentView::leaveEvent(QEvent* event)
@@ -779,6 +825,23 @@ void WebContentView::set_device_pixel_ratio(double device_pixel_ratio)
     m_device_pixel_ratio = device_pixel_ratio;
     update_viewport_size();
     handle_resize();
+}
+
+void WebContentView::set_vertical_tab_overlay_insets([[maybe_unused]] int left, [[maybe_unused]] int right)
+{
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    if (m_vertical_tab_overlay_left == left && m_vertical_tab_overlay_right == right)
+        return;
+
+    // While vertical tabs are hover-expanded they overlay this view. On the Vulkan presentation path, the native window
+    // would occlude them, so we clear these left/right strips (in logical pixels) to transparent, letting the tab
+    // column that paints in the widget backing store show through.
+    m_vertical_tab_overlay_left = left;
+    m_vertical_tab_overlay_right = right;
+
+    update_vulkan_window_input_region();
+    schedule_repaint();
+#endif
 }
 
 void WebContentView::set_zoom_level(double zoom_level)

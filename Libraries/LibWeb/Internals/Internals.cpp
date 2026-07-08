@@ -56,7 +56,7 @@
 #include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
@@ -421,9 +421,9 @@ void Internals::set_marked_text_from_input_method(Utf16String const& text)
     page().focused_navigable().set_marked_text_from_input_method(text);
 }
 
-void Internals::commit_text_from_input_method(Utf16String const& text)
+void Internals::commit_text_from_input_method(Utf16String const& text, WebIDL::Long replacement_start, WebIDL::Long replacement_length)
 {
-    page().focused_navigable().commit_text_from_input_method(text);
+    page().focused_navigable().commit_text_from_input_method(text, replacement_start, replacement_length);
 }
 
 void Internals::unmark_text_from_input_method()
@@ -633,6 +633,11 @@ void Internals::set_device_pixel_ratio(double ratio)
 bool Internals::headless()
 {
     return page().client().is_headless();
+}
+
+bool Internals::needs_repaint()
+{
+    return page().top_level_traversable()->needs_repaint();
 }
 
 String Internals::dump_display_list()

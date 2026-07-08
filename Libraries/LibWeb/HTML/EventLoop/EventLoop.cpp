@@ -27,7 +27,7 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/IndexedDB/Internal/Algorithms.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/Timer.h>
@@ -279,6 +279,7 @@ void EventLoop::process_input_events() const
 
             for (size_t i = 0; i < event.coalesced_event_count; ++i)
                 page_client.report_finished_handling_input_event(event.page_id, EventResult::Dropped);
+            page_client.did_handle_input_event(event.page_id, event.event);
             page_client.report_finished_handling_input_event(event.page_id, result);
         }
 
