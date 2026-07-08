@@ -118,7 +118,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto transport_ports = TRY(IPC::bootstrap_transport_from_xpc());
     auto client = RequestServer::ConnectionFromClient::construct(
         make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)),
-        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes, connections, disk_cache);
+        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes, RequestServer::IsPrivate::No,
+        connections, disk_cache);
 #else
     auto client = TRY(IPC::take_over_accepted_client_from_system_server<RequestServer::ConnectionFromClient>(
         mach_server_name,
