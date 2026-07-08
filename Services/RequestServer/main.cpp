@@ -126,6 +126,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         RequestServer::IsPrivate::No,
         connections,
         disk_cache));
+#endif
 
     return event_loop.exec();
 }

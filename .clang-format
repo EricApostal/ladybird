@@ -19,6 +19,7 @@ RemoveSemicolon: true
 RequiresClausePosition: WithFollowing
 RequiresExpressionIndentation: OuterScope
 SpaceAfterTemplateKeyword: false
+SpaceInEmptyBlock: false
 WrapNamespaceBodyWithEmptyLines: Always
 
 ---
