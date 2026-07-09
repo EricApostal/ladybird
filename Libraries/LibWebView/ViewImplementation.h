@@ -299,6 +299,11 @@ public:
     Function<void(URL::URL const&)> on_url_change;
     Function<void(URL::URL const&, bool)> on_load_start;
     Function<void(URL::URL const&)> on_load_finish;
+    // Fired whenever the traversable's session history mirror actually
+    // changes -- new navigation, pushState/replaceState, back/forward
+    // traversal, reload, or crash-recovery reseed. No payload; consumers
+    // should read the current state via traversable().session_history().
+    Function<void()> on_navigation_history_change;
 
     struct NavigationListener {
         Function<void(URL::URL const&, bool)> on_load_start;

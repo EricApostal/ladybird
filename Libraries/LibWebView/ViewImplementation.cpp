@@ -1587,6 +1587,9 @@ void ViewImplementation::update_navigation_action_state()
 {
     m_navigate_back_action->set_enabled(m_top_level_traversable.session_history().can_go_back());
     m_navigate_forward_action->set_enabled(m_top_level_traversable.session_history().can_go_forward());
+
+    if (on_navigation_history_change)
+        on_navigation_history_change();
 }
 
 void ViewImplementation::seed_web_content_session_history_from_ui_process(AllowCurrentEntryReconstruction allow_current_entry_reconstruction)
