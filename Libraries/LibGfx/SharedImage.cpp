@@ -11,6 +11,11 @@
 #ifdef USE_VULKAN_DMABUF_IMAGES
 #    include <LibGfx/VulkanImage.h>
 #endif
+#ifdef USE_VULKAN_AHB_IMAGES
+#    include <LibGfx/VulkanImage.h>
+#    include <sys/socket.h>
+#    include <unistd.h>
+#endif
 #ifdef USE_DIRECTX
 #    include <LibGfx/D3DSharedTexture.h>
 #endif
@@ -38,6 +43,13 @@ SharedImage::SharedImage(WindowsD3DHandle&& d3d_handle)
 {
 }
 
+#    ifdef USE_VULKAN_AHB_IMAGES
+SharedImage::SharedImage(AndroidAhbHandle&& ahb_handle)
+    : m_data(move(ahb_handle))
+{
+}
+#    endif
+
 #    ifdef USE_VULKAN_DMABUF_IMAGES
 SharedImage duplicate_shared_image(VulkanImage const& vulkan_image)
 {
@@ -56,6 +68,35 @@ LinuxDmaBufHandle duplicate_linux_dmabuf_handle(VulkanImage const& vulkan_image)
     dma_buf.objects.append(IPC::File::adopt_fd(fd));
     dma_buf.planes.append({ .object_index = 0, .offset = 0, .pitch = static_cast<u32>(vulkan_image.info.row_pitch) });
     return dma_buf;
+}
+#    endif
+
+#    ifdef USE_VULKAN_AHB_IMAGES
+SharedImage duplicate_shared_image(VulkanImage const& vulkan_image)
+{
+    return SharedImage { duplicate_android_ahb_handle(vulkan_image) };
+}
+
+AndroidAhbHandle duplicate_android_ahb_handle(VulkanImage const& vulkan_image)
+{
+    auto* ahb = vulkan_image.get_ahardware_buffer();
+    VERIFY(ahb != nullptr);
+
+    int sockets[2];
+    VERIFY(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    // Hand the buffer's handle through the socket; the receiving process reads it back out with
+    // AHardwareBuffer_recvHandleFromUnixSocket. The buffer stays alive because the sender keeps its own reference.
+    VERIFY(AHardwareBuffer_sendHandleToUnixSocket(ahb, sockets[0]) == 0);
+    close(sockets[0]);
+
+    auto const& info = vulkan_image.info;
+    return AndroidAhbHandle {
+        .bitmap_format = BitmapFormat::RGBA8888,
+        .alpha_type = AlphaType::Premultiplied,
+        .size = IntSize(static_cast<int>(info.extent.width), static_cast<int>(info.extent.height)),
+        .socket_fd = IPC::File::adopt_fd(sockets[1]),
+    };
 }
 #    endif
 
@@ -83,8 +124,34 @@ namespace IPC {
 enum class SharedImageBackingType : u8 {
     ShareableBitmap,
     LinuxDmaBuf,
+#    ifdef USE_VULKAN_AHB_IMAGES
+    AndroidAhb,
+#    endif
     WindowsD3DTexture,
 };
+
+#    ifdef USE_VULKAN_AHB_IMAGES
+template<>
+ErrorOr<void> encode(Encoder& encoder, Gfx::AndroidAhbHandle const& ahb_handle)
+{
+    TRY(encoder.encode(ahb_handle.bitmap_format));
+    TRY(encoder.encode(ahb_handle.alpha_type));
+    TRY(encoder.encode(ahb_handle.size));
+    TRY(encoder.encode(TRY(IPC::File::clone_fd(ahb_handle.socket_fd.fd()))));
+    return {};
+}
+
+template<>
+ErrorOr<Gfx::AndroidAhbHandle> decode(Decoder& decoder)
+{
+    return Gfx::AndroidAhbHandle {
+        .bitmap_format = TRY(decoder.decode<Gfx::BitmapFormat>()),
+        .alpha_type = TRY(decoder.decode<Gfx::AlphaType>()),
+        .size = TRY(decoder.decode<Gfx::IntSize>()),
+        .socket_fd = TRY(decoder.decode<IPC::File>()),
+    };
+}
+#    endif
 
 template<>
 ErrorOr<void> encode(Encoder& encoder, Gfx::WindowsD3DHandle const& d3d_handle)
@@ -121,6 +188,13 @@ ErrorOr<void> encode(Encoder& encoder, Gfx::SharedImage const& shared_image)
             TRY(encoder.encode(dmabuf));
             return {};
         },
+#    ifdef USE_VULKAN_AHB_IMAGES
+        [&](Gfx::AndroidAhbHandle const& ahb_handle) -> ErrorOr<void> {
+            TRY(encoder.encode(SharedImageBackingType::AndroidAhb));
+            TRY(encoder.encode(ahb_handle));
+            return {};
+        },
+#    endif
         [&](Gfx::WindowsD3DHandle const& d3d_handle) -> ErrorOr<void> {
             TRY(encoder.encode(SharedImageBackingType::WindowsD3DTexture));
             TRY(encoder.encode(d3d_handle));
@@ -143,6 +217,10 @@ ErrorOr<Gfx::SharedImage> decode(Decoder& decoder)
         return Gfx::SharedImage { TRY(decoder.decode<Gfx::ShareableBitmap>()) };
     case SharedImageBackingType::LinuxDmaBuf:
         return Gfx::SharedImage { TRY(decoder.decode<Gfx::LinuxDmaBufHandle>()) };
+#    ifdef USE_VULKAN_AHB_IMAGES
+    case SharedImageBackingType::AndroidAhb:
+        return Gfx::SharedImage { TRY(decoder.decode<Gfx::AndroidAhbHandle>()) };
+#    endif
     case SharedImageBackingType::WindowsD3DTexture:
         return Gfx::SharedImage { TRY(decoder.decode<Gfx::WindowsD3DHandle>()) };
     default:

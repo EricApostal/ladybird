@@ -88,6 +88,13 @@ static constexpr Array<char const*, 4> s_enabled_device_extensions = {
     VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
 };
+#elif defined(USE_VULKAN_AHB_IMAGES)
+// Android's counterpart of the dmabuf extensions: the image memory behind a backing store is an AHardwareBuffer that
+// the UI process imports zero-copy.
+static constexpr Array<char const*, 2> s_enabled_device_extensions = {
+    VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+};
 #else
 static constexpr Array<char const*, 0> s_enabled_device_extensions;
 #endif
@@ -159,7 +166,7 @@ static ErrorOr<VkDevice> create_logical_device(VkPhysicalDevice physical_device,
     return device;
 }
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 static ErrorOr<VkCommandPool> create_command_pool(VkDevice logical_device, uint32_t queue_family_index)
 {
     VkCommandPoolCreateInfo command_pool_info = {
@@ -224,10 +231,12 @@ ErrorOr<VulkanContext> create_vulkan_context()
     VkQueue graphics_queue;
     vkGetDeviceQueue(logical_device, graphics_queue_family, 0, &graphics_queue);
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
     VkCommandPool command_pool = TRY(create_command_pool(logical_device, graphics_queue_family));
     VkCommandBuffer command_buffer = TRY(allocate_command_buffer(logical_device, command_pool));
+#endif
 
+#ifdef USE_VULKAN_DMABUF_IMAGES
     auto pfn_vk_get_memory_fd_khr = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(logical_device, "vkGetMemoryFdKHR"));
     if (pfn_vk_get_memory_fd_khr == nullptr) {
         return Error::from_string_literal("vkGetMemoryFdKHR unavailable");
@@ -242,6 +251,13 @@ ErrorOr<VulkanContext> create_vulkan_context()
     }
 #endif
 
+#ifdef USE_VULKAN_AHB_IMAGES
+    auto pfn_vk_get_memory_android_hardware_buffer = reinterpret_cast<PFN_vkGetMemoryAndroidHardwareBufferANDROID>(vkGetDeviceProcAddr(logical_device, "vkGetMemoryAndroidHardwareBufferANDROID"));
+    if (pfn_vk_get_memory_android_hardware_buffer == nullptr) {
+        return Error::from_string_literal("vkGetMemoryAndroidHardwareBufferANDROID unavailable");
+    }
+#endif
+
     return VulkanContext {
         .api_version = api_version,
         .instance = instance,
@@ -252,13 +268,18 @@ ErrorOr<VulkanContext> create_vulkan_context()
         .graphics_queue_family = graphics_queue_family,
         .enabled_device_extensions = s_enabled_device_extensions,
         .can_sample_through_ycbcr_conversion = can_sample_through_ycbcr_conversion,
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
         .command_pool = command_pool,
         .command_buffer = command_buffer,
         .ext_procs = {
+#    ifdef USE_VULKAN_DMABUF_IMAGES
             .get_memory_fd = pfn_vk_get_memory_fd_khr,
             .get_memory_fd_properties = pfn_vk_get_memory_fd_properties_khr,
             .get_image_drm_format_modifier_properties = pfn_vk_get_image_drm_format_modifier_properties_khr,
+#    endif
+#    ifdef USE_VULKAN_AHB_IMAGES
+            .get_memory_android_hardware_buffer = pfn_vk_get_memory_android_hardware_buffer,
+#    endif
         },
 #endif
     };

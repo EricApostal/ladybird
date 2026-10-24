@@ -11,6 +11,9 @@
 #include <AK/Variant.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Forward.h>
+#ifdef USE_VULKAN_AHB_IMAGES
+#    include <LibGfx/AndroidAhbHandle.h>
+#endif
 #include <LibGfx/LinuxDmaBufHandle.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibIPC/File.h>
@@ -32,10 +35,17 @@ struct WindowsD3DHandle {
 };
 #endif
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 struct VulkanImage;
 SharedImage duplicate_shared_image(VulkanImage const&);
+#endif
+
+#ifdef USE_VULKAN_DMABUF_IMAGES
 LinuxDmaBufHandle duplicate_linux_dmabuf_handle(VulkanImage const&);
+#endif
+
+#ifdef USE_VULKAN_AHB_IMAGES
+AndroidAhbHandle duplicate_android_ahb_handle(VulkanImage const&);
 #endif
 
 #ifdef USE_DIRECTX
@@ -57,6 +67,9 @@ public:
 #else
     explicit SharedImage(ShareableBitmap);
     explicit SharedImage(LinuxDmaBufHandle&&);
+#ifdef USE_VULKAN_AHB_IMAGES
+    explicit SharedImage(AndroidAhbHandle&&);
+#endif
     explicit SharedImage(WindowsD3DHandle&&);
 #endif
 
@@ -64,7 +77,12 @@ private:
 #ifdef AK_OS_MACOS
     Core::MachPort m_port;
 #else
-    Variant<ShareableBitmap, LinuxDmaBufHandle, WindowsD3DHandle> m_data;
+    Variant<ShareableBitmap, LinuxDmaBufHandle,
+#ifdef USE_VULKAN_AHB_IMAGES
+        AndroidAhbHandle,
+#endif
+        WindowsD3DHandle>
+        m_data;
 #endif
 
     friend class SharedImageBuffer;

@@ -12,6 +12,9 @@
 #    include <AK/Span.h>
 #    include <LibGfx/GpuDeviceIdentity.h>
 #    include <vulkan/vulkan.h>
+#    ifdef USE_VULKAN_AHB_IMAGES
+#        include <vulkan/vulkan_android.h>
+#    endif
 
 namespace Gfx {
 
@@ -25,14 +28,19 @@ struct VulkanContext {
     uint32_t graphics_queue_family { 0 };
     ReadonlySpan<char const*> enabled_device_extensions;
     bool can_sample_through_ycbcr_conversion { false };
-#    ifdef USE_VULKAN_DMABUF_IMAGES
+#    if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
     VkCommandPool command_pool { VK_NULL_HANDLE };
     VkCommandBuffer command_buffer { VK_NULL_HANDLE };
     struct
     {
+#        ifdef USE_VULKAN_DMABUF_IMAGES
         PFN_vkGetMemoryFdKHR get_memory_fd { nullptr };
         PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_properties { nullptr };
         PFN_vkGetImageDrmFormatModifierPropertiesEXT get_image_drm_format_modifier_properties { nullptr };
+#        endif
+#        ifdef USE_VULKAN_AHB_IMAGES
+        PFN_vkGetMemoryAndroidHardwareBufferANDROID get_memory_android_hardware_buffer { nullptr };
+#        endif
     } ext_procs;
 #    endif
 };

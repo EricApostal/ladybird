@@ -4,12 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 
 #    include <AK/Array.h>
 #    include <AK/Format.h>
 #    include <AK/Vector.h>
 #    include <LibGfx/VulkanImage.h>
+#    ifdef USE_VULKAN_AHB_IMAGES
+#        include <vulkan/vulkan_android.h>
+#    endif
 
 namespace Gfx {
 
@@ -26,6 +29,11 @@ static uint32_t find_memory_type_index(VkPhysicalDeviceMemoryProperties const& m
 
 VulkanImage::~VulkanImage()
 {
+#    ifdef USE_VULKAN_AHB_IMAGES
+    if (m_android_hardware_buffer != nullptr)
+        AHardwareBuffer_release(m_android_hardware_buffer);
+#    endif
+
     if (image != VK_NULL_HANDLE) {
         vkDestroyImage(context.logical_device, image, nullptr);
     }
@@ -79,6 +87,7 @@ void VulkanImage::transition_layout(VkImageLayout old_layout, VkImageLayout new_
     vkQueueWaitIdle(context.graphics_queue);
 }
 
+#    ifdef USE_VULKAN_DMABUF_IMAGES
 int VulkanImage::get_dma_buf_fd() const
 {
     VkMemoryGetFdInfoKHR get_fd_info = {
@@ -95,9 +104,142 @@ int VulkanImage::get_dma_buf_fd() const
     }
     return fd;
 }
+#    endif
+
+#    ifdef USE_VULKAN_AHB_IMAGES
+// The AHardwareBuffer this image's memory lives in. Vulkan allocates it as part of the exported memory, so the
+// embedder is handed the very buffer the compositor renders into.
+AHardwareBuffer* VulkanImage::get_ahardware_buffer() const
+{
+    if (m_android_hardware_buffer != nullptr)
+        return m_android_hardware_buffer;
+
+    VkMemoryGetAndroidHardwareBufferInfoANDROID get_ahb_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+        .pNext = nullptr,
+        .memory = memory,
+    };
+    AHardwareBuffer* ahb = nullptr;
+    auto result = context.ext_procs.get_memory_android_hardware_buffer(context.logical_device, &get_ahb_info, &ahb);
+    if (result != VK_SUCCESS) {
+        dbgln("vkGetMemoryAndroidHardwareBufferANDROID returned {}", to_underlying(result));
+        return nullptr;
+    }
+    if (ahb == nullptr)
+        return nullptr;
+
+    m_android_hardware_buffer = ahb;
+    return m_android_hardware_buffer;
+}
+#    endif
 
 ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers)
 {
+#    ifdef USE_VULKAN_AHB_IMAGES
+    (void)modifiers;
+
+    VkFormatProperties2 format_props = {};
+    format_props.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+    vkGetPhysicalDeviceFormatProperties2(context.physical_device, format, &format_props);
+
+    VkFormatFeatureFlags ahb_required_features = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if ((format_props.formatProperties.optimalTilingFeatures & ahb_required_features) != ahb_required_features)
+        return Error::from_string_literal("optimal tiling unsupported for shared Vulkan image format");
+
+    NonnullRefPtr<VulkanImage> ahb_image = make_ref_counted<VulkanImage>(context);
+    VkExternalMemoryImageCreateInfo ahb_external_mem_image_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+    };
+    Array<uint32_t, 1> ahb_queue_families = { context.graphics_queue_family };
+    VkImageCreateInfo ahb_image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &ahb_external_mem_image_info,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent = {
+            .width = width,
+            .height = height,
+            .depth = 1,
+        },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        // An AHardwareBuffer the other processes map is linear memory.
+        .tiling = VK_IMAGE_TILING_LINEAR,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = ahb_queue_families.size(),
+        .pQueueFamilyIndices = ahb_queue_families.data(),
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    auto ahb_result = vkCreateImage(context.logical_device, &ahb_image_info, nullptr, &ahb_image->image);
+    if (ahb_result != VK_SUCCESS) {
+        dbgln("vkCreateImage returned {}", to_underlying(ahb_result));
+        return Error::from_string_literal("image creation failed");
+    }
+
+    VkMemoryRequirements ahb_mem_reqs;
+    vkGetImageMemoryRequirements(context.logical_device, ahb_image->image, &ahb_mem_reqs);
+    VkPhysicalDeviceMemoryProperties ahb_mem_props;
+    vkGetPhysicalDeviceMemoryProperties(context.physical_device, &ahb_mem_props);
+
+    uint32_t ahb_mem_type_idx = find_memory_type_index(ahb_mem_props, ahb_mem_reqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (ahb_mem_type_idx == ahb_mem_props.memoryTypeCount)
+        ahb_mem_type_idx = find_memory_type_index(ahb_mem_props, ahb_mem_reqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ahb_mem_type_idx == ahb_mem_props.memoryTypeCount)
+        return Error::from_string_literal("unable to find suitable image memory type");
+
+    VkMemoryDedicatedAllocateInfo ahb_mem_dedicated_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        .pNext = nullptr,
+        .image = ahb_image->image,
+        .buffer = VK_NULL_HANDLE,
+    };
+    VkExportMemoryAllocateInfo ahb_export_mem_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+        .pNext = &ahb_mem_dedicated_alloc_info,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+    };
+    VkMemoryAllocateInfo ahb_mem_alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &ahb_export_mem_alloc_info,
+        .allocationSize = ahb_mem_reqs.size,
+        .memoryTypeIndex = ahb_mem_type_idx,
+    };
+    ahb_result = vkAllocateMemory(context.logical_device, &ahb_mem_alloc_info, nullptr, &ahb_image->memory);
+    if (ahb_result != VK_SUCCESS) {
+        dbgln("vkAllocateMemory returned {}", to_underlying(ahb_result));
+        return Error::from_string_literal("image memory allocation failed");
+    }
+
+    ahb_result = vkBindImageMemory(context.logical_device, ahb_image->image, ahb_image->memory, 0);
+    if (ahb_result != VK_SUCCESS) {
+        dbgln("vkBindImageMemory returned {}", to_underlying(ahb_result));
+        return Error::from_string_literal("bind image memory failed");
+    }
+
+    VkImageSubresource ahb_subresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+    VkSubresourceLayout ahb_subresource_layout = {};
+    vkGetImageSubresourceLayout(context.logical_device, ahb_image->image, &ahb_subresource, &ahb_subresource_layout);
+
+    // external APIs require general layout
+    VkImageLayout ahb_layout = VK_IMAGE_LAYOUT_GENERAL;
+    ahb_image->transition_layout(VK_IMAGE_LAYOUT_UNDEFINED, ahb_layout);
+
+    ahb_image->info = {
+        .format = ahb_image_info.format,
+        .extent = ahb_image_info.extent,
+        .tiling = ahb_image_info.tiling,
+        .usage = ahb_image_info.usage,
+        .sharing_mode = ahb_image_info.sharingMode,
+        .layout = ahb_layout,
+        .row_pitch = ahb_subresource_layout.rowPitch,
+    };
+    return ahb_image;
+#    else
     VkDrmFormatModifierPropertiesListEXT format_mod_props_list = {};
     format_mod_props_list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
     format_mod_props_list.pNext = nullptr;
@@ -246,6 +388,7 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
         .modifier = image_format_mod_props.drmFormatModifier,
     };
     return image;
+#    endif
 }
 
 }
