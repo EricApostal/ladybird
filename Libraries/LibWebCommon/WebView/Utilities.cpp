@@ -104,6 +104,11 @@ ErrorOr<Vector<ByteString>> get_paths_for_helper_process(StringView process_name
     TRY(paths.try_append(LexicalPath::join(prefix.string(), "bin"sv, process_name).string()));
 #endif
     TRY(paths.try_append(ByteString::formatted("{}/{}", application_path, process_name)));
+#if defined(AK_OS_ANDROID)
+    // Android packages the helper processes as shared libraries in the app's native library directory, named
+    // lib<Name>.so; that directory is where the UI process's own executable also lives.
+    TRY(paths.try_append(ByteString::formatted("{}/lib{}.so", application_path, process_name)));
+#endif
     TRY(paths.try_append(ByteString::formatted("./{}", process_name)));
     // NOTE: Add platform-specific paths here
     return paths;
