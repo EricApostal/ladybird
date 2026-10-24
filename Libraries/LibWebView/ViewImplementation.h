@@ -498,6 +498,11 @@ public:
     Function<void(bool)> on_loading_state_change;
     Function<void()> on_top_level_navigation_commit;
     Function<void()> on_browser_history_traversal_complete;
+    // Fired whenever the tab's session history mirror actually changes (new
+    // navigation, pushState/replaceState, back/forward traversal, reload, or
+    // crash-recovery reseed). No payload; embedders read the current state via
+    // history_json_entries(traversable().session_history()). Used by libbird.
+    Function<void()> on_navigation_history_change;
     Function<void(DictionaryLookup const&, Gfx::IntPoint)> on_request_dictionary_lookup;
     Function<void(Optional<Gfx::Bitmap const&>)> on_favicon_change;
     Function<void(Gfx::Cursor const&)> on_cursor_change;

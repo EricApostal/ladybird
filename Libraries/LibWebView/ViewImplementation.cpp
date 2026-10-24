@@ -3620,6 +3620,8 @@ String ViewImplementation::session_store_tab_state_for_testing(Badge<WebContentP
 
 void ViewImplementation::notify_session_history_changed()
 {
+    if (on_navigation_history_change)
+        on_navigation_history_change();
     if (!m_session_tab_id.has_value())
         return;
     auto url = traversable().session_history().current_entry().url;
