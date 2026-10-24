@@ -22,7 +22,7 @@
 
 #ifdef AK_OS_MACOS
 #    include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
-#elif defined(USE_VULKAN_DMABUF_IMAGES)
+#elif defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 #    include <LibGfx/VulkanImage.h>
 #    include <gpu/ganesh/vk/GrVkBackendSurface.h>
 #    include <gpu/ganesh/vk/GrVkTypes.h>
@@ -45,7 +45,7 @@ struct PaintingSurface::Impl {
     bool wraps_shared_image { false };
 };
 
-#if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX)
+#if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES) || defined(USE_DIRECTX)
 static GrSurfaceOrigin origin_to_sk_origin(PaintingSurface::Origin origin)
 {
     switch (origin) {
@@ -59,12 +59,17 @@ static GrSurfaceOrigin origin_to_sk_origin(PaintingSurface::Origin origin)
 }
 #endif
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 static SkColorType vk_format_to_sk_color_type(VkFormat format)
 {
     switch (format) {
     case VK_FORMAT_B8G8R8A8_UNORM:
         return kBGRA_8888_SkColorType;
+#    ifdef USE_VULKAN_AHB_IMAGES
+    // Android's hardware buffers are RGBA.
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        return kRGBA_8888_SkColorType;
+#    endif
     // add more as needed
     default:
         VERIFY_NOT_REACHED();
