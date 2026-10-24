@@ -30,10 +30,17 @@ target_include_directories(audioserverservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Ser
 
 target_link_libraries(AudioServer PRIVATE audioserverservice LibAudio LibCore LibMain LibSandbox)
 target_link_libraries(audioserverservice PRIVATE LibAudio LibCore LibIPC LibThreading)
+
 target_link_libraries(AudioServer PRIVATE LibThreading)
 
 # The platform backends: the only code in the tree that opens an audio device.
-if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
+if (LADYBIRD_AUDIO_BACKEND STREQUAL "AAUDIO")
+    target_sources(audioserverservice PRIVATE PlaybackStreamAAudio.cpp)
+    # Playback only: capture and device enumeration have no AAudio counterpart here, which is the WASAPI precedent.
+    target_compile_definitions(audioserverservice PRIVATE AUDIOSERVER_PLAYBACK_BACKEND=1)
+    find_library(AAUDIO_LIB aaudio REQUIRED)
+    target_link_libraries(audioserverservice PRIVATE ${AAUDIO_LIB})
+elseif (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
     target_sources(audioserverservice PRIVATE
         AudioDevicesPulseAudio.cpp
         PlaybackStreamPulseAudio.cpp
