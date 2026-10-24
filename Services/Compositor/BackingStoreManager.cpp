@@ -11,9 +11,12 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/SharedImageBuffer.h>
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 #    include <AK/Array.h>
 #    include <LibGfx/VulkanImage.h>
+#endif
+
+#ifdef USE_VULKAN_DMABUF_IMAGES
 #    include <libdrm/drm_fourcc.h>
 #endif
 
@@ -52,7 +55,7 @@ static NonnullRefPtr<Gfx::PaintingSurface> create_shareable_bitmap_backing_store
     return Gfx::PaintingSurface::wrap_bitmap(*buffer.bitmap());
 }
 
-#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX)
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX) || defined(USE_VULKAN_AHB_IMAGES)
 struct GpuBackingStore {
     RefPtr<Gfx::PaintingSurface> surface;
     Gfx::SharedImage shared_image;
@@ -94,6 +97,21 @@ static ErrorOr<GpuBackingStore> create_shared_gpu_backing_store(Gfx::IntSize siz
     auto const& vulkan_context = skia_backend_context.vulkan_context();
     auto const modifiers = shared_backing_store_drm_format_modifiers(vulkan_context);
     auto image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), VK_FORMAT_B8G8R8A8_UNORM, modifiers.span()));
+    auto shared_image = Gfx::duplicate_shared_image(*image);
+
+    return GpuBackingStore {
+        .surface = Gfx::PaintingSurface::create_from_vkimage(skia_backend_context, move(image), Gfx::PaintingSurface::Origin::TopLeft),
+        .shared_image = move(shared_image),
+    };
+}
+#endif
+
+#ifdef USE_VULKAN_AHB_IMAGES
+static ErrorOr<GpuBackingStore> create_shared_gpu_backing_store(Gfx::IntSize size, Gfx::SkiaBackendContext& skia_backend_context)
+{
+    auto const& vulkan_context = skia_backend_context.vulkan_context();
+    // Android's hardware buffers are RGBA, and carry no DRM modifiers.
+    auto image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), VK_FORMAT_R8G8B8A8_UNORM, ReadonlySpan<u64> {}));
     auto shared_image = Gfx::duplicate_shared_image(*image);
 
     return GpuBackingStore {
@@ -194,7 +212,7 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
         return index == 0 ? BufferState::Presented : BufferState::Available;
     };
 
-#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX)
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX) || defined(USE_VULKAN_AHB_IMAGES)
     if (skia_backend_context && gpu_sharing == GpuSharing::Allowed) {
         Vector<Gfx::SharedImage> shared_images;
         shared_images.ensure_capacity(buffer_count);

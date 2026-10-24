@@ -15,7 +15,7 @@
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/Size.h>
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
 namespace Gfx {
 
 struct VulkanImage;
@@ -63,7 +63,7 @@ public:
     static NonnullRefPtr<PaintingSurface> create_from_shared_image_buffer(SharedImageBuffer&, NonnullRefPtr<SkiaBackendContext>, Origin = Origin::TopLeft);
 #endif
 
-#ifdef USE_VULKAN_DMABUF_IMAGES
+#if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
     static NonnullRefPtr<PaintingSurface> create_from_vkimage(NonnullRefPtr<SkiaBackendContext> context, NonnullRefPtr<VulkanImage> vulkan_image, Origin origin);
 #endif
 
