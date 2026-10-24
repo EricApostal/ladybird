@@ -717,6 +717,9 @@ public:
     virtual void inject_rendering_opportunity([[maybe_unused]] double frame_time) { }
     virtual void page_did_change_title(Utf16String const&) { }
     virtual void page_did_update_editing_history_state(bool, bool) { }
+    // Fired when a document's focused area changes, so the UI process can re-push the input method state (and with it
+    // the caret rect) for a field that was focused without the user touching it, e.g. autofocus.
+    virtual void page_did_change_focused_editable_element() { }
     virtual void page_did_set_text_fragment_indication_visibility(bool) { }
     virtual void page_did_request_refresh() { }
     virtual void page_did_request_resize_window(Gfx::IntSize, u64) { }

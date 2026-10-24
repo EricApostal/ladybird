@@ -4109,6 +4109,10 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
     if (new_focused_element)
         new_focused_element->did_receive_focus();
 
+    // The caret a text control now owns is what platform input methods position their overlays against; a focus change
+    // that no input event follows (autofocus, focus() from script) would otherwise never reach them.
+    page().client().page_did_change_focused_editable_element();
+
     reset_cursor_blink_cycle();
 
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
