@@ -4117,6 +4117,8 @@ void ViewImplementation::set_reports_session_history(bool reports_session_histor
 
 void ViewImplementation::notify_session_history_changed()
 {
+    if (on_navigation_history_change)
+        on_navigation_history_change();
     if (!m_reports_session_history)
         return;
     auto history = session_history_snapshot();
