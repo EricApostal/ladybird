@@ -477,7 +477,7 @@ enum InFlowReuse {
         validity: fc_run_cache::FcRunCacheValidity,
         flow_position: CssPixels,
         abspos_containing_block_info_contributions_received: u64,
-        host_findings_noted_in_pass: u64,
+        host_findings_noted_so_far: u64,
     },
 }
 
@@ -3564,7 +3564,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             flow_position: self.flow_position(),
             abspos_containing_block_info_contributions_received: self
                 .abspos_containing_block_info_contributions_received(),
-            host_findings_noted_in_pass: callbacks.host_findings_noted_in_pass(),
+            host_findings_noted_so_far: callbacks.host_findings_noted_so_far(),
         }
     }
 
@@ -3638,7 +3638,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             validity,
             flow_position,
             abspos_containing_block_info_contributions_received,
-            host_findings_noted_in_pass,
+            host_findings_noted_so_far,
         } = attempt
         else {
             return;
@@ -3654,7 +3654,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             && self.floats.borrow().is_empty()
             && self.abspos_containing_block_info_contributions_received()
                 == abspos_containing_block_info_contributions_received
-            && self.run.callbacks.host_findings_noted_in_pass() == host_findings_noted_in_pass
+            && self.run.callbacks.host_findings_noted_so_far() == host_findings_noted_so_far
             && used.border_box_block_size(false) != CssPixels::default();
         if !reusable {
             return;
@@ -3683,6 +3683,29 @@ impl<'pass> BlockFormattingContext<'pass> {
             .callbacks
             .in_flow_block_cache_store()
             .store(node.slot_index(), entry, committed_identity);
+    }
+
+    fn prepare_inline_content_of_children_ahead(&self, block_container: Node) {
+        let callbacks = self.run.callbacks;
+        if callbacks.lays_out_with_position_option() {
+            return;
+        }
+        let memos = callbacks.prepared_inline_content_memos();
+        let children = parallel_layout::fork_candidates(&callbacks, callbacks.children(block_container), |child| child)
+            .into_iter()
+            .filter(|&child| {
+                let facts = self.facts(child);
+                facts.is_block_container()
+                    && facts.children_are_inline()
+                    && !facts.is_floating()
+                    && !facts.is_absolutely_positioned()
+                    && formatting_context::formatting_context_type_created_by_box(facts).is_none()
+                    && memos
+                        .kept(child, fc_run_cache::run_root_validity(&callbacks, child))
+                        .is_none()
+            })
+            .collect();
+        parallel_layout::prepare_inline_content_ahead(&callbacks, children);
     }
 
     fn layout_block_level_children(
@@ -3726,6 +3749,9 @@ impl<'pass> BlockFormattingContext<'pass> {
             .unwrap_or_else(|| self.run.callbacks.first_child(block_container.node));
         if block_container.node == self.run.box_ {
             self.root_flow_children.borrow_mut().clear();
+        }
+        if fragmentainer.is_none() {
+            self.prepare_inline_content_of_children_ahead(block_container.node);
         }
         let mut summary = ChildrenSummary::default();
         for child in self

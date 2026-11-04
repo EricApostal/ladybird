@@ -262,6 +262,9 @@ pub struct ReplayLayer {
     pub backdrop_corner_radii: CornerRadii,
     /// The color the backdrop is read over, transparent unless the parent layer is the root isolation layer.
     pub backdrop_base_color: Color,
+    /// Where a blur() in the backdrop filter mirrors: the region as the clips around the box leave it, in the
+    /// effect's space. None when the filter holds no such blur.
+    pub backdrop_blur_edge: OptionalFloatRect,
     pub effect: EffectNodeIndex,
     /// Bounds of everything replay draws into the layer, in the effect's space, when known.
     pub content_bounds: OptionalFloatRect,
@@ -907,11 +910,15 @@ pub struct DrawCompositedContext {
     pub dst_rect: FloatRect,
     pub child_context_id: CompositorContextId,
     pub scaling_mode: ScalingMode,
+    pub spatial_node_index: SpatialNodeIndex,
+    pub snap_origin_if_untransformed: bool,
 }
 ffi_bytes_fields!(DrawCompositedContext {
     dst_rect,
     child_context_id,
-    scaling_mode
+    scaling_mode,
+    spatial_node_index,
+    snap_origin_if_untransformed
 });
 
 impl DisplayListCommand for DrawCompositedContext {

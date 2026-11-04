@@ -55,17 +55,17 @@ pub(crate) struct RenderState {
 
 impl RenderState {
     /// Makes the state `seed` describes, whose style engine shares `process_style` with the other documents', and whose
-    /// style passes run on `style_pool`.
+    /// style passes run on `style_layout_pool`.
     fn new(
         seed: owner::StateSeed,
         process_style: &std::sync::Arc<crate::css::style::ProcessStyle>,
-        style_pool: &std::sync::Arc<crate::css::style::pipeline::pool::StylePool>,
+        style_layout_pool: &std::sync::Arc<crate::style_layout_pool::StyleLayoutPool>,
     ) -> Self {
         let owner::StateSeed { shared } = seed;
         let mut arena = Box::new(ArenaHandle::new());
         let mut engine = Box::new(crate::css::style::StyleEngine::new());
         engine.share_process_style(std::sync::Arc::clone(process_style));
-        engine.share_style_pool(style_pool.clone());
+        engine.share_style_layout_pool(style_layout_pool.clone());
         engine.share_element_random_base_values_exist(shared.element_random_base_values_exist);
         engine.share_declaration_block_versions(shared.declaration_block_versions);
         engine.share_container_effects_held(shared.container_effects_held);
@@ -899,7 +899,7 @@ fn wait_for_render_side() {
 /// Whether the calling thread's stack has room for a job on a render state that recurses through a tree `tree_depth`
 /// levels deep. Only the Render thread's stack is large enough for any tree.
 #[cfg(not(test))]
-fn stack_has_room_for_render_job(tree_depth: u32) -> bool {
+pub(crate) fn stack_has_room_for_render_job(tree_depth: u32) -> bool {
     /// The stack a job on a render state takes at most per level of the tree it recurses through, as it builds and
     /// lays out boxes, with room to spare for the boxes a level adds: release builds took about 1.5 KiB per element,
     /// and debug builds about 2 KiB.
@@ -927,7 +927,7 @@ fn stack_has_room_for_render_job(tree_depth: u32) -> bool {
 }
 
 #[cfg(test)]
-fn stack_has_room_for_render_job(_: u32) -> bool {
+pub(crate) fn stack_has_room_for_render_job(_: u32) -> bool {
     false
 }
 

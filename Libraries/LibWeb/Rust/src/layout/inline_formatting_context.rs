@@ -556,7 +556,7 @@ pub(crate) fn compute(
 
             let mut direct = true;
             let mut previous: Option<usize> = None;
-            let mut ancestor = context.nearest_fragmented_inline_ancestor(fragment.layout_node);
+            let mut ancestor = context.inline_box_for_fragment(fragment.layout_node);
             while !ancestor.is_invalid() {
                 let node_index = if let Some(index) = node_to_index.get(&ancestor) {
                     *index
@@ -1316,7 +1316,7 @@ impl<'context> InlineFormattingContext<'context> {
 
     fn fragmented_inline_ancestors(&self, node: Node) -> Vec<Node> {
         let mut ancestors = Vec::new();
-        let mut ancestor = self.nearest_fragmented_inline_ancestor(node);
+        let mut ancestor = self.inline_box_for_fragment(node);
         while !ancestor.is_invalid() {
             ancestors.push(ancestor);
             ancestor = self.nearest_fragmented_inline_ancestor(ancestor);
@@ -1329,6 +1329,14 @@ impl<'context> InlineFormattingContext<'context> {
         let mut ancestors = self.fragmented_inline_ancestors(before);
         ancestors.retain(|ancestor| after_ancestors.contains(ancestor));
         ancestors
+    }
+
+    fn inline_box_for_fragment(&self, node: Node) -> Node {
+        if !node.is_invalid() && self.facts(node).is_fragmented_inline() {
+            node
+        } else {
+            self.nearest_fragmented_inline_ancestor(node)
+        }
     }
 
     pub(crate) fn nearest_fragmented_inline_ancestor(&self, node: Node) -> Node {
@@ -1609,6 +1617,7 @@ impl<'context> InlineFormattingContext<'context> {
     pub(crate) fn content_sizes_from_items(
         &self,
         items: &[inline_level_iterator::Item],
+        prepared: &prepared_inline_content::PreparedInlineContent,
     ) -> sizing_context::ContentInlineSizes {
         let containing_style = self.style(self.containing_block);
         let container_wraps = containing_style.text_wrap_mode() == text_wrap_mode::WRAP;
@@ -1623,8 +1632,8 @@ impl<'context> InlineFormattingContext<'context> {
             container_wraps,
         );
         for index in 0..items.len() {
-            max_content_lines.append(self, items, index);
-            min_content_lines.append(self, items, index);
+            max_content_lines.append(self, items, prepared, index);
+            min_content_lines.append(self, items, prepared, index);
         }
         let (max_content_inline_size, first_line_max_content) =
             max_content_lines.lines.finish_measurement_and_first_line();
@@ -1707,6 +1716,7 @@ impl<'context> InlineFormattingContext<'context> {
     fn break_overflowing_text_item<'builder>(
         &'builder self,
         line_builder: &mut line_builder::LineBuilder<'builder, 'context>,
+        prepared: &prepared_inline_content::PreparedInlineContent,
         item: &mut inline_level_iterator::Item,
         item_index: usize,
         mut line_limit: Option<&mut FragmentainerLineLimit>,
@@ -1745,6 +1755,7 @@ impl<'context> InlineFormattingContext<'context> {
             }
             let split_item = self.callbacks.with_grapheme_segmenter(item.node, |grapheme_segmenter| {
                 item.split_for_overflow_break(
+                    prepared,
                     &text_content.text,
                     grapheme_segmenter,
                     letter_spacing,
@@ -1764,7 +1775,7 @@ impl<'context> InlineFormattingContext<'context> {
                 );
                 continue;
             };
-            line_builder.append_text_item(&mut prefix, style);
+            line_builder.append_text_item(&mut prefix, prepared, style);
             self.set_current_line_start_offset(item_index, item.offset_in_node);
             line_builder.break_line(line_builder::ForcedBreak::No, NodeSlotId::INVALID, None);
         }
@@ -2036,6 +2047,7 @@ impl<'context> InlineFormattingContext<'context> {
                 let style = self.style(self.parent_node(item.node));
                 let text_content = self.callbacks.text_content(item.node);
                 item.drop_prefix_before(
+                    iterator.prepared_content(),
                     offset_in_node,
                     &text_content.text,
                     style.letter_spacing().to_double() as f32,
@@ -2080,6 +2092,12 @@ impl<'context> InlineFormattingContext<'context> {
             leading_padding = CssPixels::default();
 
             match item.type_ {
+                inline_level_iterator::ItemType::InlineEdge => {
+                    if self.stops_at_line_clamp_point(line_builder, &mut state_at_clamp_point) {
+                        break;
+                    }
+                    line_builder.append_inline_edge(&item);
+                }
                 inline_level_iterator::ItemType::ForcedBreak => {
                     self.current_line_start.set(fragmentation::LinePosition {
                         item_index: item_index + 1,
@@ -2264,6 +2282,7 @@ impl<'context> InlineFormattingContext<'context> {
                         if overflow_break_allowed {
                             if self.break_overflowing_text_item(
                                 line_builder,
+                                iterator.prepared_content(),
                                 &mut item,
                                 item_index,
                                 line_limit.as_mut(),
@@ -2278,7 +2297,7 @@ impl<'context> InlineFormattingContext<'context> {
                     if self.stops_at_line_clamp_point(line_builder, &mut state_at_clamp_point) {
                         break;
                     }
-                    line_builder.append_text_item(&mut item, style);
+                    line_builder.append_text_item(&mut item, iterator.prepared_content(), style);
                 }
             }
         }
@@ -2954,7 +2973,11 @@ impl<'context> InlineFormattingContext<'context> {
             .chain(childless_inline_boxes)
             .filter(|node| !node.is_invalid())
         {
-            let mut ancestor = self.callbacks.parent(node);
+            let mut ancestor = if self.facts(node).is_fragmented_inline() {
+                node
+            } else {
+                self.callbacks.parent(node)
+            };
             while !ancestor.is_invalid() && ancestor != self.containing_block && walked.insert(ancestor) {
                 present.insert(ancestor);
                 ancestor = self.callbacks.parent(ancestor);
@@ -2988,7 +3011,12 @@ impl<'context> InlineFormattingContext<'context> {
             // NB: Fragments that text-overflow elided keep their shift too, since the elided content still extends
             //     the scrollable overflow.
             for fragment in &mut line.fragments {
-                fragment.relpos_delta = accumulated_relative_offset_from(self.callbacks.parent(fragment.layout_node));
+                let first_ancestor = if self.facts(fragment.layout_node).is_fragmented_inline() {
+                    fragment.layout_node
+                } else {
+                    self.callbacks.parent(fragment.layout_node)
+                };
+                fragment.relpos_delta = accumulated_relative_offset_from(first_ancestor);
             }
         }
         for piece in &mut data.inline_box_pieces {
@@ -3248,7 +3276,13 @@ impl ContentSizingLines {
         self.lines.breaks_at_every_opportunity
     }
 
-    fn append(&mut self, context: &InlineFormattingContext<'_>, items: &[inline_level_iterator::Item], index: usize) {
+    fn append(
+        &mut self,
+        context: &InlineFormattingContext<'_>,
+        items: &[inline_level_iterator::Item],
+        prepared: &prepared_inline_content::PreparedInlineContent,
+        index: usize,
+    ) {
         let item = &items[index];
         if item.type_ == inline_level_iterator::ItemType::FloatingElement {
             self.append_float(context, item);
@@ -3306,6 +3340,9 @@ impl ContentSizingLines {
         );
         match item.type_ {
             inline_level_iterator::ItemType::ForcedBreak => self.lines.force_break(),
+            inline_level_iterator::ItemType::InlineEdge => {
+                self.lines.append(border_box_inline_size, false, CssPixels::default());
+            }
             inline_level_iterator::ItemType::Element => {
                 self.lines
                     .append_atomic_inline(border_box_inline_size, self.container_wraps);
@@ -3368,6 +3405,7 @@ impl ContentSizingLines {
                         self.append_text_broken_between_graphemes(
                             context,
                             item,
+                            prepared,
                             style,
                             margin_start,
                             border_start + padding_start,
@@ -3412,10 +3450,12 @@ impl ContentSizingLines {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_text_broken_between_graphemes(
         &mut self,
         context: &InlineFormattingContext<'_>,
         item: &inline_level_iterator::Item,
+        prepared: &prepared_inline_content::PreparedInlineContent,
         style: StyleValues<'_>,
         margin_start: CssPixels,
         border_and_padding_start: CssPixels,
@@ -3426,6 +3466,7 @@ impl ContentSizingLines {
             .callbacks
             .with_grapheme_segmenter(item.node, |grapheme_segmenter| {
                 item.grapheme_cluster_inline_sizes(
+                    prepared,
                     &text_content.text,
                     grapheme_segmenter,
                     style.letter_spacing().to_double() as f32,

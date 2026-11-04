@@ -336,7 +336,7 @@ pub struct RetainedState {
     live_counters: pipeline::counters::Counters,
     /// The threads style passes run on, which the process shares where a render state holds the
     /// engine.
-    style_pool: Option<std::sync::Arc<pipeline::pool::StylePool>>,
+    style_layout_pool: Option<std::sync::Arc<crate::style_layout_pool::StyleLayoutPool>>,
     /// The font longhand values the engine substituted, one value per property and content: the
     /// font resolver knows a family and its feature values by their values' identities.
     substituted_font_values: std::sync::Arc<std::sync::Mutex<Vec<(u16, RetainedStyleValueData)>>>,
@@ -436,6 +436,14 @@ pub struct StyleEngine {
 }
 
 impl RetainedState {
+    pub(crate) fn deepest_element_depth(&self) -> u32 {
+        self.deepest_element.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn started_style_layout_pool(&self) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+        self.style_layout_pool.as_ref()?.started()
+    }
+
     /// The groups of default values every computation starting from nothing starts from.
     pub(crate) fn default_groups(&self) -> &crate::css::computed_values::DefaultGroups {
         &self.process_style.default_groups

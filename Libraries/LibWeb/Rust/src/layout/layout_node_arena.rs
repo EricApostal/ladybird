@@ -34,7 +34,6 @@ use crate::layout::tree_mutation::HostCalls;
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::render_state::DocumentHost;
 use crate::stage::MainThread;
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
@@ -255,24 +254,29 @@ struct IntrinsicSizeCacheSlot {
 /// went stale in its memo invalidations, which the stage applies before its next run reads any.
 #[derive(Default)]
 pub(crate) struct IntrinsicSizeCaches {
-    slots: RefCell<Vec<IntrinsicSizeCacheSlot>>,
+    slots: super::pass_column::PassColumn<IntrinsicSizeCacheSlot>,
 }
 
 impl IntrinsicSizeCaches {
+    pub(super) fn cover_slots(&mut self, slot_count: usize) {
+        self.slots.cover_slots(slot_count);
+    }
+
     pub(crate) fn drop_entries_of_slot(&mut self, slot: u32) {
-        if let Some(slot) = self.slots.get_mut().get_mut(slot as usize) {
+        if let Some(slot) = self.slots.row_mut(slot as usize) {
             *slot = IntrinsicSizeCacheSlot::default();
         }
     }
 
     /// Answers `answer` from the maps of `node`, where they hold what was measured for it.
     fn with_maps<R>(&self, node: NodeSlotId, answer: impl FnOnce(&IntrinsicSizeMaps) -> Option<R>) -> Option<R> {
-        let caches = self.slots.borrow();
-        let slot = caches.get(node.slot_index() as usize)?;
-        if slot.generation != node.generation() {
-            return None;
-        }
-        answer(slot.sizes.as_ref()?)
+        self.slots.with_row(node.slot_index() as usize, |slot| {
+            let slot = slot?;
+            if slot.generation != node.generation() {
+                return None;
+            }
+            answer(slot.sizes.as_ref()?)
+        })
     }
 
     pub(crate) fn max_content_block_size_cache_get(
@@ -284,19 +288,15 @@ impl IntrinsicSizeCaches {
     }
 
     fn with_maps_mut(&self, node: NodeSlotId, callback: impl FnOnce(&mut IntrinsicSizeMaps)) {
-        let index = node.slot_index() as usize;
-        let mut caches = self.slots.borrow_mut();
-        if caches.len() <= index {
-            caches.resize_with(index + 1, IntrinsicSizeCacheSlot::default);
-        }
-        let slot = &mut caches[index];
-        if slot.generation != node.generation() {
-            *slot = IntrinsicSizeCacheSlot {
-                generation: node.generation(),
-                sizes: None,
-            };
-        }
-        callback(slot.sizes.get_or_insert_with(Box::default));
+        self.slots.with_row_mut(node.slot_index() as usize, |slot| {
+            if slot.generation != node.generation() {
+                *slot = IntrinsicSizeCacheSlot {
+                    generation: node.generation(),
+                    sizes: None,
+                };
+            }
+            callback(slot.sizes.get_or_insert_with(Box::default));
+        });
     }
 
     pub(crate) fn max_content_block_size_cache_put(
@@ -365,15 +365,20 @@ struct TextSlots {
     states: CowVec<TextNodeState, TEXT_STATES_PER_CHUNK>,
     /// The places in `states` no slot uses.
     vacant_states: Vec<u32>,
+    released_states: Vec<u32>,
     published: CowColumn<PublishedTextSlot, SLOTS_PER_CHUNK>,
 }
 
 impl TextSlots {
-    fn state(&self, id: NodeSlotId) -> Option<&TextNodeState> {
+    fn state_index(&self, id: NodeSlotId) -> Option<u32> {
         self.slots
             .get(id.slot_index() as usize)
             .filter(|slot| slot.generation == id.generation() && slot.state != TextNodeSlot::NO_STATE)
-            .map(|slot| &self.states[slot.state as usize])
+            .map(|slot| slot.state)
+    }
+
+    fn state(&self, id: NodeSlotId) -> Option<&TextNodeState> {
+        self.state_index(id).map(|state| &self.states[state as usize])
     }
 
     /// The state of `id`'s slot, for writing. A slot last used by another generation starts over.
@@ -413,6 +418,7 @@ impl TextSlots {
         if state != TextNodeSlot::NO_STATE {
             self.states[state as usize] = TextNodeState::default();
             self.vacant_states.push(state);
+            self.released_states.push(state);
         }
     }
 
@@ -1374,6 +1380,9 @@ impl LayoutNodeArena {
 
     /// What writes did to the boxes the layout stage's run memos hold entries of since the stage last took it.
     pub(crate) fn take_memo_invalidations(&mut self) -> super::memo_invalidations::MemoInvalidations {
+        for state in self.text_slots.released_states.drain(..) {
+            self.memo_invalidations.note_text_state_dropped(state);
+        }
         std::mem::take(&mut self.memo_invalidations)
     }
 
@@ -5419,7 +5428,11 @@ impl LayoutNodeArena {
         if !parent.is_invalid() && super::node_facts::has_flag(self.data(parent), NodeFlag::Anonymous) {
             self.derive_flex_or_grid_item_flags(parent);
         }
-        self.memo_invalidations.note_text_replaced(id.slot_index());
+        let text_state = self
+            .text_slots
+            .state_index(id)
+            .expect("the row has the text it was just given");
+        self.memo_invalidations.note_text_state_dropped(text_state);
         self.searchable_text = None;
         // Publication can happen through a C++ text read before the enrolled
         // sync runs. Invalidate here so every publication invalidates layout,
@@ -5526,6 +5539,17 @@ impl LayoutNodeArena {
 
     pub(crate) fn text_content(&self, id: NodeSlotId) -> Option<&TextContent> {
         self.text_node_state(id)?.content.as_ref()
+    }
+
+    pub(crate) fn text_state_index(&self, id: NodeSlotId) -> Option<u32> {
+        if !self.slot_is_live(id) {
+            return None;
+        }
+        self.text_slots.state_index(id)
+    }
+
+    pub(crate) fn text_state_capacity(&self) -> usize {
+        self.text_slots.states.len()
     }
 
     pub(super) fn set_first_letter_slices(
@@ -6000,6 +6024,10 @@ impl LayoutNodeArena {
             .get(&node)
             .copied()
             .filter(|&inline_box| self.slot_is_live(inline_box))
+    }
+
+    pub(crate) fn slot_capacity(&self) -> usize {
+        self.slot_metadata.len()
     }
 
     /// The live node in the slot at `index`, if there is one.
@@ -7701,7 +7729,8 @@ mod tests {
     #[test]
     fn intrinsic_size_cache_answers_masked_probes_only_from_independent_measurements() {
         let mut arena = LayoutNodeArena::new();
-        let caches = super::IntrinsicSizeCaches::default();
+        let mut caches = super::IntrinsicSizeCaches::default();
+        caches.cover_slots(64);
         let allocation = arena.allocate_for_test();
         let dependent_allocation = arena.allocate_for_test();
         let key_with_basis = |basis: i32| IntrinsicSizeCacheKey {
@@ -7838,7 +7867,8 @@ mod tests {
     #[test]
     fn intrinsic_inline_size_cache_answers_probes_through_every_combination_of_masked_key_parts() {
         let mut arena = LayoutNodeArena::new();
-        let caches = super::IntrinsicSizeCaches::default();
+        let mut caches = super::IntrinsicSizeCaches::default();
+        caches.cover_slots(64);
         let measured_key = inline_size_cache_key(Some(100), Some(300), Some(50));
         for observed_parts in every_combination_of_key_parts() {
             let allocation = arena.allocate_for_test();
@@ -7871,7 +7901,8 @@ mod tests {
     #[test]
     fn intrinsic_inline_size_cache_masks_the_block_size_of_measurements_that_never_observed_it() {
         let mut arena = LayoutNodeArena::new();
-        let caches = super::IntrinsicSizeCaches::default();
+        let mut caches = super::IntrinsicSizeCaches::default();
+        caches.cover_slots(64);
         let observes_block_size = IntrinsicMeasurementDependencies {
             block_size: true,
             ..Default::default()

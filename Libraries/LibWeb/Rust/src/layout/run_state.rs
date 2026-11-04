@@ -13,7 +13,6 @@ use super::*;
 pub(crate) struct LayoutScratch {
     /// The intrinsic sizes passes measured, kept for the passes after them.
     pub(super) intrinsic_size_caches: super::layout_node_arena::IntrinsicSizeCaches,
-    host_findings_noted_in_pass: Cell<u64>,
     /// The results of formatting context runs, kept for the runs after them in this pass and the passes after it.
     fc_run_cache_store: super::fc_run_cache::FcRunCacheStore,
     /// The layouts of in-flow blocks, kept for the passes after the one that laid them out.
@@ -23,9 +22,8 @@ pub(crate) struct LayoutScratch {
     pub(super) layout_trace: super::trace::LayoutTrace,
     /// The chunks and grapheme segmenters of the text rows the passes laid out.
     text_memos: super::rendered_text::TextMemos,
-    inline_content_preparation_buffers: Cell<super::prepared_inline_content::InlineContentPreparationBuffers>,
     prepared_inline_content_memos: super::prepared_inline_content::PreparedInlineContentMemos,
-    fragment_builder_scratch: RefCell<fragment_tree::FragmentBuilderScratch>,
+    fragment_builder_scratch: fragment_tree::FragmentBuilderScratch,
 }
 
 /// What layout found out that the host hears of once the layout that found it is committed: what the
@@ -43,6 +41,35 @@ pub(crate) struct ContainerLengthRead {
     pub(crate) reader: NodeSlotId,
     pub(crate) element: crate::css::style::tree::StyleNodeID,
     pub(crate) bases: crate::css::style::ContainerUnitBases,
+}
+
+#[derive(Default)]
+pub(crate) struct HostFindingsSink {
+    findings: std::sync::Mutex<HostFindings>,
+    noted_any: std::sync::atomic::AtomicBool,
+    notes: std::sync::atomic::AtomicU64,
+}
+
+impl HostFindingsSink {
+    pub(crate) fn note(&self, note: impl FnOnce(&mut HostFindings)) {
+        let mut findings = self.findings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        note(&mut findings);
+        self.noted_any.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.notes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn notes_so_far(&self) -> u64 {
+        self.notes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn take(&self) -> HostFindings {
+        if !self.noted_any.load(std::sync::atomic::Ordering::Relaxed) {
+            return HostFindings::default();
+        }
+        let mut findings = self.findings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.noted_any.store(false, std::sync::atomic::Ordering::Relaxed);
+        std::mem::take(&mut *findings)
+    }
 }
 
 impl HostFindings {
@@ -110,10 +137,10 @@ impl HostFindings {
     }
 }
 
-// The scratch can move to the thread a layout stage runs on.
+// The scratch can move to the thread a layout stage runs on, and the runs of a pass can share it across threads.
 const _: () = {
-    const fn assert_send<T: Send>() {}
-    assert_send::<LayoutScratch>();
+    const fn assert_send_and_sync<T: Send + Sync>() {}
+    assert_send_and_sync::<LayoutScratch>();
 };
 
 impl LayoutScratch {
@@ -121,8 +148,8 @@ impl LayoutScratch {
     /// the rest anew.
     pub(super) fn fork(&self) -> Self {
         Self {
-            fc_run_cache_store: self.fc_run_cache_store.clone(),
-            in_flow_block_cache_store: self.in_flow_block_cache_store.clone(),
+            fc_run_cache_store: self.fc_run_cache_store.fork(),
+            in_flow_block_cache_store: self.in_flow_block_cache_store.fork(),
             text_memos: self.text_memos.fork(),
             prepared_inline_content_memos: self.prepared_inline_content_memos.fork(),
             ..Self::default()
@@ -133,7 +160,7 @@ impl LayoutScratch {
         &self.fc_run_cache_store
     }
 
-    pub(super) fn fragment_builder_scratch(&self) -> &RefCell<fragment_tree::FragmentBuilderScratch> {
+    pub(super) fn fragment_builder_scratch(&self) -> &fragment_tree::FragmentBuilderScratch {
         &self.fragment_builder_scratch
     }
 
@@ -149,14 +176,15 @@ impl LayoutScratch {
         &self.prepared_inline_content_memos
     }
 
-    pub(super) fn inline_content_preparation_buffers(
-        &self,
-    ) -> &Cell<super::prepared_inline_content::InlineContentPreparationBuffers> {
-        &self.inline_content_preparation_buffers
-    }
-
     /// Brings the run memos up to date with what the arena's writes since the last call did to their boxes.
     pub(super) fn apply_memo_invalidations(&mut self, arena: &mut LayoutNodeArena) {
+        let slot_count = arena.slot_capacity();
+        self.intrinsic_size_caches.cover_slots(slot_count);
+        self.text_memos.cover_text_states(arena.text_state_capacity());
+        self.fragment_builder_scratch.cover_slots(slot_count);
+        self.fc_run_cache_store.cover_slots(slot_count);
+        self.in_flow_block_cache_store.cover_slots(slot_count);
+        self.prepared_inline_content_memos.cover_slots(slot_count);
         arena.take_memo_invalidations().apply_to(
             &mut self.fc_run_cache_store,
             &mut self.in_flow_block_cache_store,
@@ -164,15 +192,6 @@ impl LayoutScratch {
             &mut self.prepared_inline_content_memos,
             &mut self.intrinsic_size_caches,
         );
-    }
-
-    pub(super) fn note_host_findings_noted_in_pass(&self) {
-        self.host_findings_noted_in_pass
-            .set(self.host_findings_noted_in_pass.get() + 1);
-    }
-
-    pub(super) fn host_findings_noted_in_pass(&self) -> u64 {
-        self.host_findings_noted_in_pass.get()
     }
 
     /// Brings the run memos up to date with what the commit into `arena` did to their boxes, and sweeps the run cache.
@@ -195,7 +214,7 @@ pub(crate) struct RunState {
     /// The anchor-size() resolutions of an absolutely positioned root, a run input that is constant for the run.
     root_anchor_resolved_values: Option<Box<style_values::AnchorResolvedValues>>,
     /// What the run found out for the host so far, which the pass the run is handed notes into.
-    host_findings: RefCell<HostFindings>,
+    host_findings: HostFindingsSink,
     fragments: Option<fragment_tree::RunFragmentBuilder>,
 }
 
@@ -396,7 +415,7 @@ impl RunState {
                 PercentageBlockSizeDependency::default()
             )]),
             root_anchor_resolved_values,
-            host_findings: RefCell::new(HostFindings::default()),
+            host_findings: HostFindingsSink::default(),
             fragments,
         };
         run(
@@ -411,7 +430,7 @@ impl RunState {
 
     /// What this run found out for the host, which its outputs carry to the run that uses its result.
     pub(crate) fn take_host_findings(&self) -> Option<Box<HostFindings>> {
-        let findings = std::mem::take(&mut *self.host_findings.borrow_mut());
+        let findings = self.host_findings.take();
         (!findings.is_empty()).then(|| Box::new(findings))
     }
 
@@ -513,7 +532,7 @@ mod tests {
     fn a_nested_run_keeps_its_own_root_and_host_findings() {
         let mut arena = LayoutNodeArena::new();
         let scratch = LayoutScratch::default();
-        let host_findings_outside_runs = RefCell::default();
+        let host_findings_outside_runs = HostFindingsSink::default();
         let root = arena.allocate_for_test().slot;
         let child = arena.allocate_for_test().slot;
         RunState::with_root(
@@ -543,6 +562,6 @@ mod tests {
                 );
             },
         );
-        assert!(host_findings_outside_runs.borrow().is_empty());
+        assert!(host_findings_outside_runs.take().is_empty());
     }
 }
