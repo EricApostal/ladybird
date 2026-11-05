@@ -11,14 +11,17 @@
 #include <LibJS/Runtime/Realm.h>
 #include <LibURL/RustIntegration.h>
 #include <LibWeb/Bindings/DOMException.h>
+#include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/Bindings/RustSerialization.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/CustomElements/CustomElementReactions.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/Window.h>
@@ -106,7 +109,10 @@ u64 web_bindings_currently_running_task(void* realm);
 void* web_bindings_create_callback_function(JSObject* callable, bool returns_promise);
 JSCompletion web_bindings_invoke_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
 void* web_bindings_invoke_promise_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
+void web_bindings_push_element_queue();
+void web_bindings_pop_element_queue_and_invoke_reactions();
 bool web_bindings_realm_is_window(void* realm);
+bool web_bindings_realm_is_secure_context(void* realm);
 HTML::Window* web_bindings_window_from_global_object(JSObject* global_object);
 DOM::Document* web_bindings_window_associated_document(HTML::Window*);
 bool web_bindings_document_is_fully_active(DOM::Document*);
@@ -136,6 +142,9 @@ void web_bindings_message_port_transport_close_after_sending_all_pending_message
 bool web_bindings_message_port_transport_send(IPC::Transport*, HTML::SerializedTransferRecord const*);
 bool web_bindings_message_port_transport_read_messages(IPC::Transport*, void* records, void (*append)(void*, HTML::SerializedTransferRecord*));
 
+void* web_css_wrap_object(void* realm, void* cell);
+void* web_css_realm_document(void* realm);
+
 void* web_bindings_wrapper_world(void* realm, bool* is_main_world)
 {
     auto& wrapper_world = host_defined_wrapper_world(*static_cast<JS::Realm*>(realm));
@@ -154,6 +163,35 @@ void web_bindings_set_rust_wrapper(void* realm, void* cell, JSObject* wrapper)
 {
     auto& host_object = as<JS::HostObject>(*JS::HostABI::object_from_abi(wrapper));
     host_defined_wrapper_world(*static_cast<JS::Realm*>(realm)).set_rust_wrapper(*static_cast<RustInterfaceCell*>(cell), host_object);
+}
+
+void* web_css_wrap_object(void* realm, void* cell)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto& wrappable = *static_cast<GCAllocatedWrappable*>(static_cast<GC::Cell*>(cell));
+    auto wrapper = wrap(host_defined_wrapper_world(js_realm), js_realm, GC::Ref<Wrappable> { wrappable });
+    return JS::HostABI::object_to_abi(wrapper.ptr());
+}
+
+void* web_css_realm_document(void* realm)
+{
+    return static_cast<GC::Cell*>(const_cast<DOM::Document*>(HTML::relevant_window(static_cast<JS::Realm*>(realm)->global_object()).document().ptr()));
+}
+
+bool web_bindings_realm_is_secure_context(void* realm)
+{
+    return HTML::is_secure_context(principal_host_defined_environment_settings_object(*static_cast<JS::Realm*>(realm)));
+}
+
+void web_bindings_push_element_queue()
+{
+    main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.append({});
+}
+
+void web_bindings_pop_element_queue_and_invoke_reactions()
+{
+    auto queue = main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.take_last();
+    HTML::invoke_custom_element_reactions(queue);
 }
 
 bool web_bindings_realm_is_window(void* realm)

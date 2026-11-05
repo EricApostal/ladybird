@@ -54,6 +54,7 @@ use crate::css::selector_arena::{NestingTarget, RuleOrdinal};
 use crate::css::selector_parser::{
     RustParsedSelectorList, SelectorType, StyleNestingParent, parse_selector_list_from_component_values,
 };
+use crate::css::serialize::TextSink;
 use crate::css::serialize::serialize_component_values_to_utf16;
 use crate::css::style_compute::value_is_computationally_independent;
 use crate::css::style_rule::StyleRule;
@@ -225,7 +226,7 @@ enum ParsedRulePrelude {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct ParsedPageSelector {
+pub(crate) struct ParsedPageSelector {
     name: Option<ParserString>,
     pseudo_classes: Vec<PagePseudoClass>,
 }
@@ -443,7 +444,7 @@ fn parse_page_selectors(values: &[ComponentValue]) -> ParsedRulePrelude {
 }
 
 // https://drafts.csswg.org/cssom/#parse-a-list-of-css-page-selectors
-fn parse_page_selector_list<'a>(source: impl Into<TokenizerInput<'a>>) -> Option<Vec<ParsedPageSelector>> {
+pub(crate) fn parse_page_selector_list<'a>(source: impl Into<TokenizerInput<'a>>) -> Option<Vec<ParsedPageSelector>> {
     // NB: This replaces the C++ path that wrapped the source in `@page <source> {}` and parsed
     //     exactly one rule. Consuming the complete component-value list
     //     preserves rejection of trailing tokens without constructing synthetic CSS.
@@ -455,7 +456,7 @@ fn parse_page_selector_list<'a>(source: impl Into<TokenizerInput<'a>>) -> Option
 }
 
 impl PageSelectorList {
-    fn new(parsed_selectors: Vec<ParsedPageSelector>) -> Self {
+    pub(crate) fn new(parsed_selectors: Vec<ParsedPageSelector>) -> Self {
         Self {
             selectors: parsed_selectors.into_boxed_slice(),
         }
@@ -2864,7 +2865,7 @@ fn collect_descriptors<'a>(
                     &mut descriptors,
                     DescriptorData {
                         id: longhand.descriptor_id,
-                        name: CssString::from_utf16(declaration.name.as_ref()),
+                        name: CssString::from_utf16(&longhand.name.encode_utf16().collect::<Vec<_>>()),
                         value: values.as_slice()[index].clone().into_arc(),
                     },
                 );
@@ -4381,13 +4382,20 @@ pub unsafe extern "C" fn rust_page_selector_list_serialize(
     context: *mut c_void,
     visit: crate::css::parser::query_parser::VisitQuerySerialization,
 ) {
-    let mut text = Vec::new();
+    let text = serialized_page_selectors(list);
+    let units = text.to_utf16();
+    unsafe { visit(context, units.as_ptr(), units.len()) };
+}
+
+/// The text of a list of page selectors.
+pub(crate) fn serialized_page_selectors(list: &PageSelectorList) -> ak::Utf16String {
+    let mut text = TextSink::new();
     for (index, selector) in list.selectors.iter().enumerate() {
         if index != 0 {
-            text.extend([u16::from(b','), u16::from(b' ')]);
+            text.push_ascii(", ");
         }
         if let Some(name) = &selector.name {
-            text.extend_from_slice(name);
+            name.iter().for_each(|&unit| text.push_code_unit(unit));
         }
         for pseudo_class in &selector.pseudo_classes {
             let name = match pseudo_class {
@@ -4396,10 +4404,10 @@ pub unsafe extern "C" fn rust_page_selector_list_serialize(
                 PagePseudoClass::First => ":first",
                 PagePseudoClass::Blank => ":blank",
             };
-            text.extend(name.bytes().map(u16::from));
+            text.push_ascii(name);
         }
     }
-    unsafe { visit(context, text.as_ptr(), text.len()) };
+    text.into_utf16_string()
 }
 
 /// Retains a normalized declaration block from parsed block contents, ignoring rules.

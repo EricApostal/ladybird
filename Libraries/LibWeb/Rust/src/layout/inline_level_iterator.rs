@@ -49,6 +49,8 @@ pub(crate) struct Item {
     pub(crate) border_end: CssPixels,
     pub(crate) margin_start: CssPixels,
     pub(crate) margin_end: CssPixels,
+    pub(crate) entered_right_to_left_end_margin: CssPixels,
+    pub(crate) exited_right_to_left_end_margin: CssPixels,
     pub(crate) is_collapsible_whitespace: bool,
     pub(crate) can_break_before: bool,
     pub(crate) preceded_by_unattached_inline_start_edges: bool,
@@ -56,11 +58,11 @@ pub(crate) struct Item {
     atomic: Option<Box<AtomicItemMetrics>>,
 }
 
-const _: () = assert!(size_of::<Item>() == 88);
+const _: () = assert!(size_of::<Item>() == 96);
 
 #[derive(Clone, Debug)]
 struct OwnedGlyphRun {
-    glyphs: Vec<libgfx_rust::text_layout::DrawGlyph>,
+    glyphs: libgfx_rust::text_layout::GlyphBuffer,
     width: f32,
     is_upright: bool,
 }
@@ -77,11 +79,8 @@ struct AtomicItemMetrics {
 fn shaped_glyphs_from(
     shape: &libgfx_rust::text_layout::SharedShape,
     baseline_start_x: f32,
-) -> Vec<libgfx_rust::text_layout::DrawGlyph> {
-    match shape.with_baseline_start(baseline_start_x).into_glyphs() {
-        libgfx_rust::text_layout::GlyphBuffer::Owned(glyphs) => glyphs,
-        libgfx_rust::text_layout::GlyphBuffer::Shared(glyphs) => glyphs.to_vec(),
-    }
+) -> libgfx_rust::text_layout::GlyphBuffer {
+    shape.with_baseline_start(baseline_start_x).into_glyphs()
 }
 
 fn reshaped_glyph_run(
@@ -99,7 +98,7 @@ fn reshaped_glyph_run(
         word_spacing,
     );
     OwnedGlyphRun {
-        glyphs: shape.glyphs().to_vec(),
+        glyphs: shape.glyphs().clone(),
         width: shape.width(),
         is_upright: false,
     }
@@ -132,18 +131,18 @@ pub(crate) fn text_is_set_upright(writing_mode: u8, text_orientation: u8, code_p
 /// which runs downwards in the frame of a vertical writing mode, while keeping its own horizontal width, which painting
 /// centers it within. Invisible characters such as soft hyphens take no space.
 // FIXME: Use the vertical metrics of the font, where it has them.
-fn set_glyphs_upright(glyphs: &mut [libgfx_rust::text_layout::DrawGlyph], inline_offset: f32, advance: f32) -> f32 {
+fn set_glyphs_upright(glyphs: &mut libgfx_rust::text_layout::GlyphBuffer, inline_offset: f32, advance: f32) -> f32 {
     let mut pen = inline_offset;
     let mut count = 0usize;
-    for glyph in glyphs.iter_mut() {
-        if glyph.length_in_code_units != 0 && glyph.should_paint {
+    glyphs.update_positions(|glyph, x, _| {
+        if glyph.length_in_code_units() != 0 && glyph.should_paint() {
             if count > 0 {
                 pen += advance;
             }
             count += 1;
         }
-        glyph.x = pen;
-    }
+        *x = pen;
+    });
     advance * count as f32
 }
 
@@ -151,7 +150,7 @@ fn shape_set_upright(
     shape: &libgfx_rust::text_layout::SharedShape,
     advance: f32,
 ) -> libgfx_rust::text_layout::SharedShape {
-    let mut glyphs = shape.glyphs().to_vec();
+    let mut glyphs = shape.glyphs().clone();
     let width = set_glyphs_upright(&mut glyphs, 0.0, advance);
     libgfx_rust::text_layout::SharedShape::from_glyphs(
         glyphs,
@@ -179,6 +178,8 @@ impl Item {
             border_end: CssPixels::default(),
             margin_start: CssPixels::default(),
             margin_end: CssPixels::default(),
+            entered_right_to_left_end_margin: CssPixels::default(),
+            exited_right_to_left_end_margin: CssPixels::default(),
             is_collapsible_whitespace: false,
             can_break_before: false,
             preceded_by_unattached_inline_start_edges: false,
@@ -253,14 +254,14 @@ impl Item {
         }
     }
 
-    /// The glyph run of a text item as one it owns, copying the glyphs of its prepared item's shape if it has none.
+    /// The glyph run of a text item as one it owns, sharing the glyphs of its prepared item's shape if it has none.
     fn take_owned_glyph_run(&mut self, prepared: &PreparedInlineContent) -> OwnedGlyphRun {
         if let Some(owned) = self.owned_glyph_run.take() {
             return *owned;
         }
         let prepared_item = self.prepared_item(prepared);
         OwnedGlyphRun {
-            glyphs: prepared_item.shape().glyphs().to_vec(),
+            glyphs: prepared_item.shape().glyphs().clone(),
             width: prepared_item.shape().width(),
             is_upright: prepared_item.has(PreparedItem::UPRIGHT),
         }
@@ -381,26 +382,24 @@ impl Item {
     fn shaped_glyphs_after(&self, prepared: &PreparedInlineContent, code_units: usize) -> Option<OwnedGlyphRun> {
         let run = self.glyph_run(prepared)?;
         if run.text_type == line_box_fragment::GLYPH_TEXT_TYPE_RTL
-            || run.glyphs.iter().map(|glyph| glyph.length_in_code_units).sum::<usize>() != self.length_in_node
+            || run
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.length_in_code_units())
+                .sum::<usize>()
+                != self.length_in_node
         {
             return None;
         }
         let mut consumed = 0;
         let split_glyph_index = run.glyphs.iter().position(|glyph| {
-            let at_split = consumed == code_units && glyph.length_in_code_units != 0;
-            consumed += glyph.length_in_code_units;
+            let at_split = consumed == code_units && glyph.length_in_code_units() != 0;
+            consumed += glyph.length_in_code_units();
             at_split
         })?;
-        let split_x = run.glyphs[split_glyph_index].x;
-        let glyphs = run.glyphs[split_glyph_index..]
-            .iter()
-            .map(|glyph| libgfx_rust::text_layout::DrawGlyph {
-                x: glyph.x - split_x,
-                ..*glyph
-            })
-            .collect();
+        let split_x = run.glyphs.placed().nth(split_glyph_index)?.x;
         Some(OwnedGlyphRun {
-            glyphs,
+            glyphs: run.glyphs.remainder_from(split_glyph_index),
             width: run.width - split_x,
             is_upright: run.is_upright,
         })
@@ -419,6 +418,7 @@ impl Item {
         prefix.margin_start = self.margin_start;
         prefix.border_start = self.border_start;
         prefix.padding_start = self.padding_start;
+        prefix.entered_right_to_left_end_margin = self.entered_right_to_left_end_margin;
         prefix.can_break_before = self.can_break_before;
         prefix.owned_glyph_run = Some(Box::new(prefix_glyphs));
         self.drop_prefix(split_offset_in_node, remainder_glyphs);
@@ -433,6 +433,7 @@ impl Item {
         self.margin_start = CssPixels::default();
         self.border_start = CssPixels::default();
         self.padding_start = CssPixels::default();
+        self.entered_right_to_left_end_margin = CssPixels::default();
         self.can_break_before = false;
     }
 
@@ -447,21 +448,21 @@ impl Item {
         if run.text_type == line_box_fragment::GLYPH_TEXT_TYPE_RTL || run.glyphs.len() < 2 {
             return None;
         }
-        let shaped_length_in_code_units: usize = run.glyphs.iter().map(|glyph| glyph.length_in_code_units).sum();
+        let shaped_length_in_code_units: usize = run.glyphs.iter().map(|glyph| glyph.length_in_code_units()).sum();
         if shaped_length_in_code_units != self.length_in_node {
             return None;
         }
 
         let leading_edge_inline_size = self.margin_start + self.border_start + self.padding_start;
         let mut split: Option<(usize, usize)> = None;
-        let mut code_units = run.glyphs[0].length_in_code_units;
-        for (glyph_index, glyph) in run.glyphs.iter().enumerate().skip(1) {
-            if glyph.length_in_code_units == 0 {
+        let mut code_units = run.glyphs[0].length_in_code_units();
+        for (glyph_index, placed) in run.glyphs.placed().enumerate().skip(1) {
+            if placed.glyph.length_in_code_units() == 0 {
                 continue;
             }
             let offset = self.offset_in_node + code_units;
             if segmenter.next_boundary(offset, true) == Some(offset) {
-                let prefix_inline_size = CssPixels::nearest_value_for_f32(glyph.x);
+                let prefix_inline_size = CssPixels::nearest_value_for_f32(placed.x);
                 if leading_edge_inline_size + prefix_inline_size > max_border_box_inline_size {
                     if split.is_none() && take_first_grapheme_when_none_fits {
                         split = Some((glyph_index, code_units));
@@ -470,16 +471,14 @@ impl Item {
                 }
                 split = Some((glyph_index, code_units));
             }
-            code_units += glyph.length_in_code_units;
+            code_units += placed.glyph.length_in_code_units();
         }
         let (split_glyph_index, split_code_units) = split?;
 
         let mut prefix = self.take_owned_glyph_run(prepared);
-        let split_x = prefix.glyphs[split_glyph_index].x;
-        let mut remainder_glyphs = prefix.glyphs.split_off(split_glyph_index);
-        for glyph in &mut remainder_glyphs {
-            glyph.x -= split_x;
-        }
+        let split_x = prefix.glyphs.placed().nth(split_glyph_index)?.x;
+        let remainder_glyphs = prefix.glyphs.remainder_from(split_glyph_index);
+        prefix.glyphs.truncate(split_glyph_index);
         let remainder = OwnedGlyphRun {
             glyphs: remainder_glyphs,
             width: prefix.width - split_x,
@@ -551,6 +550,49 @@ impl Item {
         Some(self.take_prefix_before(split, shape(&text[start..split]), shape(&text[split..end])))
     }
 
+    pub(crate) fn first_grapheme_cluster_inline_size(
+        &self,
+        prepared: &PreparedInlineContent,
+        text: &[u16],
+        segmenter: &text_chunker::GraphemeSegmenter,
+        letter_spacing: f32,
+        word_spacing: f32,
+    ) -> Option<CssPixels> {
+        assert_eq!(self.type_, ItemType::Text);
+        let run = self.glyph_run(prepared)?;
+        let start = self.offset_in_node;
+        let end = start + self.length_in_node;
+        if run.text_type != line_box_fragment::GLYPH_TEXT_TYPE_RTL
+            && let Some(first_glyph) = run.glyphs.first()
+        {
+            let mut code_units = first_glyph.length_in_code_units();
+            for placed in run.glyphs.placed().skip(1) {
+                if placed.glyph.length_in_code_units() == 0 {
+                    continue;
+                }
+                let offset = start + code_units;
+                if offset >= end {
+                    break;
+                }
+                if segmenter.next_boundary(offset, true) == Some(offset) {
+                    return Some(CssPixels::nearest_value_for_f32(placed.x));
+                }
+                code_units += placed.glyph.length_in_code_units();
+            }
+        }
+        let boundary = segmenter
+            .next_boundary(start, false)
+            .filter(|boundary| *boundary < end)?;
+        let width = libgfx_rust::text_layout::shaped_text_width(
+            run.font,
+            &text[start..boundary],
+            libgfx_rust::text_layout::TextType::try_from(run.text_type).expect("invalid Gfx::GlyphRun::TextType"),
+            letter_spacing,
+            word_spacing,
+        );
+        Some(CssPixels::nearest_value_for_f32(width))
+    }
+
     pub(crate) fn grapheme_cluster_inline_sizes(
         &self,
         prepared: &PreparedInlineContent,
@@ -601,6 +643,7 @@ struct PendingInlineEdge {
     border: CssPixels,
     padding: CssPixels,
     physical: ExtraBoxMetrics,
+    right_to_left_end_margin: CssPixels,
     is_start: bool,
     is_low: bool,
     takes_leading_metrics: bool,
@@ -643,6 +686,8 @@ struct InlineContentPreparer<'pass> {
     /// The text of the text node before the current one, when nothing but inline box boundaries and out-of-flow
     /// boxes lies between them.
     previous_text: Option<&'pass [u16]>,
+    /// Whether the previous text wraps with `word-break: break-all`.
+    previous_text_breaks_all: bool,
     /// The number of regional indicators that end the previous text, including any in the text nodes before it.
     previous_text_regional_indicators: usize,
     /// The number of regional indicators that end the text before the current text node.
@@ -698,6 +743,7 @@ impl<'pass> InlineContentPreparer<'pass> {
             walks_within_item: false,
             previous_chunk_can_break_after: false,
             previous_text: None,
+            previous_text_breaks_all: false,
             previous_text_regional_indicators: 0,
             regional_indicators_before_text: 0,
             code_unit_before_previous_text: None,
@@ -971,6 +1017,8 @@ impl<'pass> InlineContentPreparer<'pass> {
                 };
                 self.code_unit_before_previous_text = self.code_unit_before_text;
                 self.previous_text = Some(text_context.text);
+                self.previous_text_breaks_all =
+                    text_context.should_wrap_lines && text_context.style.word_break() == word_break::BREAK_ALL;
             }
             self.text_node_context = None;
             self.previous_chunk_can_break_after = false;
@@ -1061,7 +1109,8 @@ impl<'pass> InlineContentPreparer<'pass> {
         }
         let mut can_break_before = self.previous_chunk_can_break_after;
         // NB: Look for a soft wrap opportunity between the texts of two text nodes, which the chunker of either text
-        //     cannot see. This uses the line breaking properties of the text after it.
+        //     cannot see. This uses the line breaking properties of the text after it, and `word-break: break-all` text
+        //     before it also breaks there.
         if is_first_chunk {
             self.regional_indicators_before_text = if self.previous_text.is_some() {
                 self.previous_text_regional_indicators
@@ -1073,7 +1122,7 @@ impl<'pass> InlineContentPreparer<'pass> {
         if is_first_chunk
             && !can_break_before
             && let Some(previous_text) = self.previous_text.take()
-            && text_context.should_wrap_lines
+            && (text_context.should_wrap_lines || self.previous_text_breaks_all)
         {
             let style = text_context.style;
             let line_break_language = if style.line_break() == line_break::LOOSE {
@@ -1081,15 +1130,19 @@ impl<'pass> InlineContentPreparer<'pass> {
             } else {
                 text_chunker::LineBreakLanguage::Other
             };
-            can_break_before = text_chunker::soft_wrap_opportunity_between(
-                previous_text,
-                &full_text[chunk.start..],
-                self.code_unit_before_previous_text,
-                self.regional_indicators_before_text,
-                style.word_break(),
-                style.line_break(),
-                line_break_language,
-            );
+            let opportunity_with = |word_break| {
+                text_chunker::soft_wrap_opportunity_between(
+                    previous_text,
+                    &full_text[chunk.start..],
+                    self.code_unit_before_previous_text,
+                    self.regional_indicators_before_text,
+                    word_break,
+                    style.line_break(),
+                    line_break_language,
+                )
+            };
+            can_break_before = (text_context.should_wrap_lines && opportunity_with(style.word_break()))
+                || (self.previous_text_breaks_all && opportunity_with(word_break::BREAK_ALL));
         }
         self.previous_text = None;
         self.previous_chunk_can_break_after = chunk.can_break_after;
@@ -1349,6 +1402,7 @@ impl<'context> RunItemResolver<'_, 'context> {
                 padding: sides.padding_right,
             }
         };
+        let right_to_left_end_margin = self.negative_right_to_left_end_margin(node, sides.margin_left);
         if margin != CssPixels::default()
             || border != CssPixels::default()
             || padding != CssPixels::default()
@@ -1362,6 +1416,7 @@ impl<'context> RunItemResolver<'_, 'context> {
                 border,
                 padding,
                 physical,
+                right_to_left_end_margin,
                 is_start,
                 is_low: is_start != reversed,
                 takes_leading_metrics: is_start,
@@ -1396,6 +1451,14 @@ impl<'context> RunItemResolver<'_, 'context> {
         self.keep_inline_edge(node, &sides, false);
     }
 
+    fn negative_right_to_left_end_margin(&self, node: Node, margin_left: CssPixels) -> CssPixels {
+        if margin_left < CssPixels::default() && self.context().style(node).direction() == direction::RTL {
+            margin_left
+        } else {
+            CssPixels::default()
+        }
+    }
+
     /// The end edges of inline boxes that end right after an out-of-flow box are pending when the resolver reaches
     /// that box. It takes no edges itself, so they precede the next item rather than follow its content.
     fn carry_trailing_metrics_past_out_of_flow_box(&mut self) {
@@ -1415,15 +1478,19 @@ impl<'context> RunItemResolver<'_, 'context> {
                 item.margin_start += edge.physical.margin;
                 item.border_start += edge.physical.border;
                 item.padding_start += edge.physical.padding;
-                false
             } else if !edge.takes_leading_metrics && add_trailing_metrics {
                 item.margin_end += edge.physical.margin;
                 item.border_end += edge.physical.border;
                 item.padding_end += edge.physical.padding;
-                false
             } else {
-                true
+                return true;
             }
+            if edge.is_start {
+                item.entered_right_to_left_end_margin += edge.right_to_left_end_margin;
+            } else {
+                item.exited_right_to_left_end_margin += edge.right_to_left_end_margin;
+            }
+            false
         });
     }
 
@@ -1568,6 +1635,8 @@ impl<'context> RunItemResolver<'_, 'context> {
         item.border_end = contributions.border_end;
         item.margin_start = contributions.margin_start;
         item.margin_end = contributions.margin_end;
+        item.entered_right_to_left_end_margin = self.negative_right_to_left_end_margin(item.node, item.margin_start);
+        item.exited_right_to_left_end_margin = item.entered_right_to_left_end_margin;
     }
 
     fn resolve_element_item(&mut self, item_index: usize, prepared_item: &PreparedItem) -> Item {
@@ -1585,6 +1654,8 @@ impl<'context> RunItemResolver<'_, 'context> {
             item.border_end = box_cells.border_right;
             item.margin_start = box_cells.margin_left;
             item.margin_end = box_cells.margin_right;
+            item.entered_right_to_left_end_margin = self.negative_right_to_left_end_margin(node, item.margin_start);
+            item.exited_right_to_left_end_margin = item.entered_right_to_left_end_margin;
             item.atomic = Some(Box::new(AtomicItemMetrics {
                 min_content_inline_size: None,
                 content_baselines,
@@ -1809,14 +1880,32 @@ impl InlineLevelIterator {
         &self,
         context: &inline_formatting_context::InlineFormattingContext<'_>,
     ) -> Option<CssPixels> {
-        sequence_inline_size(context, self.items(), false)
+        sequence_inline_size(context, &self.prepared, self.items(), false)
     }
 
     pub(crate) fn next_unbreakable_run_inline_size(
         &self,
         context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> Option<CssPixels> {
+        sequence_inline_size(context, &self.prepared, self.items(), true)
+    }
+
+    pub(crate) fn unbreakable_run_inline_size(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+        item: &Item,
+        stop_at_overflow_breakable_text: bool,
     ) -> CssPixels {
-        sequence_inline_size(context, self.items(), true).unwrap_or_default()
+        let items = std::iter::once(item).chain(self.items());
+        let (length, end) = sequence_length(context, items.clone(), stop_at_overflow_breakable_text);
+        if end == SequenceEnd::OverflowBreakableText {
+            let first_grapheme_cluster = items
+                .clone()
+                .nth(length)
+                .map(|item| first_grapheme_cluster(context, &self.prepared, item));
+            return sequence_inline_extent(context, items.take(length).chain(first_grapheme_cluster.as_ref()));
+        }
+        sequence_inline_extent(context, items.take(length.max(1)))
     }
 
     pub(crate) fn next_non_whitespace_text_allows_overflow_break(
@@ -1841,35 +1930,167 @@ impl InlineLevelIterator {
     }
 }
 
+pub(crate) fn whitespace_and_sequence_inline_size(
+    context: &inline_formatting_context::InlineFormattingContext<'_>,
+    whitespace: &Item,
+    items: &[Item],
+) -> Option<CssPixels> {
+    let (length, _) = sequence_length(context, items, false);
+    if length == 0 {
+        return None;
+    }
+    let size = sequence_inline_extent(context, std::iter::once(whitespace).chain(&items[..length]));
+    (size > inline_extent([whitespace])).then_some(size)
+}
+
 pub(crate) fn sequence_inline_size(
     context: &inline_formatting_context::InlineFormattingContext<'_>,
+    prepared: &PreparedInlineContent,
     items: &[Item],
     stop_at_overflow_breakable_text: bool,
 ) -> Option<CssPixels> {
-    let mut size = CssPixels::default();
-    for (index, item) in items.iter().enumerate() {
+    let (length, end) = sequence_length(context, items, stop_at_overflow_breakable_text);
+    let first_grapheme_cluster =
+        (end == SequenceEnd::OverflowBreakableText).then(|| first_grapheme_cluster(context, prepared, &items[length]));
+    let size = sequence_inline_extent(context, items[..length].iter().chain(first_grapheme_cluster.as_ref()));
+    (end == SequenceEnd::ForcedBreak || size > CssPixels::default()).then_some(size)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SequenceEnd {
+    ForcedBreak,
+    OverflowBreakableText,
+    Other,
+}
+
+fn sequence_length<'item>(
+    context: &inline_formatting_context::InlineFormattingContext<'_>,
+    items: impl IntoIterator<Item = &'item Item>,
+    stop_at_overflow_breakable_text: bool,
+) -> (usize, SequenceEnd) {
+    let mut length = 0;
+    for item in items {
         match item.type_ {
-            ItemType::ForcedBreak => return Some(CssPixels::default()),
+            ItemType::ForcedBreak => return (length, SequenceEnd::ForcedBreak),
             ItemType::BlockLevelBox => break,
             _ => {}
+        }
+        // NB: The sequence ends at its next soft wrap opportunity, such as the one after a hyphen.
+        if length > 0 && item.can_break_before {
+            break;
         }
         let style = context.style(context.style_source(item.node));
         if style.text_wrap_mode() == text_wrap_mode::WRAP {
             if item.type_ != ItemType::Text || item.is_collapsible_whitespace {
                 break;
             }
-            // NB: The sequence ends at its next soft wrap opportunity, such as the one after a hyphen.
-            if index > 0 && item.can_break_before {
-                break;
-            }
             if item.is_ascii_whitespace(context) {
                 break;
             }
             if stop_at_overflow_breakable_text && context.overflow_break_applies(item.node) {
-                break;
+                return (length, SequenceEnd::OverflowBreakableText);
             }
         }
-        size += item.border_box_inline_size();
+        length += 1;
     }
-    (size > CssPixels::default()).then_some(size)
+    (length, SequenceEnd::Other)
+}
+
+fn first_grapheme_cluster(
+    context: &inline_formatting_context::InlineFormattingContext<'_>,
+    prepared: &PreparedInlineContent,
+    item: &Item,
+) -> Item {
+    let style = context.style(context.style_source(item.node));
+    let text_content = context.callbacks.text_content(item.node);
+    let first_grapheme_cluster_inline_size = context.callbacks.with_grapheme_segmenter(item.node, |segmenter| {
+        item.first_grapheme_cluster_inline_size(
+            prepared,
+            &text_content.text,
+            segmenter,
+            style.letter_spacing().to_double() as f32,
+            style.word_spacing().to_double() as f32,
+        )
+    });
+    let mut cluster = Item::new(ItemType::Text, item.node, item.prepared_item_index as usize);
+    cluster.margin_start = item.margin_start;
+    cluster.border_start = item.border_start;
+    cluster.padding_start = item.padding_start;
+    cluster.entered_right_to_left_end_margin = item.entered_right_to_left_end_margin;
+    match first_grapheme_cluster_inline_size {
+        Some(inline_size) => cluster.inline_size = inline_size,
+        None => {
+            cluster.inline_size = item.inline_size;
+            cluster.padding_end = item.padding_end;
+            cluster.border_end = item.border_end;
+            cluster.margin_end = item.margin_end;
+            cluster.exited_right_to_left_end_margin = item.exited_right_to_left_end_margin;
+        }
+    }
+    cluster
+}
+
+fn sequence_inline_extent<'item>(
+    context: &inline_formatting_context::InlineFormattingContext<'_>,
+    items: impl Iterator<Item = &'item Item> + Clone,
+) -> CssPixels {
+    let mut last_content = None::<(usize, CssPixels)>;
+    for (index, item) in items.clone().enumerate() {
+        let whitespace = item.trailing_whitespace;
+        if whitespace.length_in_code_units == 0 {
+            last_content = Some((index, CssPixels::default()));
+            continue;
+        }
+        let is_collapsible = item.is_collapsible_whitespace
+            || matches!(
+                context.style(context.style_source(item.node)).white_space_collapse(),
+                white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS
+            );
+        if !is_collapsible {
+            last_content = Some((index, CssPixels::default()));
+        } else if whitespace.length_in_code_units < item.length_in_node {
+            last_content = Some((index, whitespace.inline_size));
+        }
+    }
+    let mut previous_placed_item = None::<&Item>;
+    inline_extent_without_removed_whitespace(items.enumerate().map(move |(index, item)| {
+        let collapses = item.is_collapsible_whitespace
+            && previous_placed_item
+                .is_some_and(|previous| previous.type_ == ItemType::Text && previous.ends_in_ascii_space(context));
+        if !collapses {
+            previous_placed_item = Some(item);
+        }
+        let removed_inline_size = match last_content {
+            _ if collapses => item.inline_size,
+            Some((last_index, _)) if index < last_index => CssPixels::default(),
+            Some((last_index, whitespace_inline_size)) if index == last_index => whitespace_inline_size,
+            _ => item.inline_size,
+        };
+        (item, removed_inline_size)
+    }))
+}
+
+pub(crate) fn inline_extent<'item>(items: impl IntoIterator<Item = &'item Item>) -> CssPixels {
+    inline_extent_without_removed_whitespace(items.into_iter().map(|item| (item, CssPixels::default())))
+}
+
+fn inline_extent_without_removed_whitespace<'item>(
+    items: impl IntoIterator<Item = (&'item Item, CssPixels)>,
+) -> CssPixels {
+    let mut position = CssPixels::default();
+    let mut extent = None::<CssPixels>;
+    let mut held_end_margin = CssPixels::default();
+    for (item, removed_inline_size) in items {
+        held_end_margin += item.entered_right_to_left_end_margin;
+        position += item.margin_start - item.entered_right_to_left_end_margin + item.border_box_inline_size()
+            - removed_inline_size;
+        let end = position.max(position + item.margin_end);
+        extent = Some(extent.map_or(end, |extent| extent.max(end)));
+        position += item.margin_end;
+        // NB: The end margin of a box that started before these items is already part of the line.
+        let released_end_margin = item.exited_right_to_left_end_margin.max(held_end_margin);
+        position += released_end_margin;
+        held_end_margin -= released_end_margin;
+    }
+    extent.unwrap_or_default()
 }

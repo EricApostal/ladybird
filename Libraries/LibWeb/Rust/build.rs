@@ -235,7 +235,7 @@ fn generate_descriptor_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(
          pub(crate) enum DescriptorValueType { CounterStyleSystem, CounterStyleAdditiveSymbols, CounterStyleName, CounterStyleNegative, CounterStylePad, CounterStyleRange, CropOrCross, FamilyName, FontSrcList, FontWeightAbsolutePair, Length, OptionalDeclarationValue, PageSize, PositivePercentage, String, Symbol, Symbols, UnicodeRangeTokens }\n\n\
          pub(crate) struct DescriptorMetadata { pub id: u8, pub syntax: &'static [DescriptorSyntax], pub allow_arbitrary_substitution_functions: bool, pub allow_css_wide_keywords: bool }\n\n\
          #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
-         pub(crate) struct DescriptorLonghand { pub descriptor_id: u8, pub property_id: u16 }\n\n\
+         pub(crate) struct DescriptorLonghand { pub descriptor_id: u8, pub property_id: u16, pub name: &'static str }\n\n\
          fn equals(value: &[u16], expected: &[u8]) -> bool { value.len() == expected.len() && value.iter().zip(expected).all(|(&left, &right)| u8::try_from(left).is_ok_and(|left| left.eq_ignore_ascii_case(&right))) }\n\n\
          pub(crate) fn descriptor_metadata(at_rule: u8, name: &[u16]) -> Option<DescriptorMetadata> {\n    match at_rule {\n",
     );
@@ -366,16 +366,17 @@ fn generate_descriptor_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(
                 generated_longhands.push((
                     descriptor_id(longhand)?,
                     longhand.replace('-', "_").to_ascii_uppercase(),
+                    longhand,
                 ));
             }
             if generated_longhands.is_empty() {
                 continue;
             }
             write!(output, "        ({at_rule_index}, {}) => &[", descriptor_id(name)?)?;
-            for (longhand_id, property_constant) in generated_longhands {
+            for (longhand_id, property_constant, longhand_name) in generated_longhands {
                 write!(
                     output,
-                    "DescriptorLonghand {{ descriptor_id: {longhand_id}, property_id: property_id::{property_constant} }},"
+                    "DescriptorLonghand {{ descriptor_id: {longhand_id}, property_id: property_id::{property_constant}, name: \"{longhand_name}\" }},"
                 )?;
             }
             output.push_str("],\n");
@@ -935,7 +936,6 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     let mut affects_hit_testing = vec![false; levels.len()];
     let mut style_group_indices = vec![u8::MAX; levels.len()];
     let mut initial_values = vec![String::new(); levels.len()];
-    let mut numeric_range_rows = vec![String::new(); levels.len()];
     let value_types = [
         "anchor",
         "anchor-size",
@@ -1062,43 +1062,6 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         initial_values[index] = property_field(name, "initial")
             .and_then(|value| value.as_str().map(str::to_string))
             .ok_or_else(|| format!("missing initial value for {name}"))?;
-
-        let mut ranges = Vec::new();
-        if let Some(valid_types) = property_field(name, "valid-types").and_then(|value| value.as_array().cloned()) {
-            for valid_type in valid_types {
-                let valid_type = valid_type.as_str().unwrap();
-                let Some((type_name, range)) = valid_type.split_once(' ') else {
-                    continue;
-                };
-                if !range.starts_with('[') || !range.ends_with(']') || !range.contains(',') {
-                    continue;
-                }
-                if type_name == "custom-ident" {
-                    continue;
-                }
-                let value_type = value_types
-                    .iter()
-                    .position(|candidate| *candidate == type_name)
-                    .ok_or_else(|| format!("unknown ranged value type '{type_name}' for {name}"))?;
-                let (min, max) = range[1..range.len() - 1]
-                    .split_once(',')
-                    .ok_or_else(|| format!("bad numeric range '{range}' for {name}"))?;
-                let format_bound = |bound: &str| match (type_name, bound) {
-                    ("integer", "-∞") => "i32::MIN as f64".to_string(),
-                    ("integer", "∞") => "i32::MAX as f64".to_string(),
-                    (_, "-∞") => "f32::MIN as f64".to_string(),
-                    (_, "∞") => "f32::MAX as f64".to_string(),
-                    _ if bound.contains('.') => bound.to_string(),
-                    _ => format!("{bound}.0"),
-                };
-                ranges.push(format!(
-                    "FfiPropertyNumericRange {{ value_type: {value_type}, min: {}, max: {} }}",
-                    format_bound(min),
-                    format_bound(max)
-                ));
-            }
-        }
-        numeric_range_rows[index] = ranges.join(", ");
     }
 
     let mut output = String::new();
@@ -1106,6 +1069,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     // Shorthand expansion tables for the cascade. The "all" shorthand expands to every
     // longhand except direction and unicode-bidi, mirroring the C++ generator.
     let mut shorthand_rows = Vec::new();
+    let mut immediate_longhands = Vec::new();
     for name in &shorthands {
         let longhand_names: Vec<String> = if name == "all" {
             properties
@@ -1130,6 +1094,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         };
         let ids_row: Vec<u16> = longhand_names.iter().map(|longhand| ids[longhand]).collect();
         shorthand_rows.push(format!("    &{ids_row:?},"));
+        immediate_longhands.push(longhand_names);
     }
     output.push_str(&format!(
         "pub(crate) static SHORTHAND_EXPANSIONS: [&[u16]; {}] = [\n{}\n];\n\n",
@@ -1486,6 +1451,68 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         .map(|name| logical_group_by_property.get(name).copied().unwrap_or(0))
         .collect();
     let expanded_longhand_counts: Vec<usize> = expanded_shorthand_longhands.iter().map(Vec::len).collect();
+    let expanded_longhand_rows: Vec<String> = expanded_shorthand_longhands
+        .iter()
+        .map(|longhands| {
+            let row: Vec<u16> = longhands.iter().map(|longhand| ids[longhand]).collect();
+            format!("    &{row:?},")
+        })
+        .collect();
+
+    // Each property's shorthands, in preferred order: the most longhands first, then those not starting with "-",
+    // then those starting with "-webkit-", then lexicographically.
+    // https://drafts.csswg.org/cssom/#concept-shorthands-preferred-order
+    let is_legacy_shorthand = |name: &str| {
+        properties[name]
+            .get("legacy-shorthand")
+            .and_then(|value| value.as_bool())
+    };
+    let mut immediate_shorthands = std::collections::HashMap::<&str, Vec<&str>>::new();
+    for (name, longhands) in shorthands.iter().zip(&immediate_longhands) {
+        if is_legacy_shorthand(name) == Some(true) {
+            continue;
+        }
+        for longhand in longhands {
+            immediate_shorthands.entry(longhand).or_default().push(name);
+        }
+    }
+    fn shorthands_of<'a>(
+        property: &str,
+        immediate_shorthands: &std::collections::HashMap<&str, Vec<&'a str>>,
+        result: &mut Vec<&'a str>,
+    ) {
+        for shorthand in immediate_shorthands.get(property).into_iter().flatten() {
+            result.push(shorthand);
+            shorthands_of(shorthand, immediate_shorthands, result);
+        }
+    }
+    let expanded_longhand_count = |shorthand: &str| {
+        let index = shorthands.iter().position(|name| name == shorthand).unwrap();
+        expanded_longhand_counts[index]
+    };
+    let shorthands_for_longhand_rows: Vec<String> = property_names
+        .iter()
+        .map(|name| {
+            let mut result = Vec::new();
+            shorthands_of(name, &immediate_shorthands, &mut result);
+            result.sort_by_key(|shorthand| {
+                (
+                    std::cmp::Reverse(expanded_longhand_count(shorthand)),
+                    shorthand.starts_with('-'),
+                    !shorthand.starts_with("-webkit-"),
+                    *shorthand,
+                )
+            });
+            let row: Vec<u16> = result.iter().map(|shorthand| ids[*shorthand]).collect();
+            format!("    &{row:?},")
+        })
+        .collect();
+    let mut legacy_shorthands: Vec<u16> = shorthands
+        .iter()
+        .filter(|name| is_legacy_shorthand(name) == Some(true))
+        .map(|name| ids[name])
+        .collect();
+    legacy_shorthands.sort_unstable();
 
     // Accepted property keywords are a property's valid identifiers and the
     // keywords of the enums in its valid types.
@@ -1497,6 +1524,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     let mut coordinating_list_rows = Vec::new();
     let mut maximum_value_count_rows = Vec::new();
     let mut percentages_resolve_to_rows = Vec::new();
+    let mut numeric_range_rows = Vec::new();
     let mut unitless_length_quirk_rows = Vec::new();
     let mut hashless_hex_color_quirk_rows = Vec::new();
     for name in &property_names {
@@ -1600,6 +1628,42 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
             }
             None => "    None,".to_string(),
         });
+        let mut ranges = Vec::new();
+        if let Some(valid_types) = property_field(name, "valid-types").and_then(|value| value.as_array().cloned()) {
+            for valid_type in valid_types {
+                let valid_type = valid_type.as_str().unwrap();
+                let Some((type_name, range)) = valid_type.split_once(' ') else {
+                    continue;
+                };
+                if !range.starts_with('[') || !range.ends_with(']') || !range.contains(',') {
+                    continue;
+                }
+                if type_name == "custom-ident" {
+                    continue;
+                }
+                let value_type = value_types
+                    .iter()
+                    .position(|candidate| *candidate == type_name)
+                    .ok_or_else(|| format!("unknown ranged value type '{type_name}' for {name}"))?;
+                let (min, max) = range[1..range.len() - 1]
+                    .split_once(',')
+                    .ok_or_else(|| format!("bad numeric range '{range}' for {name}"))?;
+                let format_bound = |bound: &str| match (type_name, bound) {
+                    ("integer", "-∞") => "i32::MIN as f64".to_string(),
+                    ("integer", "∞") => "i32::MAX as f64".to_string(),
+                    (_, "-∞") => "f32::MIN as f64".to_string(),
+                    (_, "∞") => "f32::MAX as f64".to_string(),
+                    _ if bound.contains('.') => bound.to_string(),
+                    _ => format!("{bound}.0"),
+                };
+                ranges.push(format!(
+                    "FfiPropertyNumericRange {{ value_type: {value_type}, min: {}, max: {} }}",
+                    format_bound(min),
+                    format_bound(max)
+                ));
+            }
+        }
+        numeric_range_rows.push(ranges.join(", "));
         unitless_length_quirk_rows.push(
             property_field(name, "quirks")
                 .and_then(|value| value.as_array().cloned())
@@ -1645,6 +1709,19 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "pub(crate) static PHYSICAL_TO_LOGICAL_ALIAS: [u16; {}] = {:?};\n\n",
         physical_to_logical_alias.len(),
         physical_to_logical_alias
+    ));
+    output.push_str(&format!(
+        "pub(crate) static EXPANDED_LONGHANDS_FOR_SHORTHAND: [&[u16]; {}] = [\n{}\n];\n\n",
+        expanded_longhand_rows.len(),
+        expanded_longhand_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static SHORTHANDS_FOR_LONGHAND: [&[u16]; {}] = [\n{}\n];\n\n",
+        shorthands_for_longhand_rows.len(),
+        shorthands_for_longhand_rows.join("\n")
+    ));
+    output.push_str(&format!(
+        "pub(crate) static LEGACY_SHORTHANDS: &[u16] = &{legacy_shorthands:?};\n\n"
     ));
     output.push_str(&format!(
         "pub(crate) static SHORTHAND_EXPANDED_LONGHAND_COUNTS: [usize; {}] = {:?};\n\n",
@@ -2549,6 +2626,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/calc.rs"),
             manifest_dir.join("src/css/serialize.rs"),
             manifest_dir.join("src/css/color_resolution.rs"),
+            manifest_dir.join("src/css/resolved_value.rs"),
             manifest_dir.join("src/css/absolutize.rs"),
             manifest_dir.join("src/css/ffi_stats.rs"),
         ],

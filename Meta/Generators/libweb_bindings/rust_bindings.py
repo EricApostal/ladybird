@@ -20,6 +20,7 @@ from io import StringIO
 from typing import Callable
 from typing import Dict
 from typing import List
+from typing import Optional
 from typing import TextIO
 from typing import Tuple
 
@@ -29,6 +30,8 @@ from Generators.libweb_bindings.operations import idl_type_is_json_type
 from Generators.libweb_bindings.operations import operation_is_default_to_json
 from Generators.libweb_bindings.rust_members import RustAttribute
 from Generators.libweb_bindings.rust_members import RustConstructor
+from Generators.libweb_bindings.rust_members import RustIndexedPropertyGetter
+from Generators.libweb_bindings.rust_members import RustIndexedPropertySetter
 from Generators.libweb_bindings.rust_members import RustMembers
 from Generators.libweb_bindings.rust_members import RustOperation
 from Generators.libweb_bindings.rust_members import RustOperationSet
@@ -52,6 +55,7 @@ from Generators.libweb_bindings.rust_types import CPP_PARENT_INTERFACES
 from Generators.libweb_bindings.rust_types import UnsupportedByRustBindings
 from Generators.libweb_bindings.rust_types import cpp_ancestor
 from Generators.libweb_bindings.rust_types import cpp_interface_name_constant
+from Generators.libweb_bindings.rust_types import holds_cells
 from Generators.libweb_bindings.rust_types import inheriting_interfaces
 from Generators.libweb_bindings.rust_types import is_implemented_in_rust
 from Generators.libweb_bindings.rust_types import is_promise_type
@@ -262,10 +266,13 @@ void {interface.namespace_class}::initialize(JS::Realm& realm, JS::Object& objec
     initialize_prototype = rust_entry_point_name(interface, "initialize_prototype")
     initialize_constructor = rust_entry_point_name(interface, "initialize_constructor")
     construct = rust_entry_point_name(interface, "construct")
-    supports_indexed_properties = rust_members(interface).indexed_property_getter is not None
-    if supports_indexed_properties and inheriting_interfaces(interface, context):
+    # NB: An interface that inherits indexed properties reads them through the entry point of the interface defining them.
+    indexed_interface = rust_interface_with_indexed_properties(interface, context)
+    supports_indexed_properties = indexed_interface is not None
+    has_indexed_property_setter = rust_members(interface).indexed_property_setter is not None
+    if has_indexed_property_setter and inheriting_interfaces(interface, context):
         raise UnsupportedByRustBindings(
-            f"{interface.path}: {interface.name} supports indexed properties and others inherit from it, which the "
+            f"{interface.path}: {interface.name} has an indexed property setter and others inherit from it, which the "
             "Rust bindings do not handle yet"
         )
     out.write(
@@ -278,8 +285,13 @@ void {initialize_constructor}(JSVM*, void* realm, JSObject* constructor);
     )
     if supports_indexed_properties:
         out.write(
-            f"bool {item_value_entry_point(interface)}(JSVM*, void* realm, JSObject* wrapper, size_t index, "
+            f"bool {item_value_entry_point(indexed_interface)}(JSVM*, void* realm, JSObject* wrapper, size_t index, "
             "JSValue* out_value);\n"
+        )
+    if has_indexed_property_setter:
+        out.writelines(
+            f"JSCompletion {entry_point}(JSVM*, void* realm, JSObject* wrapper, u32 index, JSValue value);\n"
+            for entry_point in indexed_property_setter_entry_points(interface)
         )
     if interface.constructors:
         out.write(f"JSCompletion {construct}(JSVM*, JSObject* constructor, JSObject* new_target);\n")
@@ -289,8 +301,10 @@ void {initialize_constructor}(JSVM*, void* realm, JSObject* constructor);
                 f"{interface.path}: {interface.name} supports indexed properties and inherits from an interface "
                 "implemented in C++, which the Rust bindings do not handle yet"
             )
-        out.write(
-            f"""
+        indexed_ancestor = cpp_ancestor_with_indexed_properties(interface, context)
+        if indexed_ancestor is None:
+            out.write(
+                f"""
 }}
 
 // The wrappers hold the cell of their object as host data and, for an interface that inherits from one implemented in
@@ -298,7 +312,25 @@ void {initialize_constructor}(JSVM*, void* realm, JSObject* constructor);
 constexpr JSHostClass {wrapper_host_class_symbol(interface)} = JS::make_host_class(JS_HOST_CLASS_OBJECT, "{interface.name}"sv,
     &{parent_host_class}, &platform_object_hooks, nullptr, platform_object_host_class_flags);
 """
-        )
+            )
+        else:
+            legacy_info = f"{wrapper_name(interface)}_legacy_platform_object_info"
+            out.write(
+                f"""
+}}
+
+static constexpr LegacyPlatformObjectInfo {legacy_info} {{
+    .supports_indexed_properties = true,
+    .item_value = {wrapper_name(indexed_ancestor)}_item_value,
+}};
+
+// The wrappers hold the cell of their object as host data and the C++ object it owns as their wrappable, whose indexed
+// properties the C++ bindings of the ancestor read.
+constexpr JSHostClass {wrapper_host_class_symbol(interface)} = JS::make_host_class(JS_HOST_CLASS_OBJECT, "{interface.name}"sv,
+    &{parent_host_class}, &indexed_legacy_platform_object_hooks, &{legacy_info},
+    platform_object_host_class_flags | JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE);
+"""
+            )
     elif not supports_indexed_properties:
         out.write(
             f"""
@@ -314,6 +346,25 @@ constexpr JSHostClass {wrapper_host_class_symbol(interface)} = JS::make_host_cla
     else:
         includes.add("LibWeb/Bindings/PlatformObject.h")
         legacy_info = f"{wrapper_name(interface)}_legacy_platform_object_info"
+        setter_functions = ""
+        has_setter_info = ""
+        setter_info = ""
+        if has_indexed_property_setter:
+            includes.add("LibWeb/WebIDL/ExceptionOr.h")
+            has_setter_info = "    .has_indexed_property_setter = true,\n"
+            for hook, entry_point in zip(
+                ("set_value_of_new_indexed_property", "set_value_of_existing_indexed_property"),
+                indexed_property_setter_entry_points(interface),
+            ):
+                function = f"{wrapper_name(interface)}_{hook}"
+                setter_functions += f"""static WebIDL::ExceptionOr<void> {function}(JS::HostObject& wrapper, JS::Realm& realm, u32 index, JS::Value value)
+{{
+    TRY(JS::HostABI::completion_from_abi<JS::Value>({entry_point}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(&wrapper), index, JS::HostABI::value_to_abi(value))));
+    return {{}};
+}}
+
+"""
+                setter_info += f"    .{hook} = {function},\n"
         out.write(
             f"""
 }}
@@ -321,15 +372,15 @@ constexpr JSHostClass {wrapper_host_class_symbol(interface)} = JS::make_host_cla
 static Optional<JS::Value> {wrapper_name(interface)}_item_value(JS::HostObject const& wrapper, WrapperWorld&, JS::Realm& realm, size_t index)
 {{
     JSValue value {{}};
-    if (!{item_value_entry_point(interface)}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(const_cast<JS::HostObject*>(&wrapper)), index, &value))
+    if (!{item_value_entry_point(indexed_interface)}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(const_cast<JS::HostObject*>(&wrapper)), index, &value))
         return {{}};
     return JS::HostABI::value_from_abi(value);
 }}
 
-static constexpr LegacyPlatformObjectInfo {legacy_info} {{
+{setter_functions}static constexpr LegacyPlatformObjectInfo {legacy_info} {{
     .supports_indexed_properties = true,
-    .item_value = {wrapper_name(interface)}_item_value,
-}};
+{has_setter_info}    .item_value = {wrapper_name(interface)}_item_value,
+{setter_info}}};
 
 // The wrappers are legacy platform objects, whose indexed properties the Rust bindings read: their implementation is a
 // cell in their host data, not an implementation object in their wrappable slot.
@@ -405,8 +456,16 @@ def write_ensure_web_prototype_declaration(out: TextIO) -> None:
 extern "C" JSObject* web_bindings_ensure_web_prototype(void* realm, u16 interface_name);
 extern "C" JSObject* web_bindings_ensure_web_constructor(void* realm, u16 interface_name);
 extern "C" JSObject* web_bindings_ensure_web_iterator_prototype(void* realm, u16 interface_name);
+
+// Defines the unforgeable attributes of an interface implemented in C++ on the wrapper of an object of an interface
+// implemented in Rust that inherits from it.
+extern "C" void web_bindings_define_unforgeable_attributes(void* realm, JSObject* wrapper, u16 interface_name);
 """
     )
+
+
+def has_unforgeable_attributes(interface: Interface) -> bool:
+    return any("LegacyUnforgeable" in attribute.extended_attributes for attribute in interface.regular_attributes)
 
 
 def write_ensure_web_prototype_implementation(out: TextIO, intrinsics: List[Interface]) -> None:
@@ -431,12 +490,12 @@ JSObject* {function}(void* realm, u16 interface_name)
     switch (static_cast<InterfaceName>(interface_name)) {{
 """
         )
-        for interface in interfaces:
-            out.write(
-                f"""    case InterfaceName::{interface.name}:
+        out.writelines(
+            f"""    case InterfaceName::{interface.name}:
         return JS::HostABI::object_to_abi(&{object_of(interface)});
 """
-            )
+            for interface in interfaces
+        )
         out.write(
             """    default:
         VERIFY_NOT_REACHED();
@@ -472,6 +531,31 @@ JSObject* {function}(void* realm, u16 interface_name)
             if rust_members(interface).async_iterator is not None
             else f'ensure_web_prototype<{interface.name}IteratorPrototype>(js_realm, "{interface.name}Iterator"_utf16_fly_string)'
         ),
+    )
+
+    out.write(
+        """
+void web_bindings_define_unforgeable_attributes(void* realm, JSObject* wrapper, u16 interface_name)
+{
+    [[maybe_unused]] auto& js_realm = *static_cast<JS::Realm*>(realm);
+    [[maybe_unused]] auto& object = *JS::HostABI::object_from_abi(wrapper);
+    switch (static_cast<InterfaceName>(interface_name)) {
+"""
+    )
+    out.writelines(
+        f"""    case InterfaceName::{interface.name}:
+        {interface.prototype_class}::define_unforgeable_attributes(js_realm, object);
+        return;
+"""
+        for interface in intrinsics
+        if interface.name in cpp_parent_names and has_unforgeable_attributes(interface)
+    )
+    out.write(
+        """    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+"""
     )
 
 
@@ -510,8 +594,6 @@ def write_parameter_conversions(
 ) -> None:
     for index, parameter in enumerate(parameters):
         parameter_what = f"the parameter {parameter.name} of {what}"
-        if parameter.variadic:
-            raise UnsupportedByRustBindings(f"{parameter_what} is variadic")
         unsupported = set(parameter.extended_attributes) - {
             "AllowShared",
             "AllowResizable",
@@ -522,6 +604,23 @@ def write_parameter_conversions(
         if unsupported:
             raise UnsupportedByRustBindings(f"{parameter_what} has the extended attributes {sorted(unsupported)}")
         name = rust_local_name(parameter.name)
+        if parameter.variadic:
+            # NB: A variadic parameter takes every remaining argument, so it is always the last parameter.
+            conversion = rust_to_idl_value(
+                parameter.type, parameter.extended_attributes, "argument", parameter.name, context, parameter_what
+            )
+            keeps_cells_alive = holds_cells(parameter.type, context)
+            storage = "MarkedVec::new(vm)" if keeps_cells_alive else "Vec::new()"
+            mutability = "" if keeps_cells_alive else "mut "
+            out.write(
+                f"""        let {mutability}{name} = {storage};
+        for index in {index}..vm.argument_count() {{
+            let argument = vm.argument(index);
+            {name}.push({conversion}?);
+        }}
+"""
+            )
+            continue
         conversion = rust_to_idl_value(
             parameter.type,
             parameter.extended_attributes,
@@ -606,8 +705,16 @@ def implementation_method_signatures(
         key_type, value_type = pair_iterator_types(context, interface, members.pair_iterator)
         signatures.append(
             f"impl PairIterable with Key = {key_type} and Value = {value_type}: "
-            "fn value_pairs_to_iterate_over(&self) -> impl Deref<Target = [(Self::Key, Self::Value)]> + '_"
+            "fn value_pairs_to_iterate_over(target: &Self::Target) -> impl Deref<Target = [(Self::Key, Self::Value)]> + '_"
         )
+    if members.setlike is not None:
+        signatures.append("impl Setlike: fn set_entries(&self, cx: &CallContext) -> Gc<Set>")
+        if members.setlike.writable_operations:
+            signatures.append("impl WritableSetlike: fn set_add, fn set_remove, fn set_clear")
+    if members.maplike is not None:
+        signatures.append("impl Maplike: fn map_entries(&self, cx: &CallContext) -> Gc<Map>")
+        if members.maplike.writable_operations:
+            signatures.append("impl WritableMaplike: fn map_set, fn map_remove, fn map_clear")
     if members.async_iterator is not None:
         what = f"the asynchronously iterable declaration of {interface.name}"
         parameters = parameter_list(what, members.async_iterator.parameters)
@@ -628,6 +735,13 @@ def implementation_method_signatures(
             f"fn {getter.method}(&self, cx: &mut CallContext{parameters}) -> "
             f"WebIdlResult<{rust_type(getter.operation.return_type, context, what, is_result=True)}>"
         )
+    if members.indexed_property_setter is not None:
+        what = f"the indexed property setter of {interface.name}"
+        value_type = rust_parameter_type(members.indexed_property_setter.value_parameter, context, what)
+        for method in ("set_value_of_new_indexed_property", "set_value_of_existing_indexed_property"):
+            signatures.append(
+                f"fn {method}(&self, cx: &mut CallContext, index: u32, value: {value_type}) -> WebIdlResult<()>"
+            )
     for operation_set in members.static_operation_sets:
         for overload in operation_set.overloads:
             what = f"{interface.name}.{operation_set.name}()"
@@ -648,6 +762,88 @@ def pair_iterator_types(
         rust_type(pair_iterator.key_type, context, what, is_result=True),
         rust_type(pair_iterator.value_type, context, what, is_result=True),
     )
+
+
+def write_rust_collection_declaration(
+    out: TextIO, context: GenerationContext, interface: Interface, members: RustMembers
+) -> None:
+    """The value check of the operations that the bindings define for a setlike or maplike declaration."""
+    what = f"the value type of the declaration of {interface.name}"
+    if members.setlike is not None:
+        conversion = rust_to_idl_value(members.setlike.value_type, {}, "value", "value", context, what)
+        out.write(
+            f"""
+    impl crate::bindings::setlike::SetlikeDeclaration for Implementation {{
+        fn check_value(vm: &Vm, value: Value) -> ThrowCompletionOr<()> {{
+            {conversion}?;
+            Ok(())
+        }}
+    }}
+"""
+        )
+    if members.maplike is not None and "set" in members.maplike.writable_operations:
+        conversion = rust_to_idl_value(members.maplike.value_type, {}, "value", "value", context, what)
+        out.write(
+            f"""
+    impl crate::bindings::maplike::MaplikeDeclaration for Implementation {{
+        fn check_value(vm: &Vm, value: Value) -> ThrowCompletionOr<()> {{
+            {conversion}?;
+            Ok(())
+        }}
+    }}
+"""
+        )
+
+
+def write_rust_collection_properties(out: TextIO, members: RustMembers, defined_property_names: list[str]) -> None:
+    """Defines the properties of a setlike or maplike declaration on the interface prototype object."""
+
+    def define_writable_operations(module: str, prefix: str, operations: list[str], lengths: dict[str, int]) -> None:
+        for name in operations:
+            out.write(
+                f'        define_operation(vm, realm, prototype, "{name}", '
+                f"raw_native!(crate::bindings::{module}::{prefix}_{name}::<Implementation>), {lengths[name]});\n"
+            )
+        defined_property_names.extend(operations)
+
+    if members.setlike is not None:
+        out.write(
+            """        crate::bindings::setlike::define_setlike_properties(
+            vm,
+            realm,
+            prototype,
+            raw_native!(crate::bindings::setlike::set_size::<Implementation>),
+            raw_native!(crate::bindings::setlike::set_iterator_entries::<Implementation>),
+            raw_native!(crate::bindings::setlike::set_for_each::<Implementation>),
+            raw_native!(crate::bindings::setlike::set_has::<Implementation>),
+            raw_native!(crate::bindings::setlike::set_iterator_values::<Implementation>),
+        );
+"""
+        )
+        defined_property_names.extend(members.setlike.function_names)
+        define_writable_operations(
+            "setlike", "set", members.setlike.writable_operations, {"add": 1, "delete": 1, "clear": 0}
+        )
+    if members.maplike is not None:
+        out.write(
+            """        crate::bindings::maplike::define_maplike_properties(
+            vm,
+            realm,
+            prototype,
+            raw_native!(crate::bindings::maplike::map_size::<Implementation>),
+            raw_native!(crate::bindings::maplike::map_iterator_entries::<Implementation>),
+            raw_native!(crate::bindings::maplike::map_iterator_keys::<Implementation>),
+            raw_native!(crate::bindings::maplike::map_iterator_values::<Implementation>),
+            raw_native!(crate::bindings::maplike::map_for_each::<Implementation>),
+            raw_native!(crate::bindings::maplike::map_get::<Implementation>),
+            raw_native!(crate::bindings::maplike::map_has::<Implementation>),
+        );
+"""
+        )
+        defined_property_names.extend(members.maplike.function_names)
+        define_writable_operations(
+            "maplike", "map", members.maplike.writable_operations, {"set": 2, "delete": 1, "clear": 0}
+        )
 
 
 def write_rust_pair_iterator(out: TextIO, interface: Interface) -> None:
@@ -784,13 +980,13 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
     use ak::Utf16String;
     use libjs_rust::api::{
         ArrayBuffer, DataView, EmbedderClass, ErrorKind, ErrorType, FunctionObject, Gc, JSHostClass, MarkedVec,
-        Object, PropertyKey, RawNativeFunctionResult, ThrowCompletionOr, TypedArrayBase, TypedArrayKind, Value, Vm,
+        Object, PropertyKey, RawNativeFunctionResult, ShouldThrowExceptions, ThrowCompletionOr, TypedArrayBase, TypedArrayKind, Value, Vm,
         is_host_instance_of, raw_native,
     };
 
     use crate::bindings::conversions::{
         ArrayBufferView, BufferSource, BufferSourceRules, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
-        implements_cpp_interface, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js,
+        frozen_array_to_js, implements_cpp_interface, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js,
         sequence_from_js, sequence_to_js, to_array_buffer_view, to_boolean, to_buffer_source, to_cpp_interface,
         to_cpp_interface_in_union, to_dom_string,
         to_dom_string_treating_null_as_empty, to_double, to_float, to_long, to_long_enforcing_range, to_long_long,
@@ -803,7 +999,7 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
         define_attribute, define_cached_attribute, define_constants, define_indexed_properties_iterator,
         define_interface_object_properties, define_operation, define_to_string_tag, define_unimplemented_property,
         define_value_iterator_properties, entry_point_arguments, implementation_if, implementation_of,
-        prototype_from_new_target, realm_is_window, rejected_promise, set_dictionary_member,
+        prototype_from_new_target, realm_is_secure_context, realm_is_window, rejected_promise, set_dictionary_member,
         set_interface_prototype_object_prototype, this_object, to_interface,
     };
     use crate::bindings::async_iterable::{
@@ -814,11 +1010,11 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
         DefaultIterator, DefaultIteratorClasses, define_pair_iterator_properties, entries, for_each, iterator_next, keys,
         values,
     };
-    use crate::bindings::callback::{CallbackFunction, PromiseCallbackFunction};
+    use crate::bindings::callback::{CallbackFunction, CallbackInterface, PromiseCallbackFunction};
     use crate::bindings::event_target::{event_handler_attribute, set_event_handler_attribute};
     use crate::bindings::promise::WebIdlPromise;
     use crate::bindings::structured_data;
-    use crate::bindings::{CallContext, WebIdlResult};
+    use crate::bindings::{CallContext, WebIdlResult, with_custom_element_reactions};
 """
 
 
@@ -874,6 +1070,14 @@ def write_rust_interface(
         inherited_interface_name = f"Some(super::{rust_module_name(parent)}::INTERFACE_NAME)"
     else:
         inherited_interface_name = f"Some({cpp_interface_name_constant(parent)})"
+    cpp_ancestor = parent
+    while cpp_ancestor is not None and is_implemented_in_rust(cpp_ancestor):
+        cpp_ancestor = context.interfaces.get(cpp_ancestor.parent_name)
+    unforgeable_attributes_interface = (
+        f"Some({cpp_interface_name_constant(cpp_ancestor)})"
+        if cpp_ancestor is not None and has_unforgeable_attributes(cpp_ancestor)
+        else "None"
+    )
     method_documentation = "".join(
         f"/// - `{signature}`\n" for signature in implementation_method_signatures(context, interface, members)
     )
@@ -898,6 +1102,7 @@ def write_rust_interface(
         const CELL_CLASS: &'static EmbedderClass<Wrapped<Self>> = &CELL_CLASS;
         const INTERFACE_NAME: u16 = INTERFACE_NAME;
         const NAME: &'static str = "{interface.namespaced_name}";
+        const UNFORGEABLE_ATTRIBUTES_INTERFACE: Option<u16> = {unforgeable_attributes_interface};
 
         fn wrapper_class() -> &'static JSHostClass {{
             // SAFETY: LibWeb defines the class of the wrappers as constant data.
@@ -957,6 +1162,11 @@ def write_rust_interface(
         )
         if attribute.setter_method is not None:
             write_rust_attribute_setter(out, context, interface, attribute)
+        elif attribute.put_forwards is not None:
+            write_rust_put_forwards_setter(out, attribute)
+
+    if interface.name == "CSSStyleProperties":
+        write_css_property_accessors(out)
 
     for operation_set in members.operation_sets:
         if len(operation_set.overloads) == 1 and operation_set.overloads[0].is_default_to_json:
@@ -969,12 +1179,18 @@ def write_rust_interface(
 
     if members.indexed_property_getter is not None:
         getter = members.indexed_property_getter.operation
-        getter_set = RustOperationSet(getter.operation.name, [getter])
-        write_rust_operation(out, context, interface, getter_set.name, getter_set.function, getter)
-        write_rust_item_value(out, context, interface, getter)
+        if getter.operation.name:
+            getter_set = RustOperationSet(getter.operation.name, [getter])
+            write_rust_operation(out, context, interface, getter_set.name, getter_set.function, getter)
+        write_rust_item_value(out, context, interface, members.indexed_property_getter)
+
+    if members.indexed_property_setter is not None:
+        write_rust_indexed_property_setter(out, context, interface, members.indexed_property_setter)
 
     if members.pair_iterator is not None:
         write_rust_pair_iterator(out, interface)
+
+    write_rust_collection_declaration(out, context, interface, members)
 
     if members.async_iterator is not None:
         write_rust_async_iterator(out, context, interface)
@@ -1009,13 +1225,21 @@ def write_rust_interface(
             continue
         name = attribute.attribute.name
         getter = f"raw_native!({attribute.getter_function})"
+        is_secure_context_only = "SecureContext" in attribute.attribute.extended_attributes
         if attribute.is_cached:
-            out.write(f'        define_cached_attribute(vm, realm, prototype, "{name}", {getter});\n')
+            definition = f'define_cached_attribute(vm, realm, prototype, "{name}", {getter});'
+            out.write(secure_context_only_definition(definition, is_secure_context_only))
             defined_property_names.append(name)
             continue
-        setter = "None" if attribute.attribute.readonly else f"raw_native!({attribute.setter_function})"
-        out.write(f'        define_attribute(vm, realm, prototype, "{name}", {getter}, {setter});\n')
+        has_setter = not attribute.attribute.readonly or attribute.put_forwards is not None
+        setter = f"raw_native!({attribute.setter_function})" if has_setter else "None"
+        definition = f'define_attribute(vm, realm, prototype, "{name}", {getter}, {setter});'
+        out.write(secure_context_only_definition(definition, is_secure_context_only))
         defined_property_names.append(name)
+    if interface.name == "CSSStyleProperties":
+        out.write(
+            "        Implementation::define_property_accessors(vm, realm, prototype, property_getter, property_setter);\n"
+        )
     for operation_set in members.operation_sets:
         name = operation_set.name
         function = operation_set.function
@@ -1033,12 +1257,13 @@ def write_rust_interface(
         defined_property_names.append("toString")
     if members.indexed_property_getter is not None:
         getter = members.indexed_property_getter.operation
-        getter_set = RustOperationSet(getter.operation.name, [getter])
-        out.write(
-            f'        define_operation(vm, realm, prototype, "{getter_set.name}", raw_native!({getter_set.function}), '
-            f"{getter_set.length});\n"
-        )
-        defined_property_names.append(getter_set.name)
+        if getter.operation.name:
+            getter_set = RustOperationSet(getter.operation.name, [getter])
+            out.write(
+                f'        define_operation(vm, realm, prototype, "{getter_set.name}", raw_native!({getter_set.function}), '
+                f"{getter_set.length});\n"
+            )
+            defined_property_names.append(getter_set.name)
         out.write("        define_indexed_properties_iterator(vm, realm, prototype);\n")
         if members.indexed_property_getter.has_value_iterator:
             out.write("        define_value_iterator_properties(vm, realm, prototype);\n")
@@ -1056,6 +1281,7 @@ def write_rust_interface(
 """
         )
         defined_property_names.extend(members.pair_iterator.function_names)
+    write_rust_collection_properties(out, members, defined_property_names)
     if members.async_iterator is not None:
         out.write(
             f"""        define_async_iterator_properties(
@@ -1243,6 +1469,17 @@ def write_rust_namespace(out: TextIO, context: GenerationContext, interface: Int
     out.write("    }\n}\n")
 
 
+def secure_context_only_definition(definition: str, is_secure_context_only: bool) -> str:
+    """A statement of the steps that initialize an interface prototype object, which defines a [SecureContext] member
+    only if the realm is a secure context."""
+    if not is_secure_context_only:
+        return f"        {definition}\n"
+    return f"""        if realm_is_secure_context(realm) {{
+            {definition}
+        }}
+"""
+
+
 def window_only_definition(definition: str, is_window_only: bool) -> str:
     """A statement of the steps that initialize an interface object or an interface prototype object, which defines a
     member that only a Window has only if the global object of the realm is a Window."""
@@ -1294,22 +1531,59 @@ def write_default_to_json(out: TextIO, context: GenerationContext, interface: In
     )
 
 
+def cpp_ancestor_with_indexed_properties(interface: Interface, context: GenerationContext) -> Optional[Interface]:
+    """The nearest ancestor implemented in C++ that declares an indexed property getter."""
+    ancestor = cpp_ancestor(interface, context)
+    while ancestor is not None:
+        if ancestor.indexed_property_getter is not None:
+            return ancestor
+        ancestor = context.interfaces.get(ancestor.parent_name)
+    return None
+
+
+def rust_interface_with_indexed_properties(interface: Interface, context: GenerationContext) -> Optional[Interface]:
+    """The interface implemented in Rust that defines the indexed properties of the interface: itself or the closest
+    ancestor implemented in Rust that has them, if any."""
+    candidate: Optional[Interface] = interface
+    while candidate is not None and is_implemented_in_rust(candidate):
+        if rust_members(candidate).indexed_property_getter is not None:
+            return candidate
+        candidate = context.interfaces.get(candidate.parent_name)
+    return None
+
+
 def item_value_entry_point(interface: Interface) -> str:
     return rust_entry_point_name(interface, "item_value")
 
 
-def write_rust_item_value(out: TextIO, context: GenerationContext, interface: Interface, getter: RustOperation) -> None:
+def write_rust_item_value(
+    out: TextIO, context: GenerationContext, interface: Interface, indexed_property_getter: RustIndexedPropertyGetter
+) -> None:
     """The entry point through which the internal methods of a legacy platform object that LibWeb's C++ defines read
     an indexed property of a wrapper of the interface, which has a value if the index is a supported property index,
     https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty"""
+    getter = indexed_property_getter.operation
     return_type = getter.operation.return_type
-    if not return_type.nullable:
-        raise UnsupportedByRustBindings(
-            f"{interface.path}: the indexed property getter of {interface.name} does not return a nullable type, by "
-            "which the Rust bindings tell the indices that are not supported property indices"
-        )
+    implementation = "implementation_of::<Implementation>(wrapper)"
+    if inheriting_interfaces(interface, context):
+        implementation = "receiver_of(wrapper)"
     what = f"the indexed property getter of {interface.name}"
     conversion = rust_to_js_value(return_type.without_nullable(), "value", "&cx", context, what)
+    if return_type.nullable:
+        value_steps = f"""let Ok(Some(value)) = Implementation::{getter.method}(&implementation, &mut cx, index) else {{
+            return false;
+        }};"""
+    else:
+        # NB: A getter that does not return a nullable type has no value for an index that is not a supported one.
+        value_steps = f"""let Ok(length) = Implementation::{indexed_property_getter.length_method}(&implementation, &mut cx) else {{
+            return false;
+        }};
+        if index >= length {{
+            return false;
+        }}
+        let Ok(value) = Implementation::{getter.method}(&implementation, &mut cx, index) else {{
+            return false;
+        }};"""
     out.write(
         f"""
     /// The value of the indexed property of the wrapper, which LibWeb's C++ asks for, if the index is a supported
@@ -1331,16 +1605,76 @@ def write_rust_item_value(out: TextIO, context: GenerationContext, interface: In
         let Ok(index) = u32::try_from(index) else {{
             return false;
         }};
-        let implementation = implementation_of::<Implementation>(wrapper);
+        let implementation = {implementation};
         let mut cx = CallContext::new(vm, realm);
-        let Ok(Some(value)) = Implementation::{getter.method}(&implementation, &mut cx, index) else {{
-            return false;
-        }};
+        {value_steps}
         let value = {conversion}.expect("converting an object to a JS value does not throw");
         *out_value = value.to_raw();
         true
     }}
 """
+    )
+
+
+def indexed_property_setter_entry_points(interface: Interface) -> List[str]:
+    return [
+        rust_entry_point_name(interface, "set_value_of_new_indexed_property"),
+        rust_entry_point_name(interface, "set_value_of_existing_indexed_property"),
+    ]
+
+
+def write_rust_indexed_property_setter(
+    out: TextIO, context: GenerationContext, interface: Interface, setter: RustIndexedPropertySetter
+) -> None:
+    """The entry points through which the internal methods of a legacy platform object that LibWeb's C++ defines run the
+    steps of the indexed property setter, https://webidl.spec.whatwg.org/#invoke-indexed-setter"""
+    parameter = setter.value_parameter
+    what = f"the indexed property setter of {interface.name}"
+    conversion = rust_to_idl_value(
+        parameter.type,
+        parameter.extended_attributes,
+        "value",
+        parameter.name,
+        context,
+        what,
+        keeps_cells_alive=True,
+    )
+    out.writelines(
+        f"""
+    /// The steps of the indexed property setter, which LibWeb's C++ runs on the wrapper.
+    ///
+    /// # Safety
+    ///
+    /// The pointers must be the VM, a live realm and a live wrapper of the interface.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn {entry_point}(
+        vm: *mut c_void,
+        realm: *mut c_void,
+        wrapper: *mut c_void,
+        index: u32,
+        value: u64,
+    ) -> RawNativeFunctionResult {{
+        // SAFETY: The caller passes live pointers.
+        let (vm, realm, wrapper) = unsafe {{ entry_point_arguments(vm, realm, wrapper) }};
+        // SAFETY: The caller passes the raw bits of a value.
+        let value = unsafe {{ Value::from_raw(value) }};
+        let steps = || -> ThrowCompletionOr<Value> {{
+            let implementation = implementation_of::<Implementation>(wrapper);
+            let mut cx = CallContext::new(vm, realm);
+            let type_error_realm_scope = vm.type_error_realm_scope(cx.realm());
+            let value = {conversion}?;
+            drop(type_error_realm_scope);
+            Implementation::{method}(&implementation, &mut cx, index, value)
+                .map_err(|exception| exception.throw(&cx))?;
+            Ok(Value::UNDEFINED)
+        }};
+        RawNativeFunctionResult::from_completion(steps())
+    }}
+"""
+        for method, entry_point in zip(
+            ("set_value_of_new_indexed_property", "set_value_of_existing_indexed_property"),
+            indexed_property_setter_entry_points(interface),
+        )
     )
 
 
@@ -1525,7 +1859,7 @@ def write_this_implementation(out: TextIO, context: GenerationContext, interface
                 }}
 """
     choices = f"""        if let Some(object) = implementation_if::<Implementation>(object) {{
-            return Ok((Receiver::{interface.name}(object), cx));
+            return Receiver::{interface.name}(object);
         }}
 """
     for other in inheriting:
@@ -1548,7 +1882,7 @@ def write_this_implementation(out: TextIO, context: GenerationContext, interface
 {steps}                }}
 """
         choices += f"""        if let Some(object) = implementation_if::<{path}>(object) {{
-            return Ok((Receiver::{other.name}(object), cx));
+            return Receiver::{other.name}(object);
         }}
 """
     out.write(
@@ -1567,11 +1901,15 @@ def write_this_implementation(out: TextIO, context: GenerationContext, interface
         }}
     }}
 
+    /// The object that a wrapper of the interface wraps.
+    fn receiver_of(object: Gc<Object>) -> Receiver {{
+{choices}        unreachable!("a wrapper of the interface wraps an object of it or of an interface that inherits from it")
+    }}
+
     /// The object that an attribute or an operation runs on, and the context it runs in.
     fn this_implementation(vm: &Vm) -> ThrowCompletionOr<(Receiver, CallContext<'_>)> {{
         let (object, realm) = this_object(vm, Implementation::wrapper_class(), Implementation::NAME)?;
-        let cx = CallContext::new(vm, realm);
-{choices}        unreachable!("a wrapper of the interface wraps an object of it or of an interface that inherits from it")
+        Ok((receiver_of(object), CallContext::new(vm, realm)))
     }}
 """
     )
@@ -1636,6 +1974,39 @@ def inherited_attribute_getter_call(context: GenerationContext, interface: Inter
     )
 
 
+def write_css_property_accessors(out: TextIO) -> None:
+    """The getter and the setter of the accessors of CSSStyleProperties, one for each CSS property, which behave as a
+    [CEReactions, LegacyNullToEmptyString] attribute of type CSSOMString does:
+    https://drafts.csswg.org/cssom/#dom-cssstyleproperties-camel_cased_attribute"""
+    out.write(
+        """
+    fn property_getter(vm: &Vm, property: &crate::css::css_style_properties::CSSPropertyAccessor) -> ThrowCompletionOr<Value> {
+        let (implementation, mut cx) = this_implementation(vm)?;
+        let result = Implementation::property_value(&implementation, &mut cx, property)
+            .map_err(|exception| exception.throw(&cx))?;
+        result.to_js(&cx)
+    }
+
+    fn property_setter(vm: &Vm, property: &crate::css::css_style_properties::CSSPropertyAccessor) -> ThrowCompletionOr<Value> {
+        let value = vm.argument(0);
+        let (implementation, mut cx) = this_implementation(vm)?;
+        let type_error_realm_scope = vm.type_error_realm_scope(cx.realm());
+        let idl_value = to_dom_string_treating_null_as_empty(vm, value)?;
+        drop(type_error_realm_scope);
+        with_custom_element_reactions(|| Implementation::set_property_value(&implementation, &mut cx, property, idl_value))
+            .map_err(|exception| exception.throw(&cx))?;
+        Ok(Value::UNDEFINED)
+    }
+"""
+    )
+
+
+def with_ce_reactions(call: str) -> str:
+    """The call of the steps of a [CEReactions] construct, whose exception the caller rethrows after the reactions ran:
+    https://html.spec.whatwg.org/multipage/custom-elements.html#cereactions"""
+    return f"with_custom_element_reactions(|| {call})"
+
+
 def write_rust_attribute_setter(
     out: TextIO, context: GenerationContext, interface: Interface, attribute: RustAttribute
 ) -> None:
@@ -1660,6 +2031,9 @@ def write_rust_attribute_setter(
     if "NeedsCallerRealm" in attribute.attribute.extended_attributes:
         receiver = "(implementation, _)"
         caller_realm_context = CALLER_REALM_CONTEXT
+    call = f"Implementation::{attribute.setter_method}(&implementation, &mut cx, idl_value)"
+    if "CEReactions" in attribute.attribute.extended_attributes:
+        call = with_ce_reactions(call)
     out.write(
         f"""
     fn {attribute.setter_function}(vm: &Vm) -> ThrowCompletionOr<Value> {{
@@ -1668,8 +2042,32 @@ def write_rust_attribute_setter(
 {caller_realm_context}        let type_error_realm_scope = vm.type_error_realm_scope(cx.realm());
         {conversion}
         drop(type_error_realm_scope);
-        Implementation::{attribute.setter_method}(&implementation, &mut cx, idl_value)
+        {call}
             .map_err(|exception| exception.throw(&cx))?;
+        Ok(Value::UNDEFINED)
+    }}
+"""
+    )
+
+
+def write_rust_put_forwards_setter(out: TextIO, attribute: RustAttribute) -> None:
+    """The native function of the setter of a [PutForwards] attribute, which sets the attribute that it names on the
+    value of the attribute: https://webidl.spec.whatwg.org/#dfn-attribute-setter"""
+    out.write(
+        f"""
+    fn {attribute.setter_function}(vm: &Vm) -> ThrowCompletionOr<Value> {{
+        let value = vm.argument(0);
+        let (object, _) = this_object(vm, Implementation::wrapper_class(), Implementation::NAME)?;
+        let receiver = object.get(vm, &PropertyKey::from_utf8("{attribute.attribute.name}"))?;
+        if !receiver.is_object() {{
+            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&"{attribute.attribute.name}"]);
+        }}
+        receiver.as_object().set(
+            vm,
+            &PropertyKey::from_utf8("{attribute.put_forwards}"),
+            value,
+            ShouldThrowExceptions::No,
+        )?;
         Ok(Value::UNDEFINED)
     }}
 """
@@ -1696,6 +2094,10 @@ def write_rust_operation(
     arguments = "".join(f", {rust_local_name(parameter.name)}" for parameter in operation.parameters)
     returns_promise = is_promise_type(operation.return_type) and not operation.return_type.nullable
     call = f"Implementation::{overload.method}(&implementation, &mut cx{arguments})"
+    if "CEReactions" in operation.extended_attributes:
+        if returns_promise:
+            raise UnsupportedByRustBindings(f"{what} returns a promise and is [CEReactions]")
+        call = with_ce_reactions(call)
     if operation.return_type.name == "undefined" and not operation.return_type.nullable:
         # NB: An operation that returns nothing has no result to name, and the conversion of nothing is undefined.
         steps.write(
@@ -1805,11 +2207,11 @@ pub(crate) mod definitions {
     };
 
     use crate::bindings::CallContext;
-    use crate::bindings::callback::{CallbackFunction, PromiseCallbackFunction};
+    use crate::bindings::callback::{CallbackFunction, CallbackInterface, PromiseCallbackFunction};
     use crate::bindings::conversions::{
         ArrayBufferView, BufferSource, BufferSourceRules, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
         buffer_source_if, dictionary_member, dictionary_object, enumeration_value_to_js, implements_cpp_interface,
-        iterator_method, record_from_js, record_to_js, rooted_sequence_to_js, sequence_from_iterable, sequence_from_js,
+        frozen_array_to_js, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js, sequence_from_iterable, sequence_from_js,
         sequence_to_js, throw_no_union_types_matched, to_array_buffer_view, to_boolean, to_buffer_source,
         to_cpp_interface,
         to_dom_string, to_dom_string_treating_null_as_empty, to_double, to_enumeration_value, to_float, to_long,

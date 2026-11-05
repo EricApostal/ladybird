@@ -31,9 +31,9 @@ use libjs_rust::api::{
 use crate::bindings::CallContext;
 use crate::bindings::realm_data::wrapper_world_of;
 use crate::bindings::services::{
-    web_bindings_ensure_web_constructor, web_bindings_ensure_web_prototype, web_bindings_realm_is_window,
-    web_bindings_rejected_promise, web_bindings_rust_wrapper_for, web_bindings_set_rust_wrapper,
-    web_bindings_with_temporary_execution_context,
+    web_bindings_define_unforgeable_attributes, web_bindings_ensure_web_constructor, web_bindings_ensure_web_prototype,
+    web_bindings_realm_is_secure_context, web_bindings_realm_is_window, web_bindings_rejected_promise,
+    web_bindings_rust_wrapper_for, web_bindings_set_rust_wrapper, web_bindings_with_temporary_execution_context,
 };
 
 /// What an implementation can tell the bindings about its objects, as a C++ implementation object does by overriding
@@ -114,6 +114,9 @@ pub(crate) trait Interface: Wrappable + Trace + Sized + 'static {
     const INTERFACE_NAME: u16;
     /// The name that errors call the interface.
     const NAME: &'static str;
+    /// The interface implemented in C++ that the interface inherits from, if it has unforgeable attributes, which are
+    /// properties of each wrapper.
+    const UNFORGEABLE_ATTRIBUTES_INTERFACE: Option<u16> = None;
 
     /// The class of the wrappers of the objects of the interface.
     fn wrapper_class() -> &'static JSHostClass;
@@ -249,6 +252,12 @@ pub(crate) fn to_interface<T: Interface>(vm: &Vm, value: Value) -> ThrowCompleti
     vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&T::NAME])
 }
 
+/// The `this` value of an operation of a setlike or maplike, its implementation, and the context of its realm.
+pub(crate) fn this_implementation<T: Interface>(vm: &Vm) -> ThrowCompletionOr<(Gc<Object>, Ref<T>, CallContext<'_>)> {
+    let (wrapper, realm) = this_object(vm, T::wrapper_class(), T::NAME)?;
+    Ok((wrapper, implementation_of(wrapper), CallContext::new(vm, realm)))
+}
+
 /// The wrapper of the object in the wrapper world of the realm of the call context, which the first call for that
 /// world creates, as Web::Bindings::wrap() does for a C++ implementation object.
 pub(crate) fn wrap<T: Interface>(cx: &CallContext, object: Ref<T>) -> Gc<Object> {
@@ -328,7 +337,7 @@ fn register_wrapper_outside_main_world<T: Interface>(realm: Gc<Realm>, object: R
 fn create_wrapper<T: Interface>(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>, object: Ref<T>) -> Gc<HostObject> {
     // SAFETY: The wrapper class's hooks expect a wrappable exactly for an interface that inherits from an interface
     //         implemented in C++, whose objects own one, and the wrappable and the host data are live cells.
-    unsafe {
+    let wrapper = unsafe {
         HostObject::create(
             vm,
             realm,
@@ -337,7 +346,14 @@ fn create_wrapper<T: Interface>(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>
             object.cpp_parent(),
             Some(object.as_non_null().cast()),
         )
+    };
+    if let Some(interface_name) = T::UNFORGEABLE_ATTRIBUTES_INTERFACE {
+        // SAFETY: The realm and the wrapper are live, and the interface is one the wrapper's interface inherits from.
+        unsafe {
+            web_bindings_define_unforgeable_attributes(realm.as_ptr().cast(), wrapper.as_ptr().cast(), interface_name);
+        }
     }
+    wrapper
 }
 
 /// The cell of an object of the interface, as LibWeb's C++ code holds it: a pointer to a class that derives from
@@ -374,6 +390,12 @@ pub(crate) unsafe fn cell_if_abi<T: Interface>(cell: *mut c_void) -> Option<Ref<
 pub(crate) fn realm_is_window(realm: Gc<Realm>) -> bool {
     // SAFETY: The realm is live.
     unsafe { web_bindings_realm_is_window(realm.as_ptr().cast()) }
+}
+
+/// Whether the realm is a secure context, which the [SecureContext] members are defined for.
+pub(crate) fn realm_is_secure_context(realm: Gc<Realm>) -> bool {
+    // SAFETY: The realm is live.
+    unsafe { web_bindings_realm_is_secure_context(realm.as_ptr().cast()) }
 }
 
 /// Runs the steps while an execution context of the realm is on the stack, for steps that can run script but that do not

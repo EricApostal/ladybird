@@ -256,66 +256,26 @@ class ContentStyleValue;
 class CounterDefinitionsStyleValue;
 class CounterStyleStyleValue;
 class CSSAnimation;
-class CSSConditionRule;
-class CSSContainerRule;
-class CSSCounterStyleRule;
 class CSSDescriptors;
-class CSSFontFaceDescriptors;
 class CSSFontFaceRule;
-class CSSFontFeatureValuesMap;
 class CSSFontFeatureValuesRule;
-class CSSFunctionDescriptors;
 class CSSFunctionRule;
 class CSSGroupingRule;
-class CSSImageValue;
 class CSSImportRule;
-class CSSKeyframeRule;
 class CSSKeyframesRule;
 class CSSKeywordValue;
-class CSSLayerBlockRule;
-class CSSLayerStatementRule;
-class CSSMarginRule;
-class CSSMathClamp;
-class CSSMathInvert;
-class CSSMathMax;
-class CSSMathMin;
-class CSSMathNegate;
-class CSSMathProduct;
-class CSSMathSum;
-class CSSMathValue;
-class CSSMatrixComponent;
-class CSSMediaRule;
-class CSSNamespaceRule;
 class CSSNestedDeclarations;
-class CSSNumericArray;
 class CSSNumericValue;
-class CSSPageRule;
-class CSSPageDescriptors;
-class CSSPerspective;
 class CSSPositionTryDescriptors;
-class CSSPositionTryRule;
-class CSSPropertyRule;
-class CSSRotate;
 class CSSRule;
 class CSSRuleList;
-class CSSScale;
-class CSSScopeRule;
-class CSSSkew;
-class CSSSkewX;
-class CSSSkewY;
 class CSSStyleDeclaration;
 class CSSStyleProperties;
 class CSSStyleRule;
 class CSSStyleSheet;
 class StyleSheetState;
 class CSSStyleValue;
-class CSSSupportsRule;
-class CSSTransformComponent;
-class CSSTransformValue;
-class CSSTranslate;
 class CSSUnitValue;
-class CSSUnparsedValue;
-class CSSVariableReferenceValue;
 class CursorStyleValue;
 class CustomIdentStyleValue;
 class DimensionStyleValue;
@@ -335,7 +295,6 @@ class Frequency;
 class FrequencyPercentage;
 class FrequencyStyleValue;
 class FunctionStyleValue;
-class Highlight;
 class HighlightRegistry;
 class HueRotateFilterStyleValue;
 class ImageSetStyleValue;
@@ -349,7 +308,6 @@ class LengthPercentageOrAuto;
 class LengthStyleValue;
 class MediaList;
 class MediaQueryList;
-class MediaQueryListEvent;
 class Number;
 class NumberStyleValue;
 class NumericType;
@@ -363,7 +321,6 @@ class RatioStyleValue;
 class Resolution;
 class ResolutionStyleValue;
 class Screen;
-class ScreenOrientation;
 class Selector;
 class ShadowStyleValue;
 class ShorthandStyleValue;
@@ -372,7 +329,6 @@ class StyleComputer;
 class StylePropertyMap;
 class StylePropertyMapReadOnly;
 class StyleScope;
-class StyleSheet;
 class StyleSheetImport;
 class StyleSheetList;
 class StyleValue;
@@ -912,11 +868,9 @@ class IDBFactory;
 
 namespace Web::Internals {
 
-class FakeXRDevice;
 class Internals;
 class InternalGamepad;
 class WebUI;
-class XRTest;
 
 }
 
@@ -1069,13 +1023,6 @@ class PerformanceResourceTiming;
 namespace Web::Selection {
 
 class Selection;
-
-}
-
-namespace Web::Serial {
-
-class Serial;
-class SerialPort;
 
 }
 
@@ -1314,17 +1261,6 @@ namespace Web::WebVTT {
 
 class VTTCue;
 class VTTRegion;
-
-}
-
-namespace Web::WebXR {
-
-class XRLayer;
-class XRRenderState;
-class XRSession;
-class XRSessionEvent;
-class XRSystem;
-class XRWebGLLayer;
 
 }
 

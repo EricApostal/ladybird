@@ -28,7 +28,7 @@ use crate::css::serialize::{
 
 pub(crate) use crate::css::css_string::{CssString, CssStringList};
 
-enum ReifiedUnresolvedSegment {
+pub enum ReifiedUnresolvedSegment {
     Text(Vec<u16>),
     Variable {
         name: Vec<u16>,
@@ -138,31 +138,6 @@ fn reify_unresolved_segments(values: &[ComponentValue]) -> Vec<ReifiedUnresolved
     output
 }
 
-fn visit_reified_unresolved_segments(
-    segments: &[ReifiedUnresolvedSegment],
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, u8, *const u16, usize, bool),
-) {
-    for segment in segments {
-        match segment {
-            ReifiedUnresolvedSegment::Text(text) => unsafe {
-                visit(context, 0, text.as_ptr(), text.len(), false);
-            },
-            ReifiedUnresolvedSegment::Variable { name, fallback } => {
-                unsafe {
-                    visit(context, 1, name.as_ptr(), name.len(), fallback.is_some());
-                }
-                if let Some(fallback) = fallback {
-                    visit_reified_unresolved_segments(fallback, context, visit);
-                }
-                unsafe {
-                    visit(context, 2, std::ptr::null(), 0, false);
-                }
-            }
-        }
-    }
-}
-
 // Appends the name of every custom property a `var()` or `inherit()` in `values` refers to, and returns whether every
 // reference names its property with a plain identifier.
 fn scan_custom_property_references<'a>(
@@ -208,23 +183,12 @@ pub(crate) fn custom_property_references(value: &StyleValueData) -> Option<(impl
     Some((unresolved_payload.references(), unresolved_payload.references_visible()))
 }
 
-/// Visits the Typed OM reification of an unresolved style value. Event 0 appends a text segment,
-/// event 1 begins a variable reference, and event 2 ends its optional fallback.
-///
-/// # Safety
-/// `value` must point at live unresolved style value data, and `visit` must remain callable for
-/// the duration of this function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_unresolved_style_value_visit_reification(
-    value: *const c_void,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, u8, *const u16, usize, bool),
-) {
-    let StyleValueData::Unresolved(unresolved_payload) = (unsafe { &*value.cast::<StyleValueData>() }) else {
+/// The text and the variable references of an unresolved value, for a CSSUnparsedValue.
+pub(crate) fn reified_unresolved_segments(value: &StyleValueData) -> Vec<ReifiedUnresolvedSegment> {
+    let StyleValueData::Unresolved(unresolved_payload) = value else {
         unreachable!("reification requires an unresolved style value");
     };
-    let segments = reify_unresolved_segments(&unresolved_payload.components());
-    visit_reified_unresolved_segments(&segments, context, visit);
+    reify_unresolved_segments(&unresolved_payload.components())
 }
 
 #[cfg(test)]
@@ -1710,6 +1674,10 @@ pub struct RetainedNumericRangeByType {
 }
 
 impl RetainedNumericRangeByType {
+    pub(crate) fn new(value_type: u8, min: f64, max: f64) -> Self {
+        Self { value_type, min, max }
+    }
+
     pub(crate) fn value_type(&self) -> u8 {
         self.value_type
     }
@@ -4229,31 +4197,8 @@ pub extern "C" fn rust_style_value_create_ratio(
     ))))
 }
 
-/// Takes ownership of one strong reference to the number, percentage or calculated value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_opacity_value(value: *const StyleValueData) -> *const StyleValueData {
-    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::OpacityValue {
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the length-percentage value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_text_indent(
-    length_percentage: *const StyleValueData,
-    hanging: bool,
-    each_line: bool,
-) -> *const StyleValueData {
-    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::TextIndent {
-        length_percentage: unsafe { RetainedStyleValueData::from_retained_pointer(length_percentage) },
-        hanging,
-        each_line,
-    }))
-}
-
 /// Takes ownership of one strong reference to each track size.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_grid_track_size_list(
+pub(crate) unsafe fn style_value_create_grid_track_size_list(
     track_sizes: *const *const StyleValueData,
     length: usize,
 ) -> *const StyleValueData {
@@ -4274,8 +4219,7 @@ pub unsafe extern "C" fn rust_style_value_create_grid_track_size_list(
 
 /// The track size of a grid track size list that holds just one track size, without line names, or null. The
 /// returned value is borrowed from `data`.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_grid_track_size_list_single_size(data: &StyleValueData) -> *const StyleValueData {
+pub(crate) fn style_value_grid_track_size_list_single_size(data: &StyleValueData) -> *const StyleValueData {
     let StyleValueData::GridTrackSizeList(grid_track_size_list) = data else {
         return std::ptr::null();
     };

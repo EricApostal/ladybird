@@ -171,6 +171,7 @@ impl LaneDelivery {
             Some(output) => TickPresented::Frame {
                 output,
                 hit_test_list_changed: true,
+                publishes: true,
             },
             None => TickPresented::Nothing,
         };
@@ -178,6 +179,7 @@ impl LaneDelivery {
             recorder,
             presentation,
             presented,
+            presented_hit_test_items: None,
         };
         let (ticks, frame) = (Arc::clone(&self.ticks), self.frame);
         super::super::post_to_render_side(move || {
