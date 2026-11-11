@@ -5,21 +5,13 @@ set(SOURCES
     DisplayList/Canvas2DCommandStream.cpp
     DisplayList/Canvas2DTape.cpp
     DisplayList/DisplayList.cpp
-    DisplayList/DisplayListDamage.cpp
     DisplayList/DisplayListResourceStorage.cpp
     DisplayList/DisplayListResourceTransaction.cpp
     DisplayList/RustFFIAssertions.cpp
     DisplayList/VisualContextTreeTestBuilder.cpp
     FontServiceClient.cpp
-    Scrolling/AsyncScrollTree.cpp
-    Scrolling/AsyncScrollingState.cpp
-    Scrolling/ElasticOverscroll.cpp
-    Scrolling/ScrollFling.cpp
-    Scrolling/ScrollSnapSelection.cpp
-    Scrolling/ScrollState.cpp
+    Scrolling/RecordedDisplayListScrolling.cpp
     Scrolling/SmoothScrollAnimation.cpp
-    Scrolling/WheelGestureIdentity.cpp
-    Types.cpp
     UIOverlays.cpp
     Video/VideoFrameHold.cpp
     Video/VideoFramePresentationPage.cpp
@@ -38,6 +30,8 @@ compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorWebContentClien
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorWebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorWebContentServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/RenderClockClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/RenderClockClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/RenderClockServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/RenderClockServerEndpoint.h)
+compile_ipc(DisplayList/DisplayListProperties.ipc DisplayList/DisplayListPropertiesCodecs.h)
+compile_ipc(Types.ipc TypesCodecs.h)
 compile_ipc(FontClient.ipc FontClientEndpoint.h)
 compile_ipc(FontServer.ipc FontServerEndpoint.h)
 
@@ -110,7 +104,7 @@ if(NOT BUILD_SHARED_LIBS)
 
     # POST_BUILD steps don't track inputs, so the bridge files depend on the Rust archive: when it
     # changes, LibCompositing re-archives and the merge picks up the fresh objects.
-    foreach(bridge IN ITEMS DisplayList/AccumulatedVisualContext.cpp DisplayList/DisplayList.cpp DisplayList/DisplayListDamage.cpp DisplayList/DisplayListResourceStorage.cpp DisplayList/VisualContextTreeTestBuilder.cpp)
+    foreach(bridge IN ITEMS DisplayList/AccumulatedVisualContext.cpp DisplayList/DisplayList.cpp DisplayList/DisplayListResourceStorage.cpp DisplayList/VisualContextTreeTestBuilder.cpp Scrolling/RecordedDisplayListScrolling.cpp Scrolling/SmoothScrollAnimation.cpp)
         set_property(SOURCE ${bridge} APPEND PROPERTY OBJECT_DEPENDS ${_libcompositing_rust_lib})
     endforeach()
 endif()

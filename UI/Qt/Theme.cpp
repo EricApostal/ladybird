@@ -443,15 +443,30 @@ static AccentColor const& system_accent_color()
     return *closest;
 }
 
+static Optional<QColor> s_desktop_accent;
+
+void set_desktop_accent(Optional<QColor> color)
+{
+    s_desktop_accent = move(color);
+}
+
+Optional<QColor> const& desktop_accent()
+{
+    return s_desktop_accent;
+}
+
 // The theme's accent clears 3:1 on the toolbar, darker on the light appearance and lighter on the dark one.
+static QColor accent(bool dark, QColor const& toolbar)
+{
+    if (auto const& base_color = s_color_theme.accent.has_value() ? s_color_theme.accent : s_desktop_accent; base_color.has_value())
+        return with_contrast(*base_color, toolbar, 3, dark ? Adjustment::Lighten : Adjustment::Darken);
+    auto const& accent = system_accent_color();
+    return dark ? accent.dark : accent.light;
+}
+
 QColor accent()
 {
-    if (s_color_theme.accent.has_value()) {
-        auto dark = is_dark();
-        return with_contrast(*s_color_theme.accent, chrome().toolbar, 3, dark ? Adjustment::Lighten : Adjustment::Darken);
-    }
-    auto const& accent = system_accent_color();
-    return is_dark() ? accent.dark : accent.light;
+    return accent(is_dark(), chrome().toolbar);
 }
 
 // On the dark appearance, the focus ring is a lighter tint of the accent, as the accent itself is too deep there.
@@ -479,17 +494,43 @@ QColor focus_ring()
     return color;
 }
 
-QColor selection()
+static TextSelectionColors text_selection(QPalette::ColorGroup group, bool dark, QColor const& toolbar, QColor const& text)
 {
-    auto color = accent();
-    color.setAlphaF(is_dark() ? 0.40f : 0.22f);
-    return color;
+    // NB: The system's colors suit only chrome of the system's own appearance, which a private window may not have. A
+    //     desktop accent is tinted like a theme's, as the desktop's own text fields show it.
+    if (!s_color_theme.accent.has_value() && !s_desktop_accent.has_value()) {
+        auto system_palette = QGuiApplication::palette();
+        auto system_is_dark = system_palette.color(QPalette::Window).lightness() < 128;
+        if (system_is_dark == dark)
+            return { system_palette.color(group, QPalette::Highlight), system_palette.color(group, QPalette::HighlightedText) };
+    }
+
+    if (group != QPalette::Active)
+        return { dark ? rgba(255, 255, 255, 0.14) : rgba(0, 0, 0, 0.10), text };
+
+    auto background = accent(dark, toolbar);
+    background.setAlphaF(dark ? 0.40f : 0.28f);
+    return { background, text };
 }
 
-// The theme's accent fills primary buttons and selected rows deep enough that white text on them clears 4.5:1.
-static QColor accent_fill()
+TextSelectionColors address_field_text_selection(QPalette const& palette, QPalette::ColorGroup group)
 {
-    return with_contrast(*s_color_theme.accent, Qt::white, 4.5f, Adjustment::Darken);
+    auto const& colors = chrome(palette);
+    return text_selection(group, is_dark(palette), colors.toolbar, colors.text);
+}
+
+TextSelectionColors panel_text_selection(QPalette::ColorGroup group, QColor const& text)
+{
+    return text_selection(group, is_dark(), chrome().toolbar, text);
+}
+
+// The accent fills primary buttons, selected rows and checked buttons deep enough that white text on them clears 4.5:1.
+QColor accent_fill()
+{
+    if (auto const& base_color = s_color_theme.accent.has_value() ? s_color_theme.accent : s_desktop_accent; base_color.has_value())
+        return with_contrast(*base_color, Qt::white, 4.5f, Adjustment::Darken);
+    auto const& accent = system_accent_color();
+    return with_contrast(is_dark() ? accent.dark : accent.light, Qt::white, 4.5f, Adjustment::Darken);
 }
 
 QColor primary()

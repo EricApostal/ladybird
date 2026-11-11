@@ -185,22 +185,27 @@ SiteSettingsPopover::SiteSettingsPopover(QWidget* parent, WebView::Settings& set
     autoplay_row->addWidget(autoplay_label, 1);
     m_autoplay_button = create_value_button(*m_site_page);
     QObject::connect(m_autoplay_button, &QPushButton::clicked, this, [this] {
-        // A site is either allowed to autoplay, or follows the default, which the menu names so that the choice it shows
-        // on the button is always one of those in the menu.
         auto const& autoplay = m_settings.autoplay_settings();
-        auto is_allowed_on_site = autoplay.site_filters.contains(m_host);
+        auto site_policy = autoplay.site_filters.get(m_origin);
         QMenu menu(this);
-        auto* allow = menu.addAction("Allow");
-        allow->setCheckable(true);
-        allow->setChecked(is_allowed_on_site);
+
+        for (auto policy : { Web::HTML::AutoplayPolicy::AllowAudioAndVideo, Web::HTML::AutoplayPolicy::BlockAudio, Web::HTML::AutoplayPolicy::BlockAudioAndVideo }) {
+            auto* action = menu.addAction(autoplay_policy_name(policy));
+            action->setData(static_cast<int>(policy));
+            action->setCheckable(true);
+            action->setChecked(site_policy == policy);
+        }
+
         auto* use_default = menu.addAction(qformatted("Default ({})", autoplay_policy_name(autoplay.policy)));
         use_default->setCheckable(true);
-        use_default->setChecked(!is_allowed_on_site);
+        use_default->setChecked(!site_policy.has_value());
+
         auto* chosen = menu.exec(m_autoplay_button->mapToGlobal(QPoint(0, m_autoplay_button->height())));
-        if (chosen == allow)
-            m_settings.add_autoplay_site_filter(m_host);
-        else if (chosen == use_default)
-            m_settings.remove_autoplay_site_filter(m_host);
+        if (chosen == use_default)
+            m_settings.remove_autoplay_site_filter(m_origin);
+        else if (chosen)
+            m_settings.add_autoplay_site_filter(m_origin, static_cast<Web::HTML::AutoplayPolicy>(chosen->data().toInt()));
+
         update_autoplay();
     });
     autoplay_row->addWidget(m_autoplay_button);
@@ -220,8 +225,8 @@ SiteSettingsPopover::SiteSettingsPopover(QWidget* parent, WebView::Settings& set
     m_force_dark_switch = new PopoverSwitch(m_site_page);
     m_force_dark_switch->setAccessibleName("Force dark mode on this site");
     QObject::connect(m_force_dark_switch, &QCheckBox::toggled, this, [this](bool enabled) {
-        if (!m_is_private && !m_force_dark_host.is_empty())
-            m_settings.set_force_dark_for_host(m_force_dark_host, enabled);
+        if (!m_is_private && !m_host.is_empty())
+            m_settings.set_force_dark_for_host(m_host, enabled);
     });
     force_dark_row->addWidget(m_force_dark_switch);
     layout->addLayout(force_dark_row);
@@ -275,9 +280,9 @@ SiteSettingsPopover::SiteSettingsPopover(QWidget* parent, WebView::Settings& set
     // What can be set for the site is reset to the defaults.
     m_reset_permissions_link = create_link(*m_site_page, "Reset permissions");
     QObject::connect(m_reset_permissions_link, &QPushButton::clicked, this, [this] {
-        m_settings.remove_autoplay_site_filter(m_host);
+        m_settings.remove_autoplay_site_filter(m_origin);
         if (!m_is_private)
-            m_settings.reset_force_dark_for_host(m_force_dark_host);
+            m_settings.reset_host_setting(WebView::HostSetting::ForceDark, m_host);
         update_autoplay();
         if (on_reset_permissions)
             on_reset_permissions();
@@ -355,14 +360,14 @@ SiteSettingsPopover::SiteSettingsPopover(QWidget* parent, WebView::Settings& set
 
 void SiteSettingsPopover::set_site(Site site)
 {
-    m_host = AK::move(site.host);
-    m_force_dark_host = AK::move(site.force_dark_host);
+    m_origin = site.origin.serialize();
+    m_host = AK::move(site.host_for_settings);
     m_is_private = site.is_private;
     content_settings_changed();
-    m_host_label->setText(qstring_from_ak_string(m_host));
+    m_host_label->setText(qstring_from_ak_string(site.origin.host().serialize()));
     // A secure connection is the norm, so only an insecure one is mentioned.
     m_security_label->setText("Connection is not secure");
-    m_security_label->setVisible(!site.is_secure);
+    m_security_label->setVisible(site.origin.scheme() != "https"sv);
 
     m_favicon->setPixmap(site.favicon.isNull() ? create_chrome_icon(ChromeIcon::Globe, Theme::panel().muted).pixmap(QSize(16, 16), devicePixelRatioF()) : site.favicon.pixmap(QSize(16, 16), devicePixelRatioF()));
 
@@ -502,15 +507,15 @@ void SiteSettingsPopover::fit_to_page()
 void SiteSettingsPopover::content_settings_changed()
 {
     QSignalBlocker blocker(m_force_dark_switch);
-    m_force_dark_switch->setChecked(m_settings.force_dark_for_host(m_force_dark_host));
-    m_force_dark_switch->setEnabled(!m_is_private && !m_force_dark_host.is_empty());
+    m_force_dark_switch->setChecked(m_settings.force_dark_for_host(m_host));
+    m_force_dark_switch->setEnabled(!m_is_private && !m_host.is_empty());
     update_reset_link();
 }
 
 void SiteSettingsPopover::update_autoplay()
 {
     auto const& autoplay = m_settings.autoplay_settings();
-    auto name = autoplay.site_filters.contains(m_host) ? QStringLiteral("Allow") : autoplay_policy_name(autoplay.policy);
+    auto name = autoplay_policy_name(autoplay.site_filters.get(m_origin).value_or(autoplay.policy));
     m_autoplay_button->setText(name);
     m_autoplay_button->setIcon(create_chrome_icon(ChromeIcon::ChevronDown, Theme::panel().muted));
     update_reset_link();
@@ -522,8 +527,8 @@ void SiteSettingsPopover::update_reset_link()
     if (!m_reset_permissions_link)
         return;
     auto const& autoplay = m_settings.autoplay_settings();
-    auto has_force_dark_choice = !m_is_private && m_settings.content_settings().force_dark_per_host.contains(m_force_dark_host);
-    m_reset_permissions_link->setEnabled(m_has_decided_permissions || autoplay.site_filters.contains(m_host) || has_force_dark_choice);
+    auto has_force_dark_choice = !m_is_private && m_settings.content_settings().force_dark_per_host.contains(m_host);
+    m_reset_permissions_link->setEnabled(m_has_decided_permissions || autoplay.site_filters.contains(m_origin) || has_force_dark_choice);
 }
 
 void SiteSettingsPopover::update_chrome_style(QPalette const& palette)

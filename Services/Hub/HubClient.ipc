@@ -65,6 +65,7 @@ struct WebView::TabPerformanceStats {
     u64 upload_bytes_per_second;
     Optional<double> frames_per_second;
     Vector<double> cpu_history;
+    u32 other_tabs_sharing_processes;
 }
 
 [ExistingCpp]
@@ -147,6 +148,7 @@ struct Hub::InitialState {
     bool scripting_enabled;
     bool blocks_pop_ups;
     bool devtools_enabled;
+    bool sandbox_is_disabled;
     Vector<Hub::DownloadState> downloads;
     Vector<URL::URL> urls;
     Vector<ByteString> raw_urls;
@@ -205,7 +207,7 @@ struct Hub::ViewState {
     Optional<ByteString> crash_report_name;
     Optional<String> crash_report_website;
     double zoom_level;
-    String force_dark_host;
+    String host_for_settings;
     i32 web_content_pid;
     bool can_report_website_issue;
     bool can_undo;

@@ -258,12 +258,12 @@ Bindings::PredefinedColorSpace Canvas2DContextBase::color_space() const
     return predefined_color_space_from_underlying(web_canvas_2d_context_color_space(cell_of(*this)));
 }
 
-RefPtr<Gfx::Bitmap> Canvas2DContextBase::read_pixels(Gfx::IntRect const& rect, Gfx::AlphaType alpha_type, Bindings::PredefinedColorSpace color_space)
+Optional<Gfx::DecodedImageFrame> Canvas2DContextBase::read_pixels(Gfx::IntRect const& rect, Gfx::AlphaType alpha_type, Bindings::PredefinedColorSpace color_space)
 {
-    auto* bitmap = static_cast<Gfx::Bitmap*>(web_canvas_2d_context_read_pixels(this, rect, to_underlying(alpha_type), to_underlying(color_space)));
-    if (!bitmap)
-        return nullptr;
-    return adopt_ref(*bitmap);
+    auto frame = adopt_own_if_nonnull(static_cast<Gfx::DecodedImageFrame*>(web_canvas_2d_context_read_pixels(this, rect, to_underlying(alpha_type), to_underlying(color_space))));
+    if (!frame)
+        return {};
+    return move(*frame);
 }
 
 bool Canvas2DContextBase::draw_image(ImageBitmap& image_bitmap, float x, float y)
@@ -700,15 +700,17 @@ void web_canvas_2d_style_value_unref(CSS::StyleValue const* style_value)
 
 Gfx::DecodedImageFrame* web_canvas_2d_image_frame_from_pixels(u8 const* first_row, size_t pitch, i32 width, i32 height, u8 color_space)
 {
-    // NB: The bitmap is shareable, so that flushing to the Compositor passes the pixels by file descriptor instead of
-    //     copying them again.
+    // NB: The bitmap is shareable, so that the frame shares its memory instead of copying the pixels again.
     auto bitmap = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Unpremultiplied, { width, height });
     if (bitmap.is_error())
         return nullptr;
     auto row_size = static_cast<size_t>(width) * sizeof(Gfx::RawPixel);
     for (int y = 0; y < height; ++y)
         __builtin_memcpy(bitmap.value()->scanline(y), first_row + static_cast<size_t>(y) * pitch, row_size);
-    return new Gfx::DecodedImageFrame { *bitmap.release_value(), Gfx::AlphaType::Unpremultiplied, gfx_color_space_for(predefined_color_space_from_underlying(color_space)) };
+    auto frame = Gfx::DecodedImageFrame::create(*bitmap.release_value(), gfx_color_space_for(predefined_color_space_from_underlying(color_space)));
+    if (frame.is_error())
+        return nullptr;
+    return new Gfx::DecodedImageFrame { frame.release_value() };
 }
 
 static CanvasImageSource image_source_from(void* source_wrapper, CanvasImageSourceKind kind)

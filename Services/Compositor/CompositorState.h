@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/DoublyLinkedList.h>
 #include <AK/HashMap.h>
 #include <AK/NonnullRefPtr.h>
@@ -14,15 +15,16 @@
 #include <AK/RefCounted.h>
 #include <Compositor/AnimatedImage.h>
 #include <Compositor/CanvasSurfaceRegistry.h>
-#include <Compositor/ContextState.h>
+#include <Compositor/CompositorCore.h>
+#include <Compositor/ContextPresenter.h>
 #include <Compositor/DisplayListPlayerSkia.h>
+#include <Compositor/FramePacer.h>
 #include <Compositor/SkiaBackendContext.h>
 #include <Compositor/VSyncScheduler.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/Forward.h>
-#include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibCompositing/Types.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Point.h>
@@ -41,35 +43,23 @@ class CompositorStateClient {
 public:
     virtual ~CompositorStateClient() = default;
 
+    virtual PresentationId presentation_id() const = 0;
+    virtual void post_message_to_presentation(IPC::MessageBuffer&) = 0;
     virtual void did_allocate_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores) = 0;
     // The stores join the ones allocated last, and leave them again once retired.
     virtual void did_add_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores) = 0;
     virtual void did_retire_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids) = 0;
     virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio) = 0;
-    // The compositor performed the event's whole default action, so the UI hears nothing more about it.
-    virtual void did_consume_input_event(Web::CompositorContextId, u64 event_id) = 0;
-    // No context could take the event; the UI sends it to WebContent itself.
-    virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) = 0;
-    // The compositor forwarded the key event to WebContent, after performing its default action by scrolling if it says so.
-    virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool performed_default_action) = 0;
 };
 
 class CompositorStateWebContentClient {
 public:
     virtual ~CompositorStateWebContentClient() = default;
 
-    virtual void dispatch_mouse_event_to_web_content(u64 page_id, Web::MouseEvent const&) = 0;
-    virtual void dispatch_key_event_to_web_content(u64 page_id, Web::KeyEvent const&) = 0;
-    virtual void dispatch_pinch_event_to_web_content(u64 page_id, Web::PinchEvent const&) = 0;
-    virtual void request_rendering_update() = 0;
+    virtual WebContentClientId web_content_client_id() const = 0;
+    virtual void post_message_to_web_content(IPC::MessageBuffer&) = 0;
+    virtual void post_message_to_render_clock(IPC::MessageBuffer&) = 0;
     virtual void rendering_opportunity(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) = 0;
-    virtual void clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds, Vector<Web::CompositorScrollOffset> const& scroll_offsets) = 0;
-    virtual void pointer_moved(Web::CompositorContextId, Web::DevicePixelPoint, u32 /* buttons */, bool /* scrolled_since_frame */, u64 /* input_event_id */) { }
-    virtual void pointer_left(Web::CompositorContextId, u64 /* input_event_id */) { }
-    virtual void pointer_rests_on_moving_content(Web::CompositorContextId) { }
-    virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) = 0;
-    virtual void animated_content_moved_under_pointer(Web::CompositorContextId, i64 /* frame_time_nanoseconds */) { }
-    virtual void overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> const&) { }
     virtual void create_video_edge(Media::VideoSinkHandle) = 0;
     virtual void release_video_edge(Media::VideoSinkHandle) = 0;
     virtual void video_sink_presented_frame(Media::VideoSinkHandle, RefPtr<Media::VideoFrame>, Media::DisplayingVideoSinkFrameCounts) { }
@@ -80,9 +70,11 @@ public:
     virtual Compositing::CanvasSurfaceOwnerId canvas_surface_owner_id() const = 0;
 };
 
-class CompositorState final : public RefCounted<CompositorState> {
+class CompositorState final
+    : public RefCounted<CompositorState>
+    , public CompositorCoreHost {
 public:
-    static NonnullRefPtr<CompositorState> create(RefPtr<Gfx::SkiaBackendContext>);
+    static NonnullRefPtr<CompositorState> create(RefPtr<Gfx::SkiaBackendContext>, bool scrollbars_always_shown = false);
     ~CompositorState();
 
     enum class ContextOwnerCheckResult {
@@ -103,11 +95,12 @@ public:
     };
 
     // Each root context presents to the presentation it is bound to. Unbound contexts keep rendering, but publish nothing.
-    void register_presentation(CompositorStateClient&, PresentationCapabilities);
+    PresentationId register_presentation(CompositorStateClient&, PresentationCapabilities);
     void unregister_presentation(CompositorStateClient&);
     void bind_presentation(Web::CompositorContextId, CompositorStateClient&);
     CompositorStateClient* presentation_for_context(Web::CompositorContextId) const;
-    ContextOwnerCheckResult check_context_owner(Web::CompositorContextId, CompositorStateWebContentClient&);
+    WebContentClientId register_web_content_client(CompositorStateWebContentClient&);
+    ContextOwnerCheckResult check_context_owner(Web::CompositorContextId, WebContentClientId);
     void destroy_contexts_for_web_content_client(CompositorStateWebContentClient&);
 
     RefPtr<Gfx::SkiaBackendContext> skia_backend_context() const { return m_skia_backend_context; }
@@ -117,12 +110,14 @@ public:
     void create_context(Web::CompositorContextId, Optional<u64> page_id, CompositorStateWebContentClient&);
     void destroy_context(Web::CompositorContextId);
 
+    bool context_can_be_nested_in(Web::CompositorContextId, Web::CompositorContextId parent_context_id) const;
     void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId> parent_context_id);
     void stop_presenting_to_client(Web::CompositorContextId);
-    void update_display_list(Web::CompositorContextId, NonnullRefPtr<Compositing::DisplayList>, Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction&&, Compositing::ScrollStateSnapshot&&);
+    // Answers false, changing nothing, for async scrolling metadata or a scroll state that do not decode.
+    bool update_display_list(Web::CompositorContextId, NonnullRefPtr<Compositing::DisplayList>, IPC::Encoded<Optional<Compositing::DisplayList::AsyncScrollingMetadata>> const&, Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction&&, ReadonlyBytes encoded_scroll_state);
     void update_display_list_resources(Web::CompositorContextId, Compositing::DisplayListResourceTransaction&&);
-    void update_visual_context_tree(Web::CompositorContextId, Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction&&);
-    void update_scroll_state(Web::CompositorContextId, Compositing::ScrollStateSnapshot&&, Compositing::KeyboardScrollState);
+    // Answers false, changing nothing, for a scroll state or keyboard scroll state that do not decode.
+    bool update_visual_context_tree(Web::CompositorContextId, Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction&&, ReadonlyBytes encoded_scroll_state, IPC::Encoded<Compositing::KeyboardScrollState> const&);
     void add_video_sink(CompositorStateWebContentClient&, Media::VideoSinkHandle);
     // For a presentation channel that arrives after the sinks did, or that replaces the one their edges were on.
     void create_video_edges(CompositorStateWebContentClient&);
@@ -138,19 +133,9 @@ public:
     // The client's images lost the decoder their sessions were on. Each keeps the frame it shows.
     void animated_image_decoder_lost(CompositorStateWebContentClient&);
     AnimatedImage const* animated_image(CompositorStateWebContentClient&, Compositing::ImageFrameResourceId) const;
-    void invalidate_wheel_event_listener_state(Web::CompositorContextId, u64 generation);
-    void invalidate_keyboard_scroll_state(Web::CompositorContextId, u64 generation);
-    void handle_and_dispatch_key_event(Web::CompositorContextId, Web::KeyEvent, bool allow_keyboard_scroll);
-    void handle_and_dispatch_mouse_event(Web::CompositorContextId, Web::MouseEvent);
-    void handle_and_dispatch_pinch_event(Web::CompositorContextId, Web::PinchEvent);
-    // Routes a wheel event the UI did not send here, such as one a test makes, as the UI's wheel events are routed.
-    Compositing::WheelEventAnswer take_wheel_event_from_main_thread(Web::CompositorContextId, Web::MouseEvent const&, Compositing::AsyncScrollOperationTracking, Compositing::WheelEventRouting);
-    // Scrolls by a step that the page of the context dispatched and did not cancel. The context that routes the
-    // gesture is the nearest one, from that context out to the presenting one, that noted the gesture, and the steps the
-    // compositor still has to route of the gesture no longer wait for the page.
-    Compositing::WheelEventAnswer scroll_for_wheel_event_the_page_let_through(Web::CompositorContextId, Compositing::WheelStepLetThrough const&, Compositing::AsyncScrollOperationTracking, CompositorStateWebContentClient const& page_client);
-    void forget_wheel_gesture_the_page_canceled(Web::CompositorContextId, u64 gesture_id);
-    void apply_scroll_requests(Web::CompositorContextId, ReadonlySpan<Compositing::ScrollRequest>);
+    // The messages of WebContent and of a presentation that the scroll and input logic takes undecoded.
+    IPC::RawMessage::OutcomeInRust handle_message_from_web_content(WebContentClientId, IPC::RawMessage&);
+    IPC::RawMessage::OutcomeInRust handle_message_from_presentation(PresentationId, IPC::RawMessage&);
     void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
     void request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void set_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays);
@@ -167,11 +152,6 @@ public:
     void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
     void set_client_gpu_presentation_capability(CompositorStateClient&, bool supported, u64 adapter_luid);
     void set_scrollbar_track_press_jumps(CompositorStateClient&, bool jumps);
-    String scroll_state_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID stretched_scroller) const;
-    Optional<Compositing::FirstWheelStepRouteForTesting> route_first_wheel_step_for_testing(Web::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels);
-    void begin_input_trace_for_testing(Web::CompositorContextId);
-    void clear_per_test_input_state_for_testing(Web::CompositorContextId);
-    Vector<Web::InputTraceRecord> take_input_trace_for_testing(Web::CompositorContextId);
 
     struct PlaceholderCanvasAllocation {
         Compositing::CanvasId canvas_id;
@@ -187,7 +167,39 @@ public:
     PlaceholderCanvasPixels read_placeholder_canvas_pixels(CompositorStateWebContentClient&, Compositing::CanvasId, Gfx::IntRect);
 
 private:
-    CompositorState(RefPtr<Gfx::SkiaBackendContext>);
+    CompositorState(RefPtr<Gfx::SkiaBackendContext>, bool scrollbars_always_shown);
+
+    CompositorStateWebContentClient* web_content_client_if_present(WebContentClientId) const;
+    virtual void post_message_to_web_content(WebContentClientId, IPC::MessageBuffer&) override;
+    virtual void post_message_to_render_clock_of_web_content(WebContentClientId, IPC::MessageBuffer&) override;
+    virtual void post_message_to_presentation(PresentationId, IPC::MessageBuffer&) override;
+    virtual void request_display_ticks(Web::CompositorContextId) override;
+    virtual void set_timer(Web::CompositorContextId, ContextTimer, AK::Duration delay) override;
+    virtual void cancel_timer(Web::CompositorContextId, ContextTimer) override;
+    void context_timer_fired(Web::CompositorContextId, ContextTimer);
+
+    // What the compositor keeps of a context to present it.
+    struct PresentedContext {
+        AK_MAKE_NONCOPYABLE(PresentedContext);
+        AK_MAKE_NONMOVABLE(PresentedContext);
+
+    public:
+        AK_ALLOC_WITH_KMALLOC;
+
+        PresentedContext(Optional<u64> page_id, CompositorStateWebContentClient&, OwnedCanvasSurfaces);
+
+        Optional<u64> page_id;
+        CompositorStateWebContentClient& web_content_client;
+        ContextPresenter presenter;
+        Optional<Web::CompositorContextId> parent_context_id;
+        Compositing::ContextVisibility visibility { Compositing::ContextVisibility::Visible };
+        Optional<u64> display_id;
+        double display_refresh_rate { 60.0 };
+        // Whether the presentation shows this context's frames from CPU memory for now, as when the UI paints it itself.
+        bool presents_from_cpu_memory { false };
+        PacedTickRequest rendering_opportunity_request;
+        PacedTickRequest clock_tick_request;
+    };
 
     struct PendingAsyncPresent {
         PendingAsyncPresent(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio)
@@ -210,37 +222,30 @@ private:
         bool publish_to_presentation { true };
     };
 
-    ContextState* context_if_present(Web::CompositorContextId);
-    // Hands the context's async scroll updates to its WebContent process as soon as they exist,
-    // so a rendering update reads them locally instead of asking for them over a synchronous call.
-    void publish_pending_async_scroll_updates(Web::CompositorContextId, ContextState&);
-
 public:
     void present_pending_frames_for_testing() { present_pending_frames_on_vsync({}, MonotonicTime::now()); }
     size_t pending_async_present_count_for_testing() const { return m_pending_async_presents.size(); }
 
-    // What was not published yet, for a caller that needs the compositor's state as of now.
-    Compositing::PendingAsyncScrollUpdates take_pending_async_scroll_updates(Web::CompositorContextId);
-
 private:
-    ContextState const* context_if_present(Web::CompositorContextId) const;
-    Optional<u64> display_id_for_context(ContextState const&) const;
-    ContextState const* root_context_of(ContextState const&) const;
-    bool nested_context_scrolled_since_last_frame(Web::CompositorContextId) const;
-    bool context_is_effectively_visible(ContextState const&) const;
-    void resume_presentation_after_becoming_visible(Web::CompositorContextId root_context_id, ContextState& root_context);
-    double display_refresh_rate_for_context(ContextState const&) const;
-    void clear_parent_context(ContextState&);
+    PresentedContext* presented_context_if_present(Web::CompositorContextId);
+    PresentedContext const* presented_context_if_present(Web::CompositorContextId) const;
+    Optional<u64> display_id_for_context(PresentedContext const&) const;
+    PresentedContext const* root_context_of(PresentedContext const&) const;
+    Web::CompositorContextId root_context_id_of(Web::CompositorContextId) const;
+    bool context_is_effectively_visible(PresentedContext const&) const;
+    void resume_presentation_after_becoming_visible(Web::CompositorContextId root_context_id, PresentedContext& root_context);
+    double display_refresh_rate_for_context(PresentedContext const&) const;
+    void clear_parent_context(Web::CompositorContextId, PresentedContext&);
     CompositedContextResolver resolver_for(Web::CompositorContextId parent_context_id);
     CompositedContextSurface resolve_composited_context(Web::CompositorContextId parent_context_id, Web::CompositorContextId child_context_id, Gfx::FloatRect destination_rect, Gfx::FloatMatrix4x4 const& canvas_transform);
-    void schedule_backing_store_shrink(Web::CompositorContextId, ContextState&);
+    void schedule_backing_store_shrink(Web::CompositorContextId, PresentedContext&);
     void shrink_backing_stores_after_resize(Web::CompositorContextId);
-    void resize_backing_stores_if_needed(Web::CompositorContextId, ContextState&);
-    void add_backing_store_for_pending_frame_if_needed(Web::CompositorContextId, ContextState&);
-    void schedule_surplus_backing_store_retirement(Web::CompositorContextId, ContextState&);
+    void resize_backing_stores_if_needed(Web::CompositorContextId, PresentedContext&);
+    void add_backing_store_for_pending_frame_if_needed(Web::CompositorContextId, PresentedContext&);
+    void schedule_surplus_backing_store_retirement(Web::CompositorContextId, PresentedContext&);
     void retire_idle_surplus_backing_stores(Web::CompositorContextId);
-    void present_current_frame(Web::CompositorContextId, ContextState&);
-    void resolve_video_sinks(ContextState&);
+    void present_current_frame(Web::CompositorContextId, PresentedContext&);
+    void resolve_video_sinks(PresentedContext&);
     enum class VideoSinkUpdateResult : u8 {
         NoUnpaintedSinkRequiresUpdates,
         UnpaintedSinkRequiresUpdates,
@@ -252,73 +257,21 @@ private:
     int unpainted_video_update_interval_ms() const;
     void present_contexts_drawing_video_sink(CompositorStateWebContentClient&, Media::VideoSinkHandle);
     void present_contexts_drawing_canvas(CompositorStateWebContentClient&, Compositing::CanvasId);
-    bool apply_context_update_result(
-        Web::CompositorContextId,
-        ContextState&,
-        ContextState::ContextUpdateResult const&);
-    void schedule_animation_frames_if_needed(ContextState&);
-    enum class WheelStepOrigin : u8 {
-        UI,
-        Fling,
-        MainThread,
-    };
-    // A fling step is scrolled at the frame time the fling synthesized it for.
-    ContextState::ContextUpdateResult scroll_for_wheel_step(Web::CompositorContextId, ContextState&, Web::MouseEvent const&, WheelStepOrigin, bool is_first_wheel_event_with_delta, Compositing::AsyncScrollOperationTracking, MonotonicTime now);
-    // How a wheel step went in a context that presented and published what the step changed itself.
-    struct AppliedWheelStep {
-        // What is left for the context that routes the step to present and report.
-        ContextState::ContextUpdateResult result;
-        bool presents_frame { false };
-    };
-    // A process only knows the ids of its own nodes, and only follows the operations of its own contexts.
-    AppliedWheelStep apply_wheel_step_result(Web::CompositorContextId, ContextState&, ContextState::ContextUpdateResult const&, CompositorStateWebContentClient const& reporting_client);
-    static Compositing::WheelEventAnswer wheel_event_answer_for(AppliedWheelStep const&, Optional<Web::WheelGestureMark>);
-    AppliedWheelStep hand_wheel_step_to_nested_context(Web::CompositorContextId, ContextState&, Web::MouseEvent const&, ContextState::NestedContextWheelStep const&, ContextState::WheelEventListenerGate const&, Compositing::AsyncScrollOperationTracking, MonotonicTime now);
-    struct NestedContextTakingWheelStep {
-        Web::CompositorContextId context_id;
-        // Null when the step cannot be handed to the context.
-        ContextState* context { nullptr };
-        Gfx::FloatPoint position {};
-        ContextState::FirstWheelStepRoute route;
-    };
-    struct FirstWheelStepInNestedContexts {
-        // The innermost context that the step went into, whose page sees the step.
-        Web::CompositorContextId innermost_context_id;
-        // The context that takes the step, which is empty when each of them passes the step on.
-        Optional<NestedContextTakingWheelStep> taking_context {};
-    };
-    // Where the first step of a gesture over the content of a context nested in the context `context_id` goes, among
-    // that context and the contexts nested in it.
-    FirstWheelStepInNestedContexts first_wheel_step_in_nested_contexts(Web::CompositorContextId, Compositing::NestedContextHit, Gfx::FloatPoint delta_in_css_pixels, Web::WheelDeltaPrecision);
-    // Routes the first step of a gesture that the page of the listener context let through: in that context, from the
-    // scrollers the page found around the target, and on to the contexts around it for what a context passes on, up to
-    // the routing context, which latches the gesture. A page of another process than a context's scrolls it only by
-    // what the UI left to the page in the gesture.
-    AppliedWheelStep route_wheel_step_the_page_let_through(Web::CompositorContextId routing_context_id, ContextState& routing_context, Web::CompositorContextId listener_context_id, ContextState& listener_context, ContextState::WheelStep, ReadonlySpan<Web::AsyncScrollNodeStableID> scroll_chain, CompositorStateWebContentClient const* page_client, MonotonicTime now);
-    // The nearest context, from the given one out to the presenting one, that noted the gesture.
-    Optional<Web::CompositorContextId> routing_context_of_wheel_gesture(Web::CompositorContextId, u64 gesture_id);
-    // The scrollbars of a context nested in the presenting context `context_id` take the pointer over that context's
-    // content, and a drag of one of them takes the pointer wherever it goes until the drag ends.
-    ContextState::ContextUpdateResult handle_mouse_event_in_nested_contexts(Web::CompositorContextId, ContextState&, Web::MouseEvent const&);
-    ContextState* context_still_nested_in(Web::CompositorContextId containing_context_id, Optional<Web::CompositorContextId>);
-    // Where the position in the presenting context lands in the nested context, through each context in between and
-    // without regard to where their content is or what clips it.
-    Optional<Gfx::FloatPoint> position_in_nested_context_ignoring_clips(Web::CompositorContextId presenting_context_id, ContextState& presenting_context, ContextState& nested_context, Gfx::FloatPoint position);
-    bool is_nested_in(Web::CompositorContextId containing_context_id, ContextState const&) const;
-    bool page_under_pinch_may_cancel_it(Web::CompositorContextId, ContextState&, Gfx::FloatPoint position);
-    void dispatch_scroll_fling_step(Web::CompositorContextId, ContextState&, Optional<Web::MouseEvent>, MonotonicTime now);
-    void present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
-    void schedule_present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
-    void schedule_present_frame(Web::CompositorContextId, ContextState&, Gfx::IntRect viewport_rect);
-    void schedule_pending_present_frame(Web::CompositorContextId, ContextState&);
-    void schedule_pending_present_frame_on_vsync(Web::CompositorContextId, ContextState&);
-    void schedule_containing_context_present(ContextState&);
-    void schedule_pending_present_frame_if_unblocked(Web::CompositorContextId, ContextState&);
-    bool try_present_frame_during_resize(Web::CompositorContextId, ContextState&);
-    void schedule_caret_repaint(Web::CompositorContextId, Gfx::IntRect damage_rect);
+    bool needs_animation_frames(Web::CompositorContextId, PresentedContext const&, MonotonicTime now);
+    static bool has_pending_present_frame_scheduled_on(PresentedContext const&, Optional<u64> display_id);
+    void schedule_animation_frames_if_needed(Web::CompositorContextId, PresentedContext const&);
+    void present_frame(Web::CompositorContextId, PresentedContext&, PendingFrame);
+    void schedule_requested_presents();
+    void schedule_present_frame(Web::CompositorContextId, PresentedContext&, PendingFrame);
+    void schedule_present_frame(Web::CompositorContextId, PresentedContext&, Gfx::IntRect viewport_rect);
+    void schedule_pending_present_frame(Web::CompositorContextId, PresentedContext&);
+    void schedule_pending_present_frame_on_vsync(Web::CompositorContextId, PresentedContext&);
+    void schedule_containing_context_present(PresentedContext&);
+    void schedule_pending_present_frame_if_unblocked(Web::CompositorContextId, PresentedContext&);
+    bool try_present_frame_during_resize(Web::CompositorContextId, PresentedContext&);
     VSyncScheduler& vsync_scheduler_for_display(Optional<u64> display_id);
     void present_pending_frames_on_vsync(Optional<u64> display_id, MonotonicTime frame_time);
-    void publish_backing_stores(Web::CompositorContextId, ContextState&, BackingStoreManager::Publication&&);
+    void publish_backing_stores(Web::CompositorContextId, PresentedContext&, BackingStoreManager::Publication&&);
     BackingStoreManager::GpuSharing gpu_sharing_for_context(Web::CompositorContextId) const;
     void unbind_presentation(Web::CompositorContextId);
     void update_scroll_capabilities();
@@ -328,7 +281,10 @@ private:
     void schedule_gpu_completion_check();
     void check_gpu_completions();
 
-    HashMap<Web::CompositorContextId, OwnPtr<ContextState>> m_contexts;
+    HashMap<Web::CompositorContextId, NonnullOwnPtr<PresentedContext>> m_presented_contexts;
+    u64 m_next_web_content_client_id { 1 };
+    HashMap<WebContentClientId, CompositorStateWebContentClient*> m_web_content_clients;
+    HashMap<Web::CompositorContextId, HashMap<ContextTimer, NonnullRefPtr<Core::Timer>>> m_context_timers;
 
     DoublyLinkedList<PendingAsyncPresent> m_pending_async_presents;
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
@@ -338,6 +294,8 @@ private:
     RefPtr<Core::Timer> m_gpu_completion_timer;
 
     HashMap<CompositorStateClient*, PresentationCapabilities> m_presentations;
+    u64 m_next_presentation_id { 1 };
+    HashMap<PresentationId, CompositorStateClient*> m_presentations_by_id;
     HashMap<Web::CompositorContextId, CompositorStateClient*> m_context_presentations;
 
     struct VideoSinkState {
@@ -356,7 +314,7 @@ private:
     bool animated_image_is_drawn(CompositorStateWebContentClient*, Compositing::ImageFrameResourceId);
     void show_animated_image_frame(CompositorStateWebContentClient*, Compositing::ImageFrameResourceId, Gfx::DecodedImageFrame const&);
     // A frame that names an animated image brings frame 0 with it, whichever frame the image is at.
-    void show_animated_image_frames_in(ContextState&);
+    void show_animated_image_frames_in(PresentedContext&);
     void update_animated_images();
     void schedule_animated_image_update(AK::Duration delay);
     HashMap<CompositorStateWebContentClient*, HashMap<u64, NonnullOwnPtr<AnimatedImage>>> m_animated_images;
@@ -371,6 +329,8 @@ private:
         bool origin_clean { true };
     };
     HashMap<Compositing::CanvasId, PlaceholderCanvas> m_placeholder_canvases;
+
+    CompositorCore m_core;
 };
 
 }

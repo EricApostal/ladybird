@@ -3,6 +3,7 @@ if (BUILD_TESTING AND NOT WIN32)
         ladybird_python_test(test-devtools-catch-up-layout.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-devtools-client-follows-the-tab.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-iframe-console.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-console-previews.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-message-port-collection.py ARGS $<TARGET_FILE:WebDriver>)
         ladybird_python_test(test-shared-stylesheet-memory.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
         ladybird_python_test(test-user-agent-preset-reaches-child-frames.py ARGS $<TARGET_FILE:ladybird>)
@@ -26,9 +27,6 @@ if (BUILD_TESTING AND NOT WIN32)
     ladybird_python_test(test-webdriver-delete-session.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-error-keep-alive.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-force-dark.py ARGS $<TARGET_FILE:WebDriver>)
-    ladybird_python_test(test-webdriver-location-policy.py ARGS $<TARGET_FILE:WebDriver>)
-    ladybird_python_test(test-webdriver-microphone-policy.py ARGS $<TARGET_FILE:WebDriver>)
-    ladybird_python_test(test-webdriver-notifications-policy.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-permissions-settings.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-search-engine-settings.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-set-permission.py ARGS $<TARGET_FILE:WebDriver>)
@@ -103,10 +101,10 @@ if (LINUX)
     list(APPEND TEST_SOURCES TestAudioDaemonSocket.cpp)
 endif()
 
-if (APPLE AND NOT IOS)
+if ((APPLE AND NOT IOS) OR LINUX)
     target_link_libraries(TestLibWebView PRIVATE LibWebSocket OpenSSL::Crypto OpenSSL::SSL)
     target_sources(TestLibWebView PRIVATE
-        TestWebDriverMachBootstrap.cpp
+        TestWebDriverSession.cpp
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/BiDiSession.cpp"
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/BrowserConnection.cpp"
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/Client.cpp"
@@ -115,6 +113,10 @@ if (APPLE AND NOT IOS)
     )
     target_include_directories(TestLibWebView PRIVATE "${LADYBIRD_SOURCE_DIR}/Services" "${CMAKE_BINARY_DIR}/Services")
     set_tests_properties(TestLibWebView PROPERTIES TIMEOUT 120)
+endif()
+
+if (APPLE AND NOT IOS)
+    target_sources(TestLibWebView PRIVATE TestWebDriverMachBootstrap.cpp)
 endif()
 
 if (NOT WIN32)

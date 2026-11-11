@@ -197,7 +197,7 @@ bool CompositorConnectionFrameSink::post_display_list_update(Web::CompositorCont
     }
     auto copy_time = timer.elapsed_time();
 
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateDisplayList::static_encode(context_id, shared_tape_buffer.value(), display_list.tape_size(), display_list.run_count(), display_list.properties(), update.visual_context_tree, update.resource_transaction, update.scroll_state_snapshot));
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateDisplayList::static_encode(context_id, shared_tape_buffer.value(), display_list.tape_size(), display_list.run_count(), display_list.properties(), IPC::Encoded { display_list.async_scrolling_metadata() }, update.visual_context_tree, update.resource_transaction, update.encoded_scroll_state));
     if (!post(encoded_message))
         return false;
     if (display_list_timing_enabled())
@@ -219,12 +219,12 @@ bool CompositorConnectionFrameSink::submit(CompositorFrame&& frame)
     if (auto& update = frame.visual_context_tree_update; update.has_value()) {
         if (!post_resource_additions_in_batches(context_id, update->resource_transaction))
             return false;
-        auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateVisualContextTree::static_encode(context_id, update->visual_context_tree, update->resource_transaction));
+        auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateVisualContextTree::static_encode(context_id, update->visual_context_tree, update->resource_transaction, update->encoded_scroll_state, IPC::Encoded { update->keyboard_scroll_state }));
         if (!post(encoded_message))
             return false;
     }
     if (auto& update = frame.scroll_state_update; update.has_value()) {
-        auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateScrollState::static_encode(context_id, update->scroll_state_snapshot, update->keyboard_scroll_state));
+        auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateScrollState::static_encode(context_id, update->encoded_scroll_state, update->keyboard_scroll_state));
         if (!post(encoded_message))
             return false;
     }
@@ -424,19 +424,7 @@ void CompositorConnection::update_canvas_2d_stream(Compositing::Canvas2DCommandS
             added_fonts.append(move(font));
     }
 
-    // A frame travels in a shared bitmap. One that cannot be placed in one is left out, and the Compositor skips the
-    // draws that name it.
-    Vector<Compositing::DisplayListImageFrameResource> image_frames;
-    for (auto& frame : stream.take_image_frames()) {
-        auto bitmap = frame.frame.bitmap().to_shareable_bitmap();
-        if (!bitmap.is_valid()) {
-            dbgln("WebContent: Could not place a {} canvas image frame in shared memory", frame.frame.bitmap().size());
-            continue;
-        }
-        image_frames.append({ .id = frame.id, .frame = Gfx::DecodedImageFrame { *bitmap.bitmap(), frame.frame.color_space() } });
-    }
-
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateCanvas2dStream::static_encode(stream.take_segments(), move(kept_font_ids), move(added_fonts), move(image_frames)));
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateCanvas2dStream::static_encode(stream.take_segments(), move(kept_font_ids), move(added_fonts), stream.take_image_frames()));
     auto video_frame_holds = stream.take_video_frame_holds();
     if (post_message(encoded_message).is_error()) {
         did_lose_compositor();

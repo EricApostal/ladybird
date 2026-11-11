@@ -56,6 +56,7 @@ add_library(ladybird_impl STATIC
     RemoteView.cpp
     ReportReview.cpp
     RestoreSessionCard.cpp
+    SandboxOffBar.cpp
     ScreenshotSelectionOverlay.cpp
     ScreenshotViewer.cpp
     SessionHistorySnapshotStorage.cpp
@@ -151,6 +152,7 @@ if (APPLE)
         MicrophoneAuthorizerMacOS.mm
         NativeTextEditingBindings.mm
         Menu.mm
+        PlatformColorsMac.mm
         ScrollbarPreferencesMac.mm
         SpellCheckerMac.mm
         SystemAppearanceMac.mm
@@ -162,6 +164,7 @@ if (APPLE)
     set_source_files_properties(
         LadybirdAccessibilityElement.mm
         MicrophoneAuthorizerMacOS.mm
+        PlatformColorsMac.mm
         SpellCheckerMac.mm
         TranslateIconMac.mm
         TranslatorMac.mm

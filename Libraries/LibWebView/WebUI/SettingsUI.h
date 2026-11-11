@@ -51,13 +51,12 @@ private:
     virtual void browsing_behavior_changed() override { broadcast_settings_change(); }
     virtual void search_engine_settings_changed() override { broadcast_settings_change(); }
     virtual void autoplay_settings_changed() override { broadcast_settings_change(); }
-    virtual void browsing_data_settings_changed() override { broadcast_settings_change(); }
     virtual void global_privacy_control_changed() override { broadcast_settings_change(); }
     virtual void crash_report_sending_changed() override { broadcast_settings_change(); }
     virtual void crash_reports_changed() override;
     virtual void dns_settings_changed() override { broadcast_settings_change(); }
     virtual void config_variable_changed(ConfigVariableID) override { broadcast_settings_change(); }
-    virtual void geolocation_settings_changed() override { broadcast_settings_change(); }
+    virtual void permission_settings_changed(Web::Permissions::PermissionName) override { broadcast_settings_change(); }
     virtual void background_networking_settings_changed() override { broadcast_settings_change(); }
     virtual void content_blocker_settings_changed() override { broadcast_settings_change(); }
 
@@ -74,7 +73,7 @@ private:
     void set_languages(JsonValue const&);
     void set_appearance(JsonValue const&);
     void set_content_settings(JsonValue const&);
-    void reset_force_dark_for_host(JsonValue const&);
+    void reset_host_setting(JsonValue const&);
     void set_tab_settings(JsonValue const&);
     void set_browsing_behavior(JsonValue const&);
     void set_config_variable(JsonValue const&);
@@ -89,15 +88,10 @@ private:
     void add_site_setting_filter(JsonValue const&);
     void remove_site_setting_filter(JsonValue const&);
     void remove_all_site_setting_filters(JsonValue const&);
-    void set_location_policy(JsonValue const&);
-    void set_microphone_policy(JsonValue const&);
-    void set_notifications_policy(JsonValue const&);
-    void set_site_permission(JsonValue const&);
 
     OwnPtr<SettingsUISitePermissionsObserver> m_site_permissions_observer;
 
     void estimate_browsing_data_sizes(JsonValue const&);
-    void set_browsing_data_settings(JsonValue const&);
     void clear_browsing_data(JsonValue const&);
     void set_global_privacy_control(JsonValue const&);
     void set_crash_report_sending(JsonValue const&);

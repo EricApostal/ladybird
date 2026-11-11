@@ -20,6 +20,7 @@ use crate::painting::visual_context::VisualContextTree;
 use crate::painting::visual_context::VisualContextTreeDump;
 use crate::painting::visual_context::dump::SlotKind;
 use crate::stage::MainThread;
+use libcompositing_rust::visual_context::CompositorScrollTable;
 use libgfx_rust::path::Path;
 use libgfx_rust::{
     Color, CompositingAndBlendingOperator, CornerRadii, FloatPoint, FloatRect, FloatSize, IntPoint, IntRect, IntSize,
@@ -146,6 +147,7 @@ pub unsafe extern "C" fn painting_dump(
         let owner = owners.owner(kind, index)?;
         Some(callbacks.debug_description(&main_thread, owner))
     });
+    dump_compositor_scroll_table(&mut output, visual_context_tree.compositor_scroll_table());
     output.push_str("\nDisplayList:\n");
     dump_commands(&main_thread, &mut output, &callbacks, display_list, 0);
     callbacks.append_text(&main_thread, &output);
@@ -153,6 +155,54 @@ pub unsafe extern "C" fn painting_dump(
 
 fn push_indent(output: &mut String, indent: usize) {
     output.extend(std::iter::repeat_n(' ', indent * 2));
+}
+
+// Lists every row, unlike the tree section above it, which shows only the nodes that command runs reach.
+fn dump_compositor_scroll_table(output: &mut String, table: &CompositorScrollTable) {
+    if table.nodes.is_empty() {
+        return;
+    }
+    output.push_str("\nScrollNodes:\n");
+    for node in table.nodes.iter() {
+        output.push_str("ScrollNode");
+        write_field(output, "scroll_node_index", node.scroll_node_index);
+        write_field(output, "parent_scroll_node_index", node.parent_scroll_node_index);
+        write_field(output, "scrollport_rect", node.scrollport_rect);
+        write_field(output, "min_scroll_offset", node.min_scroll_offset);
+        write_field(output, "max_scroll_offset", node.max_scroll_offset);
+        writeln!(output, " is_viewport={}", node.is_viewport).unwrap();
+        let Ok(container_index) = table
+            .snap_containers
+            .binary_search_by_key(&node.scroll_node_index, |container| container.scroll_node_index)
+        else {
+            continue;
+        };
+        let container = &table.snap_containers[container_index];
+        push_indent(output, 1);
+        output.push_str("SnapContainer");
+        write_field(output, "snapport", container.snapport);
+        write_field(output, "min_scroll_offset", container.min_scroll_offset);
+        write_field(output, "max_scroll_offset", container.max_scroll_offset);
+        writeln!(
+            output,
+            " strictness={} snaps_x={} snaps_y={} horizontal_writing_mode={}",
+            container.strictness, container.snaps_x, container.snaps_y, container.horizontal_writing_mode
+        )
+        .unwrap();
+        let first_area_index = container.first_area_index as usize;
+        for area in &table.snap_areas[first_area_index..first_area_index + container.area_count as usize] {
+            push_indent(output, 2);
+            output.push_str("SnapArea");
+            write!(output, " pseudo_element_type={}", area.pseudo_element_type).unwrap();
+            write_field(output, "rect", area.rect);
+            writeln!(
+                output,
+                " align_x={} align_y={} always_stop={}",
+                area.align_x, area.align_y, area.always_stop
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn dump_commands(
@@ -578,15 +628,6 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             write_field(output, "rect", command.rect);
             write!(output, " effect=e{}", command.effect.0).unwrap();
         }
-        DisplayListCommandType::CompositorScrollNode => {
-            let command = read_command::<CompositorScrollNode>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write_field(output, "parent_scroll_node_index", command.parent_scroll_node_index);
-            write_field(output, "scrollport_rect", command.scrollport_rect);
-            write_field(output, "min_scroll_offset", command.min_scroll_offset);
-            write_field(output, "max_scroll_offset", command.max_scroll_offset);
-            write!(output, " is_viewport={}", command.is_viewport).unwrap();
-        }
         DisplayListCommandType::CompositorBlockingWheelEventRegion => {
             let command = read_command::<CompositorBlockingWheelEventRegion>(payload);
             write_field(output, "rect", command.rect);
@@ -638,31 +679,6 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             .unwrap();
         }
         DisplayListCommandType::PaintScrollBar => {}
-        DisplayListCommandType::CompositorSnapContainer => {
-            let command = read_command::<CompositorSnapContainer>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write_field(output, "snapport", command.snapport);
-            write_field(output, "min_scroll_offset", command.min_scroll_offset);
-            write_field(output, "max_scroll_offset", command.max_scroll_offset);
-            write!(
-                output,
-                " strictness={} snaps_x={} snaps_y={} horizontal_writing_mode={}",
-                command.strictness, command.snaps_x, command.snaps_y, command.horizontal_writing_mode
-            )
-            .unwrap();
-        }
-        DisplayListCommandType::CompositorSnapArea => {
-            let command = read_command::<CompositorSnapArea>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write!(output, " pseudo_element_type={}", command.pseudo_element_type).unwrap();
-            write_field(output, "rect", command.rect);
-            write!(
-                output,
-                " align_x={} align_y={} always_stop={}",
-                command.align_x, command.align_y, command.always_stop
-            )
-            .unwrap();
-        }
         // The display list of a page holds none of the commands of the canvas 2D stream.
         DisplayListCommandType::Canvas2DFillPath
         | DisplayListCommandType::Canvas2DStrokePath

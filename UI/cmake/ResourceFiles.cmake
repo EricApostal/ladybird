@@ -40,7 +40,6 @@ set(ABOUT_PAGES
     history.html
     newtab.html
     settings.html
-    services.html
     version.html
     webui.css
     welcome.css
@@ -57,16 +56,12 @@ set(ABOUT_SETTINGS_RESOURCES
     content.js
     dialog-deep-link.js
     feedback.js
-    geolocation.js
     languages.js
     network.js
-    microphone.js
-    notifications.js
     permissions.js
     privacy.js
     search.js
     services.js
-    site-permissions.js
     startup.js
     tabs.js
 )

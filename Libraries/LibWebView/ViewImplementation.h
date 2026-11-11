@@ -277,10 +277,12 @@ public:
     void zoom_in();
     void zoom_out();
     void set_zoom(double zoom_level);
-    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     void reset_zoom();
     double zoom_level() const { return m_zoom_level; }
+
+    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
+
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
     // Sends the display metadata to every page hosting documents of the tab.
@@ -334,7 +336,8 @@ public:
         return m_backing_stores->displayed_frame().map([](auto const& frame) { return frame.device_pixel_ratio; });
     }
 
-    String force_dark_host() const;
+    String current_host_for_settings() const;
+
     bool force_dark_enabled() const;
     bool can_set_force_dark() const;
     void set_force_dark_enabled(bool);
@@ -844,6 +847,7 @@ protected:
     void display_traversable(CanonicalTraversable&, Web::HTML::VisibilityState);
     void display_page_changed(RefPtr<WebContentPage> previous_page);
     void cancel_all_native_geolocation_requests();
+    void geolocation_settings_changed();
     void send_geolocation_emulated_position(WebContentPage&);
     WebContentPage& focused_navigable_host() const;
     void reset_page_media_state();
@@ -866,13 +870,11 @@ protected:
     void prepare_for_navigation_after_crash(Optional<NavigationToRetry> navigation_to_retry = {});
     void set_crash_state(Optional<CrashState>);
 
-    String current_host_for_settings() const;
-
     virtual void languages_changed() override;
     virtual void content_settings_changed() override;
     virtual void browsing_behavior_changed() override;
     virtual void autoplay_settings_changed() override;
-    virtual void geolocation_settings_changed() override;
+    virtual void permission_settings_changed(Web::Permissions::PermissionName name) override;
     virtual void global_privacy_control_changed() override;
 
     void send_context_menu_request(ContextMenuRequest, Gfx::IntPoint content_position);

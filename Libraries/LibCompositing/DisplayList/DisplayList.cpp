@@ -56,7 +56,7 @@ NonnullRefPtr<DisplayList> DisplayList::share_rust_command_storage(AccumulatedVi
 
 NonnullRefPtr<DisplayList> DisplayList::adopt_received_storage(Properties properties, void const* storage)
 {
-    return adopt_ref(*new DisplayList(properties.compatible_visual_context_tree_structural_epoch, properties.id, storage, properties.surface_clear_color, properties.root_group_color, move(properties.async_scrolling_metadata)));
+    return adopt_ref(*new DisplayList(properties.compatible_visual_context_tree_structural_epoch, properties.id, storage, properties.surface_clear_color, properties.root_group_color, {}));
 }
 
 // Copies a tape and run table that came from another process into Rust memory through `fill`, then checks them and
@@ -95,32 +95,15 @@ bool DisplayList::requires_direct_replay_without_nested_lists(AccumulatedVisualC
     return RustFFI::display_list_storage_requires_direct_replay_without_nested_lists(m_storage, visual_context_tree.rust_handle());
 }
 
-void DisplayList::for_each_compositor_metadata(Function<void(ContextRef, DisplayListCommandType, ReadonlyBytes)> const& callback) const
-{
-    RustFFI::display_list_storage_for_each_compositor_metadata(m_storage, const_cast<void*>(static_cast<void const*>(&callback)), [](void* context, ContextRef run_context, DisplayListCommandType command_type, u8 const* payload, size_t payload_size) {
-        (*static_cast<Function<void(ContextRef, DisplayListCommandType, ReadonlyBytes)> const*>(context))(run_context, command_type, { payload, payload_size });
-    });
-}
-
-void DisplayList::for_each_caret(Function<void(ContextRef, Gfx::IntRect, PaintCaret const&)> const& callback) const
-{
-    RustFFI::display_list_storage_for_each_caret(m_storage, const_cast<void*>(static_cast<void const*>(&callback)), [](void* context, ContextRef run_context, Gfx::IntRect bounding_rect, u8 const* payload, size_t payload_size) {
-        auto command = read_display_list_object<PaintCaret>({ payload, payload_size });
-        (*static_cast<Function<void(ContextRef, Gfx::IntRect, PaintCaret const&)> const*>(context))(run_context, bounding_rect, command);
-    });
-}
-
-void DisplayList::replay(AccumulatedVisualContextTree const& visual_context_tree, ScrollStateSnapshot const& scroll_state, RustFFI::FfiDisplayListReplayCallbacks const& callbacks) const
+void DisplayList::replay(AccumulatedVisualContextTree const& visual_context_tree, RustFFI::FfiDisplayListReplayCallbacks const& callbacks) const
 {
     VERIFY(m_compatible_visual_context_tree_structural_epoch == visual_context_tree.structural_epoch());
-    auto scroll_offsets = scroll_state.device_offsets();
-    RustFFI::display_list_replay(visual_context_tree.rust_handle(), m_storage, m_root_group_color, scroll_offsets.data(), scroll_offsets.size(), &callbacks);
+    RustFFI::display_list_replay(visual_context_tree.rust_handle(), m_storage, m_root_group_color, &callbacks);
 }
 
-void DisplayList::replay_records(ReadonlyBytes records, ScrollStateSnapshot const& scroll_state, RustFFI::FfiDisplayListReplayCallbacks const& callbacks)
+void DisplayList::replay_records(ReadonlyBytes records, RustFFI::FfiDisplayListReplayCallbacks const& callbacks)
 {
-    auto scroll_offsets = scroll_state.device_offsets();
-    RustFFI::display_list_replay_records(records.data(), records.size(), scroll_offsets.data(), scroll_offsets.size(), &callbacks);
+    RustFFI::display_list_replay_records(records.data(), records.size(), &callbacks);
 }
 
 u64 DisplayList::tape_size() const
@@ -166,7 +149,16 @@ DisplayList::Properties DisplayList::properties() const
         .compatible_visual_context_tree_structural_epoch = m_compatible_visual_context_tree_structural_epoch,
         .surface_clear_color = m_surface_clear_color,
         .root_group_color = m_root_group_color,
-        .async_scrolling_metadata = m_async_scrolling_metadata,
+    };
+}
+
+RustFFI::FfiDisplayList DisplayList::for_scroll_logic(ReadonlyBytes encoded_async_scrolling_metadata) const
+{
+    return {
+        .storage = m_storage,
+        .id = m_id,
+        .compatible_visual_context_tree_structural_epoch = m_compatible_visual_context_tree_structural_epoch,
+        .async_scrolling_metadata = encoded_async_scrolling_metadata,
     };
 }
 
@@ -180,60 +172,6 @@ ErrorOr<void> validate_display_list_references_live_visual_context_nodes(Display
 }
 
 namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Compositing::DisplayList::AsyncScrollingMetadata const& metadata)
-{
-    TRY(encoder.encode(metadata.document_id));
-    TRY(encoder.encode(metadata.viewport_rect));
-    TRY(encoder.encode(metadata.wheel_event_listener_state_generation));
-    TRY(encoder.encode(metadata.has_blocking_wheel_event_listeners));
-    TRY(encoder.encode(metadata.has_blocking_wheel_event_region_covering_viewport));
-    TRY(encoder.encode(metadata.viewport_keeps_horizontal_scrolls));
-    TRY(encoder.encode(metadata.viewport_keeps_vertical_scrolls));
-    TRY(encoder.encode(metadata.device_pixels_per_css_pixel));
-    TRY(encoder.encode(metadata.keyboard_scroll_state));
-    return {};
-}
-
-template<>
-ErrorOr<Compositing::DisplayList::AsyncScrollingMetadata> decode(Decoder& decoder)
-{
-    return Compositing::DisplayList::AsyncScrollingMetadata {
-        .document_id = TRY(decoder.decode<Optional<Web::UniqueNodeID>>()),
-        .viewport_rect = TRY(decoder.decode<Gfx::IntRect>()),
-        .wheel_event_listener_state_generation = TRY(decoder.decode<u64>()),
-        .has_blocking_wheel_event_listeners = TRY(decoder.decode<bool>()),
-        .has_blocking_wheel_event_region_covering_viewport = TRY(decoder.decode<bool>()),
-        .viewport_keeps_horizontal_scrolls = TRY(decoder.decode<bool>()),
-        .viewport_keeps_vertical_scrolls = TRY(decoder.decode<bool>()),
-        .device_pixels_per_css_pixel = TRY(decoder.decode<double>()),
-        .keyboard_scroll_state = TRY(decoder.decode<Compositing::KeyboardScrollState>()),
-    };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Compositing::DisplayList::Properties const& properties)
-{
-    TRY(encoder.encode(properties.id));
-    TRY(encoder.encode(properties.compatible_visual_context_tree_structural_epoch));
-    TRY(encoder.encode(properties.surface_clear_color));
-    TRY(encoder.encode(properties.root_group_color));
-    TRY(encoder.encode(properties.async_scrolling_metadata));
-    return {};
-}
-
-template<>
-ErrorOr<Compositing::DisplayList::Properties> decode(Decoder& decoder)
-{
-    return Compositing::DisplayList::Properties {
-        .id = TRY(decoder.decode<u64>()),
-        .compatible_visual_context_tree_structural_epoch = TRY(decoder.decode<u64>()),
-        .surface_clear_color = TRY(decoder.decode<Optional<Gfx::Color>>()),
-        .root_group_color = TRY(decoder.decode<Gfx::Color>()),
-        .async_scrolling_metadata = TRY(decoder.decode<Optional<Compositing::DisplayList::AsyncScrollingMetadata>>()),
-    };
-}
 
 template<>
 ErrorOr<void> encode(Encoder& encoder, Compositing::DisplayList const& display_list)

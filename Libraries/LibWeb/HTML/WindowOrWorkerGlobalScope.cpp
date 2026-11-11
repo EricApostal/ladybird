@@ -290,7 +290,7 @@ static ErrorOr<NonnullRefPtr<Gfx::Bitmap>> scale_bitmap(Compositor::CompositorHo
 
     auto output = TRY(Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, size));
     Compositing::DisplayListResourceStorage resource_storage;
-    auto display_list = Painting::record_image_frame_display_list(Gfx::DecodedImageFrame { input }, output->rect().to_type<float>(), scaling_mode, resource_storage);
+    auto display_list = Painting::record_image_frame_display_list(TRY(Gfx::DecodedImageFrame::create(input)), output->rect().to_type<float>(), scaling_mode, resource_storage);
     if (!compositor_host->rasterize_display_list(display_list, resource_storage, output))
         return Error::from_string_literal("Unable to scale the bitmap");
     return output;
@@ -302,10 +302,9 @@ enum class ImageIsImageElementOrBlob : u8 {
 };
 
 // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#cropped-to-the-source-rectangle-with-formatting
-static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatting(Compositor::CompositorHost const* compositor_host, Gfx::DecodedImageFrame const& input_frame, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, ImageBitmapOptions const& options, ImageIsImageElementOrBlob image_is_image_element_or_blob = ImageIsImageElementOrBlob::No)
+static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatting(Compositor::CompositorHost const* compositor_host, Gfx::Bitmap const& input, Gfx::ColorSpace const& input_color_space, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, ImageBitmapOptions const& options, ImageIsImageElementOrBlob image_is_image_element_or_blob = ImageIsImageElementOrBlob::No)
 {
     // 1. Let input be the bitmap data being transformed.
-    auto const& input = input_frame.bitmap();
 
     // 2. If sx, sy, sw and sh are specified, let sourceRectangle be a rectangle whose corners are the four points
     //    (sx, sy), (sx+sw, sy), (sx+sw, sy+sh), (sx, sy+sh). Otherwise, let sourceRectangle be a rectangle whose
@@ -426,7 +425,7 @@ static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatt
             continue;
         output = TRY(scale_bitmap(compositor_host, *output, size, scaling_pass.mode));
     }
-    auto output_color_space = input_frame.color_space();
+    auto output_color_space = input_color_space;
 
     // 8. If the value of the imageOrientation member of options is "flipY", output must be flipped vertically,
     //    disregarding any image orientation metadata of the source (such as EXIF metadata), if any. [EXIF]
@@ -457,7 +456,7 @@ static ErrorOr<Gfx::DecodedImageFrame> crop_to_the_source_rectangle_with_formatt
     // FIXME: 10. Let val be the value of premultiplyAlpha member of options, and then run these substeps:
 
     // 11. Return output.
-    return Gfx::DecodedImageFrame { *output, move(output_color_space) };
+    return Gfx::DecodedImageFrame::create(*output, move(output_color_space));
 }
 
 struct VectorImageRaster {
@@ -621,7 +620,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     // If this is an animated image, imageBitmap's bitmap data must only be taken from the default image
                     // of the animation (the one that the format defines is to be used when animation is not supported
                     // or is disabled), or, if there is no such image, the first frame of the animation.
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(WebIDL::promise_realm(*p).global_object()), Gfx::DecodedImageFrame { *result.frames.take_first().bitmap, result.color_space }, sx, sy, sw, sh, options, ImageIsImageElementOrBlob::Yes);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(WebIDL::promise_realm(*p).global_object()), *result.frames.take_first().bitmap, result.color_space, sx, sy, sw, sh, options, ImageIsImageElementOrBlob::Yes);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -671,7 +670,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
             }
 
             // 3. Set imageBitmap's bitmap data to image's image data, cropped to the source rectangle with formatting.
-            auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), Gfx::DecodedImageFrame { *bitmap_or_error.release_value(), gfx_color_space_for(image_data->color_space()) }, sx, sy, sw, sh, options);
+            auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *bitmap_or_error.release_value(), gfx_color_space_for(image_data->color_space()), sx, sy, sw, sh, options);
             // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
             // Spec issue: https://github.com/whatwg/html/issues/3323
             if (cropped_bitmap_or_error.is_error()) {
@@ -700,7 +699,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image size is invalid"_utf16));
                         return;
                     }
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *canvas_frame, sx, sy, sw, sh, options);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *canvas_frame->bitmap_sharing_pixels(), canvas_frame->color_space(), sx, sy, sw, sh, options);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -729,7 +728,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                     }
 
                     // 1. Set imageBitmap's bitmap data to a copy of image's bitmap data, cropped to the source rectangle with formatting.
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *source_image_bitmap->frame(), sx, sy, sw, sh, options);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *source_image_bitmap->frame()->bitmap_sharing_pixels(), source_image_bitmap->frame()->color_space(), sx, sy, sw, sh, options);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -767,7 +766,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Video has no frame"_utf16));
                         return;
                     }
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *video_frame, sx, sy, sw, sh, options);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *video_frame->bitmap_sharing_pixels(), video_frame->color_space(), sx, sy, sw, sh, options);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {
@@ -828,7 +827,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
                         WebIDL::reject_promise(*p, WebIDL::InvalidStateError::create("Image could not be rendered"_utf16));
                         return;
                     }
-                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *decoded_frame, sx, sy, sw, sh, options, ImageIsImageElementOrBlob::Yes);
+                    auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *decoded_frame->bitmap_sharing_pixels(), decoded_frame->color_space(), sx, sy, sw, sh, options, ImageIsImageElementOrBlob::Yes);
                     // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
                     // Spec issue: https://github.com/whatwg/html/issues/3323
                     if (cropped_bitmap_or_error.is_error()) {

@@ -1532,6 +1532,19 @@ WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(Utf16View text,
     if (m_active_parser_was_aborted)
         return {};
 
+    // AD-HOC: The document write steps don't bound recursive parser invocations. Limit nested writes so a script
+    // can't keep writing itself indefinitely, and suppress further writes until the outermost call returns.
+    static constexpr size_t maximum_write_depth = 21;
+    if (m_document_write_depth >= maximum_write_depth || m_document_write_limit_reached) {
+        m_document_write_limit_reached = true;
+        return {};
+    }
+    ++m_document_write_depth;
+    ScopeGuard restore_write_depth = [&] {
+        if (--m_document_write_depth == 0)
+            m_document_write_limit_reached = false;
+    };
+
     // 9. If the insertion point is undefined, then:
     if (!(m_parser && m_parser->tokenizer().is_insertion_point_defined())) {
         // 1. If document's unload counter is greater than 0 or document's ignore-destructive-writes counter is greater than 0, then return.
@@ -3175,8 +3188,10 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
 
     // Scroll nodes are (re)created by the visual context tree build above, so scroll offsets and
     // the snapshot must be derived only after structure work is done.
-    if (has_committed_viewport_box())
-        paint_state().refresh_scroll_state(read, *this);
+    if (has_committed_viewport_box() && paint_state().refresh_scroll_state(read, *this) == Painting::RequiresDisplayListRecording::Yes) {
+        set_needs_to_record_display_list();
+        m_document->set_needs_repaint();
+    }
 }
 
 bool Document::can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const& layout_node) const
@@ -8493,11 +8508,6 @@ Compositing::AccumulatedVisualContextTree Document::visual_context_tree() const
     return paint_state().visual_context_tree(*this);
 }
 
-Compositing::ScrollStateSnapshot const& Document::scroll_state_snapshot() const
-{
-    return paint_state().scroll_state_snapshot();
-}
-
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-the-history-object-state
 void Document::restore_the_history_object_state(NonnullRefPtr<HTML::SessionHistoryEntry> entry)
 {
@@ -9320,7 +9330,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
     CompositorAnimationKeyframesByEffect keyframes_by_effect;
     GC::RootHashMap<GC::Ptr<Animations::KeyframeEffect>, bool> only_translates_horizontally_cache;
     GC::RootHashMap<GC::Ptr<Animations::KeyframeEffect>, bool> animated_transform_preserves_axes_cache;
-    GC::RootHashMap<Element const*, GC::RootVector<GC::Ptr<Animations::KeyframeEffect>>> in_effect_transform_effects_by_target;
+    HashMap<Layout::Node const*, GC::RootVector<GC::Ptr<Animations::KeyframeEffect>>> in_effect_transform_effects_by_layout_node;
     GC::RootHashMap<GC::Ptr<Element>, CSSPixelRect> observation_target_rect_cache;
     GC::RootHashTable<GC::Ref<Element>> elements_with_intersection_observation_descendants;
     GC::RootHashTable<GC::Ref<Element>> elements_with_visibility_observation_descendants;
@@ -9387,12 +9397,10 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         for (auto const* ancestor = layout_node->parent(); ancestor; ancestor = ancestor->parent()) {
             if (ancestor->has_css_transform() && !transform_preserves_horizontal_axis(*ancestor))
                 return true;
-            if (auto* ancestor_element = as_if<Element>(ancestor->dom_node())) {
-                if (auto effects = in_effect_transform_effects_by_target.find(ancestor_element); effects != in_effect_transform_effects_by_target.end()) {
-                    for (auto effect : effects->value) {
-                        if (!animated_transform_preserves_axes(*effect, *ancestor))
-                            return true;
-                    }
+            if (auto effects = in_effect_transform_effects_by_layout_node.find(ancestor); effects != in_effect_transform_effects_by_layout_node.end()) {
+                for (auto effect : effects->value) {
+                    if (!animated_transform_preserves_axes(*effect, *ancestor))
+                        return true;
                 }
             }
             if (ancestor->dom_node() == &observation_root)
@@ -9522,9 +9530,9 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         auto visible_bounds = viewport_bounds;
         for (auto const* ancestor = layout_node; ancestor; ancestor = ancestor->parent()) {
             bool can_move_or_expand_paint = ancestor->has_css_transform() || ancestor->perspective().has_value()
-                || ancestor->is_sticky_position() || ancestor->filter().has_filters();
+                || ancestor->is_sticky_position() || ancestor->filter().has_filters()
+                || in_effect_transform_effects_by_layout_node.contains(ancestor);
             if (auto const* element = as_if<Element>(ancestor->dom_node())) {
-                can_move_or_expand_paint |= in_effect_transform_effects_by_target.contains(element);
                 if (auto effects = competing_effects.get(*element); effects.has_value() && effects->filter.winner)
                     can_move_or_expand_paint = true;
             }
@@ -9657,7 +9665,8 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
             add_competing_effect(effects.filter);
         if (any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); })) {
             add_competing_effect(effects.transform);
-            in_effect_transform_effects_by_target.ensure(&target->element()).append(effect);
+            if (auto const* layout_node = target->unsafe_layout_node(read))
+                in_effect_transform_effects_by_layout_node.ensure(layout_node).append(effect);
         }
     }
 
@@ -12266,7 +12275,7 @@ Painting::HitTestListAdoption Document::adopt_published_recording(Optional<Layou
     }
 
     if (recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source)
-        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, referenced_resources());
+        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, referenced_resources(), recording.visual_context_tree);
     return adoption;
 }
 
@@ -12320,13 +12329,8 @@ Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunR
             return {};
     }
 
-    auto visual_context_tree = paint_state().visual_context_tree_without_update(read, *this);
-    if (visual_animation_sample_time_nanoseconds.has_value() && visual_context_tree.has_visual_animations())
-        visual_context_tree = visual_context_tree.with_visual_animation_samples(*visual_animation_sample_time_nanoseconds);
     return Painting::HitTestQuery {
         *m_hit_test_display_list,
-        move(visual_context_tree),
-        scroll_state_snapshot(),
         page().client().device_pixels_per_css_pixel(),
         page().chrome_metrics(),
         visual_animation_sample_time_nanoseconds,

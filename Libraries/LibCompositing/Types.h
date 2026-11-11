@@ -16,6 +16,7 @@
 #include <AK/Vector.h>
 #include <LibCompositing/Export.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
+#include <LibCompositing/Scrolling/ScrollSnapSelection.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Page/CompositorContextId.h>
 #include <LibWebCommon/Page/InputEvent.h>
@@ -49,6 +50,18 @@ enum class ScrollAnimationKind : u8 {
     SmoothScroll,
     Wheel,
     Momentum,
+};
+
+// Where the first step of a wheel gesture over a position goes, as far as the admission and the hit test decide it.
+struct FirstWheelStepRoute {
+    Web::InputRoutingDecision decision;
+    Optional<Web::AsyncScrollNodeStableID> scroller {};
+};
+
+struct FirstWheelStepRouteForTesting {
+    FirstWheelStepRoute route;
+    // The document whose scrolling state decided the route.
+    Optional<Web::UniqueNodeID> document_id;
 };
 
 // A scroll the compositor started for user input of its own: the main thread registers it as a user scroll in
@@ -100,14 +113,6 @@ struct PendingAsyncScrollUpdates {
     Vector<Web::AsyncScrollNodeStableID> boxes_in_user_scroll_gesture;
     Vector<Web::AsyncScrollNodeStableID> boxes_whose_user_scroll_gesture_ended;
     Optional<Web::AsyncScrollNodeStableID> wheel_latched_scroller;
-};
-
-struct AsyncScrollEnqueueResult {
-    bool accepted { false };
-    Optional<AsyncScrollOperationID> operation_id {};
-    // Why the compositor took or turned away a wheel step, and the scroller it routed the step to.
-    Optional<Web::InputRoutingDecision> routing_decision {};
-    Optional<Web::AsyncScrollNodeStableID> routed_scroller {};
 };
 
 // What the compositor did with a wheel event that WebContent's main thread passed on to it, as the compositor does with
@@ -301,66 +306,4 @@ inline constexpr AK::Duration user_scroll_settle_delay = AK::Duration::from_mill
 
 }
 
-namespace IPC {
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::KeyboardScrollState const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::KeyboardScrollState> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::AsyncScrollOffset const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::AsyncScrollOffset> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::SnapAreaIdentity const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::SnapAreaIdentity> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::SnapDestination const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::SnapDestination> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::StartedUserScroll const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::StartedUserScroll> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::AppliedScrollRequest const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::AppliedScrollRequest> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::PendingAsyncScrollUpdates const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::PendingAsyncScrollUpdates> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::RequestedRelativeScroll const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::RequestedRelativeScroll> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::RequestedSmoothScroll const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::RequestedSmoothScroll> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::ScrollRequest const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::ScrollRequest> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::WheelEventAnswer const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::WheelEventAnswer> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::WheelStepLetThrough const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::WheelStepLetThrough> decode(Decoder&);
-
-}
+#include <LibCompositing/TypesCodecs.h>

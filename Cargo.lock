@@ -605,6 +605,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "compositor_core"
+version = "0.1.0"
+dependencies = [
+ "ak",
+ "cbindgen",
+ "ladybird_allocator",
+ "libcompositing_rust",
+ "libgfx_rust",
+ "libipc_rust",
+ "rustc-demangle",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1749,6 +1762,7 @@ dependencies = [
  "foldhash 0.2.0",
  "ladybird_allocator",
  "libgfx_rust",
+ "libipc_rust",
  "rustc-demangle",
 ]
 
@@ -1776,6 +1790,7 @@ dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
  "ladybird_allocator",
+ "libipc_rust",
  "rustc-demangle",
  "yuv",
 ]
@@ -1802,6 +1817,7 @@ dependencies = [
 name = "libipc_rust"
 version = "0.1.0"
 dependencies = [
+ "ak",
  "libc",
 ]
 
@@ -2018,6 +2034,7 @@ dependencies = [
  "ladybird_allocator",
  "libcompositing_rust",
  "libgfx_rust",
+ "libipc_rust",
  "liburl_rust",
  "libweb_html_tokenizer",
  "rayon",

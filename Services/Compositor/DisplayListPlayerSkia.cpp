@@ -37,7 +37,6 @@
 #include <Compositor/CanvasSurfaceRegistry.h>
 #include <Compositor/DisplayListPlayerSkia.h>
 #include <Compositor/DisplayListRasterCache.h>
-#include <Compositor/ScrollbarController.h>
 #include <Compositor/SkiaBackendContext.h>
 #include <Compositor/SkiaUtils.h>
 #include <LibGfx/Bitmap.h>
@@ -68,21 +67,20 @@ void DisplayListPlayerSkia::execute(
     AccumulatedVisualContextTree const& visual_context_tree,
     DisplayListResourceStorage const& resource_storage,
     DisplayListRasterCache& raster_cache,
-    ScrollStateSnapshot const& scroll_state_snapshot,
+    FrameInputs const* frame_inputs,
     RefPtr<Gfx::PaintingSurface> surface,
     OwnedCanvasSurfaces const* canvas_surfaces,
-    CompositedContextResolver const* composited_context_resolver,
-    ScrollbarController const* scrollbar_controller)
+    CompositedContextResolver const* composited_context_resolver)
 {
     TemporaryChange composited_context_resolver_change { m_composited_context_resolver, composited_context_resolver };
-    TemporaryChange scrollbar_controller_change { m_scrollbar_controller, scrollbar_controller };
+    TemporaryChange scrollbars_of_frame_change { m_scrollbars_of_frame, frame_inputs ? frame_inputs->scrollbars() : ReadonlySpan<ScrollbarOfFrame> {} };
     raster_cache.drop_clip_paths_not_used_since_last_frame();
     TemporaryChange raster_cache_change { m_raster_cache, &raster_cache };
     DisplayListPlayer::execute(
         display_list,
         visual_context_tree,
         resource_storage,
-        scroll_state_snapshot,
+        frame_inputs,
         move(surface),
         canvas_surfaces);
 }
@@ -159,7 +157,7 @@ static bool rect_is_pixel_aligned(SkRect const& rect)
     return rect.left() == roundf(rect.left()) && rect.top() == roundf(rect.top()) && rect.right() == roundf(rect.right()) && rect.bottom() == roundf(rect.bottom());
 }
 
-static void paint_scrollbar_into_surface(Gfx::PaintingSurface& surface, ScrollbarController::PresentedScrollbar const& scrollbar)
+static void paint_scrollbar_into_surface(Gfx::PaintingSurface& surface, PresentedScrollbar const& scrollbar)
 {
     auto opacity = scrollbar.opacity;
     if (opacity <= 0)
@@ -199,9 +197,13 @@ static void paint_scrollbar_into_surface(Gfx::PaintingSurface& surface, Scrollba
     canvas.drawRRect(thumb_rrect, stroke_paint);
 }
 
-void DisplayListPlayerSkia::paint_scrollbar(Gfx::PaintingSurface& surface, ScrollbarController::PresentedScrollbar const& scrollbar)
+void DisplayListPlayerSkia::paint_scrollbars_painted_by_compositor(Gfx::PaintingSurface& surface, ReadonlySpan<ScrollbarOfFrame> scrollbars_of_frame)
 {
-    paint_scrollbar_into_surface(surface, scrollbar);
+    for (auto const& scrollbar : scrollbars_of_frame) {
+        if (!scrollbar.is_painted_by_compositor)
+            continue;
+        paint_scrollbar_into_surface(surface, presented_scrollbar_with_colors(scrollbar, scrollbar.thumb_color, scrollbar.thumb_outline_color, scrollbar.track_color));
+    }
 }
 
 static SkMatrix vertical_glyph_run_rotation(Gfx::IntRect const& rect)
@@ -291,7 +293,7 @@ void DisplayListPlayerSkia::play_command(DrawCompositedContext const& command)
 
     // Snap iframe origins to device pixels for browser compatibility when transforms are absent or identity.
     // Preserve fractional placement under other transforms to retain the raster phase of surrounding content.
-    if (command.snap_origin_if_untransformed && active_visual_context_tree().translations_snap_to_device_pixels(command.spatial_node_index, active_scroll_state())) {
+    if (command.snap_origin_if_untransformed && active_visual_context_tree().translations_snap_to_device_pixels(command.spatial_node_index)) {
         destination_rect.set_x(roundf(destination_rect.x()));
         destination_rect.set_y(roundf(destination_rect.y()));
     }
@@ -1305,14 +1307,14 @@ void DisplayListPlayerSkia::play_command(DrawIsolatedGroup const& command)
     if (command.filter.size != 0)
         group_paint.setImageFilter(image_filter_from_bytes(inline_data(command.filter)));
     canvas.saveLayer(nullptr, &group_paint);
-    execute_command_bytes(inline_data(command.content), active_scroll_state());
+    execute_command_bytes(inline_data(command.content));
     if (command.mask.size != 0) {
         SkPaint mask_paint;
         mask_paint.setBlender(Gfx::to_skia_blender(Gfx::CompositingAndBlendingOperator::DestinationIn));
         if (command.mask_kind == Gfx::MaskKind::Luminance)
             mask_paint.setColorFilter(SkLumaColorFilter::Make());
         canvas.saveLayer(nullptr, &mask_paint);
-        execute_command_bytes(inline_data(command.mask), active_scroll_state());
+        execute_command_bytes(inline_data(command.mask));
         canvas.restore();
     }
     canvas.restore();
@@ -1328,6 +1330,8 @@ void DisplayListPlayerSkia::play_command(PaintNestedDisplayList const& command)
 {
     auto& canvas = surface().canvas();
     auto const& nested_display_list = resource_storage().display_list_resource(command.display_list_id);
+    // The scrollbars of this context do not belong to the scroll nodes of a nested display list.
+    TemporaryChange<ReadonlySpan<ScrollbarOfFrame>> scrollbars_of_frame_change { m_scrollbars_of_frame, {} };
 
     // Rasterize immutable nested lists (SVG images and masks) at list resolution and reuse their snapshots.
     // The first paint of a list rasterizes only the visible portion, so lists replaced every frame do not paint
@@ -1426,15 +1430,8 @@ void DisplayListPlayerSkia::play_command(PaintNestedDisplayList const& command)
         if (!list_bounds.is_empty() && !command.rect.is_empty())
             canvas.scale(command.rect.width() / command.list_size.width(), command.rect.height() / command.list_size.height());
     }
-    ScrollStateSnapshot scroll_state_snapshot;
-    // The scrollbars of this context do not belong to the scroll nodes of a nested display list.
-    TemporaryChange<ScrollbarController const*> scrollbar_controller_change { m_scrollbar_controller, nullptr };
-    execute_nested_display_list(*nested_display_list.display_list, nested_display_list.visual_context_tree, scroll_state_snapshot);
+    execute_nested_display_list(*nested_display_list.display_list, nested_display_list.visual_context_tree);
     canvas.restore();
-}
-
-void DisplayListPlayerSkia::play_command(CompositorScrollNode const&)
-{
 }
 
 void DisplayListPlayerSkia::play_command(CompositorWheelHitTestTarget const&)
@@ -1457,29 +1454,23 @@ void DisplayListPlayerSkia::play_command(CompositorBlockingWheelEventRegion cons
 {
 }
 
-void DisplayListPlayerSkia::play_command(CompositorSnapContainer const&)
-{
-}
-
-void DisplayListPlayerSkia::play_command(CompositorSnapArea const&)
-{
-}
-
 void DisplayListPlayerSkia::play_command(CompositorNestedContextWheelRegion const&)
 {
 }
 
 void DisplayListPlayerSkia::play_command(PaintScrollBar const& command)
 {
-    if (m_scrollbar_controller) {
-        if (auto scrollbar = m_scrollbar_controller->presented_scrollbar_painted_by_display_list(command.scroll_node_index, command.vertical, command.thumb_color, command.thumb_outline_color, command.track_color, active_scroll_state()); scrollbar.has_value()) {
-            paint_scrollbar_into_surface(surface(), *scrollbar);
+    // A scrollbar command of the display list with no scrollbar of the frame is painted as the command gives it. The
+    // colors are the ones the display list resolved for the page, which it may have darkened.
+    for (auto const& scrollbar_of_frame : m_scrollbars_of_frame) {
+        if (!scrollbar_of_frame.is_painted_by_compositor && scrollbar_of_frame.scroll_node_index == command.scroll_node_index && scrollbar_of_frame.vertical == command.vertical) {
+            paint_scrollbar_into_surface(surface(), presented_scrollbar_with_colors(scrollbar_of_frame, command.thumb_color, command.thumb_outline_color, command.track_color));
             return;
         }
     }
-    ScrollbarController::PresentedScrollbar scrollbar {
+    PresentedScrollbar scrollbar {
         .gutter_rect = command.gutter_rect.to_type<float>(),
-        .thumb_rect = ScrollbarController::thumb_rect_kept_inside_track(command.thumb_rect, command.track_rect, command.vertical).to_type<float>(),
+        .thumb_rect = thumb_rect_kept_inside_track(command.thumb_rect, command.track_rect, command.vertical).to_type<float>(),
         .thumb_color = command.thumb_color,
         .thumb_outline_color = command.thumb_outline_color,
         .track_color = command.track_color,
@@ -1667,7 +1658,7 @@ void DisplayListPlayerSkia::pop_mask(ReplayMask const& mask, EffectNodeIndex eff
     if (auto content = declared_mask_content(effect); content.has_value()) {
         canvas.save();
         canvas.clipRect(to_skia_rect(mask.rect.to_type<float>()));
-        execute_command_bytes(*content, active_scroll_state());
+        execute_command_bytes(*content);
         canvas.restore();
     }
     canvas.restore();

@@ -1129,9 +1129,9 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
     };
 
     use crate::bindings::conversions::{
-        ArrayBufferView, BufferSource, BufferSourceRules, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
+        ArrayBufferView, BufferSource, BufferSourceRules, ByteString, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
         frozen_array_to_js, implements_cpp_interface, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js,
-        sequence_from_js, sequence_to_js, to_array_buffer_view, to_boolean, to_buffer_source, to_cpp_interface,
+        sequence_from_js, sequence_to_js, to_array_buffer_view, to_boolean, to_buffer_source, to_byte_string, to_cpp_interface,
         to_cpp_interface_in_union, to_dom_string,
         to_dom_string_treating_null_as_empty, to_double, to_float, to_long, to_long_enforcing_range, to_long_long,
         to_long_long_clamping, to_long_long_enforcing_range, to_object, to_promise, to_typed_array,
@@ -1384,13 +1384,21 @@ def write_rust_interface(
         is_secure_context_only = "SecureContext" in attribute.attribute.extended_attributes
         if attribute.is_cached:
             definition = f'define_cached_attribute(vm, realm, prototype, "{name}", {getter});'
-            out.write(member_exposure_definition(definition, secure_context_only=is_secure_context_only))
+            out.write(
+                member_exposure_definition(
+                    definition, secure_context_only=is_secure_context_only, window_only=attribute.is_window_only
+                )
+            )
             defined_property_names.append(name)
             continue
         has_setter = not attribute.attribute.readonly or attribute.put_forwards is not None
         setter = f"raw_native!({attribute.setter_function})" if has_setter else "None"
         definition = f'define_attribute(vm, realm, prototype, "{name}", {getter}, {setter});'
-        out.write(member_exposure_definition(definition, secure_context_only=is_secure_context_only))
+        out.write(
+            member_exposure_definition(
+                definition, secure_context_only=is_secure_context_only, window_only=attribute.is_window_only
+            )
+        )
         defined_property_names.append(name)
     if interface.name == "CSSStyleProperties":
         out.write(
@@ -2484,11 +2492,11 @@ pub(crate) mod definitions {
     use crate::bindings::CallContext;
     use crate::bindings::callback::{CallbackFunction, CallbackInterface, PromiseCallbackFunction};
     use crate::bindings::conversions::{
-        ArrayBufferView, BufferSource, BufferSourceRules, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
+        ArrayBufferView, BufferSource, BufferSourceRules, ByteString, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
         buffer_source_if, dictionary_member, dictionary_object, enumeration_value_to_js, implements_cpp_interface,
         frozen_array_to_js, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js, sequence_from_iterable, sequence_from_js,
         sequence_to_js, throw_no_union_types_matched, to_array_buffer_view, to_boolean, to_buffer_source,
-        to_cpp_interface,
+        to_byte_string, to_cpp_interface,
         to_dom_string, to_dom_string_treating_null_as_empty, to_double, to_enumeration_value, to_float, to_long,
         to_long_enforcing_range, to_long_long, to_long_long_enforcing_range, to_object, to_typed_array,
         to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_enforcing_range,

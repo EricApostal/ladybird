@@ -81,19 +81,150 @@ pub extern "C" fn layout_row_paintable_wheel_scrollable_axes(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_row_snap_container_geometry(
+fn snap_container_geometry(
     host: &crate::render_state::DocumentHost,
     snap_container: NodeSlotId,
-    out_geometry: &mut crate::painting::host::FfiSnapContainerGeometry,
-) -> bool {
-    let geometry = read_measured_rows(host, super::node_read(), |rows| {
+) -> Option<libcompositing_rust::scrolling::scroll_snap_selection::SnapContainerGeometry> {
+    read_measured_rows(host, super::node_read(), |rows| {
         crate::painting::scroll_snap::snap_container_geometry(rows, snap_container)
-    });
-    let Some(geometry) = geometry else {
+    })
+    .map(Into::into)
+}
+
+fn snap_areas(
+    host: &crate::render_state::DocumentHost,
+    snap_container: NodeSlotId,
+) -> Vec<libcompositing_rust::scrolling::scroll_snap_selection::SnapAreaGeometry> {
+    read_arena(host, super::node_read(), snap_container, |arena, snap_container| {
+        let mut areas = Vec::new();
+        crate::painting::scroll_snap::for_each_snap_area(&arena.paintable_rows(), snap_container, |slot, mut area| {
+            // A re-snap right after layout runs ahead of the visual context tree that names the area's
+            // element, so the area is named by what the build stamped onto its row.
+            area.node_id = arena.unique_node_ids().id(slot);
+            areas.push(area.into());
+        });
+        areas
+    })
+}
+
+/// # Safety
+///
+/// `receive` must copy what it keeps of the destination synchronously.
+unsafe fn receive_snap_destination(
+    destination: libcompositing_rust::scrolling::SnapDestination,
+    receiver: *mut c_void,
+    receive: unsafe extern "C" fn(*mut c_void, &crate::painting::host::FfiSnapDestination<'_>),
+) {
+    use crate::painting::host::{FfiSnapAreaIdentity, FfiSnapDestination};
+    let x: Vec<FfiSnapAreaIdentity> = destination.snapped_areas.x.into_iter().map(Into::into).collect();
+    let y: Vec<FfiSnapAreaIdentity> = destination.snapped_areas.y.into_iter().map(Into::into).collect();
+    let destination = FfiSnapDestination {
+        position: destination.position.into(),
+        snapped_x: destination.snapped_x,
+        snapped_y: destination.snapped_y,
+        evaluated_x: destination.evaluated_x,
+        evaluated_y: destination.evaluated_y,
+        snapped_areas_x: ak::Span::new(&x),
+        snapped_areas_y: ak::Span::new(&y),
+    };
+    // SAFETY: The caller copies what it keeps of the destination synchronously.
+    unsafe { receive(receiver, &destination) };
+}
+
+/// Answers false, without calling `receive`, for a box that snaps along none of the axes the scroll selects a snap
+/// position in.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread. `receive` must copy what it keeps of the
+/// destination synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_select_snap_destination(
+    host: &crate::render_state::DocumentHost,
+    snap_container: NodeSlotId,
+    destination: FfiCssPixelPoint,
+    strategy: &crate::painting::host::FfiSnapSelectionStrategy,
+    receiver: *mut c_void,
+    receive: unsafe extern "C" fn(*mut c_void, &crate::painting::host::FfiSnapDestination<'_>),
+) -> bool {
+    use libcompositing_rust::scrolling::scroll_snap_selection::{axes_to_evaluate, select_snap_destination};
+    let Some(geometry) = snap_container_geometry(host, snap_container) else {
         return false;
     };
-    *out_geometry = geometry;
+    let strategy = strategy.into();
+    if axes_to_evaluate(geometry.axes, &strategy).is_empty() {
+        return false;
+    }
+    let destination = select_snap_destination(
+        &geometry,
+        &snap_areas(host, snap_container),
+        destination.into(),
+        &strategy,
+    );
+    // SAFETY: The caller copies what it keeps of the destination synchronously.
+    unsafe { receive_snap_destination(destination, receiver, receive) };
+    true
+}
+
+struct SnapAreaDomRelationsOfHost<'a>(&'a crate::painting::host::FfiSnapAreaDomRelations);
+
+impl crate::painting::scroll_resnap::SnapAreaDomRelations for SnapAreaDomRelationsOfHost<'_> {
+    fn area_contains_focused_node(&self, area: libcompositing_rust::scrolling::SnapAreaIdentity) -> bool {
+        // SAFETY: The entry point's caller keeps the relation callbacks live for selection.
+        unsafe { (self.0.area_contains_focused_node)(self.0.context, area.into()) }
+    }
+
+    fn area_contains_targeted_element(&self, area: libcompositing_rust::scrolling::SnapAreaIdentity) -> bool {
+        // SAFETY: The entry point's caller keeps the relation callbacks live for selection.
+        unsafe { (self.0.area_contains_targeted_element)(self.0.context, area.into()) }
+    }
+
+    fn element_of_area_is_ancestor_of_element_of(
+        &self,
+        area: libcompositing_rust::scrolling::SnapAreaIdentity,
+        other_area: libcompositing_rust::scrolling::SnapAreaIdentity,
+    ) -> bool {
+        // SAFETY: The entry point's caller keeps the relation callbacks live for selection.
+        unsafe { (self.0.element_of_area_is_ancestor_of_element_of)(self.0.context, area.into(), other_area.into()) }
+    }
+}
+
+/// Answers false, without calling `receive`, for a box that snaps along no axis.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread. The relation callbacks must stay live for
+/// selection, and `receive` must copy what it keeps of the destination synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_select_resnap_destination(
+    host: &crate::render_state::DocumentHost,
+    snap_container: NodeSlotId,
+    current_offset: FfiCssPixelPoint,
+    snapped_areas_x: ak::Span<'_, crate::painting::host::FfiSnapAreaIdentity>,
+    snapped_areas_y: ak::Span<'_, crate::painting::host::FfiSnapAreaIdentity>,
+    relations: &crate::painting::host::FfiSnapAreaDomRelations,
+    receiver: *mut c_void,
+    receive: unsafe extern "C" fn(*mut c_void, &crate::painting::host::FfiSnapDestination<'_>),
+) -> bool {
+    let Some(geometry) = snap_container_geometry(host, snap_container) else {
+        return false;
+    };
+    if geometry.axes.is_empty() {
+        return false;
+    }
+    let selection = libcompositing_rust::scrolling::SnappedAreas {
+        x: snapped_areas_x.as_slice().iter().copied().map(Into::into).collect(),
+        y: snapped_areas_y.as_slice().iter().copied().map(Into::into).collect(),
+    };
+    let destination = crate::painting::scroll_resnap::select_resnap_destination(
+        &geometry,
+        &snap_areas(host, snap_container),
+        current_offset.into(),
+        &selection,
+        &SnapAreaDomRelationsOfHost(relations),
+    );
+    // SAFETY: The caller copies what it keeps of the destination synchronously.
+    unsafe { receive_snap_destination(destination, receiver, receive) };
     true
 }
 
@@ -351,61 +482,44 @@ pub unsafe extern "C" fn render_state_sync_svg_paint_resources(
 }
 
 /// Re-reads the scroll containers' offsets when something invalidated them since the last refresh, resolves the
-/// sticky nodes' offsets on top of them, and hands the dense device-pixel snapshot to `publish`; otherwise the caller
-/// keeps its copy.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread; `publish` is called synchronously with `sink` and a
-/// view of the snapshot that is valid only for the duration of that call.
+/// sticky nodes' offsets on top of them, and has `host` keep them as its document's scroll state; otherwise the host
+/// keeps the one it has. Refreshes the compositor scroll table of the tree as well. Answers whether the offsets
+/// changed, and what refreshing the table changed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_refresh_scroll_state(
+pub extern "C" fn render_state_refresh_scroll_state(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     device_pixels_per_css_pixel: f64,
-    sink: *mut c_void,
-    publish: unsafe extern "C" fn(*mut c_void, *const libgfx_rust::FloatPoint, usize),
-) {
-    let snapshot = run_paint_pass(read, host, PassEffect::RewritesRows, |arena| {
-        crate::painting::paint_passes::refresh_scroll_state(arena, device_pixels_per_css_pixel)
+    device_viewport_size: libgfx_rust::IntSize,
+) -> crate::painting::paint_passes::FfiCompositorScrollRefreshOutcome {
+    let (device_offsets, mut outcome) = run_paint_pass(read, host, PassEffect::RewritesRows, |arena| {
+        crate::painting::paint_passes::refresh_scroll_state(arena, device_pixels_per_css_pixel, device_viewport_size)
     });
-    if let Some(snapshot) = snapshot {
-        // SAFETY: The C++ sink copies the offsets synchronously.
-        unsafe { publish(sink, snapshot.as_ptr(), snapshot.len()) };
-    }
+    outcome.scroll_state_changed =
+        device_offsets.is_some_and(|device_offsets| host.refresh_scroll_state(device_offsets));
+    outcome
 }
 
+/// Has `host` forget its document's scroll state, as the viewport's row or the document's paint state starts over.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_forget_scroll_state(host: &crate::render_state::DocumentHost) {
+    host.forget_scroll_state();
+}
+
+/// Hands `append` the scroll state of `host`'s document as the scroll logic of the compositor reads it.
+///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread. The host callback receives each snap area's
-/// geometry, valid for the duration of the call.
+/// `append` is called synchronously with `sink`, and must copy the bytes it keeps.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_for_each_snap_area(
+pub unsafe extern "C" fn render_state_encode_scroll_state(
     host: &crate::render_state::DocumentHost,
-    snap_container: NodeSlotId,
-    context: *mut c_void,
-    push_snap_area: unsafe extern "C" fn(*mut c_void, *const crate::painting::host::FfiSnapAreaGeometry),
+    sink: *mut c_void,
+    append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
 ) {
-    let areas = {
-        read_arena(host, super::node_read(), snap_container, |arena, snap_container| {
-            let mut areas = Vec::new();
-            crate::painting::scroll_snap::for_each_snap_area(
-                &arena.paintable_rows(),
-                snap_container,
-                |slot, mut area| {
-                    // A re-snap right after layout runs ahead of the visual context tree that names the area's
-                    // element, so the area is named by what the build stamped onto its row.
-                    area.node_id = arena.unique_node_ids().id(slot);
-                    areas.push(area);
-                },
-            );
-            areas
-        })
-    };
-    for area in &areas {
-        // SAFETY: The C++ callback copies the geometry into a caller-owned collection.
-        unsafe { push_snap_area(context, area) };
-    }
+    let bytes = host.scroll_state().to_encoded_bytes();
+    // SAFETY: The C++ sink copies the bytes synchronously.
+    unsafe { append(sink, bytes.as_ptr(), bytes.len()) };
 }
 
 /// # Safety
@@ -561,7 +675,7 @@ unsafe fn commit_frame(
         content,
         recorder,
         // SAFETY: Guaranteed by the caller.
-        presentation: unsafe { crate::painting::presentation::Presentation::adopt(presentation) }
+        presentation: unsafe { crate::painting::presentation::Presentation::adopt(presentation, &host.scroll_state()) }
             .expect("a committed frame is presented"),
         timestamp,
         held_for_testing,
@@ -955,10 +1069,13 @@ pub extern "C" fn layout_hit_test_resolve_hit(
 pub unsafe extern "C" fn layout_hit_test_find_topmost_item(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
-    callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
+    query: crate::painting::host::FfiHitTestQuery,
     point: FfiCssPixelPoint,
     out: &mut crate::painting::host::FfiTopmostItem,
 ) {
+    let scroll_state = host.scroll_state();
+    let callbacks =
+        crate::painting::host::FfiHitTestQueryCallbacks::for_host_query(&query, scroll_state.device_offsets());
     *out = with_hit_test_list_spatial_indexes_and_visual_context_tree(
         host,
         read,
@@ -979,11 +1096,14 @@ pub unsafe extern "C" fn layout_hit_test_find_topmost_item(
 pub unsafe extern "C" fn layout_hit_test_all(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
-    callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
+    query: crate::painting::host::FfiHitTestQuery,
     point: FfiCssPixelPoint,
     push_context: *mut c_void,
     push: unsafe extern "C" fn(*mut c_void, usize, FfiCssPixelPoint),
 ) {
+    let scroll_state = host.scroll_state();
+    let callbacks =
+        crate::painting::host::FfiHitTestQueryCallbacks::for_host_query(&query, scroll_state.device_offsets());
     let hits =
         with_hit_test_list_spatial_indexes_and_visual_context_tree(host, read, Vec::new(), |list, tree, arena| {
             let mut sampled = None;
@@ -1006,11 +1126,14 @@ pub unsafe extern "C" fn layout_hit_test_all(
 pub unsafe extern "C" fn layout_hit_test_caret_position_from_point(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
-    callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
+    query: crate::painting::host::FfiHitTestQuery,
     point: FfiCssPixelPoint,
     constraint_scope: NodeSlotId,
     out: &mut FfiCaretAt,
 ) {
+    let scroll_state = host.scroll_state();
+    let callbacks =
+        crate::painting::host::FfiHitTestQueryCallbacks::for_host_query(&query, scroll_state.device_offsets());
     *out = with_hit_test_list_spatial_indexes_and_visual_context_tree(host, read, None, |list, tree, arena| {
         let world = callbacks.build_world_transforms(tree);
         list.caret_position_from_point(

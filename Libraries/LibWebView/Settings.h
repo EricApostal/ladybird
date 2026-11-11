@@ -18,6 +18,7 @@
 #include <LibHTTP/Cache/DiskCacheSettings.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/HTML/AutoplayPolicy.h>
+#include <LibWebCommon/Permissions/Permissions.h>
 #include <LibWebCommon/WebView/BrowsingBehavior.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/Options.h>
@@ -71,6 +72,11 @@ struct Appearance {
     ColorTheme color_theme { ColorTheme::Neutral };
 };
 
+enum class HostSetting : u8 {
+    Zoom,
+    ForceDark,
+};
+
 struct ContentSettings {
     double default_zoom_level_factor { 1.0 };
     HashMap<String, double> zoom_per_host;
@@ -100,37 +106,17 @@ struct SearchEngineSettings {
     bool suggestions { false };
 };
 
+template<typename Policy, Policy default_policy>
 struct SiteSetting {
-    OrderedHashTable<String> site_filters;
-
-protected:
-    SiteSetting() = default;
+    Policy policy { default_policy };
+    OrderedHashMap<String, Policy> site_filters;
 };
 
-struct AutoplaySiteSetting : public SiteSetting {
-    Web::HTML::AutoplayPolicy policy { Web::HTML::AutoplayPolicy::BlockAudio };
-};
+using AutoplaySiteSetting = SiteSetting<Web::HTML::AutoplayPolicy, Web::HTML::AutoplayPolicy::BlockAudio>;
 
-// Whether sites may ask for the user's location at all.
-enum class LocationPolicy : u8 {
+enum class PermissionPolicy : u8 {
     Ask,
     Block,
-};
-
-// Whether sites may ask to use the user's microphone at all.
-enum class MicrophonePolicy : u8 {
-    Ask,
-    Block,
-};
-
-// Whether sites may ask to send the user notifications at all.
-enum class NotificationsPolicy : u8 {
-    Ask,
-    Block,
-};
-
-struct BrowsingDataSettings {
-    HTTP::DiskCacheSettings disk_cache_settings;
 };
 
 enum class GlobalPrivacyControl {
@@ -164,6 +150,7 @@ enum class ConfigVariableID : u8 {
     UseClientSideWindowDecorations,
     VerticalTabsHoverExpandDelay,
     VerticalTabsHoverExpandAnimationDuration,
+    MaximumDiskCacheSize,
     MaximumConnectionsPerDownload,
     SplitDownloadsWithoutValidators,
     RestartStalledConnections,
@@ -199,14 +186,11 @@ public:
     virtual void browsing_behavior_changed() { }
     virtual void search_engine_settings_changed() { }
     virtual void autoplay_settings_changed() { }
-    virtual void browsing_data_settings_changed() { }
+    virtual void permission_settings_changed(Web::Permissions::PermissionName) { }
     virtual void global_privacy_control_changed() { }
     virtual void crash_report_sending_changed() { }
     virtual void dns_settings_changed() { }
     virtual void config_variable_changed(ConfigVariableID) { }
-    virtual void geolocation_settings_changed() { }
-    virtual void microphone_settings_changed() { }
-    virtual void notifications_settings_changed() { }
     virtual void background_networking_settings_changed() { }
     virtual void content_blocker_settings_changed() { }
 
@@ -234,11 +218,8 @@ struct WEBVIEW_API SettingsData {
     Vector<SearchEngine> m_custom_search_engines;
 
     AutoplaySiteSetting m_autoplay;
-    LocationPolicy m_location_policy { LocationPolicy::Ask };
-    MicrophonePolicy m_microphone_policy { MicrophonePolicy::Ask };
-    NotificationsPolicy m_notifications_policy { NotificationsPolicy::Ask };
+    HashMap<Web::Permissions::PermissionName, PermissionPolicy> m_permission_policies;
 
-    BrowsingDataSettings m_browsing_data_settings;
     GlobalPrivacyControl m_global_privacy_control { GlobalPrivacyControl::No };
     CrashReportSending m_crash_report_sending { CrashReportSending::AskMe };
 
@@ -287,6 +268,7 @@ public:
     WindowSettings const& window_settings() const { return m_window_settings; }
     void set_window_settings(WindowSettings);
 
+    static URL::URL const& default_new_tab_page_url();
     URL::URL const& new_tab_page_url() const { return m_new_tab_page_url; }
     void set_new_tab_page_url(URL::URL);
 
@@ -312,10 +294,12 @@ public:
 
     bool force_dark_for_host(StringView host) const;
     void set_force_dark_for_host(String const& host, bool enabled);
-    void reset_force_dark_for_host(StringView host);
 
     double zoom_for_host(StringView host) const;
     void set_zoom_for_host(String const& host, double zoom_level);
+
+    // Omitting the host resets every override for this setting.
+    void reset_host_setting(HostSetting, Optional<StringView> host = {});
 
     static TabSettings parse_tab_settings(JsonValue const&);
     TabSettings const& tab_settings() const { return m_tab_settings; }
@@ -335,22 +319,14 @@ public:
 
     AutoplaySiteSetting const& autoplay_settings() const { return m_autoplay; }
     void set_autoplay_policy(Web::HTML::AutoplayPolicy);
-    void add_autoplay_site_filter(String const&);
+    void add_autoplay_site_filter(String const&, Web::HTML::AutoplayPolicy);
     void remove_autoplay_site_filter(String const&);
     void remove_all_autoplay_site_filters();
 
-    LocationPolicy location_policy() const { return m_location_policy; }
-    void set_location_policy(LocationPolicy);
+    PermissionPolicy permission_policy(Web::Permissions::PermissionName) const;
+    void set_permission_policy(Web::Permissions::PermissionName, PermissionPolicy);
 
-    MicrophonePolicy microphone_policy() const { return m_microphone_policy; }
-    void set_microphone_policy(MicrophonePolicy);
-
-    NotificationsPolicy notifications_policy() const { return m_notifications_policy; }
-    void set_notifications_policy(NotificationsPolicy);
-
-    static BrowsingDataSettings parse_browsing_data_settings(JsonValue const&);
-    BrowsingDataSettings const& browsing_data_settings() const { return m_browsing_data_settings; }
-    void set_browsing_data_settings(BrowsingDataSettings);
+    HTTP::DiskCacheSettings disk_cache_settings() const;
 
     GlobalPrivacyControl global_privacy_control() const { return m_global_privacy_control; }
     void set_global_privacy_control(GlobalPrivacyControl);

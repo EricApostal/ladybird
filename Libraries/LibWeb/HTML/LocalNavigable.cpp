@@ -114,6 +114,7 @@
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/Infra/Strings.h>
 #include <LibWebCommon/Loader/DownloadFilename.h>
+#include <LibWebCommon/WebView/Utilities.h>
 
 #include <AK/Debug.h>
 #include <AK/LexicalPath.h>
@@ -6847,9 +6848,8 @@ void LocalNavigable::update_force_dark_for_active_document()
     if (!is_top_level_traversable())
         return;
     auto enabled = m_force_dark_default;
-    if (auto document = active_document(); document && document->url().host().has_value()) {
-        auto host = MUST(String::from_utf8(document->url().serialized_host()));
-        if (!host.is_empty())
+    if (auto document = active_document()) {
+        if (auto host = WebView::host_for_settings(document->url()); !host.is_empty())
             enabled = m_force_dark_per_host.get(host).value_or(enabled);
     }
     set_force_dark_enabled(enabled);
@@ -7100,7 +7100,6 @@ Compositor::SealedPresentation LocalNavigable::seal_presentation(DOM::Document& 
     if (records_display_list)
         visual_context_tree = paint_state.visual_context_tree(document);
     paint_state.did_update_visual_context_tree_in_compositor();
-    Compositing::ScrollStateSnapshot scroll_state_snapshot { paint_state.scroll_state_snapshot() };
     // A keyboard scroll reads the layout, which one the host knows is stale leaves to the next frame that lays it out.
     Optional<Compositing::KeyboardScrollState> keyboard_scroll_state;
     if (is_top_level_traversable() && !document.layout_is_known_stale())
@@ -7110,7 +7109,6 @@ Compositor::SealedPresentation LocalNavigable::seal_presentation(DOM::Document& 
         .visual_context_tree = move(visual_context_tree),
         .sends_visual_context_tree = sends_visual_context_tree,
         .scroll_state_changed = paint_state.take_scroll_state_change(),
-        .scroll_state_snapshot = move(scroll_state_snapshot),
         .scroll_requests = take_unsent_scroll_requests(),
         .keyboard_scroll_state = move(keyboard_scroll_state),
         .paint_command_cache_source = paint_state.display_list_used_as_paint_command_cache_source(),

@@ -21,6 +21,7 @@
 #include <LibWebCommon/WebView/Utilities.h>
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/CrashReport.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/FaviconStore.h>
 #include <LibWebView/HistoryStore.h>
@@ -879,6 +880,8 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     create_history_store(state.data_directory, state.uses_sql_database);
     // NB: Reports stay in files, which both of us read. This process keeps its own for when it crashes, and the next
     //     launch recovers that the same as one of the Hub's.
+    m_browser_options.disable_sandbox = state.sandbox_is_disabled ? WebView::DisableSandbox::Yes : WebView::DisableSandbox::No;
+    WebView::CrashReport::set_sandbox_is_disabled(m_browser_options.disable_sandbox);
     auto& crash_report_store = WebView::CrashReportStore::the();
     crash_report_store.set_directory(move(state.crash_report_directory));
     if (auto result = crash_report_store.initialize_browser_crash_handler(); result.is_error())
@@ -933,10 +936,14 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
         });
     }
 
-    QObject::connect(&SystemAppearance::the(), &SystemAppearance::changed, [this] {
+    // NB: The UI info holds the interface color scheme, which changes with the interface theme as well as with the
+    //     system's appearance. The views take it from the Hub only after this, as they update their palettes later.
+    auto send_ui_info = [this] {
         if (auto* hub = HubConnection::the_if_connected())
             hub->async_ui_info_changed(current_ui_info());
-    });
+    };
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::changed, send_ui_info);
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::interface_appearance_changed, send_ui_info);
     return {};
 }
 
@@ -2707,15 +2714,14 @@ QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_
         }
         view_menu->addSeparator();
     }
-    view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));
     view_menu->addAction(create_application_action(*view_menu, application.force_dark_action(), IncludeActionIcon::No));
+    view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));
     view_menu->addMenu(create_application_menu(*view_menu, application.contrast_menu()));
     view_menu->addMenu(create_application_menu(*view_menu, application.motion_menu()));
+    view_menu->addSeparator();
 
-    if constexpr (show_menu_bar_option_available()) {
-        view_menu->addSeparator();
+    if constexpr (show_menu_bar_option_available())
         view_menu->addAction(create_application_action(*view_menu, application.toggle_menu_bar_action(), IncludeActionIcon::No));
-    }
 
     menu_bar->addMenu(bookmarks_menu());
     menu_bar->addMenu(history_menu());

@@ -34,6 +34,14 @@ def generate(contents: str) -> str:
 
 
 class TestIPCGenerator(unittest.TestCase):
+    def test_messages_received_in_rust_carry_no_claim_by_their_sender(self) -> None:
+        header, _ = generate_files(
+            "endpoint Test { [RustReceiver] update(Web::PageId page_id, u32 value) =| other(u64 value) =| }"
+        )
+        self.assertIn("static_assert(__is_empty(IPC::SenderClaimReceiver<Web::PageId>),", header)
+        self.assertIn("static_assert(__is_empty(IPC::SenderClaimReceiver<u32>),", header)
+        self.assertNotIn("IPC::SenderClaimReceiver<u64>)", header)
+
     def test_non_template_implementations_are_only_in_the_cpp_file(self) -> None:
         header, implementation = generate_files(ENDPOINT)
         self.assertIn('#include "TestEndpoint.h"', implementation)
@@ -324,6 +332,57 @@ using Value = Variant<Test::Record, u32, IPC::File>;
             '_ => ::std::result::Result::Err(::libipc_rust::wire::DecodeError::InvalidValue("Test::Shape")),', rust
         )
 
+    def test_enums_that_give_their_values_go_as_them(self) -> None:
+        declaration = "[ExistingCpp] enum Test::Key : u8 { Escape = 0x1B, Space = 32 }"
+        _, implementation = generate_files(declaration)
+        self.assertIn(
+            """\
+    static_assert(static_cast<u8>(Test::Key::Escape) == 27);
+    static_assert(static_cast<u8>(Test::Key::Space) == 32);
+    switch (value) {
+    case Test::Key::Escape:
+    case Test::Key::Space:
+        return encoder.encode(static_cast<u8>(value));
+    }
+""",
+            implementation,
+        )
+        self.assertIn("    case 27:\n        return Test::Key::Escape;\n", implementation)
+        rust = generate_rust(declaration)
+        self.assertIn("#[repr(u8)]\npub enum Test_Key {\n    Escape = 27,\n    Space = 32,\n}", rust)
+        self.assertIn("32 => ::std::result::Result::Ok(Self::Space),", rust)
+
+        header, _ = generate_files("enum Test::Key : u8 { Escape = 27 }")
+        self.assertIn("enum class Key : u8 {\n    Escape = 27,\n};", header)
+
+    def test_flags_go_as_their_number_whatever_bits_it_has(self) -> None:
+        declaration = (
+            "[ExistingCpp, Flags, RustDerive=Default] enum Test::Modifier : u32 { None = 0, Alt = 0x01, Mask = 0x1F }"
+        )
+        _, implementation = generate_files(declaration)
+        self.assertIn(
+            """\
+    static_assert(sizeof(UnderlyingType<Test::Modifier>) == sizeof(u32));
+    static_assert(static_cast<u32>(Test::Modifier::None) == 0x0);
+    static_assert(static_cast<u32>(Test::Modifier::Alt) == 0x1);
+    static_assert(static_cast<u32>(Test::Modifier::Mask) == 0x1f);
+    return encoder.encode(static_cast<u32>(value));
+""",
+            implementation,
+        )
+        self.assertIn("    return static_cast<Test::Modifier>(TRY(decoder.decode<u32>()));\n", implementation)
+        rust = generate_rust(declaration)
+        self.assertIn(
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]\n#[repr(transparent)]\npub struct Test_Modifier(pub u32);",
+            rust,
+        )
+        self.assertIn("    pub const Mask: Self = Self(0x1f);\n", rust)
+        self.assertIn("::std::result::Result::Ok(Self(decoder.decode()?))", rust)
+
+        header, _ = generate_files("[Flags] enum Test::Modifier : u8 { Alt = 1 }")
+        self.assertIn("#include <AK/EnumBits.h>", header)
+        self.assertIn("enum class Modifier : u8 {\n    Alt = 1,\n};\n\nAK_ENUM_BITWISE_OPERATORS(Modifier);", header)
+
     def test_sizes_are_bounded_before_contents_and_other_fields_are_checked_after_decoding(self) -> None:
         _, implementation = generate_files(DECLARATIONS)
         self.assertIn(
@@ -466,6 +525,12 @@ using Value = Variant<Test::Record, u32, IPC::File>;
             ("enum Test::Kind : int { A }", "sized integer"),
             ("enum Test::Kind : u8 { }", "Empty enum"),
             ("enum Test::Kind : i8 { " + ", ".join(f"V{i}" for i in range(129)) + " }", "more values than i8"),
+            ("enum Test::Kind : u8 { A = 1, B }", "a value for each of its members or for none"),
+            ("enum Test::Kind : u8 { A = 1, B = 1 }", "Duplicate value"),
+            ("enum Test::Kind : u8 { A = 256 }", "a value that u8 does not hold"),
+            ("enum Test::Kind : u8 { A = one }", "Expected a number"),
+            ("[Flags] enum Test::Kind : u8 { A }", "need a value for each"),
+            ("[Flags] struct Test::Record { u32 id; }", "Only an enum can be flags"),
             ("variant Test::Value { A u32, B u32 }", "distinct type"),
             ("variant Test::Value { " + ", ".join(f"V{i} Test::T{i}" for i in range(255)) + " }", "too many"),
             ("struct Test::Record { u32 id; u32 id; }", "Duplicate member"),
@@ -610,6 +675,33 @@ class TestIPCRustGenerator(unittest.TestCase):
         self.assertIn("if magic != ENDPOINT_MAGIC", generated)
         self.assertIn('InvalidValue("message ID")', generated)
         self.assertNotIn("decoder.is_at_end()", generated)
+
+    def test_messages_received_in_rust_get_a_stub_and_a_dispatcher(self) -> None:
+        generated = self.generate(
+            "endpoint Test { [RustReceiver] update(u32 value) =| [RustReceiver] query() => (u32 value) other() =| }"
+        )
+        self.assertIn(
+            """\
+    pub trait Stub {
+        fn update(&mut self, message: messages::Update) -> ::std::result::Result<(), ::libipc_rust::wire::Misbehavior>;
+        fn query(&mut self, message: messages::Query) -> ::std::result::Result<messages::QueryResponse, ::libipc_rust::wire::Misbehavior>;
+    }
+""",
+            generated,
+        )
+        self.assertIn(
+            """\
+            <messages::Query as ::libipc_rust::wire::EndpointMessage>::MESSAGE_ID => {
+                let response = stub.query(decoder.decode()?)?;
+                ::std::result::Result::Ok(::std::option::Option::Some(::libipc_rust::wire::EndpointMessage::encode_message(response)?))
+            }
+""",
+            generated,
+        )
+        self.assertNotIn("pub enum Message", generated)
+        self.assertNotIn("Other", generated)
+
+        self.assertNotIn("Stub", self.generate("endpoint Test { [RustSender] update(u32 value) =| }"))
 
     def test_owned_encoding_moves_every_field(self) -> None:
         generated = self.generate("endpoint Test { send(Vector<IPC::File> files) =| }")

@@ -28,6 +28,7 @@
 #include <LibWebCommon/WebDriver/Error.h>
 #include <LibWebCommon/WebDriver/Input.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalSessionHistoryEntry.h>
 #include <LibWebView/CrashReportOutbox.h>
@@ -794,6 +795,15 @@ void ViewImplementation::set_zoom(double zoom_level)
     update_zoom();
 }
 
+void ViewImplementation::reset_zoom()
+{
+    set_zoom(1.0);
+    page().async_reset_zoom();
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host_for_settings(), m_zoom_level);
+}
+
 void ViewImplementation::set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second)
 {
     m_display_id = display_id;
@@ -845,16 +855,6 @@ void ViewImplementation::send_system_theme_to_page(WebContentPage& page)
 {
     if (auto theme = system_theme(); theme.is_valid())
         page.async_update_system_theme(theme);
-}
-
-void ViewImplementation::reset_zoom()
-{
-    m_zoom_level = 1.0;
-    update_zoom();
-    page().async_reset_zoom();
-
-    if (m_is_private == IsPrivate::No)
-        Application::settings().set_zoom_for_host(current_host_for_settings(), m_zoom_level);
 }
 
 // NB: The event is handled once it leaves the queue of pending input events, or when it never enters it.
@@ -1505,19 +1505,14 @@ static void send_browsing_behavior(WebContentPage const& page)
 
 static void send_autoplay_settings(WebContentPage const& page)
 {
-    auto const& autoplay_settings = Application::settings().autoplay_settings();
     auto const& web_content_options = Application::web_content_options();
 
-    auto policy = autoplay_settings.policy;
-    if (web_content_options.enable_autoplay == EnableAutoplay::Yes)
-        policy = Web::HTML::AutoplayPolicy::AllowAudioAndVideo;
-
-    Vector<Utf16String> allowlist;
-    allowlist.ensure_capacity(autoplay_settings.site_filters.size());
-    for (auto const& site_filter : autoplay_settings.site_filters)
-        allowlist.unchecked_append(Utf16String::from_utf8(site_filter));
-
-    page.async_set_autoplay_settings(policy, move(allowlist));
+    if (web_content_options.enable_autoplay == EnableAutoplay::Yes) {
+        page.async_set_autoplay_settings(Web::HTML::AutoplayPolicy::AllowAudioAndVideo, {});
+    } else {
+        auto const& autoplay_settings = Application::settings().autoplay_settings();
+        page.async_set_autoplay_settings(autoplay_settings.policy, autoplay_settings.site_filters);
+    }
 }
 
 static void send_global_privacy_control(WebContentPage const& page)
@@ -4373,38 +4368,25 @@ Optional<String> ViewImplementation::crash_report_website() const
     return CrashReportReview::website_from_url(m_crash_state->failed_url);
 }
 
-String ViewImplementation::force_dark_host() const
-{
-    auto url = this->url();
-    if (!url.host().has_value())
-        return {};
-    return current_host_for_settings();
-}
-
 bool ViewImplementation::force_dark_enabled() const
 {
-    return Application::settings().force_dark_for_host(force_dark_host());
+    return Application::settings().force_dark_for_host(current_host_for_settings());
 }
 
 bool ViewImplementation::can_set_force_dark() const
 {
-    return m_is_private == IsPrivate::No && !force_dark_host().is_empty();
+    return m_is_private == IsPrivate::No && !current_host_for_settings().is_empty();
 }
 
 void ViewImplementation::set_force_dark_enabled(bool enabled)
 {
     if (can_set_force_dark())
-        Application::settings().set_force_dark_for_host(force_dark_host(), enabled);
+        Application::settings().set_force_dark_for_host(current_host_for_settings(), enabled);
 }
 
 String ViewImplementation::current_host_for_settings() const
 {
-    auto url = this->url();
-    if (url.host().has_value())
-        return MUST(String::from_utf8(url.serialized_host()));
-    if (url.scheme() == "about"sv)
-        return MUST(String::from_utf8(url.serialize_path()));
-    return {};
+    return host_for_settings(url());
 }
 
 void ViewImplementation::languages_changed()
@@ -4433,6 +4415,12 @@ void ViewImplementation::browsing_behavior_changed()
 void ViewImplementation::autoplay_settings_changed()
 {
     traversable().for_each_hosting_page(send_autoplay_settings);
+}
+
+void ViewImplementation::permission_settings_changed(Web::Permissions::PermissionName name)
+{
+    if (name == Web::Permissions::PermissionName::Geolocation)
+        geolocation_settings_changed();
 }
 
 void ViewImplementation::global_privacy_control_changed()

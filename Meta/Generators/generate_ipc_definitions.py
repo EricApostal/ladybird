@@ -76,6 +76,8 @@ class Parameter:
     type: str = ""
     type_for_encoding: str = ""
     name: str = ""
+    # The value an enum's declaration gives the member.
+    value: Optional[int] = None
 
 
 @dataclass
@@ -88,6 +90,15 @@ class Message:
 
     def response_name(self) -> str:
         return f"{pascal_case(self.name)}Response"
+
+    def is_received_in_rust(self) -> bool:
+        return "RustReceiver" in self.attributes
+
+    def is_sent_from_rust(self) -> bool:
+        return "RustSender" in self.attributes
+
+    def has_cpp_class(self) -> bool:
+        return not (self.is_received_in_rust() and self.is_sent_from_rust())
 
 
 @dataclass
@@ -112,9 +123,23 @@ class Endpoint:
             return False
         return self.binds(message)
 
+    def has_messages_received_in_rust(self) -> bool:
+        return any(message.is_received_in_rust() for message in self.messages)
+
+    def names_rust_for_some_message(self) -> bool:
+        return any(message.is_received_in_rust() or message.is_sent_from_rust() for message in self.messages)
+
     def validate(self) -> None:
+        for message in self.messages:
+            if message.is_sent_from_rust() and message.is_synchronous:
+                raise RuntimeError(
+                    f"{self.name}::{message.name} is synchronous, and Rust cannot wait for a response yet: "
+                    f"it cannot be [RustSender]"
+                )
         if self.route is None:
             return
+        if self.names_rust_for_some_message():
+            raise RuntimeError(f"{self.name} is routed, so its messages cannot be [RustReceiver] or [RustSender]")
         for message in self.messages:
             if not self.routes(message):
                 continue
@@ -218,7 +243,8 @@ class Declaration:
     attributes: List[str] = field(default_factory=list)
     # The integer type an enum goes as.
     underlying_type: str = ""
-    # A struct's fields, an enum's values (with names only), or a variant's alternatives (with a name for Rust).
+    # A struct's fields, an enum's values (by name, or all of them with the numbers C++ gives them), or a variant's
+    # alternatives (with a name for Rust).
     members: List[Parameter] = field(default_factory=list)
 
     def is_existing_cpp(self) -> bool:
@@ -235,14 +261,39 @@ class Declaration:
         # The existing C++ type is read through accessor functions and built with a constructor taking every field.
         return "Accessors" in self.attributes
 
+    def gives_values(self) -> bool:
+        # The enum goes as the number of its value rather than as the value's position in the declaration.
+        return self.kind == "enum" and self.members[0].value is not None
+
+    def is_flags(self) -> bool:
+        # The enum's values are bits, and any combination of them goes, as the number it is.
+        return "Flags" in self.attributes
+
+    def rust_derives(self) -> List[str]:
+        derives = ["Clone", "Copy", "Debug", "PartialEq", "Eq"]
+        if self.kind != "enum":
+            carries_a_file = any("IPC::File" in member.type for member in self.members)
+            derives = [] if carries_a_file else ["Clone", "Debug", "PartialEq"]
+        for attribute in self.attributes:
+            name, _, argument = attribute.partition("=")
+            if name == "RustDerive":
+                derives += [derive for derive in argument.split("+") if derive not in derives]
+        return derives
+
     def validate(self) -> None:
         if not re.fullmatch(rf"{IDENTIFIER}(::{IDENTIFIER})+", self.name):
             raise RuntimeError(f"Expected a type name with a namespace, got '{self.name}'")
         for attribute in self.attributes:
-            if attribute not in ("ExistingCpp", "Accessors"):
+            name, _, argument = attribute.partition("=")
+            if name == "RustDerive":
+                if not re.fullmatch(rf"{IDENTIFIER}(\+{IDENTIFIER})*", argument):
+                    raise RuntimeError(f"RustDerive on {self.name} needs traits joined by '+', got '{argument}'")
+            elif attribute not in ("ExistingCpp", "Accessors", "Flags"):
                 raise RuntimeError(f"Unknown attribute '{attribute}' on {self.name}")
         if self.has_accessors() and (self.kind != "struct" or not self.is_existing_cpp()):
             raise RuntimeError(f"Only an existing C++ struct can have accessors: {self.name}")
+        if self.is_flags() and self.kind != "enum":
+            raise RuntimeError(f"Only an enum can be flags: {self.name}")
 
         names = [member.name for member in self.members]
         for name in names:
@@ -260,9 +311,20 @@ class Declaration:
         if self.kind == "enum":
             if self.underlying_type not in INTEGER_TYPES:
                 raise RuntimeError(f"Enum {self.name} needs a sized integer type, got '{self.underlying_type}'")
-            value_bits = int(self.underlying_type[1:]) - (1 if self.underlying_type.startswith("i") else 0)
+            is_signed = self.underlying_type.startswith("i")
+            value_bits = int(self.underlying_type[1:]) - (1 if is_signed else 0)
             if len(names) > 2**value_bits:
                 raise RuntimeError(f"Enum {self.name} has more values than {self.underlying_type} holds")
+            values = [member.value for member in self.members if member.value is not None]
+            if values and len(values) != len(names):
+                raise RuntimeError(f"Enum {self.name} needs a value for each of its members or for none")
+            if self.is_flags() and not values:
+                raise RuntimeError(f"Flags {self.name} need a value for each of their members")
+            for value in values:
+                if not (-(2**value_bits) if is_signed else 0) <= value < 2**value_bits:
+                    raise RuntimeError(f"Enum {self.name} has a value that {self.underlying_type} does not hold")
+            if not self.is_flags() and len(set(values)) != len(values):
+                raise RuntimeError(f"Duplicate value in {self.name}")
         elif self.kind == "variant":
             # NB: An AK::Variant of fewer than 255 types goes with a u8 index.
             if len(names) >= 255:
@@ -544,10 +606,20 @@ def parse(contents: str) -> Document:
                 consume_whitespace()
                 assert_specific(";")
             else:
-                member.name = lexer.consume_until(lambda c: c.isspace() or c in ",}")
+                member.name = lexer.consume_until(lambda c: c.isspace() or c in ",}=")
                 consume_whitespace()
                 if kind == "variant":
                     member.type = parse_parameter_type(",}")
+                    consume_whitespace()
+                elif lexer.consume_specific("="):
+                    consume_whitespace()
+                    number = lexer.consume_until(lambda c: c.isspace() or c in ",}")
+                    try:
+                        member.value = int(number, 0)
+                    except ValueError:
+                        raise RuntimeError(
+                            f"Expected a number for {declaration.name}::{member.name}, got '{number}'"
+                        ) from None
                     consume_whitespace()
                 if not lexer.consume_specific(",") and lexer.peek() != "}":
                     raise RuntimeError(f"Expected ',' or '}}' at position {lexer.position}, got '{lexer.peek()}'")
@@ -853,8 +925,9 @@ def write_proxy_method(
 
 def write_proxy_class(out: TextIO, implementation: TextIO, endpoint: Endpoint) -> None:
     name = f"{endpoint.name}Proxy"
-    connection_parameter = "IPC::ConnectionBase& connection" if endpoint.messages else "IPC::ConnectionBase&"
-    initializer = "        : m_connection(connection)\n" if endpoint.messages else ""
+    messages = [message for message in endpoint.messages if not message.is_sent_from_rust()]
+    connection_parameter = "IPC::ConnectionBase& connection" if messages else "IPC::ConnectionBase&"
+    initializer = "        : m_connection(connection)\n" if messages else ""
     out.write(f"""
 {class_declaration(endpoint, name)} {{
 public:
@@ -865,14 +938,14 @@ public:
 {initializer}    {{
     }}
 """)
-    for message in endpoint.messages:
+    for message in messages:
         write_proxy_method(out, implementation, endpoint, message, message.inputs, message.is_synchronous, is_try=False)
         if message.is_synchronous:
             write_proxy_method(
                 out, implementation, endpoint, message, message.inputs, is_synchronous=False, is_try=False
             )
             write_proxy_method(out, implementation, endpoint, message, message.inputs, is_synchronous=True, is_try=True)
-    if endpoint.messages:
+    if messages:
         out.write("\nprivate:\n    IPC::ConnectionBase& m_connection;\n")
     out.write("};\n")
 
@@ -901,8 +974,8 @@ public:
         switch (message_id) {""")
 
     for message in endpoint.messages:
-        names = [message.name]
-        if message.is_synchronous:
+        names = [] if message.is_received_in_rust() else [message.name]
+        if message.is_synchronous and message.has_cpp_class():
             names.append(message.response_name())
 
         for name in names:
@@ -925,6 +998,30 @@ public:
         "static ErrorOr<NonnullOwnPtr<IPC::Message>> decode_message(ReadonlyBytes buffer, [[maybe_unused]] Queue<IPC::Attachment>& attachments)",
         body.getvalue(),
     )
+    body = io.StringIO()
+    if endpoint.has_messages_received_in_rust():
+        body.write("\n        switch (message_id) {")
+        for message in endpoint.messages:
+            if not message.is_received_in_rust():
+                continue
+            pascal_name = pascal_case(message.name)
+            body.write(f"""
+        case (int)Messages::{endpoint.name}::MessageID::{pascal_name}:
+            return "{endpoint.name}::{pascal_name}"sv;""")
+        body.write("""
+        default:
+            return {};
+        }
+""")
+    else:
+        body.write("        return {};\n")
+    write_method(
+        out,
+        implementation,
+        f"{endpoint.name}Endpoint",
+        "static Optional<StringView> name_of_request_that_arrives_raw([[maybe_unused]] i32 message_id)",
+        body.getvalue(),
+    )
     out.write("};\n")
 
 
@@ -933,6 +1030,8 @@ def write_stub_class(out: TextIO, implementation: TextIO, endpoint: Endpoint) ->
     # anything of it is decided by the types themselves.
     argument_types: List[str] = []
     for message in endpoint.messages:
+        if message.is_received_in_rust():
+            continue
         for parameter in message.inputs:
             if parameter.type not in argument_types:
                 argument_types.append(parameter.type)
@@ -940,6 +1039,22 @@ def write_stub_class(out: TextIO, implementation: TextIO, endpoint: Endpoint) ->
     bases = "public IPC::Stub"
     if argument_types:
         bases += f"\n    , public IPC::SenderClaimReceivers<{', '.join(argument_types)}>"
+
+    # A claim is verified on the decoded arguments, which this stub never has for a message Rust receives.
+    types_received_in_rust: List[str] = []
+    for message in endpoint.messages:
+        if not message.is_received_in_rust():
+            continue
+        for parameter in message.inputs:
+            if parameter.type not in types_received_in_rust:
+                types_received_in_rust.append(parameter.type)
+    for type in types_received_in_rust:
+        out.write(
+            f"\nstatic_assert(__is_empty(IPC::SenderClaimReceiver<{type}>),"
+            f' "A message Rust receives cannot carry a claim by its sender: {type}");'
+        )
+    if types_received_in_rust:
+        out.write("\n")
 
     out.write(f"""
 {class_declaration(endpoint, f"{endpoint.name}Stub")} : {bases} {{
@@ -958,7 +1073,9 @@ public:
         pascal_name = pascal_case(message.name)
         body.write(f"\n        case (int)Messages::{endpoint.name}::MessageID::{pascal_name}:\n")
 
-        if message.inputs:
+        if message.is_received_in_rust():
+            body.write("            return handle_raw(static_cast<IPC::RawMessage&>(*message));")
+        elif message.inputs:
             body.write(f"            return handle_{message.name}(*message);")
         else:
             body.write(f"            return handle_{message.name}();")
@@ -977,6 +1094,8 @@ public:
     )
 
     for message in endpoint.messages:
+        if message.is_received_in_rust():
+            continue
         pascal_name = pascal_case(message.name)
 
         arg_parts: List[str] = []
@@ -1027,6 +1146,8 @@ public:
     out.write("\n")
 
     for message in endpoint.messages:
+        if message.is_received_in_rust():
+            continue
         return_type = "void"
 
         if message.is_synchronous and message.outputs:
@@ -1034,6 +1155,9 @@ public:
 
         params = ", ".join(f"{p.type} {p.name}" for p in message.inputs)
         out.write(f"    virtual {return_type} {message.name}({params}) = 0;\n")
+
+    if endpoint.has_messages_received_in_rust():
+        out.write("    virtual ErrorOr<OwnPtr<IPC::MessageBuffer>> handle_raw(IPC::RawMessage&) = 0;\n")
 
     out.write("};\n")
 
@@ -1198,6 +1322,8 @@ def write_endpoint(out: TextIO, implementation: TextIO, endpoint: Endpoint) -> N
     implementation.write(f"\nnamespace Messages::{endpoint.name} {{\n")
     write_message_ids_enum(out, endpoint)
     for message in endpoint.messages:
+        if not message.has_cpp_class():
+            continue
         response_name = ""
         if message.is_synchronous:
             response_name = message.response_name()
@@ -1245,8 +1371,11 @@ def write_cpp_definition(out: TextIO, declaration: Declaration) -> None:
     if declaration.kind == "enum":
         out.write(f"enum class {name} : {declaration.underlying_type} {{\n")
         for member in declaration.members:
-            out.write(f"    {member.name},\n")
+            value = f" = {member.value}" if declaration.gives_values() else ""
+            out.write(f"    {member.name}{value},\n")
         out.write("};\n")
+        if declaration.is_flags():
+            out.write(f"\nAK_ENUM_BITWISE_OPERATORS({name});\n")
     elif declaration.kind == "struct" and not declaration.members:
         out.write(f"struct {name} {{ }};\n")
     elif declaration.kind == "struct":
@@ -1262,6 +1391,57 @@ def write_cpp_definition(out: TextIO, declaration: Declaration) -> None:
 def write_cpp_enum_codec(out: TextIO, declaration: Declaration) -> None:
     name = declaration.name
     underlying_type = declaration.underlying_type
+
+    if declaration.gives_values():
+        # NB: Rust takes the numbers from the declaration, so they must be the ones C++ has.
+        number_format = "#x" if declaration.is_flags() else "d"
+        checks = "".join(
+            f"    static_assert(static_cast<{underlying_type}>({name}::{member.name}) == {member.value:{number_format}});\n"
+            for member in declaration.members
+        )
+        if declaration.is_flags():
+            out.write(f"""
+template<>
+ErrorOr<void> encode(Encoder& encoder, {name} const& value)
+{{
+    static_assert(sizeof(UnderlyingType<{name}>) == sizeof({underlying_type}));
+{checks}    return encoder.encode(static_cast<{underlying_type}>(value));
+}}
+
+template<>
+ErrorOr<{name}> decode(Decoder& decoder)
+{{
+    return static_cast<{name}>(TRY(decoder.decode<{underlying_type}>()));
+}}
+""")
+            return
+
+        out.write(f"""
+template<>
+ErrorOr<void> encode(Encoder& encoder, {name} const& value)
+{{
+{checks}    switch (value) {{
+""")
+        for member in declaration.members:
+            out.write(f"    case {name}::{member.name}:\n")
+        out.write(f"""        return encoder.encode(static_cast<{underlying_type}>(value));
+    }}
+    return Error::from_string_literal("IPC encode: Invalid {name}");
+}}
+
+template<>
+ErrorOr<{name}> decode(Decoder& decoder)
+{{
+    switch (TRY(decoder.decode<{underlying_type}>())) {{
+""")
+        for member in declaration.members:
+            out.write(f"    case {member.value}:\n        return {name}::{member.name};\n")
+        out.write(f"""    default:
+        return Error::from_string_literal("IPC decode: Invalid {name}");
+    }}
+}}
+""")
+        return
 
     # NB: An enum goes as the position of its value in the declaration, which C++ need not number the same way.
     out.write(f"""
@@ -1432,6 +1612,8 @@ def build(
                     names.append(name)
     if any(declaration.kind == "variant" for declaration in defined_declarations) and "Variant" not in names:
         names.append("Variant")
+    if any(declaration.is_flags() for declaration in defined_declarations):
+        names.append("EnumBits")
     for name in sorted(names):
         out.write(f"#include <AK/{name}.h>\n")
 
@@ -1444,6 +1626,7 @@ def build(
 #include <AK/Result.h>
 #include <LibIPC/File.h>
 #include <LibIPC/Message.h>
+#include <LibIPC/RawMessage.h>
 #include <LibIPC/SenderClaim.h>
 #include <LibIPC/Stub.h>
 
@@ -1672,6 +1855,57 @@ def write_rust_message_struct(out: TextIO, name: str, message_id: int, parameter
     out.write("        }\n    }\n")
 
 
+def write_rust_stub(out: TextIO, endpoint: Endpoint) -> None:
+    # The receiver of the messages that Rust decodes, as the C++ stub of the endpoint is of the others: one method
+    # for each message, which takes the message and answers with the response of a synchronous one.
+    received = [message for message in endpoint.messages if message.is_received_in_rust()]
+    if not received:
+        return
+
+    result = "::std::result::Result"
+    out.write("\n    pub trait Stub {\n")
+    for message in received:
+        message_type = f"messages::{rust_field_name(pascal_case(message.name))}"
+        response_type = "()"
+        if message.is_synchronous:
+            response_type = f"messages::{rust_field_name(pascal_case(message.response_name()))}"
+        out.write(
+            f"        fn {rust_field_name(message.name)}(&mut self, message: {message_type}) -> "
+            f"{result}<{response_type}, ::libipc_rust::wire::Misbehavior>;\n"
+        )
+    out.write("    }\n")
+
+    out.write(f"""
+    /// Decodes a message of this endpoint, allowing unused bytes and attachments as C++ does, hands it to the stub, and
+    /// answers with the encoded response of a synchronous message.
+    pub fn dispatch<S: Stub + ?Sized>(stub: &mut S, bytes: &[u8], attachments: ::std::vec::Vec<::libipc_rust::Attachment>) -> {result}<::std::option::Option<::libipc_rust::wire::EncodedMessage>, ::libipc_rust::wire::DispatchError> {{
+        let mut decoder = ::libipc_rust::wire::Decoder::new(bytes, attachments);
+        let (magic, id) = ::libipc_rust::wire::decode_message_header(&mut decoder)?;
+        if magic != ENDPOINT_MAGIC {{
+            return {result}::Err(::libipc_rust::wire::DecodeError::InvalidValue("endpoint magic").into());
+        }}
+        match id {{
+""")
+    for message in received:
+        message_type = f"messages::{rust_field_name(pascal_case(message.name))}"
+        method = rust_field_name(message.name)
+        out.write(f"            <{message_type} as ::libipc_rust::wire::EndpointMessage>::MESSAGE_ID => {{\n")
+        if message.is_synchronous:
+            out.write(f"                let response = stub.{method}(decoder.decode()?)?;\n")
+            out.write(
+                f"                {result}::Ok(::std::option::Option::Some("
+                "::libipc_rust::wire::EndpointMessage::encode_message(response)?))\n"
+            )
+        else:
+            out.write(f"                stub.{method}(decoder.decode()?)?;\n")
+            out.write(f"                {result}::Ok(::std::option::Option::None)\n")
+        out.write("            }\n")
+    out.write(f"""            _ => {result}::Err(::libipc_rust::wire::DecodeError::InvalidValue("message ID").into()),
+        }}
+    }}
+""")
+
+
 def write_rust_endpoint(out: TextIO, endpoint: Endpoint) -> None:
     out.write(f"""
 #[allow(clippy::all, dead_code)]
@@ -1680,20 +1914,35 @@ pub mod {rust_field_name(snake_case(endpoint.name))} {{
 """)
 
     out.write("\n    pub mod messages {\n")
+    only_messages_naming_rust = endpoint.names_rust_for_some_message()
     message_output = io.StringIO()
     variants: List[str] = []
     message_id = 0
     for message in endpoint.messages:
         message_id += 1
-        write_rust_message_struct(message_output, message.name, message_id, message.inputs)
-        variants.append(rust_field_name(pascal_case(message.name)))
+        request_id = message_id
         if message.is_synchronous:
             message_id += 1
+        if only_messages_naming_rust and not (message.is_received_in_rust() or message.is_sent_from_rust()):
+            continue
+        write_rust_message_struct(message_output, message.name, request_id, message.inputs)
+        if not only_messages_naming_rust:
+            variants.append(rust_field_name(pascal_case(message.name)))
+        if message.is_synchronous:
             write_rust_message_struct(message_output, message.response_name(), message_id, message.outputs)
-            variants.append(rust_field_name(pascal_case(message.response_name())))
+            if not only_messages_naming_rust:
+                variants.append(rust_field_name(pascal_case(message.response_name())))
 
     out.write(textwrap.indent(message_output.getvalue(), "    "))
-    out.write("    }\n\n    pub enum Message {\n")
+    out.write("    }\n")
+    if only_messages_naming_rust:
+        write_rust_stub(out, endpoint)
+        out.write("}\n")
+        return
+    if not variants:
+        out.write("}\n")
+        return
+    out.write("\n    pub enum Message {\n")
     for variant in variants:
         out.write(f"        {variant}(messages::{variant}),\n")
     out.write("    }\n")
@@ -1724,16 +1973,82 @@ def rust_field_refusals(member: Parameter, value: str) -> List[FieldRefusal]:
     return field_refusals(member, "", f"{value}.{rust_field_name(member.name)}")
 
 
-def write_rust_enum(out: TextIO, declaration: Declaration, name: str) -> None:
+def write_rust_flags(out: TextIO, declaration: Declaration, name: str) -> None:
     underlying_type = declaration.underlying_type
     out.write(f"""
 #[allow(dead_code, non_camel_case_types)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive({", ".join(declaration.rust_derives())})]
+#[repr(transparent)]
+pub struct {name}(pub {underlying_type});
+
+#[allow(dead_code, non_upper_case_globals)]
+impl {name} {{
+""")
+    for member in declaration.members:
+        out.write(f"    pub const {rust_field_name(member.name)}: Self = Self({member.value:#x});\n")
+    out.write(f"""
+    pub const fn contains(self, other: Self) -> bool {{
+        self.0 & other.0 == other.0
+    }}
+
+    pub const fn is_empty(self) -> bool {{
+        self.0 == 0
+    }}
+}}
+
+impl ::std::ops::BitOr for {name} {{
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {{
+        Self(self.0 | other.0)
+    }}
+}}
+
+impl ::std::ops::BitAnd for {name} {{
+    type Output = Self;
+
+    fn bitand(self, other: Self) -> Self {{
+        Self(self.0 & other.0)
+    }}
+}}
+
+impl ::std::ops::Not for {name} {{
+    type Output = Self;
+
+    fn not(self) -> Self {{
+        Self(!self.0)
+    }}
+}}
+
+impl ::libipc_rust::wire::Encode for {name} {{
+    fn encode(&self, encoder: &mut ::libipc_rust::wire::Encoder) -> ::std::result::Result<(), ::libipc_rust::wire::EncodeError> {{
+        encoder.encode(&self.0)
+    }}
+}}
+
+impl ::libipc_rust::wire::Decode for {name} {{
+    fn decode(decoder: &mut ::libipc_rust::wire::Decoder<'_>) -> ::std::result::Result<Self, ::libipc_rust::wire::DecodeError> {{
+        ::std::result::Result::Ok(Self(decoder.decode()?))
+    }}
+}}
+""")
+
+
+def write_rust_enum(out: TextIO, declaration: Declaration, name: str) -> None:
+    if declaration.is_flags():
+        write_rust_flags(out, declaration, name)
+        return
+
+    underlying_type = declaration.underlying_type
+    out.write(f"""
+#[allow(dead_code, non_camel_case_types)]
+#[derive({", ".join(declaration.rust_derives())})]
 #[repr({underlying_type})]
 pub enum {name} {{
 """)
     for member in declaration.members:
-        out.write(f"    {rust_field_name(member.name)},\n")
+        value = f" = {member.value}" if declaration.gives_values() else ""
+        out.write(f"    {rust_field_name(member.name)}{value},\n")
     out.write(f"""}}
 
 impl ::libipc_rust::wire::Encode for {name} {{
@@ -1747,7 +2062,8 @@ impl ::libipc_rust::wire::Decode for {name} {{
         match decoder.decode::<{underlying_type}>()? {{
 """)
     for index, member in enumerate(declaration.members):
-        out.write(f"            {index} => ::std::result::Result::Ok(Self::{rust_field_name(member.name)}),\n")
+        number = member.value if declaration.gives_values() else index
+        out.write(f"            {number} => ::std::result::Result::Ok(Self::{rust_field_name(member.name)}),\n")
     out.write(f"""            _ => ::std::result::Result::Err(::libipc_rust::wire::DecodeError::InvalidValue("{declaration.name}")),
         }}
     }}
@@ -1758,6 +2074,8 @@ impl ::libipc_rust::wire::Decode for {name} {{
 def write_rust_struct(out: TextIO, declaration: Declaration, name: str) -> None:
     fields = [(rust_field_name(member.name), rust_type(member.type)) for member in declaration.members]
     out.write("\n#[allow(dead_code, non_camel_case_types)]\n")
+    if declaration.rust_derives():
+        out.write(f"#[derive({', '.join(declaration.rust_derives())})]\n")
     if not fields:
         out.write(f"""pub struct {name};
 
@@ -1842,9 +2160,10 @@ impl ::libipc_rust::wire::Decode for {name} {{
 
 def write_rust_variant(out: TextIO, declaration: Declaration, name: str) -> None:
     alternatives = [(rust_field_name(member.name), rust_type(member.type)) for member in declaration.members]
+    derives = f"#[derive({', '.join(declaration.rust_derives())})]\n" if declaration.rust_derives() else ""
     out.write(f"""
 #[allow(dead_code, non_camel_case_types)]
-pub enum {name} {{
+{derives}pub enum {name} {{
 """)
     for alternative, alternative_type in alternatives:
         out.write(f"    {alternative}({alternative_type}),\n")

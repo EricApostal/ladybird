@@ -1,43 +1,35 @@
 set(SOURCES
     AnimatedImage.cpp
-    AsyncScrollUpdateOutbox.cpp
     BackingStoreManager.cpp
     BitmapExport.cpp
     Canvas2DCommandPlayer.cpp
     CanvasHost.cpp
-    CaretBlinkTimer.cpp
     ColorSpaceSkia.cpp
+    CompositorCore.cpp
     CompositorState.cpp
     ContextPresenter.cpp
-    ContextScene.cpp
-    ContextState.cpp
     DisplayListPlayer.cpp
     DisplayListPlayerSkia.cpp
     DisplayListRasterCache.cpp
     FontSkia.cpp
+    FrameInputs.cpp
     ConnectionFromClient.cpp
     ConnectionFromPresentation.cpp
     ConnectionFromWebContent.cpp
-    ElasticOverscrollController.cpp
     FramePacer.cpp
     HostWebGLContext.cpp
-    KeyboardScrollController.cpp
     OpenGLContext.cpp
     PaintingSurface.cpp
     PausedDebuggerOverlay.cpp
     PictureInPictureControls.cpp
     RasterizeDisplayList.cpp
     RenderClockConnection.cpp
-    ScrollFlingController.cpp
-    ScrollSnapController.cpp
-    ScrollbarController.cpp
     SkiaBackendContext.cpp
     SkiaUtils.cpp
     VideoFrameHolds.cpp
     VideoFrameSkia.cpp
     VSyncScheduler.cpp
     WebGLObjectMap.cpp
-    WheelGestureRouting.cpp
 )
 
 invoke_py_generator(
@@ -63,6 +55,10 @@ set(GENERATED_SOURCES
     WebGLCommandReplayer.cpp
 )
 
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME compositor_core FEATURES allocator FFI_HEADER CompositorCoreRustFFI.h)
+target_link_libraries(compositor_core INTERFACE LibGfx)
+test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME compositor_core)
+
 add_library(compositorservice STATIC ${SOURCES} ${GENERATED_SOURCES})
 ladybird_generated_sources(compositorservice)
 
@@ -82,7 +78,16 @@ target_include_directories(compositorservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Serv
 target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSandbox)
 # ANGLE must precede Skia so macOS GLES symbols bind to ANGLE rather than the
 # OpenGL framework pulled in by Skia.
-target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibImageDecoderClient LibIPC LibMedia LibCompositing ${ANGLE_TARGETS} skia)
+target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibImageDecoderClient LibIPC LibMedia LibCompositing compositor_core ${ANGLE_TARGETS} skia)
+
+if ((LINUX OR BSD) AND NOT BUILD_SHARED_LIBS)
+    target_link_options(compositorservice INTERFACE LINKER:--allow-multiple-definition)
+endif()
+
+if (HAS_FONTCONFIG)
+    target_link_libraries(compositorservice PRIVATE Fontconfig::Fontconfig)
+    target_link_libraries(Compositor PRIVATE Fontconfig::Fontconfig)
+endif()
 
 if (HAS_VULKAN)
     target_sources(compositorservice PRIVATE SkiaVulkanMemoryAllocator.cpp)

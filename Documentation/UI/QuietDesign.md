@@ -577,6 +577,22 @@ settings.
   - Sent or deleted rows disappear. An empty list says "No crash reports waiting".
   - A "Crash report settings" link at the bottom goes to Settings → Feedback.
 
+### Sandbox off
+
+When Ladybird runs with `--disable-sandbox`, every window shows a bar directly below the
+toolbar (or at the top of the page area in the sidebar layouts):
+
+- 32 px plus a `divider` line below, in the `toolbar` color, so it reads as part of the
+  chrome, not as a page banner. The page starts below it.
+- The `warning` icon (16 px) and one sentence in `text`: "The sandbox is off. Websites are
+  less isolated from your computer."
+- No close button, no action button, no amber fill. It can't be dismissed, because the state
+  can't be changed from inside the browser, and it should be in every screenshot that ends
+  up in a bug report.
+- Bug reports and crash reports include "sandbox: off" in their prefilled details.
+- Nothing else changes: no badge on the Ladybird button, no tint, nothing in the address
+  field (which describes the site, not the browser).
+
 ### Ladybird menu
 
 - 280 px wide, 6 px padding, 26 px rows. Groups, in order:
@@ -603,9 +619,9 @@ settings.
 
 ### New tabs
 
-New tabs are blank (`about:blank` styled in the `page` color, so dark mode never flashes
+New tabs are blank (`about:newtab` styled in the `page` color, so dark mode never flashes
 white). The tab is titled "New Tab", the address field is focused and empty, and the field
-never shows "about:blank".
+never shows "about:newtab".
 
 ### Ladybird pages
 
@@ -616,8 +632,8 @@ never shows "about:blank".
 - About: the logomark, "Ladybird" in 40 px with the release badge, one tagline, and a card
   with version, build and platform plus a Copy button. Nothing else.
 - Welcome (`about:welcome`): the logomark at 56 px (0.85 line, so it doesn't get heavy), the title, then one centered column, in this order: search engine (optional,
-  nothing preselected, engines in a new random order each time, so none is favored by its
-  place; shown by name only in a five-column grid, never with logos or letter tiles, which
+  nothing preselected, engines in alphabetical order; shown by name only in a five-column
+  grid, never with logos or letter tiles, which
   would mean shipping other companies' trademarks or contacting their servers before anyone
   has chosen), Layout (all three layouts), Color, content blocking switch, "Start browsing" (enabled as soon as the
   current settings are loaded; it never waits for a choice).

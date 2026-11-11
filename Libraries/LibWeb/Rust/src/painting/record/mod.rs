@@ -319,7 +319,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             self.committed_highlight_pseudo_style(HighlightPseudoElement::Selection, node, element_row)
         });
         let answer = Self::highlight_style_answer(committed, || {
-            self.default_selection_style(node, style_source, window_is_focused)
+            self.default_selection_style(style_source, window_is_focused)
         });
         self.scratch.selection_style_cache.insert(key, answer.clone());
         answer
@@ -337,7 +337,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         let committed =
             self.committed_highlight_pseudo_style(HighlightPseudoElement::Selection, element_row, element_row);
         let answer = Self::highlight_style_answer(committed, || {
-            self.default_selection_style(element_row, element_row, window_is_focused)
+            self.default_selection_style(element_row, window_is_focused)
         });
         self.scratch.selection_style_cache.insert(key, answer.clone());
         answer
@@ -362,9 +362,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
         let committed = self
             .first_non_anonymous_ancestor_row(node)
             .and_then(|element_row| self.committed_highlight_pseudo_style(highlight, node, element_row));
-        let answer = Self::highlight_style_answer(committed, || {
-            self.default_search_text_style(node, style_source, highlight)
-        });
+        let answer =
+            Self::highlight_style_answer(committed, || self.default_search_text_style(style_source, highlight));
         let cache = if is_current {
             &mut self.scratch.search_text_current_style_cache
         } else {
@@ -493,17 +492,13 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
     fn default_selection_style(
         &self,
-        node: crate::layout::node_data::NodeSlotId,
         style_source: crate::layout::node_data::NodeSlotId,
         window_is_focused: bool,
     ) -> paint::text::SelectionStyleAnswer {
-        let background_color = self.default_selection_background(node, style_source, window_is_focused);
+        let background_color = self.default_selection_background(style_source, window_is_focused);
         paint::text::SelectionStyleAnswer {
             facts: crate::painting::host::FfiSelectionStyleFacts {
                 background_color,
-                text_color: self
-                    .readable_selection_text_color(node, style_source, background_color)
-                    .into(),
                 wash_color: background_color,
                 ..Default::default()
             },
@@ -512,49 +507,13 @@ impl<O: Observer> PaintRecorder<'_, O> {
         }
     }
 
-    /// The color the default selection draws its text in, where the text's own color would be hard to read on the
-    /// selection: black or white, whichever stands out more. The text otherwise keeps its own color.
-    fn readable_selection_text_color(
-        &self,
-        node: crate::layout::node_data::NodeSlotId,
-        style_source: crate::layout::node_data::NodeSlotId,
-        selection_background: libgfx_rust::Color,
-    ) -> Option<libgfx_rust::Color> {
-        use libgfx_rust::Color;
-        // The contrast WCAG asks of normal-size text.
-        const MINIMUM_CONTRAST_RATIO: f64 = 4.5;
-
-        let style = self.source.node_style_if_live(style_source)?;
-        let text_color = Color(style.inherited_text().webkit_text_fill_color);
-        let uncaptured = &self.inputs.uncaptured;
-        let backdrop = crate::painting::chrome_geometry::estimated_backdrop_color(
-            self.source,
-            node,
-            uncaptured.root_background_source,
-            uncaptured.canvas_color.blend(uncaptured.background_color),
-        );
-        let behind_text = backdrop.blend(selection_background);
-        if behind_text.contrast_ratio(behind_text.blend(text_color)) >= MINIMUM_CONTRAST_RATIO {
-            return None;
-        }
-        let (black, white) = (Color::from_rgb(0, 0, 0), Color::from_rgb(255, 255, 255));
-        Some(
-            if behind_text.contrast_ratio(black) >= behind_text.contrast_ratio(white) {
-                black
-            } else {
-                white
-            },
-        )
-    }
-
     fn default_search_text_style(
         &self,
-        node: crate::layout::node_data::NodeSlotId,
         style_source: crate::layout::node_data::NodeSlotId,
         highlight: HighlightPseudoElement,
     ) -> paint::text::SelectionStyleAnswer {
         if highlight == HighlightPseudoElement::SearchTextCurrent {
-            let background_color = self.default_selection_background(node, style_source, true);
+            let background_color = self.default_selection_background(style_source, true);
             return paint::text::SelectionStyleAnswer {
                 facts: crate::painting::host::FfiSelectionStyleFacts {
                     background_color,
@@ -580,24 +539,22 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
     fn default_selection_background(
         &self,
-        node: crate::layout::node_data::NodeSlotId,
         style_source: crate::layout::node_data::NodeSlotId,
         window_is_focused: bool,
     ) -> libgfx_rust::Color {
         use crate::css::color_resolution::{PREFERRED_COLOR_SCHEME_DARK, PREFERRED_COLOR_SCHEME_LIGHT};
         let inputs = self.inputs;
-        let (color_scheme, color_scheme_is_normal) =
-            self.source.node_style_if_live(style_source).map_or((0, true), |style| {
-                let ui = style.inherited_ui();
-                (ui.color_scheme, ui.color_schemes.as_slice().is_empty())
-            });
-        let use_palette_for_normal_color_scheme = !self.source.node_is_dom_backed(node)
-            || (color_scheme_is_normal && !inputs.document_has_supported_color_schemes);
         let palette_color_scheme = if inputs.palette_is_dark {
             PREFERRED_COLOR_SCHEME_DARK
         } else {
             PREFERRED_COLOR_SCHEME_LIGHT
         };
+        // NB: The selection takes the element's used color scheme, which is light for `normal` unless the document
+        //     supports other color schemes, whatever the palette's. Without a style to tell, it takes the palette's.
+        let color_scheme = self
+            .source
+            .node_style_if_live(style_source)
+            .map_or(palette_color_scheme, |style| style.inherited_ui().color_scheme);
         let (from_palette, light, dark) = if window_is_focused {
             (
                 inputs.selection_background_from_palette,
@@ -611,7 +568,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 inputs.inactive_selection_background_dark,
             )
         };
-        if color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme {
+        if color_scheme == palette_color_scheme {
             from_palette
         } else if color_scheme == PREFERRED_COLOR_SCHEME_DARK {
             dark

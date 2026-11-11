@@ -2332,7 +2332,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "ReplayClip",
             "ReplayLayer",
             "ReplayMask",
-            "FfiVisualViewportTransform",
         ]
         .map(String::from),
     );
@@ -2373,7 +2372,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("ReplayClip", "Compositing::ReplayClip"),
         ("ReplayLayer", "Compositing::ReplayLayer"),
         ("ReplayMask", "Compositing::ReplayMask"),
-        ("FfiVisualViewportTransform", "Compositing::TransformWithOrigin"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
@@ -2417,8 +2415,6 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
         "FfiVisualAnimationTransformOperationKind",
         "FfiCompositorAnimationPublishOutcome",
         "FfiVisualAnimationSummary",
-        "FfiAnimatedContentViewportEffect",
-        "FfiTestStickyConstraints",
         "FfiDisplayListReplayCallbacks",
         "FfiEasingDescriptor",
         "FfiEasingKind",
@@ -2430,7 +2426,15 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
             .rename
             .insert(name.to_string(), format!("Compositing::RustFFI::{name}"));
     }
+    config.export.exclude.push("SnapSelectionStrategyType".to_string());
+    config.export.rename.insert(
+        "SnapSelectionStrategyType".to_string(),
+        "Compositing::SnapSelectionStrategy::Type".to_string(),
+    );
     config.includes.push("LibCompositing/RustFFI.h".to_string());
+    config
+        .includes
+        .push("LibCompositing/Scrolling/ScrollSnapSelection.h".to_string());
 }
 
 /// Names the document host and the begun read as the layout header declares them, for a header whose entries take them.
@@ -3068,6 +3072,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         ],
         &out_dir,
         Path::new("Layout/TreeBuilderRustFFI.h"),
+    );
+
+    // The lanes of the render clock - namespace Web::Compositor::RustFFI, layered on the layout header for the ticks
+    // the lanes hand on.
+    let mut render_clock_config = base_config.clone();
+    render_clock_config.namespaces = Some(vec!["Web".to_string(), "Compositor".to_string(), "RustFFI".to_string()]);
+    for (rust_name, cpp_name) in [
+        ("ArcRef", "Web::Layout::RustFFI::ArcRef"),
+        ("ClockTicks", "Web::Layout::RustFFI::ClockTicks"),
+        ("FfiThreadSafeMessagePoster", "IPC::FfiThreadSafeMessagePoster"),
+        ("RawMessage", "IPC::FfiRawMessage"),
+    ] {
+        render_clock_config
+            .export
+            .rename
+            .insert(rust_name.to_string(), cpp_name.to_string());
+    }
+    render_clock_config.includes.extend(
+        [
+            "LibIPC/RawMessage.h",
+            "LibIPC/ThreadSafeMessagePoster.h",
+            "LibWeb/Layout/LayoutRustFFI.h",
+        ]
+        .map(String::from),
+    );
+    generate_ffi_header(
+        render_clock_config,
+        &[manifest_dir.join("src/render_state/clock/render_clock.rs")],
+        &out_dir,
+        Path::new("Compositor/RenderClockRustFFI.h"),
     );
 
     // Layout engine header - namespace Web::Layout::RustFFI, layered on the tree-builder

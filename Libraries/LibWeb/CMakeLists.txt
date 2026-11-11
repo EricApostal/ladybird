@@ -1001,12 +1001,8 @@ set(SOURCES
     WebVTT/Parser.cpp
     WebVTT/VTTCue.cpp
     WebVTT/VTTRegion.cpp
-    XHR/EventNames.cpp
     XHR/FormData.cpp
-    XHR/ProgressEvent.cpp
     XHR/XMLHttpRequest.cpp
-    XHR/XMLHttpRequestEventTarget.cpp
-    XHR/XMLHttpRequestUpload.cpp
     XLink/AttributeNames.cpp
     XML/XMLDocumentBuilder.cpp
     XML/XMLFragmentParser.cpp
@@ -1096,6 +1092,7 @@ sync_rust_crate_ffi_headers(
         SelectorStateFactsGenerated.inc
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
+        Compositor/RenderClockRustFFI.h
 )
 add_dependencies(LibWeb libweb_rust-ffi-headers)
 target_link_libraries(libweb_bindings_rust INTERFACE LibGfx LibGC LibUnicode)

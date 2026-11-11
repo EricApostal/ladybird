@@ -34,9 +34,6 @@ use std::sync::Arc;
 #[repr(C)]
 pub struct FfiHoverPlanInputs {
     pub device_pixels_per_css_pixel: f64,
-    /// The scroll offsets of the frame the rendering update presented, in device pixels, by scroll frame.
-    pub scroll_offsets: *const libgfx_rust::FloatPoint,
-    pub scroll_offset_count: usize,
     pub chrome_metrics: FfiChromeMetrics,
     /// The cursor of the document's page, which the hover asks to show the cursor of what it hovers.
     pub page_cursor: FfiPageCursor,
@@ -241,20 +238,15 @@ pub(crate) struct HoverPlan {
 }
 
 impl HoverPlan {
-    /// The plan `inputs` describes.
+    /// The plan `inputs` describes, with `scroll_offsets`, the scroll offsets of the frame the rendering update
+    /// presented, in device pixels, by scroll frame.
     ///
     /// # Safety
     ///
-    /// `inputs.scroll_offsets` must point at `inputs.scroll_offset_count` offsets, or be null, the effect timing
-    /// arrays at `inputs.effect_timing_count` entries each, or be null, `inputs.page_cursor` must name a live page
-    /// cursor, or none, and `inputs.link_reporter` a live link reporter, or none.
-    pub(crate) unsafe fn from_ffi(inputs: &FfiHoverPlanInputs) -> Self {
-        let scroll_offsets = if inputs.scroll_offsets.is_null() {
-            Vec::new()
-        } else {
-            // SAFETY: Guaranteed by the caller.
-            unsafe { ak::slice_from_raw_parts(inputs.scroll_offsets, inputs.scroll_offset_count) }.to_vec()
-        };
+    /// The effect timing arrays of `inputs` must point at `inputs.effect_timing_count` entries each, or be null,
+    /// `inputs.page_cursor` must name a live page cursor, or none, and `inputs.link_reporter` a live link reporter, or
+    /// none.
+    pub(crate) unsafe fn from_ffi(inputs: &FfiHoverPlanInputs, scroll_offsets: Vec<FloatPoint>) -> Self {
         let effect_timings = if inputs.effect_timing_count == 0 {
             Vec::new()
         } else {
@@ -1696,36 +1688,6 @@ fn cursor_for_hit(state: &mut RenderState, hit: CursorHit) -> Option<u8> {
         cursor_predefined::AUTO => cursor_predefined::DEFAULT,
         predefined => predefined,
     })
-}
-
-/// Hands the clock lane `ticks` belong to where the pointer went: to `x`, `y` in device pixels where `has_position`,
-/// or out of the context, beside the mouse event with the input event id `input_event_id`, and answers what the lane
-/// wants next, as a `PointerAnswer`.
-///
-#[unsafe(no_mangle)]
-pub extern "C" fn clock_ticks_pointer_moved(
-    ticks: &super::ClockTicks,
-    has_position: bool,
-    x: f32,
-    y: f32,
-    buttons: u32,
-    scrolled_since_frame: bool,
-    input_event_id: u64,
-) -> u8 {
-    ticks.pointer_moved(PendingPointer {
-        position: has_position.then_some(FloatPoint { x, y }),
-        buttons,
-        scrolled_since_frame,
-        input_event_id,
-    }) as u8
-}
-
-/// Hands the clock lane `ticks` belong to that the pointer rests where the compositor's animations move what is under
-/// it, which the next tick hovers again in the frame as the screen shows it, and answers what the lane wants next, as a
-/// `PointerAnswer`.
-#[unsafe(no_mangle)]
-pub extern "C" fn clock_ticks_pointer_rests_on_moving_content(ticks: &super::ClockTicks) -> u8 {
-    ticks.pointer_rests_on_moving_content() as u8
 }
 
 /// Hands the clock lanes of `host`'s document that the pointer rests where the compositor's animations move what is

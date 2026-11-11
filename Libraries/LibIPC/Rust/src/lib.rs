@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 pub mod attachment;
+pub mod cpp_connection;
 mod receive_queue;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod shared_memory;
@@ -41,7 +42,10 @@ fn validate_message_size(payload_size: usize, attachment_count: usize) -> std::i
 pub mod mach;
 
 pub use attachment::Attachment;
-pub use wire::{Decode, DecodeError, Decoder, Encode, EncodeError, Encoder, EndpointMessage};
+pub use wire::{
+    Decode, DecodeError, Decoder, DispatchError, Encode, EncodeError, EncodedMessage, Encoder, EndpointMessage,
+    Misbehavior,
+};
 
 #[cfg(all(test, unix))]
 mod tests {

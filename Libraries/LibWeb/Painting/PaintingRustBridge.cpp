@@ -612,12 +612,11 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
         inputs.palette_is_dark = palette.is_dark();
         auto palette_color_scheme = palette.is_dark() ? CSS::PreferredColorScheme::Dark : CSS::PreferredColorScheme::Light;
         inputs.selection_background_from_palette = CSS::SystemColor::transform_selection_background_color(palette.selection(), palette_color_scheme);
-        inputs.selection_background_light = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::highlight(CSS::PreferredColorScheme::Light), CSS::PreferredColorScheme::Light);
-        inputs.selection_background_dark = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::highlight(CSS::PreferredColorScheme::Dark), CSS::PreferredColorScheme::Dark);
+        inputs.selection_background_light = CSS::SystemColor::transform_selection_background_color(palette.light_selection(), CSS::PreferredColorScheme::Light);
+        inputs.selection_background_dark = CSS::SystemColor::transform_selection_background_color(palette.dark_selection(), CSS::PreferredColorScheme::Dark);
         inputs.inactive_selection_background_from_palette = CSS::SystemColor::transform_selection_background_color(palette.inactive_selection(), palette_color_scheme);
         inputs.inactive_selection_background_light = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Light), CSS::PreferredColorScheme::Light);
         inputs.inactive_selection_background_dark = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Dark), CSS::PreferredColorScheme::Dark);
-        inputs.document_has_supported_color_schemes = document.supported_color_schemes().has_value();
         if (auto schemes = document.supported_color_schemes(); schemes.has_value())
             inputs.document_supports_light_or_dark = schemes->contains_slow("light"_utf16) || schemes->contains_slow("dark"_utf16);
         inputs.image_fallback_color_scheme = to_underlying(document.svg_image_color_scheme().value_or(document.page().preferred_color_scheme()));

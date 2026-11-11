@@ -298,12 +298,12 @@ void WebGLRenderingContextBase::clear_drawing_buffer()
     web_webgl_context_clear_drawing_buffer(this);
 }
 
-RefPtr<Gfx::Bitmap> WebGLRenderingContextBase::read_back_drawing_buffer(Gfx::IntRect const& rect)
+Optional<Gfx::DecodedImageFrame> WebGLRenderingContextBase::read_back_drawing_buffer(Gfx::IntRect const& rect)
 {
-    auto* bitmap = static_cast<Gfx::Bitmap*>(web_webgl_context_read_back_drawing_buffer(this, rect.x(), rect.y(), rect.width(), rect.height()));
-    if (!bitmap)
-        return nullptr;
-    return adopt_ref(*bitmap);
+    auto frame = adopt_own_if_nonnull(static_cast<Gfx::DecodedImageFrame*>(web_webgl_context_read_back_drawing_buffer(this, rect.x(), rect.y(), rect.width(), rect.height())));
+    if (!frame)
+        return {};
+    return move(*frame);
 }
 
 void WebGLRenderingContextBase::lose_context_from_compositor_loss()
@@ -413,12 +413,12 @@ TexImageSourceResult web_webgl_read_tex_image_source(void* source_wrapper, TexIm
             frame = image_frame.release_value();
         break;
     case TexImageSourceKind::HTMLCanvasElement:
-        if (auto bitmap = Bindings::impl_from<HTML::HTMLCanvasElement>(wrapper).get_bitmap_from_surface())
-            frame = Gfx::DecodedImageFrame { *bitmap };
+        if (auto canvas_frame = Bindings::impl_from<HTML::HTMLCanvasElement>(wrapper).get_srgb_frame_from_surface(); canvas_frame.has_value())
+            frame = canvas_frame.release_value();
         break;
     case TexImageSourceKind::OffscreenCanvas:
-        if (auto bitmap = Bindings::impl_from<HTML::OffscreenCanvas>(wrapper).get_bitmap_from_surface())
-            frame = Gfx::DecodedImageFrame { *bitmap };
+        if (auto canvas_frame = Bindings::impl_from<HTML::OffscreenCanvas>(wrapper).get_srgb_frame_from_surface(); canvas_frame.has_value())
+            frame = canvas_frame.release_value();
         break;
     case TexImageSourceKind::HTMLVideoElement:
         if (auto captured_frame = Bindings::impl_from<HTML::HTMLVideoElement>(wrapper).capture_current_video_frame(); captured_frame.has_value())
@@ -442,15 +442,17 @@ TexImageSourceResult web_webgl_read_tex_image_pixels(u8 const* pixels, u32 width
     if (!texture_export_format(format, type).has_value())
         return TexImageSourceResult::NoFrame;
 
-    // NB: The bitmap is shareable, so that the recorder sends it to the host without copying the pixels again.
+    // NB: The bitmap is shareable, so that the frame shares its memory instead of copying the pixels again.
     auto bitmap = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Unpremultiplied, { static_cast<int>(width), static_cast<int>(height) });
     if (bitmap.is_error())
         return TexImageSourceResult::InvalidValue;
     auto row_size = static_cast<size_t>(width) * sizeof(u32);
     for (u32 y = 0; y < height; ++y)
         memcpy(bitmap.value()->scanline_u8(static_cast<int>(y)), pixels + y * row_size, row_size);
-    NonnullRefPtr<Gfx::Bitmap const> pixels_bitmap = bitmap.release_value();
-    return tex_image_source_frame(Compositing::WebGL::ImageSourceFrame { Gfx::DecodedImageFrame { move(pixels_bitmap) } }, format, type, out_frame);
+    auto pixels_frame = Gfx::DecodedImageFrame::create(*bitmap.value());
+    if (pixels_frame.is_error())
+        return TexImageSourceResult::InvalidValue;
+    return tex_image_source_frame(Compositing::WebGL::ImageSourceFrame { pixels_frame.release_value() }, format, type, out_frame);
 }
 
 }

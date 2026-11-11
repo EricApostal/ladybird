@@ -8,6 +8,7 @@ use crate::layout::svg_formatting_context::FfiSvgNumberPercentage;
 use crate::layout::used_values;
 use crate::painting::display_list::commands::{OptionalAffineTransform, OptionalColor};
 use crate::stage::MainThread;
+use libcompositing_rust::scrolling::scroll_snap_selection::SnapSelectionStrategyType;
 use libgfx_rust::{Color, IntRect, InterpolationColorSpace};
 use std::ffi::c_void;
 
@@ -43,7 +44,6 @@ pub struct FfiRecordingInputs {
     pub inactive_selection_background_light: Color,
     pub inactive_selection_background_dark: Color,
     pub palette_is_dark: bool,
-    pub document_has_supported_color_schemes: bool,
     pub document_supports_light_or_dark: bool,
     pub image_fallback_color_scheme: u8,
     pub accessibility_focus_target: crate::layout::node_data::NodeSlotId,
@@ -151,7 +151,6 @@ impl FfiRecordingInputs {
             inactive_selection_background_light: self.inactive_selection_background_light,
             inactive_selection_background_dark: self.inactive_selection_background_dark,
             palette_is_dark: self.palette_is_dark,
-            document_has_supported_color_schemes: self.document_has_supported_color_schemes,
             document_supports_light_or_dark: self.document_supports_light_or_dark,
             image_fallback_color_scheme: self.image_fallback_color_scheme,
             accessibility_focus_target: (!self.accessibility_focus_target.is_invalid())
@@ -535,6 +534,43 @@ pub struct FfiSnapAreaGeometry {
     pub align_x: u8,
     pub align_y: u8,
     pub always_stop: bool,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiSnapAreaIdentity {
+    pub node_id: i64,
+    pub pseudo_element_type: u8,
+}
+
+#[repr(C)]
+pub struct FfiSnapSelectionStrategy {
+    pub r#type: SnapSelectionStrategyType,
+    pub has_start_offset: bool,
+    pub start_offset: used_values::FfiCssPixelPoint,
+    pub displacement: used_values::FfiCssPixelPoint,
+    pub has_starting_positions_boundary: bool,
+    pub starting_positions_boundary: used_values::FfiCssPixelPoint,
+}
+
+#[repr(C)]
+pub struct FfiSnapDestination<'a> {
+    pub position: used_values::FfiCssPixelPoint,
+    pub snapped_x: bool,
+    pub snapped_y: bool,
+    pub evaluated_x: bool,
+    pub evaluated_y: bool,
+    pub snapped_areas_x: ak::Span<'a, FfiSnapAreaIdentity>,
+    pub snapped_areas_y: ak::Span<'a, FfiSnapAreaIdentity>,
+}
+
+#[repr(C)]
+pub struct FfiSnapAreaDomRelations {
+    pub context: *mut c_void,
+    pub area_contains_focused_node: unsafe extern "C" fn(*mut c_void, FfiSnapAreaIdentity) -> bool,
+    pub area_contains_targeted_element: unsafe extern "C" fn(*mut c_void, FfiSnapAreaIdentity) -> bool,
+    pub element_of_area_is_ancestor_of_element_of:
+        unsafe extern "C" fn(*mut c_void, FfiSnapAreaIdentity, FfiSnapAreaIdentity) -> bool,
 }
 
 /// Where a recording's resources go once it is published. The fields are private: the callbacks

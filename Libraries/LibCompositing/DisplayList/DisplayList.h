@@ -17,7 +17,6 @@
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibCompositing/Export.h>
 #include <LibCompositing/Forward.h>
-#include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibCompositing/Types.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Color.h>
@@ -28,6 +27,7 @@ namespace Compositing {
 
 namespace RustFFI {
 
+struct FfiDisplayList;
 struct FfiDisplayListReplayCallbacks;
 
 }
@@ -52,13 +52,12 @@ public:
         Compositing::KeyboardScrollState keyboard_scroll_state {};
     };
 
-    // Everything about a list that travels alongside its tape when it is sent to the Compositor.
+    // What travels alongside the tape of a list for whatever plays the list.
     struct Properties {
         u64 id { 0 };
         u64 compatible_visual_context_tree_structural_epoch { 0 };
         Optional<Gfx::Color> surface_clear_color;
         Gfx::Color root_group_color { Gfx::Color::Transparent };
-        Optional<AsyncScrollingMetadata> async_scrolling_metadata;
     };
 
     // An empty list.
@@ -75,7 +74,6 @@ public:
     // write to, and checks the copies. Fails when the sizes do not fit the buffer or the tape is malformed.
     static ErrorOr<NonnullRefPtr<DisplayList>> create_from_shared_buffer(Properties, Core::AnonymousBuffer, u64 tape_size, u64 run_count);
 
-    // Taken at send time: the async scrolling metadata is restamped on every send.
     Properties properties() const;
 
     u64 compatible_visual_context_tree_structural_epoch() const { return m_compatible_visual_context_tree_structural_epoch; }
@@ -83,6 +81,9 @@ public:
 
     // The Rust storage that holds the list's tape.
     void const* rust_handle() const { return m_storage; }
+    // The list as the scroll logic takes it, with the async scrolling metadata it goes with as IPC encodes an
+    // Optional of it.
+    RustFFI::FfiDisplayList for_scroll_logic(ReadonlyBytes encoded_async_scrolling_metadata) const;
 
     // The sizes a receiver needs to unpack the list from its shared buffer.
     u64 tape_size() const;
@@ -107,15 +108,12 @@ public:
     // Whether reusing a raster of the list can produce different pixels than replaying it in place, leaving out the
     // display lists it nests.
     bool requires_direct_replay_without_nested_lists(AccumulatedVisualContextTree const&) const;
-    // Visits the compositor metadata commands with the context of their run and their payload, in tape order.
-    void for_each_compositor_metadata(Function<void(ContextRef, DisplayListCommandType, ReadonlyBytes payload)> const&) const;
-    // Visits the carets the list draws outside of any group, with the context of their run and their bounding rect.
-    void for_each_caret(Function<void(ContextRef, Gfx::IntRect, PaintCaret const&)> const&) const;
 
-    // Replays the list through a player's callbacks, against the visual context tree it was made for.
-    void replay(AccumulatedVisualContextTree const&, ScrollStateSnapshot const&, RustFFI::FfiDisplayListReplayCallbacks const&) const;
-    // Replays a stream of records that a command of a list being replayed nests.
-    static void replay_records(ReadonlyBytes records, ScrollStateSnapshot const&, RustFFI::FfiDisplayListReplayCallbacks const&);
+    // Replays the list through a player's callbacks, against the visual context tree it was made for, with nothing
+    // scrolled.
+    void replay(AccumulatedVisualContextTree const&, RustFFI::FfiDisplayListReplayCallbacks const&) const;
+    // Replays a stream of records that a command of a list being replayed nests, with nothing scrolled.
+    static void replay_records(ReadonlyBytes records, RustFFI::FfiDisplayListReplayCallbacks const&);
 
 private:
     // Takes over the storage of a tape that came from another process and passed its checks.
@@ -144,16 +142,6 @@ COMPOSITING_API ErrorOr<void> validate_display_list_references_live_visual_conte
 namespace IPC {
 
 template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::DisplayList::AsyncScrollingMetadata const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::DisplayList::AsyncScrollingMetadata> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::DisplayList::Properties const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::DisplayList::Properties> decode(Decoder&);
-
-template<>
 COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::DisplayList const&);
 template<>
 COMPOSITING_API ErrorOr<void> encode(Encoder&, NonnullRefPtr<Compositing::DisplayList> const&);
@@ -161,3 +149,5 @@ template<>
 COMPOSITING_API ErrorOr<NonnullRefPtr<Compositing::DisplayList>> decode(Decoder&);
 
 }
+
+#include <LibCompositing/DisplayList/DisplayListPropertiesCodecs.h>
