@@ -146,6 +146,12 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
     for (auto** variable = Core::Environment::raw_environ(); *variable; ++variable) {
         auto entry = Core::Environment::Entry::from_chars(*variable);
         auto is_allowed = allowed_names.contains_slow(entry.name) || any_of(allowed_prefixes, [&](auto prefix) { return entry.name.starts_with(prefix); });
+#if defined(AK_OS_ANDROID)
+        // The helper executables live in the APK's native library directory and need that directory to resolve
+        // libc++_shared.so. Android also defines AK_OS_LINUX, so this filter otherwise drops it.
+        if (entry.name == "LD_LIBRARY_PATH"sv)
+            is_allowed = true;
+#endif
         if (type == ProcessType::RequestServer) {
             is_allowed |= certificate_names.contains_slow(entry.name);
         }
