@@ -27,13 +27,6 @@ set(GENERATED_SOURCES
 )
 
 set(RS_LIB_TYPE STATIC)
-if (ANDROID)
-    list(APPEND SOURCES
-        ${LADYBIRD_SOURCE_DIR}/UI/Android/src/main/cpp/RequestServerService.cpp
-        ${LADYBIRD_SOURCE_DIR}/UI/Android/src/main/cpp/LadybirdServiceBaseJNI.cpp
-    )
-    set(RS_LIB_TYPE SHARED)
-endif()
 
 add_library(requestserverservice ${RS_LIB_TYPE} ${SOURCES} ${GENERATED_SOURCES})
 ladybird_generated_sources(requestserverservice)
