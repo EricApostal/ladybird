@@ -108,6 +108,8 @@ if (APPLE)
     set_source_files_properties(NotificationBackendMacOS.mm QuarantineMacOS.mm StringConversionsMacOS.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 elseif (LINUX)
     list(APPEND SOURCES AudioDaemonSocket.cpp CrashReportPOSIX.cpp)
+elseif (ANDROID)
+    list(APPEND SOURCES CrashReportPOSIX.cpp)
 endif()
 
 if (NOT WIN32)
