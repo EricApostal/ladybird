@@ -254,7 +254,10 @@
       "platform": "android",
       "default-features": false,
       "features": [
-        "vulkan"
+        "vulkan",
+        "freetype",
+        "harfbuzz",
+        "icu"
       ]
     },
     "sqlite3",
