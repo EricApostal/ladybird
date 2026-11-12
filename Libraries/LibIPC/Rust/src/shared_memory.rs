@@ -11,7 +11,7 @@
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn create_anonymous_file() -> io::Result<OwnedFd> {
     // NB: memfd_create() reads a NUL-terminated name and returns a new descriptor.
     let fd = unsafe { libc::memfd_create(c"".as_ptr(), libc::MFD_CLOEXEC) };
@@ -22,7 +22,7 @@ pub(crate) fn create_anonymous_file() -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn create_anonymous_file() -> io::Result<OwnedFd> {
     use std::hash::{BuildHasher, RandomState};
     use std::os::fd::AsRawFd;
