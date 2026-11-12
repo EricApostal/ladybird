@@ -12,7 +12,7 @@
 #ifdef AK_OS_MACOS
 #    include <LibMedia/AudioToolbox/AudioToolboxAudioDecoder.h>
 #endif
-#ifdef AK_OS_LINUX
+#if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)
 #    include <LibMedia/FFmpeg/SystemFFmpegDecoders.h>
 #endif
 #ifdef AK_OS_WINDOWS
@@ -43,7 +43,7 @@ ReadonlySpan<VideoDecoderRegistration> ffmpeg_video_decoders()
 {
     static Array const decoders {
         VideoDecoderRegistration { FFmpeg::FFmpegVideoDecoder::capabilities, create_ffmpeg_video_decoder },
-#ifdef AK_OS_LINUX
+#if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)
         VideoDecoderRegistration { FFmpeg::system_ffmpeg_video_decoder_capabilities, FFmpeg::create_system_ffmpeg_video_decoder },
 #endif
     };
@@ -79,7 +79,7 @@ ReadonlySpan<AudioDecoderRegistration> audio_decoders()
         AudioDecoderRegistration { WindowsMediaFoundation::WindowsMediaFoundationAudioDecoder::capabilities, create_windows_media_foundation_audio_decoder },
 #endif
         AudioDecoderRegistration { FFmpeg::FFmpegAudioDecoder::capabilities, create_ffmpeg_audio_decoder },
-#ifdef AK_OS_LINUX
+#if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)
         AudioDecoderRegistration { FFmpeg::system_ffmpeg_audio_decoder_capabilities, FFmpeg::create_system_ffmpeg_audio_decoder },
 #endif
     };
