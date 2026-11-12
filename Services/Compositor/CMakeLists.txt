@@ -51,7 +51,7 @@ set(GENERATED_SOURCES
     CompositorWebContentServerEndpoint.h
     RenderClockClientEndpoint.h
     RenderClockServerEndpoint.h
-    ${CMAKE_BINARY_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/../../Libraries/LibCompositing/WebGL/GLFunctions.cpp
     WebGLCommandReplayer.cpp
 )
 
