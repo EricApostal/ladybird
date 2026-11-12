@@ -81,6 +81,7 @@ bool can_import_dmabuf_image(VkPhysicalDevice, VkFormat, uint64_t modifier, VkIm
 
 ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers);
 
+#    ifdef USE_VULKAN_DMABUF_IMAGES
 struct ImportedDmaBufImage {
     VkImage image { VK_NULL_HANDLE };
     VkDeviceMemory memory { VK_NULL_HANDLE };
@@ -91,6 +92,7 @@ ErrorOr<ImportedDmaBufImage> import_linux_dmabuf_image(VkPhysicalDevice, VkDevic
 
 // Copies the pixels of a single-plane BGRA dma-buf that the device can import, in whatever layout it has, into a bitmap.
 ErrorOr<NonnullRefPtr<Bitmap>> read_linux_dmabuf_into_bitmap(VulkanContext const& context, LinuxDmaBufHandle const& dmabuf);
+#    endif
 
 }
 

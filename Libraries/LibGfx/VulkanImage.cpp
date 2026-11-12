@@ -459,6 +459,7 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
 #    endif
 }
 
+#    ifdef USE_VULKAN_DMABUF_IMAGES
 ErrorOr<ImportedDmaBufImage> import_linux_dmabuf_image(VkPhysicalDevice physical_device, VkDevice device, PFN_vkGetMemoryFdPropertiesKHR get_memory_fd_properties, LinuxDmaBufHandle const& dmabuf, VkFormat format, VkImageUsageFlags usage)
 {
     if (dmabuf.objects.size() != 1 || dmabuf.planes.size() != 1 || dmabuf.size.is_empty())
@@ -706,6 +707,7 @@ ErrorOr<NonnullRefPtr<Bitmap>> read_linux_dmabuf_into_bitmap(VulkanContext const
     vkUnmapMemory(device, buffer_memory);
     return bitmap_or_error;
 }
+#    endif
 
 }
 
