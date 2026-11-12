@@ -16,6 +16,7 @@
 #include <LibIPC/SingleServer.h>
 #include <LibTLS/TLSv12.h>
 #include <LibWebView/Utilities.h>
+#include <RequestServer/CURL.h>
 #include <RequestServer/ConnectionFromClient.h>
 
 namespace RequestServer {
@@ -32,7 +33,21 @@ ErrorOr<int> service_main(int ipc_socket)
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
     auto socket = TRY(Core::LocalSocket::adopt_fd(ipc_socket));
-    auto client = TRY(RequestServer::ConnectionFromClient::try_create(make<IPC::Transport>(move(socket))));
+
+    TRY(RequestServer::initialize_libcurl());
+
+    // The Android port connects a RequestServer client directly, so this service speaks the data endpoint rather than
+    // the control endpoint. The maps it registers itself in outlive the connection, which runs the event loop below.
+    RequestServer::ConnectionFromClient::ConnectionMap connections;
+    RequestServer::ConnectionFromClient::RequestTransferLeaseMap request_transfer_leases;
+    Optional<HTTP::DiskCache&> disk_cache;
+    [[maybe_unused]] auto client = RequestServer::ConnectionFromClient::construct(
+        make<IPC::Transport>(move(socket)),
+        RequestServer::IsPrivate::No,
+        RequestServer::SiteBinding::Unrestricted,
+        connections,
+        request_transfer_leases,
+        disk_cache);
 
     return event_loop.exec();
 }
