@@ -189,18 +189,48 @@ SharedImageBuffer SharedImageBuffer::import_from_shared_image(SharedImage shared
 #endif
 }
 
+#ifdef USE_VULKAN_AHB_IMAGES
+SharedImageBuffer::SharedImageBuffer(SharedImageBuffer&& other)
+    : m_android_ahb_handle(move(other.m_android_ahb_handle))
+    , m_android_ahb(other.m_android_ahb)
+    , m_bitmap(move(other.m_bitmap))
+{
+    // The raw pointer must not be released by the moved-from object as well.
+    other.m_android_ahb = nullptr;
+}
+
+SharedImageBuffer& SharedImageBuffer::operator=(SharedImageBuffer&& other)
+{
+    if (this != &other) {
+        release_android_ahb();
+        m_android_ahb_handle = move(other.m_android_ahb_handle);
+        m_android_ahb = other.m_android_ahb;
+        other.m_android_ahb = nullptr;
+        m_bitmap = move(other.m_bitmap);
+    }
+    return *this;
+}
+#else
 SharedImageBuffer::SharedImageBuffer(SharedImageBuffer&&) = default;
 
 SharedImageBuffer& SharedImageBuffer::operator=(SharedImageBuffer&&) = default;
+#endif
 
-SharedImageBuffer::~SharedImageBuffer()
+void SharedImageBuffer::release_android_ahb()
 {
 #ifdef USE_VULKAN_AHB_IMAGES
-    if (m_android_ahb != nullptr) {
+    if (m_android_ahb != nullptr && m_android_ahb_handle.has_value()) {
         AHardwareBuffer_unlock(m_android_ahb, nullptr);
         AHardwareBuffer_release(m_android_ahb);
     }
+    m_android_ahb = nullptr;
+    m_android_ahb_handle.clear();
 #endif
+}
+
+SharedImageBuffer::~SharedImageBuffer()
+{
+    release_android_ahb();
 }
 
 SharedImage SharedImageBuffer::export_shared_image() const

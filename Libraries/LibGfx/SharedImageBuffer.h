@@ -80,6 +80,7 @@ private:
     Optional<WindowsD3DHandle> m_windows_d3d_handle;
 #    endif
 #endif
+    void release_android_ahb();
     RefPtr<Bitmap> m_bitmap;
 };
 
