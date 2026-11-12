@@ -97,7 +97,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     if (force_fontconfig)
         Compositor::set_font_rasterizer(Compositor::FontRasterizer::FreeType);
 
-#if defined(AK_OS_LINUX)
+#if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)
     // NB: The GPU driver starts threads, and Landlock does not confine a thread that already runs. Seccomp covers every
     //     thread, so the rest of the sandbox can wait until the driver is done with the syscalls that only its setup uses.
     if (!disable_sandbox)

@@ -61,7 +61,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
-#if defined(AK_OS_LINUX)
+#if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)
     // Without the sandbox there is no redirect to the broker, so libpulse finds the daemon the usual way.
     if (connect_broker_fd != -1 && !disable_sandbox) {
         Sandbox::set_connect_broker_fd(connect_broker_fd);
