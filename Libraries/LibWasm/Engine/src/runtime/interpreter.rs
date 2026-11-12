@@ -228,7 +228,7 @@ mod fault {
         }
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
     unsafe fn instruction_pointer(context: *mut libc::c_void) -> *mut usize {
         unsafe {
             let context = context.cast::<libc::ucontext_t>();

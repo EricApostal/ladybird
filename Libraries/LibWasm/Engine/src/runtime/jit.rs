@@ -331,7 +331,7 @@ pub unsafe fn redirect_fault(context: *mut libc::c_void) -> bool {
 /// # Safety
 ///
 /// Only the fault handler calls this, with its context.
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
 pub unsafe fn redirect_fault(context: *mut libc::c_void) -> bool {
     unsafe {
         let context = context.cast::<libc::ucontext_t>();
@@ -420,7 +420,7 @@ pub unsafe fn redirect_fault(context: *mut libc::c_void) -> bool {
 
 #[cfg(not(any(
     all(any(target_os = "linux", target_os = "macos", windows), target_arch = "x86_64"),
-    all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64")
+    all(any(target_os = "linux", target_os = "macos", target_os = "android"), target_arch = "aarch64")
 )))]
 pub unsafe fn redirect_fault(_context: *mut libc::c_void) -> bool {
     false
