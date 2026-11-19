@@ -109,6 +109,14 @@ Process::~Process()
 }
 
 #if defined(AK_OS_LINUX)
+// NB: The child shares our memory but has a descriptor table of its own, so closing a descriptor there never affects
+//     us. It closes with a raw system call, as it may only make those, and so that Android's fdsan, which aborts a
+//     close() of a descriptor that a Java object owns, cannot kill the child before it execs.
+static void close_in_child(int fd)
+{
+    (void)syscall(SYS_close, fd);
+}
+
 static Optional<int> run_file_actions_in_child(Vector<ProcessSpawnOptions::FileActionType> const& file_actions)
 {
     for (auto const& file_action : file_actions) {
@@ -124,15 +132,15 @@ static Optional<int> run_file_actions_in_child(Vector<ProcessSpawnOptions::FileA
                 if (fd != action.fd) {
                     if (dup2(fd, action.fd) < 0) {
                         auto saved_errno = errno;
-                        close(fd);
+                        close_in_child(fd);
                         return Optional<int> { saved_errno };
                     }
-                    close(fd);
+                    close_in_child(fd);
                 }
                 return Optional<int> {};
             },
             [&](FileAction::CloseFile const& action) {
-                close(action.fd);
+                close_in_child(action.fd);
                 return Optional<int> {};
             },
             [&](FileAction::DupFd const& action) {
@@ -207,7 +215,7 @@ static Optional<int> close_undeclared_descriptors_one_by_one(ReadonlySpan<int> d
         auto bytes_read = syscall(SYS_getdents64, directory_fd, buffer, sizeof(buffer));
         if (bytes_read < 0) {
             auto saved_errno = errno;
-            close(directory_fd);
+            close_in_child(directory_fd);
             return saved_errno;
         }
         if (bytes_read == 0)
@@ -228,10 +236,10 @@ static Optional<int> close_undeclared_descriptors_one_by_one(ReadonlySpan<int> d
                 fd = fd * 10 + (*character - '0');
             }
             if (is_number && fd > STDERR_FILENO && fd != directory_fd && !is_declared(declared_descriptors, fd))
-                close(fd);
+                close_in_child(fd);
         }
     }
-    close(directory_fd);
+    close_in_child(directory_fd);
     return {};
 }
 

@@ -6,6 +6,7 @@
  */
 
 #include <AK/Checked.h>
+#include <AK/Platform.h>
 #include <AK/ScopeGuard.h>
 #include <LibCore/File.h>
 #include <LibCore/MappedFile.h>
@@ -63,7 +64,14 @@ ErrorOr<NonnullOwnPtr<MappedFile>> MappedFile::map_from_fd_range_and_close(int f
     switch (mode) {
     case Mode::ReadOnly:
         protection = PROT_READ;
+#if defined(AK_OS_ANDROID)
+        // NB: Android's 5.15 kernels refuse any MAP_SHARED mapping of a memfd with the write seal, even a read-only one,
+        //     with EPERM, which left helpers without the font catalog. Nothing can write through a read-only mapping,
+        //     so a private one reads the same bytes.
+        flags = MAP_PRIVATE;
+#else
         flags = MAP_SHARED;
+#endif
         break;
     case Mode::ReadWrite:
         protection = PROT_READ | PROT_WRITE;
