@@ -27,6 +27,17 @@ if(RUNTIME_OPTIONS STREQUAL "")
     message(FATAL_ERROR "At least one of libidn2 and libicu should be selected.")
 endif()
 
+# NB: libpsl compiles and runs a small program on the build machine while configuring
+#     (meson.get_compiler('c', native : true)). When cross-compiling, vcpkg hands Meson a native file in which every
+#     build-machine compiler is `false`, so that lookup fails. Give it the host's C compiler; Meson applies native files
+#     in order, so this one overrides the `false` entry.
+if(VCPKG_CROSSCOMPILING)
+    set(libpsl_native_file "${CURRENT_BUILDTREES_DIR}/libpsl-native-compiler.ini")
+    file(WRITE "${libpsl_native_file}" "[binaries]\nc = ['cc']\n")
+    set(VCPKG_MESON_NATIVE_FILE_RELEASE "${libpsl_native_file}")
+    set(VCPKG_MESON_NATIVE_FILE_DEBUG "${libpsl_native_file}")
+endif()
+
 vcpkg_configure_meson(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
