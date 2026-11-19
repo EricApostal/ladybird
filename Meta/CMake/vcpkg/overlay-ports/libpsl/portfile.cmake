@@ -29,11 +29,12 @@ endif()
 
 # NB: libpsl compiles and runs a small program on the build machine while configuring
 #     (meson.get_compiler('c', native : true)). When cross-compiling, vcpkg hands Meson a native file in which every
-#     build-machine compiler is `false`, so that lookup fails. Give it the host's C compiler; Meson applies native files
-#     in order, so this one overrides the `false` entry.
+#     build-machine tool is `false`, so that lookup fails. Give it the host's C compiler and archiver (Meson also looks
+#     up the static linker, `ar`, when it sets up a language); Meson applies native files in order, so this one overrides
+#     the `false` entries.
 if(VCPKG_CROSSCOMPILING)
     set(libpsl_native_file "${CURRENT_BUILDTREES_DIR}/libpsl-native-compiler.ini")
-    file(WRITE "${libpsl_native_file}" "[binaries]\nc = ['cc']\n")
+    file(WRITE "${libpsl_native_file}" "[binaries]\nc = ['cc']\nar = ['ar']\n")
     set(VCPKG_MESON_NATIVE_FILE_RELEASE "${libpsl_native_file}")
     set(VCPKG_MESON_NATIVE_FILE_DEBUG "${libpsl_native_file}")
 endif()
