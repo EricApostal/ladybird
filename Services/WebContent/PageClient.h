@@ -12,11 +12,13 @@
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/Utf16String.h>
+#include <LibGC/Weak.h>
 #include <LibGfx/Rect.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/DOM/AccessibilityChangeTracker.h>
+#include <LibWeb/Fetch/Engine/NetworkActivityObservers.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/Scripting/ConsoleInputCompletion.h>
@@ -92,6 +94,7 @@ public:
     void set_frame_rate_capped(bool capped) { m_frame_rate_capped = capped; }
     virtual double maximum_frames_per_second() const override { return m_maximum_frames_per_second; }
     void set_preferred_color_scheme(Web::CSS::PreferredColorScheme);
+    void set_screen_shows_high_dynamic_range(bool);
     void set_preferred_contrast(Web::CSS::PreferredContrast);
     void set_preferred_motion(Web::CSS::PreferredMotion);
     virtual void set_has_focus(bool) override;
@@ -120,6 +123,7 @@ public:
     void select_dropdown_closed(Optional<u32> const& selected_item_id);
 
     void set_has_devtools_client(bool);
+    static void update_keeps_long_stack_traces();
     bool has_devtools_client() const { return m_has_devtools_client; }
     virtual bool has_active_devtools_client() const override { return has_devtools_client(); }
     void start_sending_console_output(bool messages, bool errors);
@@ -182,6 +186,7 @@ private:
     PageClient(PageHost&, Web::PageId id, Optional<Web::HTML::CrossProcessId>);
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
+    virtual void finalize() override;
 
     enum class FrameTimerPurpose {
         Inactive,
@@ -242,6 +247,7 @@ private:
     }
     virtual size_t screen_count() const override { return m_all_screen_rects.size(); }
     virtual Web::CSS::PreferredColorScheme preferred_color_scheme() const override { return m_preferred_color_scheme; }
+    virtual bool screen_shows_high_dynamic_range() const override { return m_screen_shows_high_dynamic_range; }
     virtual Web::CSS::PreferredContrast preferred_contrast() const override { return m_preferred_contrast; }
     virtual Web::CSS::PreferredMotion preferred_motion() const override { return m_preferred_motion; }
     virtual void request_frame() override;
@@ -345,13 +351,15 @@ private:
     virtual void page_did_request_unload_check(Web::HTML::CrossProcessId navigable_id, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>>) override;
     virtual String page_did_request_ui_process_session_history_for_testing() override;
     virtual bool page_did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) override;
+    virtual Optional<Web::MediaSession::MediaSessionState> page_did_request_now_playing_state_for_testing() override;
+    virtual void page_did_trigger_now_playing_action_for_testing(Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) override;
     virtual bool page_did_request_tab_is_playing_audio_for_testing() override;
     virtual bool page_did_request_tab_is_heard_playing_audio_for_testing() override;
     virtual bool page_did_request_tab_is_using_microphone_for_testing() override;
     virtual bool page_did_request_tab_is_capturing_audio_for_testing() override;
     virtual void page_did_report_audio_capture_for_testing(Web::PageId labelled_page_id, bool capturing) override;
     virtual void page_did_retire_picture_in_picture_window_for_testing() override;
-    virtual u64 page_did_request_tab_audibility_change_count_for_testing() override;
+    virtual Vector<bool> page_did_request_tab_audibility_transitions_for_testing() override;
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() override;
     virtual bool page_did_request_restore_session_history_snapshot_for_testing() override;
     virtual bool page_did_request_record_reported_session_history_for_testing() override;
@@ -386,6 +394,8 @@ private:
     virtual void page_did_request_click_notification_for_testing(u64 notification_id) override;
     virtual void page_did_request_click_notification_by_id_for_testing(u64 browser_notification_id) override;
     virtual void page_did_request_dismiss_notification_for_testing(u64 notification_id) override;
+    virtual void page_did_request_hold_next_notification_show_for_testing() override;
+    virtual void page_did_request_fail_held_notification_show_for_testing() override;
     virtual void page_did_finish_test(Utf16String const& text) override;
     virtual void page_did_set_test_timeout(double milliseconds) override;
     virtual void page_did_receive_reference_test_metadata(JsonValue) override;
@@ -408,6 +418,7 @@ private:
     virtual NonnullOwnPtr<MediaClient::RemotePlaybackManager> create_media_playback_manager() override;
     virtual void rebind_media_playback_manager(MediaClient::RemotePlaybackManager&) override;
     virtual NonnullRefPtr<Core::Promise<NonnullRefPtr<Audio::RecordStream>>> create_audio_record_stream(StringView device_id, Function<void(ReadonlyBytes, Audio::SampleSpecification const&)>) override;
+    virtual void page_did_change_media_session_state(Optional<Web::MediaSession::MediaSessionState> const&) override;
     virtual void page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState) override;
     virtual void page_did_start_using_gamepads() override;
     virtual void page_did_play_gamepad_effect(Web::Gamepad::GamepadHandle, Web::Gamepad::GamepadEffect const&) override;
@@ -435,6 +446,7 @@ private:
     virtual void page_did_register_javascript_source(Web::DOM::Document&, Web::HTML::ScriptRegistry::Description const&) override;
     virtual void page_did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage const&) override;
     virtual void page_did_report_navigation_violation_of_remote_client(Web::HTML::RemoteClientNavigation const&, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective, bool url_is_https) override;
+    virtual void page_did_report_navigation_violation_of_container_document(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective, bool url_is_https) override;
 
     void setup_palette();
     ConnectionFromClient& client() const;
@@ -468,6 +480,7 @@ private:
     bool m_did_start_using_gamepads { false };
 
     Web::CSS::PreferredColorScheme m_preferred_color_scheme { Web::CSS::PreferredColorScheme::Auto };
+    bool m_screen_shows_high_dynamic_range { false };
     Web::CSS::PreferredContrast m_preferred_contrast { Web::CSS::PreferredContrast::NoPreference };
     Web::CSS::PreferredMotion m_preferred_motion { Web::CSS::PreferredMotion::NoPreference };
 
@@ -479,7 +492,9 @@ private:
     u64 m_next_webdriver_mouse_event_request_id { 0 };
     RefPtr<WebUIConnection> m_web_ui;
 
-    GC::Ptr<WebContentConsoleClient> m_top_level_document_console_client;
+    // Weak, since the page can stop showing a document here without showing another, when another process hosts the
+    // tab's next document.
+    GC::Weak<WebContentConsoleClient> m_top_level_document_console_client;
 
     RefPtr<Core::Timer> m_frame_timer;
     FrameTimerPurpose m_frame_timer_purpose { FrameTimerPurpose::Inactive };
@@ -505,6 +520,7 @@ private:
     Optional<i64> m_pending_accessibility_focus;
 
     bool m_has_devtools_client { false };
+    NonnullRefPtr<Web::Fetch::Engine::NetworkActivityObservers> m_network_activity_observers;
     bool m_devtools_takes_console_messages { false };
     bool m_devtools_takes_console_errors { false };
 

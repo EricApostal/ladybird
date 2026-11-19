@@ -71,15 +71,18 @@
 #include <LibWebView/SiteCompatibility.h>
 #include <LibWebView/SpellChecker.h>
 #include <LibWebView/StorageAreaRegistry.h>
+#include <LibWebView/SystemProbeClient.h>
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/Translator.h>
 #include <LibWebView/URL.h>
+#include <LibWebView/UpdateCheck.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebDriverBiDi.h>
 #include <LibWebView/WebDriverBrowserConnection.h>
+#include <LibWebView/WebUI/SupportUI.h>
 #include <LibWebView/WorkerAgentManager.h>
 
 #if !defined(AK_OS_WINDOWS)
@@ -103,6 +106,10 @@
 #if !defined(AK_OS_WINDOWS)
 #    include <signal.h>
 #    include <sys/wait.h>
+#endif
+
+#if defined(AK_OS_WINDOWS)
+#    include <AK/Windows.h>
 #endif
 
 namespace WebView {
@@ -163,6 +170,10 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
     {
         if (id == ConfigVariableID::MaximumDiskCacheSize)
             Application::request_server_manager().disk_cache_settings_changed();
+        else if (id == ConfigVariableID::DisableHighDynamicRangeSurfaces)
+            Application::the().update_compositor_high_dynamic_range_surfaces();
+        else if (id == ConfigVariableID::UpdateCheckInterval && Application::the().update_checker())
+            Application::the().update_checker()->settings_changed();
     }
 };
 
@@ -182,7 +193,30 @@ Application::Application(Optional<ByteString> ladybird_binary_path)
     s_the = this;
     m_ui_process_cross_process_id_allocator = allocate_cross_process_id_allocator();
 
+    m_media_session_coordinator.on_action = [](MediaSessionSource source, Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) {
+        auto view = ViewImplementation::find_view_by_id(source.view_id);
+        if (!view.has_value() || !view->has_traversable())
+            return;
+        view->traversable().for_each_hosting_page([&](WebContentPage& page) {
+            if (page.id() != source.page_id || !page.is_open())
+                return;
+            // A command from the platform's media controls is the user's gesture, like a click on a notification.
+            page.give_user_activation();
+            page.async_media_session_action(action, seek_offset, seek_time, fast_seek);
+        });
+    };
+
     platform_init(move(ladybird_binary_path));
+}
+
+void Application::set_media_session_platform_backend(OwnPtr<MediaSessionPlatformBackend> backend)
+{
+    m_media_session_coordinator.set_platform_backend(move(backend));
+}
+
+OwnPtr<MediaSessionPlatformBackend> Application::create_media_session_platform_backend()
+{
+    return {};
 }
 
 Application::~Application()
@@ -292,7 +326,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<u32> screenshot_delay;
     Optional<StringView> screenshot_path;
     bool new_window = false;
-    bool force_new_process = false;
+    Optional<i64> replace_browser_from_before;
     StringView stats_log_directory;
     Optional<StringView> profile_name;
     Optional<StringView> profile_path;
@@ -318,6 +352,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     auto site_isolation_mode = default_site_isolation_mode();
     bool disable_same_origin_tab_sharing = false;
     Optional<size_t> maximum_site_request_servers;
+    Optional<u64> web_content_memory_limit_in_mebibytes;
     bool disable_http_memory_cache = false;
     bool disable_http_disk_cache = false;
     bool disable_content_blocker = false;
@@ -329,6 +364,19 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool expose_experimental_interfaces = false;
     bool expose_internals_object = false;
     bool force_cpu_painting = false;
+    HashTable<PlatformFeatures::Feature> disabled_features;
+    HashTable<PlatformFeatures::Feature> force_enabled_features;
+    auto parse_feature_list = [](StringView list, HashTable<PlatformFeatures::Feature>& features) {
+        for (auto id : list.split_view(',')) {
+            auto feature = PlatformFeatures::feature_from_id(id);
+            if (!feature.has_value()) {
+                warnln("Unknown platform feature: {}", id);
+                return false;
+            }
+            features.set(*feature);
+        }
+        return true;
+    };
     bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool disable_scrollbar_painting = false;
@@ -384,8 +432,11 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .hide_mode = Core::ArgsParser::OptionHideMode::CommandLineAndMarkdown,
     });
     args_parser.add_option(new_window, "Force opening in a new window", "new-window", 'n');
+#if !defined(AK_OS_WINDOWS)
+    // FIXME: Offer this on Windows as well, once an unresponsive browser can be ended there.
+    args_parser.add_option(replace_browser_from_before, "End a browser that is running for the profile if it is unresponsive and started before this time, and start in its place", "replace-unresponsive-browser-from-before", 0, "unix-time-in-milliseconds");
+#endif
 #if !defined(AK_OS_ANDROID)
-    args_parser.add_option(force_new_process, "Force creation of a new browser process", "force-new-process");
     args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(profile_name, "Select or create a named profile", "profile", 0, "name");
     args_parser.add_option(profile_path, "Use a self-contained profile at an absolute path", "profile-path", 0, "path");
@@ -435,6 +486,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(disable_http_memory_cache, "Disable HTTP memory cache", "disable-http-memory-cache");
     args_parser.add_option(disable_http_disk_cache, "Disable HTTP disk cache", "disable-http-disk-cache");
     args_parser.add_option(maximum_site_request_servers, "How many RequestServers a session may have for the sites it visits, 0 to share one", "max-site-request-servers", 0, "count");
+    args_parser.add_option(web_content_memory_limit_in_mebibytes, "How much memory a WebContent process may use before it is ended, 0 for no limit", "web-content-memory-limit", 0, "MiB");
     args_parser.add_option(disable_content_blocker, "Disable content blocker", "disable-content-blocker");
     args_parser.add_option(disable_sandbox, "Disable helper process sandboxing", "disable-sandbox");
     args_parser.add_option(force_video_decoder_server, "Also decode video that has no hardware decoder in the VideoDecoderServer", "force-video-decoder-server");
@@ -454,7 +506,25 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(enable_autoplay, "Enable multimedia autoplay", "enable-autoplay");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
     args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
-    args_parser.add_option(force_cpu_painting, "Force CPU painting", "force-cpu-painting");
+    args_parser.add_option(force_cpu_painting, "Force CPU painting, the same as --disable-features=gpu_painting", "force-cpu-painting");
+    args_parser.add_option(Core::ArgsParser::Option {
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
+        .help_string = "Turn off platform features, and the features that depend on them",
+        .long_name = "disable-features",
+        .value_name = "feature,...",
+        .accept_value = [&](StringView value) -> ErrorOr<bool> {
+            return parse_feature_list(value, disabled_features);
+        },
+    });
+    args_parser.add_option(Core::ArgsParser::Option {
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
+        .help_string = "Turn on platform features despite the blocklist, where the system supports them",
+        .long_name = "force-enable-features",
+        .value_name = "feature,...",
+        .accept_value = [&](StringView value) -> ErrorOr<bool> {
+            return parse_feature_list(value, force_enabled_features);
+        },
+    });
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation", 'g');
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical scrollbars on the main viewport", "disable-scrollbar-painting");
@@ -550,6 +620,11 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .force_video_decoder_server = force_video_decoder_server ? ForceVideoDecoderServer::Yes : ForceVideoDecoderServer::No,
     };
 
+    if (web_content_memory_limit_in_mebibytes.has_value()) {
+        if (*web_content_memory_limit_in_mebibytes > NumericLimits<u64>::max() / MiB)
+            return Error::from_string_literal("The WebContent memory limit is too large");
+        m_browser_options.web_content_memory_limit_in_bytes = *web_content_memory_limit_in_mebibytes * MiB;
+    }
     if (screenshot_delay.has_value())
         m_browser_options.screenshot_delay = *screenshot_delay;
     if (screenshot_path.has_value())
@@ -602,7 +677,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     };
 
     create_platform_options(m_browser_options, m_request_server_options, m_web_content_options);
-    TRY(create_profile(profile_name, profile_path, force_new_process, temporary_profile));
+    TRY(create_profile(profile_name, profile_path, temporary_profile));
 
     // Browsers launched by WebDriver are driven directly and must never join an existing browser process. A browser
     // that logs process statistics must not join one either, since that browser would not sample them.
@@ -617,22 +692,19 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     m_browser_process = make<BrowserProcess>();
     if (coordinate_browser_process) {
-        auto disposition = TRY(m_browser_process->connect(m_browser_options.raw_urls, m_browser_options.new_window, profile().paths().runtime, profile_identity));
-        if (disposition == BrowserProcess::ProcessDisposition::ExitProcess) {
+        auto replace_from_before = replace_browser_from_before.map([](auto milliseconds) { return UnixDateTime::from_milliseconds_since_epoch(milliseconds); });
+        auto disposition = TRY(m_browser_process->connect(m_browser_options.raw_urls, m_browser_options.new_window, profile().paths().runtime, profile_identity, ui_process_id(), replace_from_before));
+        if (disposition != BrowserProcess::ProcessDisposition::ContinueMainProcess) {
             m_should_exit_after_profile_coordination = true;
+            m_browser_is_unresponsive = disposition == BrowserProcess::ProcessDisposition::BrowserIsUnresponsive;
             return {};
         }
     }
 
-    // Reports belong to the profile they came from, whose own setting decides what happens to them. A temporary
-    // profile takes nothing over, since it would take it to its grave.
+    // Reports belong to the profile they came from, whose own setting decides what happens to them.
     CrashReport::set_sandbox_is_disabled(m_browser_options.disable_sandbox);
     auto& crash_report_store = CrashReportStore::the();
     crash_report_store.set_directory(LexicalPath::join(profile().paths().data, "CrashReports"sv).string());
-    if (!profile().is_temporary()) {
-        if (auto result = crash_report_store.adopt_reports_from(CrashReportStore::default_directory()); result.is_error())
-            warnln("Could not move crash reports into the profile: {}", result.error());
-    }
     if (captures_browser_crashes()) {
         if (auto result = crash_report_store.initialize_browser_crash_handler(); result.is_error())
             warnln("Could not prepare Browser crash reporting: {}", result.error());
@@ -676,6 +748,14 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         m_web_content_options.force_cpu_painting = ForceCPUPainting::Yes;
     }
 
+    m_feature_overrides.disabled = move(disabled_features);
+    m_feature_overrides.force_enabled = move(force_enabled_features);
+    if (m_web_content_options.force_cpu_painting == ForceCPUPainting::Yes)
+        m_feature_overrides.disabled.set(PlatformFeatures::Feature::GpuPainting);
+    // Test results must not depend on the machine's GPU.
+    if (m_web_content_options.is_test_mode == IsTestMode::Yes)
+        m_feature_overrides.force_enabled.clear();
+
     if (m_web_content_options.file_scheme_urls_have_tuple_origins == FileSchemeUrlsHaveTupleOrigins::Yes)
         URL::set_file_scheme_urls_have_tuple_origins();
 
@@ -706,22 +786,26 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         start_content_blocker_list_update(ContentBlockerListUpdateTrigger::Automatic);
     }
 
+    // Every profile of this installation shares when it last checked for updates. A temporary profile only checks when
+    // the user asks it to.
+    if (!m_browser_options.headless_mode.has_value() && !m_browser_options.webdriver_browser_endpoint.has_value()) {
+        m_update_checker = make<UpdateChecker>(LexicalPath::join(m_instance_data_directory, "UpdateCheck.json"sv).string());
+        m_update_checker->on_result = [this](UpdateCheckResult const& result, UpdateCheckTrigger trigger) {
+            display_update_check_result(result, trigger);
+        };
+        if (!profile().is_temporary())
+            m_update_checker->start();
+    }
+
     initialize_page_options();
 
     return {};
 }
 
-ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> profile_name, [[maybe_unused]] Optional<StringView> profile_path, [[maybe_unused]] bool force_new_process, [[maybe_unused]] bool temporary_profile)
+ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> profile_name, [[maybe_unused]] Optional<StringView> profile_path, [[maybe_unused]] bool temporary_profile)
 {
 #if !defined(AK_OS_ANDROID)
     ProfileSelection profile_selection { .temporary = temporary_profile };
-
-    if (force_new_process) {
-        if (profile_name.has_value() || profile_path.has_value() || temporary_profile)
-            return Error::from_string_literal("--force-new-process cannot be combined with another profile selector");
-        warnln("--force-new-process is deprecated; using --temporary-profile");
-        profile_selection.temporary = true;
-    }
 
     if (profile_name.has_value())
         profile_selection.name = profile_name->to_byte_string();
@@ -747,6 +831,8 @@ ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> 
     profile_roots.data = LexicalPath { profile_roots.data }.parent().string();
     profile_roots.cache = LexicalPath { profile_roots.cache }.parent().string();
 #endif
+
+    m_instance_data_directory = LexicalPath::join(profile_roots.data, "Ladybird"sv).string();
 
 #if defined(AK_OS_ANDROID)
     m_profile = TRY(Profile::create_legacy(profile_roots));
@@ -1093,19 +1179,18 @@ void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
         open_url_in_new_tab(url, Web::HTML::ActivateTab::No);
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(IsPrivate is_private, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(BrowsingSession& session, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
-    // The client's WebContentClient picks up this same session when it is created.
-    auto session = session_for_new_view(is_private);
-
     auto cross_process_id_allocator = allocate_cross_process_id_allocator();
     auto root_navigable_id = navigable_to_adopt.has_value() ? *navigable_to_adopt : cross_process_id_allocator.allocate();
     if (!initial_document_state_id.has_value())
         initial_document_state_id = cross_process_id_allocator.allocate();
     auto initial_document_id = cross_process_id_allocator.allocate();
 
-    auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_navigable_id));
-    TRY(Application::the().connect_web_content_to_compositor(*client));
+    auto client = TRY(WebView::launch_web_content_process(session, initial_page_id, root_navigable_id));
+    // A process launched while there is no Compositor is connected to it along with every other process once it is up.
+    if (m_compositor_client)
+        TRY(connect_web_content_to_compositor(*client));
 
     // A tab's first process creates its traversable from this entry. A process hosting a navigable of an existing tab
     // stands in for the canonical current entry.
@@ -1196,6 +1281,15 @@ void Application::did_disconnect_request_server_client(int client_id)
 {
     m_request_server_client_sessions.remove(client_id);
     m_unrestricted_request_server_clients.remove(client_id);
+
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        client.request_server_site_bindings().did_disconnect(client_id);
+        return IterationDecision::Continue;
+    });
+    WorkerAgentManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) {
+        bindings.did_disconnect(client_id);
+        return IterationDecision::Continue;
+    });
 }
 
 bool Application::request_server_client_may_use_cookies_in(int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& context) const
@@ -1235,11 +1329,6 @@ RefPtr<BrowsingSession> Application::session_for_request_server_client(int clien
     if (auto it = m_request_server_client_sessions.find(client_id); it != m_request_server_client_sessions.end())
         return it->value.strong_ref();
     return {};
-}
-
-RefPtr<BrowsingSession> Application::existing_session(IsPrivate is_private)
-{
-    return is_private == IsPrivate::Yes ? the().m_private_session.strong_ref() : the().m_default_session;
 }
 
 WebDriverBrowserConnection* Application::webdriver_browser_connection()
@@ -1444,6 +1533,14 @@ void Application::update_compositor_ui_overlays(Web::CompositorContextId context
     m_compositor_client->async_set_ui_overlays(context_id, overlays);
 }
 
+void Application::update_compositor_high_dynamic_range_surfaces()
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    auto disabled = settings().config_variable_as_bool(ConfigVariableID::DisableHighDynamicRangeSurfaces);
+    m_compositor_client->async_set_window_server_may_show_high_dynamic_range(!disabled);
+}
+
 void Application::update_compositor_display_metadata(Web::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
@@ -1465,6 +1562,107 @@ void Application::update_compositor_context_visibility(Web::CompositorContextId 
     m_compositor_client->async_set_context_visibility(context_id, context_visibility);
 }
 
+Optional<Application::RemoteLayer> Application::create_remote_layer()
+{
+    if (!m_compositor_presentation_client || !can_send_compositor_process_ipc(m_compositor_client))
+        return {};
+    VERIFY(m_compositor_client);
+
+    auto remote_layer_id = m_next_remote_layer_id++;
+    auto response = m_compositor_client->try_create_remote_layer(m_compositor_presentation_id, remote_layer_id);
+    if (response.is_error())
+        return {};
+    auto host_handle = response.release_value();
+    if (host_handle.kind == Compositing::RemoteLayerHostKind::None)
+        return {};
+#if defined(AK_OS_WINDOWS)
+    if (host_handle.kind == Compositing::RemoteLayerHostKind::Win32ChildWindow && !is_window_of_compositor_process(host_handle.id)) {
+        dbgln("Ignoring remote layer {}, whose window does not belong to the Compositor", remote_layer_id);
+        m_compositor_client->async_destroy_remote_layer(remote_layer_id);
+        return {};
+    }
+#endif
+    return RemoteLayer { .id = remote_layer_id, .host_handle = host_handle };
+}
+
+#if defined(AK_OS_WINDOWS)
+bool Application::is_window_of_compositor_process(u64 window_handle)
+{
+    DWORD window_process_id = 0;
+    if (GetWindowThreadProcessId(reinterpret_cast<HWND>(static_cast<uintptr_t>(window_handle)), &window_process_id) == 0)
+        return false;
+    bool is_window_of_compositor_process = false;
+    m_process_manager->for_each_process([&](Process& process) {
+        if (process.type() == ProcessType::Compositor && process.pid() == static_cast<pid_t>(window_process_id))
+            is_window_of_compositor_process = true;
+    });
+    return is_window_of_compositor_process;
+}
+#endif
+
+void Application::destroy_remote_layer(u64 remote_layer_id)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_destroy_remote_layer(remote_layer_id);
+}
+
+void Application::show_context_in_remote_layer(u64 remote_layer_id, Optional<Web::CompositorContextId> context_id)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_show_context_in_remote_layer(remote_layer_id, context_id);
+}
+
+void Application::set_remote_layer_fit(u64 remote_layer_id, Optional<Gfx::IntSize> fit_within)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_set_remote_layer_fit(remote_layer_id, fit_within);
+}
+
+void Application::begin_synchronized_resize(u64 remote_layer_id, u64 token)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_begin_synchronized_resize(remote_layer_id, token);
+}
+
+void Application::await_synchronized_resize_frame(u64 remote_layer_id, u64 token, Gfx::IntSize size)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_await_synchronized_resize_frame(remote_layer_id, token, size);
+}
+
+void Application::commit_synchronized_resize(u64 remote_layer_id, u64 token)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_commit_synchronized_resize(remote_layer_id, token);
+}
+
+void Application::take_frame_snapshot(Web::CompositorContextId context_id, Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)> callback)
+{
+    if (!m_compositor_presentation_client) {
+        callback({});
+        return;
+    }
+    m_compositor_presentation_client->take_frame_snapshot(context_id, maximum_size, move(callback));
+}
+
 void Application::update_compositor_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
@@ -1472,6 +1670,13 @@ void Application::update_compositor_context_presents_from_cpu_memory(Web::Compos
     VERIFY(m_compositor_client);
 
     m_compositor_client->async_set_context_presents_from_cpu_memory(context_id, presents_from_cpu_memory);
+}
+
+void Application::update_compositor_context_scales_frames_to_fit(Web::CompositorContextId context_id, bool scales_frames_to_fit)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    m_compositor_client->async_set_context_scales_frames_to_fit(context_id, scales_frames_to_fit);
 }
 
 bool Application::handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId context_id, Web::KeyEvent const& event, bool allow_keyboard_scroll)
@@ -1533,29 +1738,32 @@ bool Application::same_origin_tabs_may_share_a_process() const
 
 ErrorOr<NonnullRefPtr<WebContentPage>> Application::open_page_for_new_tab(IsPrivate is_private)
 {
+    if (m_spare_web_content_process && !m_spare_web_content_process->is_open())
+        m_spare_web_content_process = nullptr;
+
     RefPtr<WebContentClient> web_content_client;
     if (is_private == IsPrivate::Yes) {
-        web_content_client = TRY(create_web_content_client(IsPrivate::Yes, allocate_page_id()));
+        web_content_client = TRY(create_web_content_client(session_for_new_view(IsPrivate::Yes), allocate_page_id()));
     } else if (m_spare_web_content_process) {
         web_content_client = m_spare_web_content_process.release_nonnull();
         launch_spare_web_content_process();
     } else {
         launch_spare_web_content_process();
-        web_content_client = TRY(create_web_content_client(IsPrivate::No, allocate_page_id()));
+        web_content_client = TRY(create_web_content_client(default_session(), allocate_page_id()));
     }
     return web_content_client->open_initial_page_for_new_top_level_traversable();
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process_without_page(IsPrivate is_private)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process_without_page(BrowsingSession& session)
 {
-    return create_web_content_client(is_private, allocate_page_id());
+    return create_web_content_client(session, allocate_page_id());
 }
 
 ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     auto page_id = allocate_page_id();
     auto initial_document_state_id = initial_history_entry.document_state.id;
-    auto client = TRY(create_web_content_client(is_private, page_id, root_navigable_id, initial_document_state_id, move(remote_navigables), move(initial_history_entry), system_visibility_state));
+    auto client = TRY(create_web_content_client(session_for_new_view(is_private), page_id, root_navigable_id, initial_document_state_id, move(remote_navigables), move(initial_history_entry), system_visibility_state));
     return ChildFrameWebContentProcess {
         .client = move(client),
         .page_id = page_id,
@@ -1583,7 +1791,7 @@ void Application::launch_spare_web_content_process()
     Core::deferred_invoke([this]() {
         m_has_queued_task_to_launch_spare_web_content_process = false;
 
-        auto web_content_client = create_web_content_client(IsPrivate::No, allocate_page_id());
+        auto web_content_client = create_web_content_client(default_session(), allocate_page_id());
         if (web_content_client.is_error()) {
             dbgln("Unable to create spare web content client: {}", web_content_client.error());
             return;
@@ -1675,6 +1883,19 @@ ErrorOr<void> Application::launch_services()
     m_process_manager->on_process_exited = [this](Process&& process, Optional<int> exit_status) {
         process_did_exit(move(process), exit_status);
     };
+    m_process_manager->on_process_near_memory_limit = [](Process& process, u64) {
+        if (process.type() != ProcessType::WebContent)
+            return;
+        if (auto client = process.client<WebContentClient>())
+            client->async_release_memory();
+    };
+    m_process_manager->on_process_exceeded_memory_limit = [](Process& process, u64) {
+        if (process.type() != ProcessType::WebContent)
+            return;
+        if (auto client = process.client<WebContentClient>())
+            client->did_exceed_memory_limit();
+    };
+    m_process_manager->set_web_content_memory_limit(m_browser_options.web_content_memory_limit_in_bytes.value_or(ProcessManager::default_web_content_memory_limit()));
 
     if (m_browser_options.disable_sql_database == DisableSQLDatabase::No) {
         auto database_path = profile().paths().data;
@@ -1781,7 +2002,14 @@ ErrorOr<void> Application::launch_services()
 
     m_image_decoder_manager = make<ImageDecoderManager>();
     TRY(launch_request_server());
-    TRY(launch_compositor_process());
+    if (prepare_platform_features() == CompositorLaunch::Now) {
+        TRY(launch_compositor_process());
+    } else {
+        // Pages opened in the meantime are attached to the Compositor once it is up, as after a crash.
+        when_platform_features_are_current([this] {
+            bring_up_compositor_process();
+        });
+    }
 
     if (m_browser_options.devtools_port.has_value()) {
         // Defer launching devtools until the entire application is initialized.
@@ -1794,16 +2022,202 @@ ErrorOr<void> Application::launch_services()
     return {};
 }
 
+static constexpr u32 system_facts_cache_format = 2;
+
+static ByteString platform_features_cache_path()
+{
+    auto const& profile = Application::profile();
+    return LexicalPath::join(profile.paths().cache, "SystemFacts.json"sv).string();
+}
+
+static Optional<SystemFacts> read_cached_system_facts(ByteString const& path)
+{
+    auto file = Core::File::open(path, Core::File::OpenMode::Read);
+    if (file.is_error())
+        return {};
+    auto contents = file.value()->read_until_eof();
+    if (contents.is_error())
+        return {};
+    auto json = JsonValue::from_string(contents.value());
+    if (json.is_error() || !json.value().is_object())
+        return {};
+    auto const& object = json.value().as_object();
+    if (object.get_u32("format"sv) != system_facts_cache_format)
+        return {};
+    auto facts_object = object.get_object("facts"sv);
+    if (!facts_object.has_value())
+        return {};
+    auto facts = SystemFacts::from_json(*facts_object);
+    if (facts.is_error())
+        return {};
+    return facts.release_value();
+}
+
+static ErrorOr<void> write_cached_system_facts(ByteString const& path, SystemFacts const& facts)
+{
+    JsonObject object;
+    object.set("format"sv, system_facts_cache_format);
+    object.set("facts"sv, facts.to_json());
+
+    // The file is replaced whole, so that a crash while writing it cannot leave half a cache behind.
+    auto temporary_path = ByteString::formatted("{}.new", path);
+    auto file = TRY(Core::File::open(temporary_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
+    auto serialized = object.serialized();
+    TRY(file->write_until_depleted(serialized.bytes()));
+    file->close();
+    TRY(FileSystem::move_file(path, temporary_path));
+    return {};
+}
+
+Application::CompositorLaunch Application::prepare_platform_features()
+{
+    // Test results must not depend on the machine's GPU, and test mode paints on the CPU regardless of what it has.
+    if (m_web_content_options.is_test_mode == IsTestMode::Yes) {
+        reevaluate_platform_features();
+        return CompositorLaunch::Now;
+    }
+
+    auto cached_facts = read_cached_system_facts(platform_features_cache_path());
+    m_system_probe = SystemProbeClient::launch(platform_presentation_gpu_device(), [this](SystemFacts const& facts) {
+        system_facts_arrived(facts);
+    });
+    // A probe that could not be launched has already reported so.
+    if (m_system_probe->has_finished())
+        return CompositorLaunch::Now;
+
+    // The Compositor starts from the facts the last probe reported, unless it would not use them. Without them, it
+    // waits for this probe, which reports soon enough not to be worth starting the Compositor twice.
+    auto launch = CompositorLaunch::Now;
+    if (cached_facts.has_value())
+        m_system_facts = cached_facts.release_value();
+    else if (!PlatformFeatureDecisions::decides_without_facts(FeatureProcess::Compositor, m_feature_overrides))
+        launch = CompositorLaunch::WhenPlatformFeaturesAreCurrent;
+
+    reevaluate_platform_features();
+    return launch;
+}
+
+void Application::system_facts_arrived(SystemFacts const& facts)
+{
+    if (facts.probe_failure.has_value()) {
+        warnln("The system probe failed: {}", *facts.probe_failure);
+        // The next launch waits for its probe rather than trusting facts that this one could not confirm.
+        (void)FileSystem::remove(platform_features_cache_path(), FileSystem::RecursionMode::Disallowed);
+    } else if (auto result = write_cached_system_facts(platform_features_cache_path(), facts); result.is_error()) {
+        warnln("Could not cache the system's facts: {}", result.error());
+    }
+
+    m_system_facts = facts;
+    reevaluate_platform_features();
+
+    // A Compositor started from the cached facts is relaunched with the features the system has now.
+    if (m_compositor_client && m_platform_feature_decisions->features_for(FeatureProcess::Compositor).to_byte_string() != m_compositor_launched_features) {
+        dbgln("The Compositor's platform features changed, relaunching it");
+        m_compositor_relaunch_is_planned = true;
+        m_compositor_client->shutdown();
+    }
+
+    auto callbacks = move(m_callbacks_awaiting_current_platform_features);
+    for (auto& callback : callbacks)
+        callback();
+}
+
+void Application::reevaluate_platform_features()
+{
+    m_platform_feature_decisions = PlatformFeatureDecisions::evaluate(m_system_facts, m_feature_overrides, m_feature_runtime_failures);
+    SupportUI::platform_features_changed();
+}
+
+JsonArray Application::platform_features_json(Optional<FeatureProcess> process) const
+{
+    JsonArray features;
+    for (auto feature : PlatformFeatures::all_features) {
+        if (process.has_value() && PlatformFeatures::process_of(feature) != *process)
+            continue;
+        auto const& status = m_platform_feature_decisions->status_of(feature);
+        if (status.state == FeatureStatus::State::NotBuilt)
+            continue;
+        JsonObject object;
+        object.set("id"sv, PlatformFeatures::feature_id(feature));
+        object.set("process"sv, PlatformFeatures::process_name(PlatformFeatures::process_of(feature)));
+        if (auto dependency = PlatformFeatures::dependency_of(feature); dependency.has_value())
+            object.set("dependency"sv, PlatformFeatures::feature_id(*dependency));
+        object.set("state"sv, feature_state_name(status.state));
+        object.set("forced"sv, status.forced);
+        object.set("reason"sv, status.reason);
+        if (!status.rule_id.is_empty())
+            object.set("rule"sv, status.rule_id);
+        if (status.blocking_feature.has_value())
+            object.set("blocked_by"sv, PlatformFeatures::feature_id(*status.blocking_feature));
+        features.must_append(move(object));
+    }
+    return features;
+}
+
+JsonObject Application::platform_features_report() const
+{
+    JsonObject report;
+    report.set("features"sv, platform_features_json({}));
+    report.set("describes_gpu"sv, PlatformFeatures::this_build.paints_through_vulkan);
+    report.set("describes_ffmpeg"sv, PlatformFeatures::this_build.decodes_video_through_vulkan());
+    report.set("facts"sv, m_system_facts.to_json());
+    if (m_system_facts.probe_failure.has_value())
+        report.set("probe_failure"sv, *m_system_facts.probe_failure);
+    return report;
+}
+
+ByteString Application::describe_platform_features_for_report(Optional<FeatureProcess> process) const
+{
+    StringBuilder builder;
+    builder.appendff("Platform features: {}\n", platform_features_json(process).serialized());
+
+    if (auto const& gpu = m_system_facts.gpu; gpu.has_value()) {
+        builder.appendff("GPU device: {} ({:04x}:{:04x})\n", gpu->device_name, gpu->vendor_id, gpu->device_id);
+        builder.appendff("GPU driver: {} {}\n", gpu->driver_name, gpu->driver_info);
+    }
+
+    // The identity is unique to the machine, and no rule reads it.
+    auto facts = m_system_facts.to_json();
+    if (auto gpu = facts.get_object("gpu"sv); gpu.has_value())
+        gpu->remove("device_identity"sv);
+    builder.appendff("Platform facts: {}\n", facts.serialized());
+    if (m_system_facts.probe_failure.has_value())
+        builder.appendff("Platform probe failure: {}\n", *m_system_facts.probe_failure);
+
+    // Reports carry plain text, and drivers name themselves however they like.
+    StringBuilder sanitized;
+    for (auto character : builder.string_view())
+        sanitized.append(character == '\n' || is_ascii_printable(character) ? character : '?');
+    return sanitized.to_byte_string();
+}
+
+void Application::when_platform_features_are_current(Function<void()> callback)
+{
+    if (m_system_probe && !m_system_probe->has_finished()) {
+        m_callbacks_awaiting_current_platform_features.append(move(callback));
+        return;
+    }
+    callback();
+}
+
+PlatformFeatures::ProcessFeatures Application::platform_features_for(FeatureProcess process) const
+{
+    return m_platform_feature_decisions->features_for(process);
+}
+
 ErrorOr<void> Application::launch_compositor_process()
 {
     VERIFY(!m_compositor_client);
-    m_compositor_client = TRY(WebView::launch_compositor_process());
+    m_compositor_launched_features = m_platform_feature_decisions->features_for(FeatureProcess::Compositor).to_byte_string();
+    m_compositor_client = TRY(WebView::launch_compositor_process(m_compositor_launched_features));
     m_compositor_client->on_death = [this]() {
         handle_compositor_process_death();
     };
     m_compositor_client->on_gpu_device_identity_reported = [this](Optional<Gfx::GpuDeviceIdentity> identity) {
         compositor_reported_gpu_device_identity(move(identity));
     };
+
+    update_compositor_high_dynamic_range_surfaces();
 
     m_reported_compositor_gpu_presentation_unavailable = false;
     Optional<u64> gpu_presentation_adapter_luid;
@@ -1873,8 +2287,11 @@ void Application::notify_compositor_gpu_presentation_unavailable()
 void Application::handle_compositor_process_death()
 {
     m_compositor_client = nullptr;
-    if (m_compositor_presentation_client)
+    if (m_compositor_presentation_client) {
         m_compositor_presentation_client->on_death = nullptr;
+        // The client can go before it hears that the connection closed, and the snapshots it waits for never come.
+        m_compositor_presentation_client->fail_pending_frame_snapshots();
+    }
     m_compositor_presentation_client = nullptr;
 
     // Nothing will forward or hand back the input events the dead compositor still held.
@@ -1915,23 +2332,58 @@ void Application::recover_compositor_process()
     if (Core::EventLoop::current().was_exit_requested())
         return;
 
-    constexpr size_t max_compositor_restart_count = 3;
-    if (m_compositor_restart_count >= max_compositor_restart_count) {
-        warnln("Compositor process crashed repeatedly, crashing Browser");
-        VERIFY_NOT_REACHED();
+    bool counts_as_crash = !exchange(m_compositor_relaunch_is_planned, false);
+
+    // A Compositor started from cached facts may have died of what changed since they were cached, so it is held until
+    // the probe reports. It only counts as a crash if the probe leaves it with the same features.
+    if (counts_as_crash && m_system_probe && !m_system_probe->has_finished()) {
+        when_platform_features_are_current([this] {
+            auto features = m_platform_feature_decisions->features_for(FeatureProcess::Compositor).to_byte_string();
+            relaunch_compositor_process(features == m_compositor_launched_features);
+        });
+        return;
     }
 
-    ++m_compositor_restart_count;
-    dbgln("Compositor process died, restarting ({}/{})", m_compositor_restart_count, max_compositor_restart_count);
+    relaunch_compositor_process(counts_as_crash);
+}
+
+void Application::relaunch_compositor_process(bool counts_as_crash)
+{
+    if (Core::EventLoop::current().was_exit_requested())
+        return;
+
+    if (counts_as_crash) {
+        constexpr size_t max_compositor_restart_count = 3;
+        if (m_compositor_restart_count >= max_compositor_restart_count) {
+            if (!m_platform_feature_decisions->is_enabled(PlatformFeatures::Feature::GpuPainting)) {
+                warnln("Compositor process crashed repeatedly, crashing Browser");
+                VERIFY_NOT_REACHED();
+            }
+            warnln("Compositor process crashed repeatedly while painting on the GPU, painting on the CPU instead");
+            m_feature_runtime_failures.set(PlatformFeatures::Feature::GpuPainting, "The Compositor crashed repeatedly while painting on the GPU"_string);
+            reevaluate_platform_features();
+            m_compositor_restart_count = 0;
+        }
+
+        ++m_compositor_restart_count;
+        dbgln("Compositor process died, restarting ({}/{})", m_compositor_restart_count, max_compositor_restart_count);
+    }
 
     VERIFY(m_compositor_recovery_state == CompositorRecoveryState::Idle);
     m_compositor_recovery_state = CompositorRecoveryState::Recovering;
     ScopeGuard clear_recovery_flag = [this] {
         m_compositor_recovery_state = CompositorRecoveryState::Idle;
     };
+    bring_up_compositor_process();
+}
+
+void Application::bring_up_compositor_process()
+{
+    if (Core::EventLoop::current().was_exit_requested())
+        return;
 
     if (auto result = launch_compositor_process(); result.is_error()) {
-        warnln("Unable to restart Compositor process: {}", result.error());
+        warnln("Unable to launch Compositor process: {}", result.error());
         VERIFY_NOT_REACHED();
     }
 
@@ -2080,6 +2532,13 @@ static void load_page_for_info_and_exit(Core::EventLoop& event_loop, HeadlessWeb
                 event_loop.quit(1);
             });
     };
+    // NB: A page that was ended for its memory use is not loaded again, so its load never finishes.
+    view.on_web_content_crashed = [&event_loop](auto crash_reason) {
+        if (crash_reason != ViewImplementation::WebContentCrashReason::ExceededMemoryLimit)
+            return;
+        warnln("Unable to get page info: the page was ended for its memory use");
+        event_loop.quit(1);
+    };
 
     view.load(url);
 }
@@ -2095,6 +2554,9 @@ static void load_page_and_exit_on_close(Core::EventLoop& event_loop, HeadlessWeb
 
 ErrorOr<int> Application::execute()
 {
+    if (!m_browser_options.headless_mode.has_value())
+        set_media_session_platform_backend(create_media_session_platform_backend());
+
     OwnPtr<HeadlessWebView> view;
     RefPtr<Core::Timer> screenshot_timer;
 
@@ -2219,6 +2681,8 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         break;
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>()) {
+            if (m_spare_web_content_process == client)
+                m_spare_web_content_process = nullptr;
             client->did_lose_process();
             if (!report_name.is_empty())
                 client->did_save_crash_report(report_name);
@@ -2713,6 +3177,9 @@ void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)
 
 void Application::background_networking_settings_changed(Badge<ApplicationSettingsObserver>)
 {
+    if (m_update_checker)
+        m_update_checker->settings_changed();
+
     if (!m_settings->automatic_filter_list_updates_allowed()) {
         m_pending_content_blocker_list_updates.remove_all_matching([](auto const& update) { return update.trigger == ContentBlockerListUpdateTrigger::Automatic; });
         if (m_active_content_blocker_list_update.has_value() && m_active_content_blocker_list_update->trigger == ContentBlockerListUpdateTrigger::Automatic)

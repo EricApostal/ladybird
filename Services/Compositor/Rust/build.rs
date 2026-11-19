@@ -25,17 +25,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("FloatRect", "Gfx::FloatRect"),
         ("IntRect", "Gfx::IntRect"),
         ("IntSize", "Gfx::IntSize"),
+        ("ScalingMode", "Gfx::ScalingMode"),
         ("SpatialNodeIndex", "Compositing::SpatialNodeIndex"),
         ("RawAttachment", "IPC::RawAttachment"),
         ("RawMessage", "IPC::FfiRawMessage"),
         ("EncodedValue", "AK::ReadonlyBytes"),
-        ("FfiDisplayList", "Compositing::RustFFI::FfiDisplayList"),
-        (
-            "FfiDisplayListReplayCallbacks",
-            "Compositing::RustFFI::FfiDisplayListReplayCallbacks",
-        ),
+        ("FfiRasterPainter", "Compositing::RustFFI::FfiRasterPainter"),
+        ("FfiReplaySelection", "Compositing::RustFFI::FfiReplaySelection"),
+        ("RecordSpan", "Compositing::RustFFI::RecordSpan"),
         ("CanvasId", "Compositing::CanvasId"),
-        ("VideoSinkResourceId", "Compositing::VideoSinkResourceId"),
         ("ImageFrameResourceId", "Compositing::ImageFrameResourceId"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
@@ -48,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "LibGfx/Color.h",
             "LibGfx/Point.h",
             "LibGfx/Rect.h",
+            "LibGfx/ScalingMode.h",
             "LibGfx/Size.h",
             "LibIPC/RawAttachment.h",
             "LibCompositing/RustFFI.h",
@@ -57,7 +56,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let mut builder = cbindgen::Builder::new().with_config(config);
-    for source in ["src/ffi.rs", "src/host.rs", "src/frame_inputs.rs", "src/core/mod.rs"] {
+    for source in [
+        "src/ffi.rs",
+        "src/host.rs",
+        "src/frame_inputs.rs",
+        "src/raster_host.rs",
+        "src/core/presenting.rs",
+        "src/core/mod.rs",
+    ] {
         println!("cargo:rerun-if-changed={source}");
         builder = builder.with_src(manifest_dir.join(source));
     }

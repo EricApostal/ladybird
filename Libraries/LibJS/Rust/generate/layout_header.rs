@@ -23,6 +23,7 @@ use crate::layout::execution_context::*;
 use crate::layout::host_class::*;
 use crate::layout::host_object::*;
 use crate::layout::object::*;
+use crate::layout::primitive_string::*;
 use crate::layout::realm::*;
 use crate::layout::shape::*;
 use crate::layout::vm::*;
@@ -34,6 +35,7 @@ use crate::layout::class::*;
 use crate::layout::execution_context::*;
 use crate::layout::host_object::*;
 use crate::layout::object::*;
+use crate::layout::primitive_string::*;
 use crate::layout::realm::*;
 use crate::layout::shape::*;
 use crate::layout::vm::*;
@@ -348,6 +350,8 @@ pub fn generate() -> LayoutHeader {
         argument_count,
         returns_to_native_caller,
         runs_jit_code,
+        caller_is_derived_construct,
+        new_target,
     });
     size!(w, "EXECUTION_CONTEXT", ExecutionContext);
     w.define("EXECUTION_CONTEXT_ALIGN", align_of::<ExecutionContext>());
@@ -378,6 +382,12 @@ pub fn generate() -> LayoutHeader {
     w.section("Storage to reserve for constructing the VM in place, at least its size and alignment");
     w.define("VM_SIZE", VM_SIZE);
     w.define("VM_ALIGN", VM_ALIGN);
+
+    w.section("PrimitiveString");
+    offset!(w, "PRIMITIVE_STRING_DEFERRED_KIND_AND_FLAGS", PrimitiveString, deferred_kind_and_flags);
+    w.define_hex("PRIMITIVE_STRING_DEFERRED_KIND_MASK", DEFERRED_KIND_MASK.into());
+    w.define("PRIMITIVE_STRING_DEFERRED_KIND_NONE", DeferredKind::None as u8);
+    offset!(w, "PRIMITIVE_STRING_UTF16_STRING", PrimitiveString, utf16_string);
 
     w.section("TypedArrayBase");
     offset!(w, "TYPED_ARRAY_KIND", TypedArrayBase, kind);
@@ -443,15 +453,15 @@ pub fn generate() -> LayoutHeader {
         error_data,
         finalize,
         get_indexed_value,
+        preserve_identity,
     });
     check_host_object_abi_struct!(w, JSHostFunctionHooks { call, construct, finalize });
     check_host_object_abi_struct!(w, JSHostArrayHooks { set, delete_property });
     check_host_object_abi_struct!(w, JSResolvedBinding { module, binding_name, r#type });
     check_host_object_abi_struct!(w, JSHostModuleHooks { get_exported_names, resolve_export, initialize_environment, execute_module });
-    check_host_object_abi_struct!(w, JSHostClass { abi_version, kind, reserved, flags, name, name_length, parent, hooks, user_data });
+    check_host_object_abi_struct!(w, JSHostClass { kind, flags, name, name_length, parent, hooks, user_data });
     check_host_object_abi_constants!(
         w,
-        JS_HOST_ABI_VERSION,
         JS_COMPLETION_NORMAL,
         JS_COMPLETION_THROW,
         JS_PROPERTY_LOOKUP_PHASE_OWN_PROPERTY,

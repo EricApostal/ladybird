@@ -50,17 +50,6 @@ namespace {
 
 constexpr auto TEST_CLIP = "big_buck_bunny_5s.webm"sv;
 
-NonnullRefPtr<IncrementallyPopulatedStream> load_test_file(StringView path)
-{
-    auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
-    return IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
-}
-
-NonnullRefPtr<Demuxer> create_demuxer(NonnullRefPtr<IncrementallyPopulatedStream> const& stream)
-{
-    return MUST(Media::create_demuxer(stream));
-}
-
 NonnullRefPtr<DecodedVideoProducer> make_decoder(Core::EventLoop& loop, StringView path)
 {
     auto stream = load_test_file(path);
@@ -113,6 +102,7 @@ struct VideoEdgeTestHarness
     struct StatusMessage {
         PipelineStatus status { PipelineStatus::Pending };
         u32 seek_id { 0 };
+        PipelineCheckpoint checkpoint { 0 };
     };
     using Message = Variant<RemoteVideoSink::LentFrame, StatusMessage>;
     struct PostedMessage {
@@ -169,7 +159,7 @@ struct VideoEdgeTestHarness
                     consumer->receive_frame(lent_frame.lend_id, lent_frame.seek_id, move(frame));
                 },
                 [&](StatusMessage const& status) {
-                    consumer->receive_status(status.status, status.seek_id);
+                    consumer->receive_status(status.status, status.seek_id, status.checkpoint);
                 });
         }
     }
@@ -184,9 +174,9 @@ void wire_full_node(VideoEdgeTestHarness& harness, NonnullRefPtr<VideoProducer> 
         if (auto harness = weak.strong_ref())
             harness->post(move(lent_frame));
     };
-    sink_delegates.send_status = [weak = harness.make_weak_ref()](PipelineStatus status, u32 seek_id) {
+    sink_delegates.send_status = [weak = harness.make_weak_ref()](PipelineStatus status, u32 seek_id, PipelineCheckpoint checkpoint) {
         if (auto harness = weak.strong_ref())
-            harness->post(VideoEdgeTestHarness::StatusMessage { status, seek_id });
+            harness->post(VideoEdgeTestHarness::StatusMessage { status, seek_id, checkpoint });
     };
     sink_delegates.notify_clock_resumed = [] { };
     sink_delegates.transmit_seek = [](InvalidateHeldData) { };
@@ -215,7 +205,7 @@ NonnullRefPtr<VideoFrame> create_pooled_frame(VideoFramePool& pool, AK::Duration
 
     auto layout = MUST(frame_plane_layout(frame_size, bit_depth, subsampling));
     auto acquired = pool.try_acquire(layout.total_byte_count).release_value();
-    return make_ref_counted<VideoFrame>(timestamp, duration, Gfx::Size<u32>(frame_size), bit_depth, subsampling, CodingIndependentCodePoints {}, move(acquired.storage));
+    return make_ref_counted<VideoFrame>(timestamp, duration, Gfx::Size<u32>(frame_size), bit_depth, subsampling, ColorMetadata {}, move(acquired.storage));
 }
 
 // A frame as the consumer receives it, which counts its release.
@@ -270,7 +260,7 @@ NonnullRefPtr<RemoteVideoSink> make_recorded_sink(LentFrameRecorder& recorder)
         MutexLocker locker { recorder->mutex };
         recorder->lent_frames.append(move(lent_frame));
     };
-    delegates.send_status = [](PipelineStatus, u32) { };
+    delegates.send_status = [](PipelineStatus, u32, PipelineCheckpoint) { };
     delegates.notify_clock_resumed = [] { };
     delegates.transmit_seek = [](InvalidateHeldData) { };
     delegates.transmit_time_reader = [](MediaTimeReader const&) { };
@@ -621,7 +611,7 @@ TEST_CASE(consumer_resolves_seeks_past_the_end_of_stream_locally)
     size_t upstream_seeks = 0;
     auto consumer = RemoteVideoProducer::create(make_consumer_delegates(upstream_seeks));
     give_lookahead(*consumer, *pool);
-    consumer->receive_status(PipelineStatus::EndOfStream, 0);
+    consumer->receive_status(PipelineStatus::EndOfStream, 0, 0);
 
     consumer->seek(AK::Duration::from_milliseconds(3000));
     EXPECT_EQ(upstream_seeks, 0u);
@@ -642,7 +632,7 @@ TEST_CASE(consumer_releases_queued_frames_on_suspension)
     auto consumer = RemoteVideoProducer::create(make_consumer_delegates(upstream_seeks));
     give_lookahead(*consumer, *pool, &on_release);
 
-    consumer->receive_status(PipelineStatus::Suspended, 0);
+    consumer->receive_status(PipelineStatus::Suspended, 0, 0);
 
     EXPECT_EQ(released_frames, 4u);
     auto output = consumer->peek();
@@ -666,7 +656,7 @@ TEST_CASE(sink_resumes_a_suspended_consumer_when_the_clock_resumes)
     consumer->receive_frame(1, 1, create_received_frame(*pool, AK::Duration::zero()));
     EXPECT(sink->current_frame() != nullptr);
 
-    consumer->receive_status(PipelineStatus::Suspended, 1);
+    consumer->receive_status(PipelineStatus::Suspended, 1, 0);
     loop.pump(Core::EventLoop::WaitMode::PollForEvents);
     EXPECT_EQ(upstream_seeks, 1u);
 

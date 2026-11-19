@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build, such as 2026.11.0'
+        description: 'Version to build, such as 2026.46.0'
         required: true
         type: string
       ref:
@@ -82,8 +82,7 @@ jobs:
             os_name: 'Linux'
             arch: 'x86_64'
             runner_labels: '["blacksmith-16vcpu-ubuntu-2404"]'
-            container: &ci_container '{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.11.1","options":"--ulimit core=1"}'
-            archives: true
+            container: &ci_container '{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.12","options":"--ulimit core=1"}'
             packages: 'DEB'
 
           - system: 'Ubuntu 26.04'
@@ -91,7 +90,6 @@ jobs:
             arch: 'arm64'
             runner_labels: '["blacksmith-16vcpu-ubuntu-2404-arm"]'
             container: *ci_container
-            archives: true
             packages: 'DEB'
 
           - system: 'Ubuntu 26.10'
@@ -159,27 +157,6 @@ jobs:
           version: ${{ inputs.version }}
           vcpkg_cache_sas: ${{ secrets.VCPKG_CACHE_SAS }}
           use_caches: false
-
-      - name: Start PulseAudio
-        if: ${{ matrix.os_name == 'Linux' }}
-        run: |
-          echo "PULSE_SERVER=unix:/tmp/pulse-native" >> "$GITHUB_ENV"
-          pulseaudio --system -D --exit-idle-time=1800 \
-            --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse-native" \
-            --load="module-null-sink sink_name=virtual_sink"
-
-      - name: Test
-        working-directory: ${{ github.workspace }}
-        run: ctest --parallel --output-on-failure --test-dir Build --timeout 1800
-
-      - name: Upload LibWeb Test Artifacts
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: libweb-test-artifacts-${{ matrix.system }}-${{ matrix.arch }}-Distribution
-          path: Build/Tests/LibWeb/test-web/test-dumps/
-          retention-days: 0
-          if-no-files-found: ignore
 
       - name: Package
         if: ${{ matrix.archives }}
@@ -255,6 +232,27 @@ jobs:
           path: Build/packages/ladybird-debuginfo-*.rpm
           archive: false
           if-no-files-found: error
+
+      - name: Start PulseAudio
+        if: ${{ matrix.os_name == 'Linux' }}
+        run: |
+          echo "PULSE_SERVER=unix:/tmp/pulse-native" >> "$GITHUB_ENV"
+          pulseaudio --system -D --exit-idle-time=1800 \
+            --load="module-native-protocol-unix auth-anonymous=1 socket=/tmp/pulse-native" \
+            --load="module-null-sink sink_name=virtual_sink"
+
+      - name: Test
+        working-directory: ${{ github.workspace }}
+        run: ctest --parallel --output-on-failure --test-dir Build --timeout 1800
+
+      - name: Upload LibWeb Test Artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: libweb-test-artifacts-${{ matrix.system }}-${{ matrix.arch }}-Distribution
+          path: Build/Tests/LibWeb/test-web/test-dumps/
+          retention-days: 0
+          if-no-files-found: ignore
 
   Flatpak:
     if: github.repository == 'LadybirdBrowser/ladybird'

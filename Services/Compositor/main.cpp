@@ -7,6 +7,7 @@
 #include <Compositor/BackingStoreManager.h>
 #include <Compositor/ConnectionFromClient.h>
 #include <Compositor/FontSkia.h>
+#include <Compositor/MainDispatchQueue.h>
 #include <Compositor/Sandbox.h>
 #include <Compositor/SkiaBackendContext.h>
 #include <LibCore/ArgsParser.h>
@@ -21,6 +22,7 @@
 #include <LibGfx/GpuDeviceIdentity.h>
 #include <LibIPC/SingleServer.h>
 #include <LibMain/Main.h>
+#include <LibPlatformFeatures/ProcessFeatures.h>
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
@@ -31,7 +33,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     StringView resource_root;
     bool wait_for_debugger = false;
     bool enable_test_mode = false;
-    bool force_cpu_painting = false;
+    StringView platform_features;
     bool force_fontconfig = false;
     bool disable_sandbox = false;
     StringView gpu_device;
@@ -46,7 +48,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(resource_root, "Path to the browser's resources", "resource-root", 0, "path");
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
-    args_parser.add_option(force_cpu_painting, "Force CPU painting", "force-cpu-painting");
+    args_parser.add_option(platform_features, "The platform features the Browser decided this process may use", "platform-features", 0, "feature,...");
     args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
     args_parser.add_option(gpu_device, "The GPU to paint on, as the presentation identifies it", "gpu-device", 0, "identity");
@@ -58,6 +60,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     if (resource_root.is_empty())
         return Error::from_string_literal("--resource-root is required");
+
+    PlatformFeatures::ProcessFeatures::initialize_for_current_process(TRY(PlatformFeatures::ProcessFeatures::from_string(PlatformFeatures::FeatureProcess::Compositor, platform_features)));
+    auto const& features = PlatformFeatures::ProcessFeatures::the();
 
     Optional<Gfx::GpuDeviceIdentity> preferred_gpu_device;
     if (!gpu_device.is_empty()) {
@@ -91,7 +96,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         warnln("Could not set main thread QoS: {}", result.error());
 
     if (enable_test_mode)
-        Compositor::force_font_hinting_for_testing();
+        Compositor::use_test_font_rendering();
 
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(TRY(String::from_utf8(resource_root))));
     if (force_fontconfig)
@@ -104,18 +109,23 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         TRY(Compositor::restrict_filesystem(resource_root));
 #endif
 
-    if (!force_cpu_painting)
+    if (features.is_enabled(PlatformFeatures::Feature::GpuPainting))
         Gfx::SkiaBackendContext::initialize_gpu_backend(preferred_gpu_device);
     auto skia_backend_context = Gfx::SkiaBackendContext::the_main_thread_context();
 
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
+#ifdef AK_OS_MACOS
+    if (auto result = Compositor::drain_main_dispatch_queue_in_event_loop(); result.is_error())
+        warnln("Unable to drain the main dispatch queue, so HDR video will not show: {}", result.error());
+#endif
 
     if (!disable_sandbox)
         TRY(Compositor::apply_sandbox(mach_server_name, cache_path, resource_root));
 
     Optional<Gfx::GpuDeviceIdentity> gpu_device_identity;
 #ifdef USE_VULKAN_DMABUF_IMAGES
-    if (skia_backend_context && skia_backend_context->vulkan_context().can_sample_through_ycbcr_conversion)
+    // Hardware decoding only starts once the GPU it decodes on is named, which is only done when its frames can be imported.
+    if (skia_backend_context && features.is_enabled(PlatformFeatures::Feature::YCbCrImport) && skia_backend_context->vulkan_context().can_sample_through_ycbcr_conversion)
         gpu_device_identity = skia_backend_context->vulkan_context().device_identity;
 #endif
 

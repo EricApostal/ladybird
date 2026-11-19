@@ -56,10 +56,12 @@ use crate::ir::NodeId;
 use crate::ir::Op;
 use crate::ir::ShapeCheck;
 use crate::ir::value;
+use crate::snapshot::CallFeedbackSnapshot;
 use crate::snapshot::CellId;
 use crate::snapshot::ConstructTarget;
 use crate::snapshot::Forwarding;
 use crate::snapshot::Intrinsic;
+use crate::snapshot::SuperConstructTarget;
 use crate::snapshot::call_feedback_flags;
 
 /// How an inlined callee was called.
@@ -99,6 +101,11 @@ pub(super) struct InlineCall {
     pub frame_bytes: u64,
     /// Whether the call is a construct, whose result is `this`.
     pub construct: bool,
+    /// The new target of a construct.
+    pub new_target: Option<CellId>,
+    /// For a construct of a derived constructor: what it does (see
+    /// `ConstructTarget`). Its `this` starts empty, and super() binds it.
+    pub derived_construct: Option<ConstructTarget>,
 }
 
 /// The callbacks a call site passed to the builtin it called, which it calls
@@ -118,7 +125,7 @@ const MAX_CALLEE_CASES: usize = 4;
 /// needed in memory outside generic nodes, its environments must stay those
 /// of its function object, it must be fully compilable, and its exception
 /// handlers must never have caught anything.
-fn can_inline(callee: &Function<'_>, virtual_arguments: bool) -> bool {
+fn can_inline(callee: &Function<'_>, virtual_arguments: bool, derived_construct: bool) -> bool {
     if !callee.written_constants.is_empty() {
         return false;
     }
@@ -134,6 +141,10 @@ fn can_inline(callee: &Function<'_>, virtual_arguments: bool) -> bool {
         if opcode == OpCode::Catch {
             return !super::has_run(callee.executable, instruction.pc);
         }
+        // NB: An inlined callee reads what its call passed for constant indices (see `try_build_argument()`).
+        if opcode == OpCode::GetArgument {
+            return virtual_arguments && arguments::has_constant_index(callee, &instruction.instruction);
+        }
         let reads_frame_fields = matches!(
             opcode,
             OpCode::GetLexicalEnvironment
@@ -147,8 +158,35 @@ fn can_inline(callee: &Function<'_>, virtual_arguments: bool) -> bool {
                 | OpCode::CallDirectEval
                 | OpCode::CallDirectEvalWithArgumentArray
                 | OpCode::Debugger
-        );
-        !reads_frame_fields && !matches!(handling(opcode), Handling::Unsupported(_))
+                // NB: These read the function, the this value or the new target of the running frame, which is the
+                //     caller's while an inlined callee runs (see `function_with_frame_as_this_environment()` in the
+                //     runtime).
+                | OpCode::SuperCallWithArgumentArray
+        ) || (!derived_construct
+            && matches!(
+                opcode,
+                OpCode::GetSuperConstructor
+                    | OpCode::SuperCall
+                    | OpCode::SuperCallWithForwardedArguments
+                    | OpCode::BindThisFromSuperCall
+            ));
+        // NB: The new target of a callee with its own new.target is known (see `try_build_new_target()`).
+        let unknown_new_target = opcode == OpCode::GetNewTarget
+            && !callee
+                .executable
+                .function
+                .is_some_and(|function| function.has_own_new_target);
+        // NB: The base of `super` property access is built from the callee's home object (see
+        //     `try_build_resolve_super_base()`).
+        let unknown_super_base = opcode == OpCode::ResolveSuperBase
+            && callee
+                .executable
+                .function
+                .is_none_or(|function| function.super_base.is_none());
+        !reads_frame_fields
+            && !unknown_super_base
+            && !unknown_new_target
+            && !matches!(handling(opcode), Handling::Unsupported(_))
     })
 }
 
@@ -174,6 +212,100 @@ fn returns_no_object(callee: &Function<'_>) -> bool {
         })
 }
 
+/// Whether every path through the derived constructor `callee` calls
+/// super() exactly once before anything else reads `this` or the frame
+/// returns, and every return returns undefined (or, right after super(),
+/// what super() returned, like default derived constructors): then the
+/// super() of an inlined construct of it (see
+/// `GraphBuilder::try_inline_super_call()`) always binds `this` while it is
+/// empty, and the result of the construct is always `this`. Its frames
+/// materialized before super() run it in the interpreter, and those
+/// materialized after super() return their this value (see
+/// `ExecutionContext::caller_is_construct` in the runtime).
+///
+/// A constructor with exception handlers never qualifies: a handler that
+/// catches what super() or its arguments throw runs in the materialized
+/// frame and can return while `this` is still empty, and nothing checks the
+/// value such a frame returns.
+fn calls_super_once_before_returning(callee: &Function<'_>) -> bool {
+    if callee
+        .instructions
+        .iter()
+        .any(|instruction| instruction.instruction.opcode() == OpCode::Catch)
+    {
+        return false;
+    }
+    let mut jump_targets = Vec::new();
+    for instruction in callee.instructions {
+        instruction
+            .instruction
+            .for_each_jump_target(|target| jump_targets.push(target.0));
+    }
+    let mut super_call_result = None;
+    let mut bound_this_at = None;
+    let mut previous_opcode = None;
+    for instruction in callee.instructions {
+        let opcode = instruction.instruction.opcode();
+        // NB: Then nothing changed what super() returned.
+        let follows_bind_this =
+            previous_opcode == Some(OpCode::BindThisFromSuperCall) && !jump_targets.contains(&instruction.pc);
+        previous_opcode = Some(opcode);
+        let called_super = super_call_result.is_some();
+        if bound_this_at.is_none() {
+            // NB: The instructions up to the BindThisFromSuperCall run once, one after the other.
+            match instruction.instruction {
+                Instruction::SuperCall { dst, .. } | Instruction::SuperCallWithForwardedArguments { dst, .. }
+                    if !called_super =>
+                {
+                    super_call_result = Some(dst);
+                    continue;
+                }
+                _ => {}
+            }
+            match instruction.instruction {
+                Instruction::BindThisFromSuperCall { result } if Some(result) == super_call_result => {
+                    bound_this_at = Some(instruction.pc);
+                    continue;
+                }
+                _ => {}
+            }
+            match opcode {
+                OpCode::GetSuperConstructor => {}
+                OpCode::SuperCall
+                | OpCode::SuperCallWithForwardedArguments
+                | OpCode::BindThisFromSuperCall
+                | OpCode::ResolveThisBinding
+                | OpCode::CreateArguments => return false,
+                _ if instruction.instruction.is_terminator() => return false,
+                _ => {}
+            }
+            continue;
+        }
+        // NB: What super() returned is `this`.
+        let returns_undefined_or_this = |value: Operand| match callee.layout.slot_kind(value) {
+            SlotKind::Constant(index) => callee.executable.constants.get(index as usize) == Some(&value::UNDEFINED),
+            _ => follows_bind_this && Some(value) == super_call_result,
+        };
+        match instruction.instruction {
+            Instruction::Return { value } | Instruction::End { value } if !returns_undefined_or_this(value) => {
+                return false;
+            }
+            _ => {}
+        }
+        if matches!(
+            opcode,
+            OpCode::GetSuperConstructor
+                | OpCode::SuperCall
+                | OpCode::SuperCallWithForwardedArguments
+                | OpCode::BindThisFromSuperCall
+                | OpCode::CreateArguments
+        ) {
+            return false;
+        }
+    }
+    bound_this_at.is_some_and(|bound_this_at| jump_targets.iter().all(|target| *target > bound_this_at))
+}
+
 /// Where the `this` value or an argument of an inlined call comes from.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum InlineValue {
@@ -184,6 +316,24 @@ pub(super) enum InlineValue {
     FrameArgument(u32),
     /// A value the code has, like an argument of an inlined callee.
     Node(NodeId),
+}
+
+/// What an inlined call does (see `GraphBuilder::inlinable_callee()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlinedCallKind {
+    Call,
+    /// A construct of a base constructor.
+    Construct,
+    /// A construct of a derived constructor, whose super() is inlined too.
+    DerivedConstruct,
+}
+
+/// A callee that `GraphBuilder::inline_call()` may inline (see
+/// `GraphBuilder::inlinable_callee()`).
+struct InlinableCallee<'a> {
+    executable: &'a crate::snapshot::ExecutableSnapshot,
+    function: Function<'a>,
+    has_legacy_arguments: bool,
 }
 
 /// A call to inline.
@@ -203,6 +353,9 @@ struct InlinedCallSite {
     dst: Operand,
     /// For a `CallConstruct`: what its construct does.
     construct: Option<ConstructTarget>,
+    /// The new target of a construct, if it is not the callee: the derived
+    /// constructor whose super() constructs with the callee.
+    new_target: Option<CellId>,
     /// The closure called, if the callee is a closure of the inlined
     /// executable's function rather than that function itself...
     closure: Option<NodeId>,
@@ -258,6 +411,7 @@ impl InlinedCallSite {
             forwarded: false,
             dst,
             construct: None,
+            new_target: None,
             closure: None,
             check_closure: false,
             callback: None,
@@ -265,7 +419,7 @@ impl InlinedCallSite {
     }
 }
 
-impl GraphBuilder<'_> {
+impl<'a> GraphBuilder<'a> {
     pub(super) fn boxed_object(&self, cell: CellId) -> u64 {
         (u64::from(value::OBJECT_TAG) << 48) | (cell.0 & self.runtime.heap_region_offset_mask)
     }
@@ -299,19 +453,41 @@ impl GraphBuilder<'_> {
         self.graph.add_frame_state(frame_state)
     }
 
+    /// Like `resume_after_frame_state()`, for an instruction that writes the slots `outputs` to the frame where it
+    /// does not continue: the frame state lists them as held by the frame. Frames of inlined calls have no slots in
+    /// sync to say so.
+    pub(super) fn resume_after_frame_state_with_outputs_in_frame(
+        &mut self,
+        dst: u32,
+        outputs: &[usize],
+    ) -> FrameStateId {
+        let live = self.function.liveness.live_out(self.function.instruction_index);
+        let mut frame_state = self.new_frame_state(&live, ResumeMode::ResumeAfter { dst });
+        for slot in outputs.iter().copied().filter(|slot| live.contains(*slot)) {
+            let operand = self.function.layout.operand_for_tracked_index(slot).raw();
+            frame_state.values.retain(|(listed, _)| *listed != operand);
+            // NB: Exits never clear the reserved registers, which frames keep.
+            if slot >= crate::bytecode::RESERVED_REGISTER_COUNT as usize
+                && let Err(position) = frame_state.in_frame.binary_search(&operand)
+            {
+                frame_state.in_frame.insert(position, operand);
+            }
+        }
+        self.graph.add_frame_state(frame_state)
+    }
+
     /// The slots in `live` whose value frame memory holds, which a frame
     /// state of the function being walked lists without a value: the
-    /// compiled function's slots that are in sync, and the slots a slow path
-    /// wrote into the frames pushed for it. Reserved registers are not
-    /// listed.
+    /// compiled function's slots that are in sync. Reserved registers are
+    /// not listed.
     fn frame_state_in_frame(&self, live: &BitSet) -> Vec<u32> {
-        let is_virtual = self.function.is_virtual();
+        if self.function.is_virtual() {
+            return Vec::new();
+        }
         // NB: Exits never clear the reserved registers, which frames keep.
         live.iter()
-            .filter(|slot| *slot >= crate::bytecode::RESERVED_REGISTER_COUNT as usize)
-            .filter(|slot| match self.frame.slots[*slot] {
-                SlotState::InMemory => true,
-                SlotState::Value { in_sync, .. } => in_sync && !is_virtual,
+            .filter(|slot| {
+                *slot >= crate::bytecode::RESERVED_REGISTER_COUNT as usize && self.frame.slots[*slot].in_sync
             })
             .map(|slot| self.function.layout.operand_for_tracked_index(slot).raw())
             .collect()
@@ -319,25 +495,24 @@ impl GraphBuilder<'_> {
 
     /// The values a frame state of the function being walked lists for the
     /// slots in `live`: those frame memory does not hold, or every one for
-    /// virtual frames but their exception register. Inlined callees that are
+    /// virtual frames, but the exception register. Inlined callees that are
     /// not strict list all their passed arguments too, since their legacy
     /// `arguments` shows them in the frames exits and slow paths materialize.
     fn frame_state_values(&self, live: &BitSet) -> Vec<(u32, NodeId)> {
         let is_virtual = self.function.is_virtual();
-        // NB: Materialized frames start with an empty exception register, and only the runtime writes it: when a
-        //     handler of the frame catches an exception, before a leave writes the rest of the frame.
+        // NB: Only the runtime writes the exception register (materialized frames start with it empty): when a
+        //     handler of the frame catches an exception, before a leave writes the rest of the frame, which must keep
+        //     it. Compiled code only ever holds what frame memory holds.
         let exception_register = self
             .function
             .layout
             .tracked_index(Operand::from_raw(crate::bytecode::EXCEPTION_REGISTER));
         let mut values = live
             .iter()
-            .filter(|slot| !is_virtual || Some(*slot) != exception_register)
-            .filter_map(|slot| match self.frame.slots[slot] {
-                SlotState::Value { node, in_sync } if is_virtual || !in_sync => {
-                    Some((self.function.layout.operand_for_tracked_index(slot).raw(), node))
-                }
-                _ => None,
+            .filter(|slot| Some(*slot) != exception_register)
+            .filter_map(|slot| {
+                let SlotState { node, in_sync } = self.frame.slots[slot];
+                (is_virtual || !in_sync).then(|| (self.function.layout.operand_for_tracked_index(slot).raw(), node))
             })
             .collect::<Vec<_>>();
         for (operand, node) in self.legacy_argument_values() {
@@ -366,9 +541,7 @@ impl GraphBuilder<'_> {
         let mut values = Vec::new();
         for argument in 0..layout.number_of_arguments {
             let slot = (layout.registers_and_locals_count + argument) as usize;
-            if let SlotState::Value { node, .. } = self.frame.slots[slot] {
-                values.push((layout.arguments_base() + argument, node));
-            }
+            values.push((layout.arguments_base() + argument, self.frame.slots[slot].node));
         }
         for (argument, node) in (layout.number_of_arguments..).zip(&call.untracked_arguments) {
             values.push((layout.arguments_base() + argument, *node));
@@ -485,14 +658,21 @@ impl GraphBuilder<'_> {
         };
         let slots_offset = u64::from(self.runtime.offsets.execution_context_slots);
         if let Some(native) = feedback.native_call.filter(|native| native.entry.is_some()) {
-            self.reserve_call_frame(slots_offset + 8 * u64::from(*argument_count));
-            self.embed(native.function);
-            self.embed(native.realm);
             // NB: Native calls take the callee, the `this` value and the
             //     arguments as inputs like direct calls do.
             let mut inputs = vec![*callee, *this_value];
             inputs.extend(arguments.iter().copied());
-            if let Some(inlined_frame_bytes) = self.inlined_frame_bytes_of_call(&inputs) {
+            // NB: Calls without the frames of the inlined calls they are in check their callee (see
+            //     `check_call_without_frames_target()`), and are generic where those checks exited before.
+            let without_frames = self.inlined_frame_bytes_of_call(&inputs);
+            if without_frames.is_some() && !self.may_speculate(ExitKind::BadCallTarget) {
+                return Ok(None);
+            }
+            self.reserve_call_frame(slots_offset + 8 * u64::from(*argument_count));
+            self.embed(native.function);
+            self.embed(native.realm);
+            if let Some(inlined_frame_bytes) = without_frames {
+                self.check_callee(*callee, native.function)?;
                 let op = Op::CallNative {
                     executable: self.function.index,
                     pc: self.function.pc,
@@ -535,10 +715,10 @@ impl GraphBuilder<'_> {
         let Instruction::Call { callee, .. } = instruction else {
             return Ok(None);
         };
-        let SlotState::Value { node, .. } = self.peek(*callee) else {
+        let Some(slot) = self.peek(*callee) else {
             return Ok(None);
         };
-        match self.graph.constant_value(node) {
+        match self.graph.constant_value(slot.node) {
             Some(bits) => self.try_direct_call_of_function(instruction, bits),
             None => Ok(None),
         }
@@ -580,6 +760,21 @@ impl GraphBuilder<'_> {
         let Handling::Generic(info) = handling(OpCode::Call) else {
             unreachable!("calls are generic instructions");
         };
+        // NB: Direct calls take the callee, the `this` value if the callee
+        //     reads it, and the arguments as inputs (see
+        //     `codegen::DIRECT_CALL_MAX_INPUTS`), and store them straight
+        //     into the callee's frame, except in inlined callees whose frames
+        //     are written whole, and for the virtual arguments object.
+        // NB: Calls without the frames of the inlined calls they are in
+        //     always take `this`, for their slow paths.
+        let mut inputs = vec![*callee, *this_value];
+        inputs.extend(arguments.iter().copied());
+        // NB: Calls without those frames check their callee, unless it is constant (see
+        //     `check_call_without_frames_target()`), and are generic where those checks exited before.
+        let without_frames = self.inlined_frame_bytes_of_call(&inputs);
+        if without_frames.is_some() && constant_target.is_none() && !self.may_speculate(ExitKind::BadCallTarget) {
+            return Ok(None);
+        }
         let slots_offset = u64::from(self.runtime.offsets.execution_context_slots);
         let slot_count = u64::from(target.registers_and_locals_and_constants_count)
             + u64::from((*argument_count).max(target.function.formal_parameter_count));
@@ -605,16 +800,10 @@ impl GraphBuilder<'_> {
                 self.embed(cell);
             }
         }
-        // NB: Direct calls take the callee, the `this` value if the callee
-        //     reads it, and the arguments as inputs (see
-        //     `codegen::DIRECT_CALL_MAX_INPUTS`), and store them straight
-        //     into the callee's frame, except in inlined callees whose frames
-        //     are written whole, and for the virtual arguments object.
-        // NB: Calls without the frames of the inlined calls they are in
-        //     always take `this`, for their slow paths.
-        let mut inputs = vec![*callee, *this_value];
-        inputs.extend(arguments.iter().copied());
-        if let Some(inlined_frame_bytes) = self.inlined_frame_bytes_of_call(&inputs) {
+        if let Some(inlined_frame_bytes) = without_frames {
+            if constant_target.is_none() {
+                self.check_call_without_frames_target(*callee, target)?;
+            }
             let op = Op::CallDirect {
                 executable: self.function.index,
                 pc: self.function.pc,
@@ -641,6 +830,34 @@ impl GraphBuilder<'_> {
             .map(Some)
     }
 
+    /// Checks that the callee of a direct call of `target` that runs without
+    /// the frames of the inlined calls it is in is the target (or a closure
+    /// of its function, if the site called those), exiting otherwise.
+    /// Where such checks exited before, the call is generic instead.
+    ///
+    /// OPTIMIZATION: Calling another callee there takes the frames of the
+    ///               inlined calls created by the runtime first, every time,
+    ///               which costs more than a generic call. Its exit lets
+    ///               the next compilation make one.
+    fn check_call_without_frames_target(
+        &mut self,
+        callee: Operand,
+        target: crate::snapshot::DirectCallTarget,
+    ) -> Result<(), CompileFailure> {
+        if target.closures {
+            let value = self.read(callee)?;
+            self.emit_checked(
+                Op::CheckClosure {
+                    shared_data: target.function.shared_data,
+                },
+                vec![value],
+                None,
+            );
+            return Ok(());
+        }
+        self.check_callee(callee, target.function.function)
+    }
+
     /// For a direct or native call in an inlined callee that can run
     /// without the frames of the inlined calls it is in, with its operands
     /// `inputs` as inputs: the bytes of those frames, which the call leaves
@@ -665,16 +882,6 @@ impl GraphBuilder<'_> {
                     .function_fields
                     .is_some_and(|fields| fields.has_script_or_module_of(&compiled_function_fields))
         };
-        if self.function.has_legacy_arguments() {
-            let layout = self.function.layout;
-            let arguments_are_values = (0..layout.number_of_arguments).all(|argument| {
-                let slot = (layout.registers_and_locals_count + argument) as usize;
-                matches!(self.frame.slots[slot], SlotState::Value { .. })
-            });
-            if !arguments_are_values {
-                return None;
-            }
-        }
         let inlined = core::iter::once(&self.function).chain(self.callers.iter().skip(1));
         if !inlined
             .into_iter()
@@ -714,7 +921,7 @@ impl GraphBuilder<'_> {
         Ok(Flow::Continue)
     }
 
-    /// Inlines a `Call`, if its feedback saw a single callee that qualifies,
+    /// Inlines a `Call`, if its callee is a function the code knows, or its feedback saw a single callee that qualifies,
     /// or a single function its callee forwarded every call to: through
     /// `Function.prototype.call` (`f.call(this_arg, ...)`), through
     /// `Function.prototype.apply` with the arguments object the code never
@@ -735,6 +942,26 @@ impl GraphBuilder<'_> {
         };
         if let Some(flow) = self.try_inline_closure_call(instruction)? {
             return Ok(Some(flow));
+        }
+        // NB: A callee the code knows exactly is what the call calls, whatever callees its feedback saw.
+        if let Some(index) = self.constant_inlinable_function(*callee) {
+            let callback = self
+                .call_feedback(*call_feedback)
+                .filter(|feedback| feedback.inline_executable == Some(index))
+                .and_then(|feedback| forwarded_callback(&feedback));
+            let call = InlinedCallSite {
+                callback,
+                ..InlinedCallSite::new(
+                    index,
+                    InlineValue::Operand(*this_value),
+                    arguments.iter().copied().map(InlineValue::Operand).collect(),
+                    *argument_count,
+                    *dst,
+                )
+            };
+            if let Some(flow) = self.inline_call(call)? {
+                return Ok(Some(flow));
+            }
         }
         // NB: The feedback of a builtin's calls comes from all its callers,
         //     whose callbacks it calls, so it says nothing about this one.
@@ -771,16 +998,7 @@ impl GraphBuilder<'_> {
             return Ok(None);
         };
         if let Some(index) = feedback.inline_executable {
-            // NB: Builtins that take callbacks record them as forwarded calls.
-            let callback = feedback
-                .forwarded
-                .filter(|forwarded| forwarded.forwarding == Forwarding::Callback)
-                .and_then(|forwarded| {
-                    Some(CallbackTarget {
-                        index: forwarded.inline_executable?,
-                        closures: feedback.flags & call_feedback_flags::FORWARDED_CLOSURES != 0,
-                    })
-                });
+            let callback = forwarded_callback(&feedback);
             let call = InlinedCallSite {
                 callee: Some(*callee),
                 callback,
@@ -928,9 +1146,7 @@ impl GraphBuilder<'_> {
     /// phi of a few function constants in the current block, like the
     /// methods a property lookup found for the shapes it switched on.
     fn callee_cases(&self, callee: Operand) -> Option<Vec<(u64, Option<u32>)>> {
-        let SlotState::Value { node, .. } = self.peek(callee) else {
-            return None;
-        };
+        let node = self.peek(callee)?.node;
         // NB: Phis of loop headers get the inputs of their back edges later.
         let block = &self.graph.blocks[self.block.index()];
         if block.is_loop_header || !block.phis.contains(&node) {
@@ -970,12 +1186,7 @@ impl GraphBuilder<'_> {
         }
         // NB: The phi reaches only the first case, so only the callee's slot,
         //     which each case gives its function, may hold it.
-        let holders = self
-            .frame
-            .slots
-            .iter()
-            .filter(|slot| matches!(slot, SlotState::Value { node, .. } if *node == callee_phi))
-            .count();
+        let holders = self.frame.slots.iter().filter(|slot| slot.node == callee_phi).count();
         if holders != 1 {
             return None;
         }
@@ -1067,10 +1278,9 @@ impl GraphBuilder<'_> {
             unreachable!("calls are generic instructions");
         };
         // NB: Every case continues with the frame the call starts with, but
-        //     for the destination, which the cases' values join in, and slots
-        //     only frame memory held, which reading the operands in a case
-        //     may load. The slow path keeps the destination in an SSA value,
-        //     and touches no other slot.
+        //     for the destination, which the cases' values join in. The slow
+        //     path keeps the destination in an SSA value, and touches no
+        //     other slot.
         let Some(dst_slot) = self.function.layout.tracked_index(*dst) else {
             return Ok(None);
         };
@@ -1078,22 +1288,17 @@ impl GraphBuilder<'_> {
             .chain(std::iter::once(*this_value))
             .chain(arguments.iter().copied())
             .collect::<Vec<_>>();
-        if self.is_reserved(*dst)
-            || self.graph.legacy_arguments.contains(&dst.raw())
+        if self.graph.legacy_arguments.contains(&dst.raw())
             || info.reads_whole_frame
             || crate::codegen::slow_path_call(OpCode::Call).is_none()
-            || !super::slow_paths::is_ssa_slow_path_output(&self.function.layout, *dst, self.function.is_virtual())
             || operands.iter().any(|operand| self.holds_virtual_arguments(*operand))
         {
             return Ok(None);
         }
-        let SlotState::Value {
+        let SlotState {
             node: callee_phi,
             in_sync: callee_in_sync,
-        } = self.peek(*callee)
-        else {
-            unreachable!("the callee is a phi");
-        };
+        } = self.peek(*callee).expect("the callee is a phi");
         let callee_slot = self
             .function
             .layout
@@ -1102,12 +1307,7 @@ impl GraphBuilder<'_> {
         let edges = self.callee_case_edges(callee_phi, &cases);
         let callee_value = match edges {
             Some(_) => None,
-            None => {
-                for operand in &operands {
-                    self.read(*operand)?;
-                }
-                Some(self.read(*callee)?)
-            }
+            None => Some(self.read(*callee)?),
         };
         let join = self.block;
         let frame = self.frame.clone();
@@ -1121,7 +1321,7 @@ impl GraphBuilder<'_> {
                     // NB: Here the callee is the case's function, which frame
                     //     states of the case give it as.
                     let function = self.constant(*bits);
-                    self.frame.slots[callee_slot] = SlotState::Value {
+                    self.frame.slots[callee_slot] = SlotState {
                         node: function,
                         in_sync: callee_in_sync,
                     };
@@ -1161,15 +1361,11 @@ impl GraphBuilder<'_> {
                     .expect("calls have a slow path on values"),
             };
             if matches!(flow, Flow::Continue) {
-                let SlotState::Value { node, .. } = self.frame.slots[dst_slot] else {
-                    unreachable!("the destination holds the call's value");
-                };
+                let node = self.frame.slots[dst_slot].node;
                 debug_assert!(
                     (0..frame.slots.len()).all(|slot| slot == dst_slot
                         || (slot == callee_slot && edges.is_some())
-                        || frame.slots[slot] == self.frame.slots[slot]
-                        || (frame.slots[slot] == SlotState::InMemory
-                            && matches!(self.frame.slots[slot], SlotState::Value { in_sync: true, .. }))),
+                        || frame.slots[slot] == self.frame.slots[slot]),
                     "cases change no slot but the destination"
                 );
                 results.push((self.block, node, *bits));
@@ -1196,7 +1392,7 @@ impl GraphBuilder<'_> {
             } else {
                 self.add_phi(functions)
             };
-            self.frame.slots[callee_slot] = SlotState::Value {
+            self.frame.slots[callee_slot] = SlotState {
                 node: function,
                 in_sync: callee_in_sync,
             };
@@ -1277,16 +1473,18 @@ impl GraphBuilder<'_> {
         else {
             return Ok(None);
         };
-        let SlotState::Value { node: closure, .. } = self.peek(*callee) else {
+        let Some(SlotState { node: closure, .. }) = self.peek(*callee) else {
             return Ok(None);
         };
         let Op::AllocateFunction {
+            executable,
             shared_function_data_index,
+            ..
         } = self.graph.node(closure).op
         else {
             return Ok(None);
         };
-        let Some(index) = self.snapshot.executables[0]
+        let Some(index) = self.snapshot.executables[executable as usize]
             .closure_templates
             .get(shared_function_data_index as usize)
             .and_then(Option::as_ref)
@@ -1331,6 +1529,11 @@ impl GraphBuilder<'_> {
         if !self.may_speculate(ExitKind::BadShape) || !self.may_speculate(ExitKind::UnexpectedValue) {
             return Ok(None);
         }
+        if let Some(super_constructor) = construct.super_constructor
+            && !self.may_inline_super_constructor(construct.executable, super_constructor)
+        {
+            return Ok(None);
+        }
         let call = InlinedCallSite {
             callee: Some(*callee),
             construct: Some(construct),
@@ -1345,10 +1548,469 @@ impl GraphBuilder<'_> {
         self.inline_call(call)
     }
 
+    /// Whether the super() of an inlined construct of the derived
+    /// constructor `constructor` here can inline the construct of `target`
+    /// (see `try_inline_super_call()`), one inlined call deeper, and so on
+    /// down the chain of super constructors if `target` is derived too. Each
+    /// construct is checked like `inline_call()` checks it (see
+    /// `inlinable_callee()`), and no super() in the chain may have exited
+    /// because `inline_call()` refused its construct after all.
+    fn may_inline_super_constructor(&self, constructor: u32, mut target: SuperConstructTarget) -> bool {
+        let Some(constructor_executable) = self.snapshot.executables.get(constructor as usize) else {
+            return false;
+        };
+        if self.super_call_exited(constructor) {
+            return false;
+        }
+        // NB: The constructors inlined above `target` by then, from the derived constructor here down.
+        let mut inlined_above = vec![constructor_executable.cell];
+        loop {
+            let kind = if target.derived {
+                InlinedCallKind::DerivedConstruct
+            } else {
+                InlinedCallKind::Construct
+            };
+            let Some(InlinableCallee { executable, .. }) =
+                self.inlinable_callee(target.executable, kind, false, true, &inlined_above)
+            else {
+                return false;
+            };
+            if !target.derived {
+                return true;
+            }
+            if self.super_call_exited(target.executable) {
+                return false;
+            }
+            let Some(next) = executable.super_constructor else {
+                return false;
+            };
+            inlined_above.push(executable.cell);
+            target = next;
+        }
+    }
+
+    /// Whether compiled code exited at a super() of the derived constructor
+    /// of snapshot executable `index` because `inline_call()` refused the
+    /// construct there (see `try_inline_super_call()`).
+    fn super_call_exited(&self, index: u32) -> bool {
+        let Some(executable) = self.snapshot.executables.get(index as usize) else {
+            return true;
+        };
+        let Ok(decoded) = super::decoded_function(executable, &self.decoded[index as usize]) else {
+            return true;
+        };
+        decoded.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.instruction.opcode(),
+                OpCode::SuperCall | OpCode::SuperCallWithForwardedArguments
+            ) && executable
+                .exit_sites
+                .contains(&(instruction.pc, ExitKind::BadCallTarget))
+        })
+    }
+
+    /// `GetSuperConstructor` in an inlined construct of a derived
+    /// constructor: its [[Prototype]], which stays the same while its shape
+    /// does.
+    pub(super) fn try_build_super_constructor(&mut self, dst: Operand) -> Result<bool, CompileFailure> {
+        let Some(construct) = self.function.inline.as_ref().and_then(|call| call.derived_construct) else {
+            return Ok(false);
+        };
+        let (function, target) = self.derived_construct_function(&construct)?;
+        // 13.3.7.2 GetSuperConstructor ( ), https://tc39.es/ecma262/#sec-getsuperconstructor
+        // 1. Let envRec be GetThisEnvironment().
+        // 2. Assert: envRec is a Function Environment Record.
+        // 3. Let activeFunction be envRec.[[FunctionObject]].
+        // 4. Assert: activeFunction is an ECMAScript function object.
+        // 5. Let superConstructor be ! activeFunction.[[GetPrototypeOf]]().
+        let function = self.boxed_object(function);
+        let function = self.constant(function);
+        self.check_shapes(
+            function,
+            &[ShapeCheck {
+                shape: target.function_shape,
+                dictionary_generation: None,
+            }],
+        );
+        // 6. Return superConstructor.
+        self.embed(target.function);
+        let super_constructor = self.boxed_object(target.function);
+        let super_constructor = self.constant(super_constructor);
+        self.write(dst, super_constructor)?;
+        Ok(true)
+    }
+
+    /// The derived constructor of an inlined construct, and the
+    /// constructor its super() constructs with.
+    fn derived_construct_function(
+        &self,
+        construct: &ConstructTarget,
+    ) -> Result<(CellId, SuperConstructTarget), CompileFailure> {
+        let invalid = |reason| CompileFailure::InvalidBytecode {
+            pc: self.function.pc,
+            reason,
+        };
+        let function = self
+            .function
+            .executable
+            .function
+            .ok_or(invalid("inlined construct without a known function"))?;
+        let target = construct
+            .super_constructor
+            .ok_or(invalid("derived construct without a super constructor"))?;
+        Ok((function.function, target))
+    }
+
+    /// `SuperCall` in an inlined construct of a derived constructor: inlines
+    /// the construct of its super constructor, with the derived constructor
+    /// as the new target. Its result is `this`, which `BindThisFromSuperCall`
+    /// binds (see `try_build_bind_this_from_super_call()`).
+    pub(super) fn try_inline_super_call(&mut self, instruction: &Instruction) -> Result<Option<Flow>, CompileFailure> {
+        let Some(construct) = self.function.inline.as_ref().and_then(|call| call.derived_construct) else {
+            return Ok(None);
+        };
+        let (dst, super_constructor, arguments, argument_count, forwarded) = match instruction {
+            Instruction::SuperCall {
+                dst,
+                super_constructor,
+                argument_count,
+                arguments,
+                ..
+            } => (
+                dst,
+                super_constructor,
+                arguments.iter().copied().map(InlineValue::Operand).collect::<Vec<_>>(),
+                *argument_count,
+                false,
+            ),
+            // NB: The passed arguments of the derived constructor are all known, as it keeps them like legacy
+            //     `arguments` (see `inline_call()`).
+            Instruction::SuperCallWithForwardedArguments {
+                dst, super_constructor, ..
+            } => {
+                let call = self
+                    .function
+                    .inline
+                    .as_ref()
+                    .expect("derived constructs are inlined calls");
+                let count = call.passed_argument_count;
+                let arguments = self
+                    .legacy_argument_values()
+                    .into_iter()
+                    .take(count as usize)
+                    .map(|(_, node)| InlineValue::Node(node))
+                    .collect::<Vec<_>>();
+                if arguments.len() != count as usize {
+                    return Err(CompileFailure::InvalidBytecode {
+                        pc: self.function.pc,
+                        reason: "forwarded arguments of an inlined derived construct are not known",
+                    });
+                }
+                (dst, super_constructor, arguments, count, true)
+            }
+            _ => return Ok(None),
+        };
+        let (function, target) = self.derived_construct_function(&construct)?;
+        // NB: GetSuperConstructor put the super constructor there.
+        let super_constructor_value = self.read(*super_constructor)?;
+        let expected = self.boxed_object(target.function);
+        if self.graph.constant_value(super_constructor_value) != Some(expected) {
+            self.emit_checked(
+                Op::CheckValue {
+                    expected,
+                    kind: ExitKind::UnexpectedValue,
+                },
+                vec![super_constructor_value],
+                None,
+            );
+        }
+        // 13.3.7.1 Runtime Semantics: Evaluation, https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation
+        // 6. Let result be ? Construct(superCtor, argList, newTarget).
+        // NB: OrdinaryCreateFromConstructor of the construct reads "prototype" of the new target, the derived
+        //     constructor.
+        // NB: A derived super constructor's super() constructs with its own parent (see
+        //     `may_inline_super_constructor()`).
+        let next_super_constructor = if target.derived {
+            let next = self
+                .snapshot
+                .executables
+                .get(target.executable as usize)
+                .and_then(|executable| executable.super_constructor);
+            if next.is_none() {
+                return Err(CompileFailure::InvalidBytecode {
+                    pc: self.function.pc,
+                    reason: "derived super constructor without a super constructor",
+                });
+            }
+            next
+        } else {
+            None
+        };
+        let new_target = self.function.inline.as_ref().and_then(|call| call.new_target);
+        let call = InlinedCallSite {
+            construct: Some(ConstructTarget {
+                executable: target.executable,
+                super_constructor: next_super_constructor,
+                ..construct
+            }),
+            new_target: Some(new_target.unwrap_or(function)),
+            forwarded,
+            ..InlinedCallSite::new(
+                target.executable,
+                InlineValue::Constant(value::UNDEFINED),
+                arguments,
+                argument_count,
+                *dst,
+            )
+        };
+        if let Some(flow) = self.inline_call(call)? {
+            return Ok(Some(flow));
+        }
+        // NB: `may_inline_super_constructor()` checks ahead what `inline_call()` checks, but not the values at the
+        //     call site, like a virtual arguments object, nor what may be speculated here. A generic SuperCall
+        //     cannot run in the inlined frame, which is not the running frame: exit, which keeps the next
+        //     compilation from inlining the construct.
+        let frame_state = self.eager_frame_state();
+        let exit = self.set_control(
+            Op::Exit {
+                kind: ExitKind::BadCallTarget,
+            },
+            Vec::new(),
+        );
+        self.graph.nodes[exit.index()].frame_state = Some(frame_state);
+        Ok(Some(Flow::Ended))
+    }
+
+    /// `BindThisFromSuperCall` in an inlined construct of a derived
+    /// constructor whose fields JIT code can define (see
+    /// `ExecutableSnapshot::derived_instance_fields`), whose `this` is still
+    /// empty there and whose super() created `this` in the graph: binds it
+    /// and defines the fields after checking that `this` has the shape they
+    /// start from. Returns false, having built nothing, otherwise.
+    pub(super) fn try_build_bind_this_defining_fields(&mut self, result: Operand) -> Result<bool, CompileFailure> {
+        if self
+            .function
+            .inline
+            .as_ref()
+            .and_then(|call| call.derived_construct)
+            .is_none()
+            || !self.may_speculate(ExitKind::BadShape)
+        {
+            return Ok(false);
+        }
+        let Some(fields) = self.function.executable.derived_instance_fields.clone() else {
+            return Ok(false);
+        };
+        let this_register = Operand::from_raw(THIS_VALUE_REGISTER);
+        let this_value = self.read(this_register)?;
+        if self.graph.constant_value(this_value) != Some(value::EMPTY) {
+            return Ok(false);
+        }
+        let object = self.read(result)?;
+        let allocation = self.graph.unrefined(object);
+        let Op::AllocateObject {
+            shape: allocated_shape,
+            property_count,
+            reserve,
+        } = self.graph.node(allocation).op
+        else {
+            return Ok(false);
+        };
+        let added_count = fields.fields.iter().map(|(offset, _, _)| offset + 1).max().unwrap_or(0);
+        let reserve = reserve.max(added_count);
+        if self.runtime.object_allocation.size_class_for(reserve).is_none() {
+            return Ok(false);
+        }
+        self.graph.nodes[allocation.index()].op = Op::AllocateObject {
+            shape: allocated_shape,
+            property_count,
+            reserve,
+        };
+
+        // NB: The shape check exits before `this` is bound, to the BindThisFromSuperCall in the interpreter.
+        let object = self.check_shapes(
+            object,
+            &[ShapeCheck {
+                shape: fields.shape,
+                dictionary_generation: None,
+            }],
+        );
+        // 13.3.7.1 Runtime Semantics: Evaluation, https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation
+        // 9. Perform ? BindThisValue(thisER, result).
+        // NB: The result of the inlined construct is its `this`, an object.
+        self.write(this_register, object)?;
+        // 10. Let funcObj be thisER.[[FunctionObject]].
+        // 11. Assert: funcObj is an ECMAScript function object.
+        // 12. Perform ? InitializeInstanceElements(result, funcObj).
+        // NB: The fields have literal values, so this cannot throw, and since `this` has the shape the fields start
+        //     from (checked above), which allows extensions and has none of their names, each field adds its property
+        //     or sets the value of an earlier field of the same name.
+        for (offset, value, added) in fields.fields {
+            let value = self.constant(value);
+            match added {
+                Some(shape) => {
+                    self.embed(shape);
+                    let address = self.cell_address(object);
+                    self.emit(
+                        Op::AddNamed {
+                            offset,
+                            shape,
+                            property_count: offset + 1,
+                        },
+                        vec![object, value, address],
+                        None,
+                    );
+                }
+                None => self.store_named_holding(object, offset, value, true),
+            }
+        }
+        // 13. Return result.
+        Ok(true)
+    }
+
+    /// `BindThisFromSuperCall` in an inlined construct of a derived
+    /// constructor with fields or private methods, whose `this` is still
+    /// empty there (see `calls_super_once_before_returning()`): its slow
+    /// path, which runs in the published frames of the inlined calls, binds
+    /// `this` and initializes the instance elements. Its result is `this`
+    /// once it continues. Returns `None` for other constructors.
+    pub(super) fn try_build_bind_this_initializing_instance_elements(
+        &mut self,
+        instruction: &Instruction,
+        result: Operand,
+    ) -> Result<Option<Flow>, CompileFailure> {
+        if self
+            .function
+            .inline
+            .as_ref()
+            .and_then(|call| call.derived_construct)
+            .is_none()
+            || !self.function.executable.has_instance_elements
+        {
+            return Ok(None);
+        }
+        let this_register = Operand::from_raw(THIS_VALUE_REGISTER);
+        let this_value = self.read(this_register)?;
+        if self.graph.constant_value(this_value) != Some(value::EMPTY) {
+            return Err(CompileFailure::InvalidBytecode {
+                pc: self.function.pc,
+                reason: "super() of an inlined derived construct with this bound",
+            });
+        }
+        let invalid = CompileFailure::InvalidBytecode {
+            pc: self.function.pc,
+            reason: "BindThisFromSuperCall has no slow path call",
+        };
+        let info = super::handling::handling(OpCode::BindThisFromSuperCall)
+            .generic()
+            .ok_or(invalid)?;
+        // NB: The published frame of the derived constructor has the empty this value of the frame state, which the
+        //     slow path binds.
+        let flow = self.try_build_slow_path_call(instruction, info)?.ok_or(invalid)?;
+        // 13.3.7.1 Runtime Semantics: Evaluation, https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation
+        // 9. Perform ? BindThisValue(thisER, result).
+        let result = self.read(result)?;
+        self.write(this_register, result)?;
+        Ok(Some(flow))
+    }
+
+    /// `BindThisFromSuperCall` in an inlined construct of a derived
+    /// constructor, whose `this` is still empty there (see
+    /// `calls_super_once_before_returning()`) and which has no fields.
+    pub(super) fn try_build_bind_this_from_super_call(&mut self, result: Operand) -> Result<bool, CompileFailure> {
+        if self
+            .function
+            .inline
+            .as_ref()
+            .and_then(|call| call.derived_construct)
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let this_register = Operand::from_raw(THIS_VALUE_REGISTER);
+        let this_value = self.read(this_register)?;
+        if self.graph.constant_value(this_value) != Some(value::EMPTY) {
+            return Err(CompileFailure::InvalidBytecode {
+                pc: self.function.pc,
+                reason: "super() of an inlined derived construct with this bound",
+            });
+        }
+        // 13.3.7.1 Runtime Semantics: Evaluation, https://tc39.es/ecma262/#sec-super-keyword-runtime-semantics-evaluation
+        // 7. Let thisER be GetThisEnvironment().
+        // 8. Assert: thisER is a Function Environment Record.
+        // 9. Perform ? BindThisValue(thisER, result).
+        // NB: The result of the inlined construct is its `this`, an object.
+        let result = self.read(result)?;
+        self.write(this_register, result)?;
+        // 10. Let funcObj be thisER.[[FunctionObject]].
+        // 11. Assert: funcObj is an ECMAScript function object.
+        // 12. Perform ? InitializeInstanceElements(result, funcObj).
+        // NB: The derived constructor has no fields or private methods.
+        // 13. Return result.
+        Ok(true)
+    }
+
+    /// `ResolveSuperBase` in an inlined callee, whose home object is known: its prototype, which stays the same while
+    /// its shape does. The interpreter's slow path reads the running function, which is the caller's here.
+    pub(super) fn try_build_resolve_super_base(&mut self, dst: Operand) -> Result<bool, CompileFailure> {
+        if !self.function.is_virtual() {
+            return Ok(false);
+        }
+        let super_base = self
+            .function
+            .executable
+            .function
+            .and_then(|function| function.super_base)
+            .ok_or(CompileFailure::InvalidBytecode {
+                pc: self.function.pc,
+                reason: "inlined ResolveSuperBase without a known home object",
+            })?;
+        self.embed(super_base.home);
+        let home = self.boxed_object(super_base.home);
+        let home = self.constant(home);
+        self.check_shapes(
+            home,
+            &[ShapeCheck {
+                shape: super_base.home_shape,
+                dictionary_generation: None,
+            }],
+        );
+        let base = match super_base.prototype {
+            Some(prototype) => {
+                self.embed(prototype);
+                self.boxed_object(prototype)
+            }
+            None => value::NULL,
+        };
+        let base = self.constant(base);
+        self.write(dst, base)?;
+        Ok(true)
+    }
+
+    /// `GetNewTarget` in an inlined callee with its own new.target: undefined for a call, and for a construct the
+    /// constructor, which is the new target of the constructs JIT code inlines. The interpreter's slow path reads the
+    /// running frame, which is the caller's here.
+    pub(super) fn try_build_new_target(&mut self, dst: Operand) -> Result<bool, CompileFailure> {
+        let Some(call) = self.function.inline.as_ref() else {
+            return Ok(false);
+        };
+        let value = if let Some(new_target) = call.new_target {
+            self.embed(new_target);
+            self.boxed_object(new_target)
+        } else {
+            value::UNDEFINED
+        };
+        let value = self.constant(value);
+        self.write(dst, value)?;
+        Ok(true)
+    }
+
     /// `this` of an inlined construct of `function`: the object its
-    /// construct creates, an empty plain object of the prototype in its
-    /// "prototype", which must still be the one it was at compile time.
-    fn construct_this(&mut self, function: CellId, construct: &ConstructTarget) -> NodeId {
+    /// construct creates, a plain object of the prototype in its
+    /// "prototype", which must still be the one it was at compile time,
+    /// with the `fields` of the base constructor (see
+    /// `ExecutableSnapshot::literal_instance_fields`).
+    fn construct_this(&mut self, function: CellId, construct: &ConstructTarget, fields: &[(u32, u64)]) -> NodeId {
         // 10.1.13 OrdinaryCreateFromConstructor ( constructor, intrinsicDefaultProto [ , internalSlotsList ] ), https://tc39.es/ecma262/#sec-ordinarycreatefromconstructor
         let constructor = self.boxed_object(function);
         let constructor = self.constant(constructor);
@@ -1361,15 +2023,24 @@ impl GraphBuilder<'_> {
         );
         self.load_constant_named(constructor, construct.prototype_offset, construct.prototype);
         self.embed(construct.this_shape);
-        self.emit(
+        let property_count = fields.iter().map(|(offset, _)| offset + 1).max().unwrap_or(0);
+        let this = self.emit(
             Op::AllocateObject {
                 shape: construct.this_shape,
-                property_count: 0,
-                reserve: construct.reserve,
+                property_count,
+                reserve: construct.reserve.max(property_count),
             },
             Vec::new(),
             Some(Repr::Tagged),
-        )
+        );
+        // 10.2.2 [[Construct]] ( argumentsList, newTarget ), https://tc39.es/ecma262/#sec-ecmascript-function-objects-construct-argumentslist-newtarget
+        // 6.b. Let initializeResult be Completion(InitializeInstanceElements(thisArgument, F)).
+        // NB: The fields have literal values, so this cannot throw, and `this` has their shape already.
+        for &(offset, value) in fields {
+            let value = self.constant(value);
+            self.emit(Op::InitializeNamed { offset }, vec![this, value], None);
+        }
+        this
     }
 
     /// The value of `value` for an inlined call.
@@ -1391,14 +2062,38 @@ impl GraphBuilder<'_> {
     /// This lets recursive functions inline their own calls twice over, and lets functions that share one executable
     /// inline each other, like the constructors that `Class.create()` returns in Prototype-style code.
     fn may_inline_calls_of(&self, callee_executable: &crate::snapshot::ExecutableSnapshot) -> bool {
+        self.may_inline_calls_of_below(callee_executable, &[])
+    }
+
+    /// Like `may_inline_calls_of()`, once the calls of the executables
+    /// `inlined_above` (their cells) are inlined here, one in the other.
+    fn may_inline_calls_of_below(
+        &self,
+        callee_executable: &crate::snapshot::ExecutableSnapshot,
+        inlined_above: &[CellId],
+    ) -> bool {
+        self.may_inline_unchecked_calls_of_below(callee_executable, inlined_above)
+            && self.may_speculate(ExitKind::BadCallTarget)
+    }
+
+    /// Like `may_inline_calls_of_below()`, for a call that inlines its
+    /// callee without checking it, since the code knows exactly what it is:
+    /// such a call cannot exit for another callee, even where checks of
+    /// the callee exited before.
+    fn may_inline_unchecked_calls_of_below(
+        &self,
+        callee_executable: &crate::snapshot::ExecutableSnapshot,
+        inlined_above: &[CellId],
+    ) -> bool {
         const MAX_RECURSION_DEPTH: usize = 2;
         let recursion_depth = core::iter::once(&self.function)
             .chain(&self.callers)
-            .filter(|function| function.executable.cell == callee_executable.cell)
+            .map(|function| function.executable.cell)
+            .chain(inlined_above.iter().copied())
+            .filter(|cell| *cell == callee_executable.cell)
             .count();
         recursion_depth <= MAX_RECURSION_DEPTH
-            && self.callers.len() < self.snapshot.options.inlining.max_depth as usize
-            && self.may_speculate(ExitKind::BadCallTarget)
+            && self.callers.len() + inlined_above.len() < self.snapshot.options.inlining.max_depth as usize
     }
 
     /// Whether a call with a few callees (see `try_inline_callee_cases()`)
@@ -1425,6 +2120,95 @@ impl GraphBuilder<'_> {
             <= self.snapshot.options.inlining.budget_instructions as usize
     }
 
+    /// The snapshot executable `index`, if a call of the
+    /// kind `kind` (a closure call if `closure`, which checks its callee if
+    /// `checks_callee`) may inline it here once the
+    /// executables `inlined_above` (their cells) are inlined here, one in the
+    /// other: the checks of `inline_call()` that do not depend on the values
+    /// at the call site, which `may_inline_super_constructor()` makes ahead
+    /// of the calls that inlined constructs inline for super().
+    fn inlinable_callee(
+        &self,
+        index: u32,
+        kind: InlinedCallKind,
+        closure: bool,
+        checks_callee: bool,
+        inlined_above: &[CellId],
+    ) -> Option<InlinableCallee<'a>> {
+        let snapshot = self.snapshot;
+        let callee_executable = snapshot.executables.get(index as usize)?;
+        callee_executable.function?;
+        let may_inline = if checks_callee {
+            self.may_inline_calls_of_below(callee_executable, inlined_above)
+        } else {
+            self.may_inline_unchecked_calls_of_below(callee_executable, inlined_above)
+        };
+        if !may_inline {
+            return None;
+        }
+        let decoded = super::decoded_function(callee_executable, &self.decoded[index as usize]).ok()?;
+        let instruction_count = decoded.instructions.len();
+        let limits = snapshot.options.inlining;
+        // NB: Builtins are always inlined (see the snapshot's inlining rules).
+        let within_budget = callee_executable.builtin
+            || crate::bytecode::inlining_size(&decoded.instructions) <= limits.always_inlined_instructions as usize
+            || (kind != InlinedCallKind::Call && instruction_count <= limits.max_construct_instructions as usize)
+            || (instruction_count <= limits.max_instructions as usize
+                && self.inlined_instructions + instruction_count <= limits.budget_instructions as usize);
+        if !within_budget {
+            return None;
+        }
+        // NB: CheckClosure checks shared data, not legacy-property eligibility.
+        //     Keep non-strict closure calls conservative. Frames with a virtual
+        //     arguments object keep every passed argument too, which exits
+        //     create the object from.
+        let virtual_arguments =
+            self.virtualize_arguments.compiled_function && self.virtualize_arguments.inlined_callees;
+        let uses_passed_arguments = decoded.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.instruction.opcode(),
+                OpCode::CreateArguments | OpCode::GetArgument
+            )
+        });
+        // NB: A derived constructor that passes its arguments on to super() keeps them all, like legacy `arguments`.
+        let derived_construct = kind == InlinedCallKind::DerivedConstruct;
+        let forwards_arguments_to_super = derived_construct
+            && decoded
+                .instructions
+                .iter()
+                .any(|instruction| instruction.instruction.opcode() == OpCode::SuperCallWithForwardedArguments);
+        let has_legacy_arguments = callee_executable.supports_legacy_arguments
+            || (closure && callee_executable.is_non_strict_function())
+            || (virtual_arguments && uses_passed_arguments)
+            || forwards_arguments_to_super;
+        let callee_function = Function::new(index, callee_executable, decoded, has_legacy_arguments).ok()?;
+        if !can_inline(&callee_function, virtual_arguments, derived_construct) {
+            return None;
+        }
+        // NB: Closures of a function share its code but may have other home objects, and the base of `super` property
+        //     access is guarded by a shape check.
+        let resolves_super_base = callee_function
+            .instructions
+            .iter()
+            .any(|instruction| instruction.instruction.opcode() == OpCode::ResolveSuperBase);
+        if resolves_super_base && (closure || !self.may_speculate(ExitKind::BadShape)) {
+            return None;
+        }
+        let qualifies = match kind {
+            InlinedCallKind::Call => true,
+            InlinedCallKind::Construct => {
+                returns_no_object(&callee_function)
+                    && (!callee_executable.has_instance_elements || callee_executable.literal_instance_fields.is_some())
+            }
+            InlinedCallKind::DerivedConstruct => calls_super_once_before_returning(&callee_function),
+        };
+        qualifies.then_some(InlinableCallee {
+            executable: callee_executable,
+            function: callee_function,
+            has_legacy_arguments,
+        })
+    }
+
     /// Inlines the call `call` describes, if its callee qualifies.
     fn inline_call(&mut self, call: InlinedCallSite) -> Result<Option<Flow>, CompileFailure> {
         let InlinedCallSite {
@@ -1437,10 +2221,12 @@ impl GraphBuilder<'_> {
             forwarded,
             dst,
             construct,
+            new_target,
             closure,
             check_closure,
             callback,
         } = call;
+        let derived_construct = construct.filter(|construct| construct.super_constructor.is_some());
         // NB: The callee's frame cannot hold the virtual arguments object:
         //     the callee's generic instructions could not read it.
         if std::iter::once(&this)
@@ -1449,52 +2235,30 @@ impl GraphBuilder<'_> {
         {
             return Ok(None);
         }
-        let snapshot = self.snapshot;
-        let Some(callee_executable) = snapshot.executables.get(index as usize) else {
+        let Some(InlinableCallee {
+            executable: callee_executable,
+            function: mut callee_function,
+            has_legacy_arguments,
+        }) = self.inlinable_callee(
+            index,
+            match (construct, derived_construct) {
+                (None, _) => InlinedCallKind::Call,
+                (Some(_), None) => InlinedCallKind::Construct,
+                (Some(_), Some(_)) => InlinedCallKind::DerivedConstruct,
+            },
+            closure.is_some(),
+            callee.is_some() || check_closure || construct.is_some(),
+            &[],
+        )
+        else {
             return Ok(None);
         };
-        let Some(function) = callee_executable.function else {
-            return Ok(None);
-        };
-        let limits = snapshot.options.inlining;
-        if !self.may_inline_calls_of(callee_executable) {
+        // NB: What a real frame would read for an argument that the call did not pass depends on %Object.prototype%.
+        if arguments::reads_argument_not_passed(&callee_function, passed_argument_count) {
             return Ok(None);
         }
-        let Ok(decoded) = super::decoded_function(callee_executable, &self.decoded[index as usize]) else {
-            return Ok(None);
-        };
-        let instruction_count = decoded.instructions.len();
-        // NB: Builtins are always inlined (see the snapshot's inlining rules).
-        let within_budget = callee_executable.builtin
-            || crate::bytecode::inlining_size(&decoded.instructions) <= limits.always_inlined_instructions as usize
-            || (construct.is_some() && instruction_count <= limits.max_construct_instructions as usize)
-            || (instruction_count <= limits.max_instructions as usize
-                && self.inlined_instructions + instruction_count <= limits.budget_instructions as usize);
-        if !within_budget {
-            return Ok(None);
-        }
-        // NB: CheckClosure checks shared data, not legacy-property eligibility.
-        //     Keep non-strict closure calls conservative. Frames with a virtual
-        //     arguments object keep every passed argument too, which exits
-        //     create the object from.
-        let virtual_arguments =
-            self.virtualize_arguments.compiled_function && self.virtualize_arguments.inlined_callees;
-        let creates_arguments = decoded
-            .instructions
-            .iter()
-            .any(|instruction| instruction.instruction.opcode() == OpCode::CreateArguments);
-        let has_legacy_arguments = callee_executable.supports_legacy_arguments
-            || (closure.is_some() && callee_executable.is_non_strict_function())
-            || (virtual_arguments && creates_arguments);
-        let Ok(mut callee_function) = Function::new(index, callee_executable, decoded, has_legacy_arguments) else {
-            return Ok(None);
-        };
-        if !can_inline(&callee_function, virtual_arguments) {
-            return Ok(None);
-        }
-        if construct.is_some() && !returns_no_object(&callee_function) {
-            return Ok(None);
-        }
+        let function = callee_executable.function.expect("inlined callees have a function");
+        let instruction_count = callee_function.instructions.len();
 
         // NB: Bind `this` like the interpreter's inline calls do.
         let receiver = if construct.is_some() {
@@ -1544,9 +2308,14 @@ impl GraphBuilder<'_> {
         if let Some(callee) = callee {
             self.check_callee(callee, expected_callee)?;
         }
+        // NB: super() creates `this` of a derived constructor.
         let receiver = match &construct {
-            Some(construct) => self.construct_this(function.function, construct),
-            None => receiver,
+            Some(construct) if derived_construct.is_none() => self.construct_this(
+                new_target.unwrap_or(function.function),
+                construct,
+                callee_executable.literal_instance_fields.as_deref().unwrap_or_default(),
+            ),
+            _ => receiver,
         };
         // NB: Arguments forwarded from the frame are as many as when the
         //     forwarding was seen.
@@ -1590,13 +2359,13 @@ impl GraphBuilder<'_> {
         let empty = self.constant(value::EMPTY);
         let undefined = self.constant(value::UNDEFINED);
         let mut slots = vec![
-            SlotState::Value {
+            SlotState {
                 node: empty,
                 in_sync: true,
             };
             layout.tracked_slot_count()
         ];
-        slots[crate::bytecode::THIS_VALUE_REGISTER as usize] = SlotState::Value {
+        slots[crate::bytecode::THIS_VALUE_REGISTER as usize] = SlotState {
             node: receiver,
             in_sync: true,
         };
@@ -1605,7 +2374,7 @@ impl GraphBuilder<'_> {
                 .tracked_index(Operand::from_raw(layout.arguments_base() + argument))
                 .expect("arguments are tracked");
             let node = argument_values.get(argument as usize).copied().unwrap_or(undefined);
-            slots[slot] = SlotState::Value { node, in_sync: true };
+            slots[slot] = SlotState { node, in_sync: true };
         }
         let callee_frame = AbstractFrame {
             slots,
@@ -1633,6 +2402,8 @@ impl GraphBuilder<'_> {
             return_fresh_shapes: None,
             frame_bytes,
             construct: construct.is_some(),
+            new_target: construct.map(|_| new_target.unwrap_or(function.function)),
+            derived_construct,
         });
 
         // NB: Walk the callee's bytecode, then continue in the caller.
@@ -1668,12 +2439,19 @@ impl GraphBuilder<'_> {
 
     /// Ends the current block of an inlined callee with a return of `value`
     /// to the continuation in the caller.
-    pub(super) fn build_inline_return(&mut self, value: NodeId, empty_is_undefined: bool) -> Flow {
-        let construct_this = self
-            .function
-            .inline
-            .as_ref()
-            .and_then(|call| call.construct.then_some(call.this));
+    pub(super) fn build_inline_return(
+        &mut self,
+        value: NodeId,
+        empty_is_undefined: bool,
+    ) -> Result<Flow, CompileFailure> {
+        let call = self.function.inline.as_ref().expect("returns from inlined callees");
+        let construct_this = if call.derived_construct.is_some() {
+            // NB: The callee returns undefined only, once super() bound `this` (see
+            //     `calls_super_once_before_returning()`), so the result is always `this`.
+            Some(self.read(Operand::from_raw(THIS_VALUE_REGISTER))?)
+        } else {
+            call.construct.then_some(call.this)
+        };
         let value = if let Some(this) = construct_this {
             // 10.2.2 [[Construct]] ( argumentsList, newTarget ), https://tc39.es/ecma262/#sec-ecmascript-function-objects-construct-argumentslist-newtarget
             // NB: The callee returns no objects but `this` (see
@@ -1709,6 +2487,17 @@ impl GraphBuilder<'_> {
         }
         self.set_control(Op::Jump { target: continuation }, Vec::new());
         self.graph.blocks[continuation.index()].predecessors.push(self.block);
-        Flow::Ended
+        Ok(Flow::Ended)
     }
+}
+
+/// The callback a call of a builtin that takes callbacks passed it, which such builtins record as forwarded calls.
+fn forwarded_callback(feedback: &CallFeedbackSnapshot) -> Option<CallbackTarget> {
+    let forwarded = feedback
+        .forwarded
+        .filter(|forwarded| forwarded.forwarding == Forwarding::Callback)?;
+    Some(CallbackTarget {
+        index: forwarded.inline_executable?,
+        closures: feedback.flags & call_feedback_flags::FORWARDED_CLOSURES != 0,
+    })
 }

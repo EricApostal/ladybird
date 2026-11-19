@@ -30,7 +30,7 @@ pub use scroll_table::{
     CompositorScrollNodeKind, CompositorScrollNodeRecord, CompositorScrollTable, CompositorSnapAreaRecord,
     CompositorSnapContainerRecord,
 };
-pub use world_transforms::WorldTransforms;
+pub use world_transforms::{RectMapping, WorldTransforms};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -170,6 +170,8 @@ pub struct StickyData {
     pub scroller: SpatialNodeIndex,
     pub parent_sticky: Option<SpatialNodeIndex>,
     pub position_relative_to_scroller: FloatPoint,
+    // Where the box's border box was recorded, in device pixels — which is where replay rounds it to.
+    pub border_box_origin: FloatPoint,
     pub border_box_size: FloatSize,
     pub scrollport_size: FloatSize,
     pub containing_block_region: FloatRect,
@@ -197,6 +199,7 @@ impl StickyData {
             scroller,
             parent_sticky,
             position_relative_to_scroller: FloatPoint::default(),
+            border_box_origin: FloatPoint::default(),
             border_box_size: FloatSize::default(),
             scrollport_size: FloatSize::default(),
             containing_block_region: FloatRect::default(),
@@ -738,7 +741,7 @@ pub struct VisualContextTree {
     compositor_scroll_table: CompositorScrollTable,
 }
 
-// A tree is shared by the arena and by the handles C++ retains; any thread may come to hold it.
+// A tree is shared by the arena, recordings, display list storages and presentations; any thread may come to hold it.
 const _: () = {
     const fn assert_send_and_sync<T: Send + Sync>() {}
     assert_send_and_sync::<VisualContextTree>();
@@ -895,6 +898,20 @@ impl VisualContextTree {
             visual_animations: std::sync::Arc::from(Vec::new()),
             compositor_scroll_table: CompositorScrollTable::default(),
         }
+    }
+
+    // A tree with no node but an identity visual viewport transform, for a list that names no other node.
+    pub fn create_identity() -> Self {
+        Self::create(TransformData {
+            matrix: libgfx_rust::FloatMatrix4x4::identity(),
+            origin: libgfx_rust::FloatPoint::default(),
+            sorting_context_root_index: None,
+            flattens_inherited_transform: false,
+            role: TransformDataRole::CssTransform,
+            synthetic_plane: false,
+            establishes_sorting_context: false,
+            bounds: libgfx_rust::FloatRect::default(),
+        })
     }
 
     // A tree over decoded arrays: no slot is free or quarantined, the live counts are recounted.

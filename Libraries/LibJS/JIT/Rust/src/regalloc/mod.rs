@@ -12,7 +12,9 @@
 //!
 //! Spilling is simple: a value that ever needs a stack slot gets one slot for
 //! its whole life, and code generation stores it there right after its
-//! definition. Values live across a call always get one.
+//! definition. Values live across a call always get one. Values loaded from a
+//! frame slot that nothing writes need none: they are reloaded from the frame
+//! (see `frame_home()`).
 //! Phis share their slots with the values flowing into them where their
 //! lives do not overlap (see `coalescing`), so that values carried around
 //! loops in stack slots need no copying.
@@ -39,9 +41,13 @@
 //! every value but `Repr::Float64` ones, which floating point registers hold.
 //! Floating point registers are numbered from `FPR_BASE` on in `Location`s
 //! and masks. Nodes whose slow paths save the general purpose registers
-//! around their calls (see `saves_only_gprs()`) clobber the floating point
+//! around their calls (see `Clobbers::Floats`) clobber the floating point
 //! ones, so float64 values live across them get stack slots, like values
 //! live across a call.
+//!
+//! What each node needs (where its inputs and its output are, its temps and
+//! what it clobbers) is declared next to its lowering, in
+//! `codegen::lowering_info()`.
 
 mod coalescing;
 mod liveness;
@@ -53,11 +59,14 @@ pub use moves::resolve_parallel_moves;
 pub use verify::verify;
 
 use crate::code::Repr;
+use crate::codegen::lowering_info::Clobbers;
+use crate::codegen::lowering_info::FixedRegister;
+use crate::codegen::lowering_info::InputConstraint;
+use crate::codegen::lowering_info::OutputConstraint;
+use crate::codegen::lowering_info::lowering_info;
 use crate::inline_vec::InlineVec;
 use crate::ir::BlockId;
-use crate::ir::BranchCondition;
 use crate::ir::Graph;
-use crate::ir::Node;
 use crate::ir::NodeId;
 use crate::ir::Op;
 use liveness::ValueLiveness;
@@ -98,45 +107,6 @@ impl RegisterClass {
     }
 }
 
-/// Whether the lowering of `op` calls out of line keeping only the general
-/// purpose registers (register-saving `CallSlowPath`s, the growth of arrays and named storage, the runtime's
-/// cache probes, and allocations that call the runtime), or stores constants
-/// through a floating point register (frame initialization for such nodes
-/// and calls): it clobbers every floating point register.
-pub fn saves_only_gprs(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::CallSlowPath {
-            saves_registers: true,
-            ..
-        } | Op::InitializeFrame { clobbers_floats: true }
-            | Op::EnsureFrameInitialized { clobbers_floats: true }
-            | Op::CallArrayPush
-            | Op::CallStoreHoleyElement
-            | Op::OpenArrayIteration
-            | Op::AddNamed { .. }
-            | Op::ProbeKeyedStore { .. }
-            | Op::ProbePropertyCache { .. }
-            | Op::ProbePropertyStore { .. }
-            | Op::ProbeHasProperty { .. }
-            | Op::AllocateObject { .. }
-            | Op::AllocateArray { .. }
-            | Op::AllocateFunction { .. }
-            | Op::AllocateEnvironment { .. }
-            | Op::ConcatenateStrings
-    )
-}
-
-/// Whether the lowering of `op` computes its output from its first input
-/// as two-address instructions do, so that the output may take the
-/// register of that input where it dies.
-fn reuses_first_input(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Int32WrappingBinary { .. } | Op::Int32Binary { .. } | Op::BoolToInt32 | Op::TypedArrayDataAddress
-    )
-}
-
 /// A set of registers, as a bit mask of register numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RegisterMask(pub u64);
@@ -169,6 +139,8 @@ pub struct RegisterSet {
     pub argument_gprs: Vec<u8>,
     /// Where calls return their (first) result.
     pub return_gpr: u8,
+    /// Where shifts by a register amount take the amount, on targets that shift by one register only.
+    pub shift_amount_gpr: Option<u8>,
     /// Never allocated. Moves between stack slots and of constants into stack
     /// slots go through it, and node lowerings may clobber it.
     pub scratch_gpr: u8,
@@ -183,17 +155,39 @@ impl RegisterSet {
         }
     }
 
+    /// The number of the calling convention's register `register`.
+    pub fn fixed(&self, register: FixedRegister) -> u8 {
+        match register {
+            FixedRegister::Argument(index) => self.argument_gprs[usize::from(index)],
+            FixedRegister::Return => self.return_gpr,
+            FixedRegister::ShiftAmount => self
+                .shift_amount_gpr
+                .expect("only targets with a shift amount register have fixed shift amounts"),
+        }
+    }
+
+    /// Where an input of `constraint` must be on this target, if it is a constant (`is_constant`) or not.
+    pub fn resolve(&self, constraint: InputConstraint, is_constant: bool) -> InputConstraint {
+        match constraint {
+            InputConstraint::ShiftAmount if is_constant || self.shift_amount_gpr.is_none() => {
+                InputConstraint::RegisterOrConstant
+            }
+            InputConstraint::ShiftAmount => InputConstraint::Fixed(FixedRegister::ShiftAmount),
+            constraint => constraint,
+        }
+    }
+
     /// The registers of both classes a call clobbers.
     pub fn caller_saved(&self) -> RegisterMask {
         RegisterMask(self.caller_saved_gprs.0 | (self.caller_saved_fprs.0 << FPR_BASE))
     }
 
     /// The fewest allocatable registers allocation works with: the ones
-    /// calls take their arguments and return their results in, and
-    /// `extra` more.
+    /// calls take their arguments and return their results in, the one
+    /// shifts take their amount in, and `extra` more.
     pub fn few_registers(&self, extra: u32) -> RegisterMask {
         let mut mask = RegisterMask(0).with(self.return_gpr);
-        for register in &self.argument_gprs {
+        for register in self.argument_gprs.iter().chain(&self.shift_amount_gpr) {
             mask = mask.with(*register);
         }
         let mut mask = RegisterMask(mask.0 & self.allocatable_gprs.0);
@@ -219,6 +213,7 @@ impl RegisterSet {
             caller_saved_fprs: RegisterMask(0b1111_1111),
             argument_gprs: vec![1, 2, 3],
             return_gpr: 0,
+            shift_amount_gpr: None,
             scratch_gpr: 7,
         }
     }
@@ -232,6 +227,9 @@ pub enum Location {
     Stack(u32),
     /// A NaN-boxed constant; only ever a move source.
     Constant(u64),
+    /// A slot of the compiled function's frame (an operand), which holds the value loaded from it wherever that value
+    /// is live (see `frame_home()`); only ever a move source.
+    Frame(u32),
 }
 
 impl Default for Location {
@@ -286,236 +284,16 @@ impl Allocation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum InputConstraint {
-    #[default]
-    Register,
-    FixedRegister(u8),
-    /// A register, or the constant itself if the input is one, which code
-    /// generation uses as an immediate.
-    RegisterOrConstant,
-    /// Wherever the value is: a register, its stack slot or a constant.
-    Anywhere,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputConstraint {
-    None,
-    Register,
-    FixedRegister(u8),
-}
-
-struct Constraints {
-    inputs: InlineVec<InputConstraint, 4>,
-    output: OutputConstraint,
-    temps: u8,
-    is_call: bool,
-}
-
-fn constraints(node: &Node, registers: &RegisterSet) -> Constraints {
-    let register_inputs = || InlineVec::from_elem(InputConstraint::Register, node.inputs.len());
-    let output = if node.repr.is_some() {
-        OutputConstraint::Register
-    } else {
-        OutputConstraint::None
-    };
-    let mut constraints = Constraints {
-        inputs: register_inputs(),
-        output,
-        temps: 0,
-        is_call: node.op.properties().is_call,
-    };
-    match node.op {
-        Op::Constant(_) | Op::Phi => unreachable!("constants and phis have no constraints"),
-        Op::ToBoolean => {
-            constraints.inputs = InlineVec::from_elem(InputConstraint::FixedRegister(registers.argument_gprs[0]), 1);
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        // NB: The VM is the first argument.
-        Op::PrimitiveToString | Op::CallIntrinsic { .. } | Op::ToObject | Op::ArrayCreate => {
-            constraints.inputs = (0..node.inputs.len())
-                .map(|index| InputConstraint::FixedRegister(registers.argument_gprs[index + 1]))
-                .collect();
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        Op::CallArraySplice => {
-            constraints.inputs = (0..node.inputs.len())
-                .map(|index| {
-                    if index < 3 {
-                        InputConstraint::FixedRegister(registers.argument_gprs[index + 1])
-                    } else {
-                        InputConstraint::RegisterOrConstant
-                    }
-                })
-                .collect();
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        Op::Generic { .. } => {
-            if node.repr.is_some() {
-                constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-            }
-        }
-        Op::SliceArguments => {
-            constraints.inputs = InlineVec::from_elem(InputConstraint::FixedRegister(registers.argument_gprs[2]), 1);
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        Op::Return => {
-            constraints.inputs = InlineVec::from_elem(InputConstraint::FixedRegister(registers.return_gpr), 1);
-        }
-        // Comparisons and int32 arithmetic take a constant right-hand side
-        // as an immediate.
-        Op::Int32Compare { .. }
-        | Op::TaggedEquals { .. }
-        | Op::Branch {
-            condition: BranchCondition::Int32(_) | BranchCondition::TaggedEquals { .. },
-            ..
-        } => constraints.inputs[1] = InputConstraint::RegisterOrConstant,
-        Op::Int32WrappingBinary { .. } => constraints.inputs[1] = InputConstraint::RegisterOrConstant,
-        Op::Int32Binary { op } if op != crate::ir::BinaryOp::Mul => {
-            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
-            // The quotient of a remainder.
-            if op == crate::ir::BinaryOp::Mod {
-                constraints.temps = 1;
-            }
-        }
-        Op::Uint32ShiftRight => constraints.inputs[1] = InputConstraint::RegisterOrConstant,
-        // The new rope string, its length and a temp.
-        Op::ConcatenateStrings => constraints.temps = 3,
-        Op::StringsEqual => constraints.temps = 1,
-        // A value and a cursor for filling the registers and locals.
-        Op::InitializeFrame { .. } | Op::EnsureFrameInitialized { .. } => constraints.temps = 2,
-        // The object's property storage.
-        Op::StoreNamed { .. } | Op::AddNamed { .. } | Op::CheckAccessorFunction { .. } => constraints.temps = 1,
-        // The object whose prototype comes next.
-        Op::HasInPrototypeChain => constraints.temps = 1,
-        // The environment's binding values.
-        Op::StoreGlobalBinding { .. } => constraints.temps = 1,
-        // Direct and native calls with inputs build the callee's frame in
-        // temps.
-        Op::CallDirect {
-            stores_operands: true, ..
-        }
-        | Op::CallNative {
-            stores_operands: true, ..
-        } => {
-            // NB: The call stores its operands to the frame first.
-            constraints.inputs = InlineVec::from_elem(InputConstraint::Anywhere, node.inputs.len());
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        Op::CallDirect { .. } | Op::CallNative { .. } if !node.inputs.is_empty() => {
-            constraints.temps = crate::codegen::DIRECT_CALL_TEMPS;
-            // NB: Calls in inlined callees return their result.
-            if node.repr.is_some() {
-                constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-            }
-        }
-        // Native accessor calls build the callee's frame in temps, and return
-        // the result.
-        Op::CallNativeAccessor { .. } => {
-            constraints.temps = crate::codegen::DIRECT_CALL_TEMPS;
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        // The object, its shape and the cache entry.
-        Op::ProbePropertyCache { .. } | Op::ProbeKeyedCache { .. } => constraints.temps = 3,
-        // Those, and the named property storage of property additions.
-        Op::ProbeKeyedStore { .. } | Op::ProbePropertyStore { .. } => constraints.temps = 4,
-        // The cache, the global declarative environment, the global object
-        // and a temp.
-        Op::ProbeGlobalCache { .. } | Op::ProbeGlobalStore { .. } => constraints.temps = 4,
-        // The object or its elements, and the keyed cache's registers.
-        Op::ProbeHasProperty { .. } => constraints.temps = 3,
-        // The address of the object.
-        Op::Branch {
-            condition: BranchCondition::ElementsKind(_),
-            ..
-        } => constraints.temps = 1,
-        // NB: Slow path calls read their operands from where they are.
-        Op::CallSlowPath { saves_registers, .. } => {
-            constraints.inputs = InlineVec::from_elem(InputConstraint::Anywhere, node.inputs.len());
-            // NB: A call's value is moved into the return register once its
-            //     slow path continued, where a conditional jump's control
-            //     word is.
-            if !saves_registers && node.repr.is_some() {
-                constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-            }
-        }
-        // NB: The output comes from where the slow path call left it.
-        Op::SlowPathOutput { .. } => constraints.inputs = InlineVec::from_elem(InputConstraint::Anywhere, 1),
-        // The object, the property iterator cache, and a temp.
-        Op::Branch {
-            condition: BranchCondition::PropertyIteratorCacheValid,
-            ..
-        } => constraints.temps = 3,
-        // The binding's index, and a temp; the environment's shape and the
-        // binding's index.
-        Op::Branch {
-            condition: BranchCondition::BindingMutable { .. } | BranchCondition::NextBindingOfShape { .. },
-            ..
-        } => constraints.temps = 2,
-        // The array's prototypes.
-        Op::Branch {
-            condition: BranchCondition::HoleFillableArray,
-            ..
-        } => constraints.temps = 1,
-        // The environment's binding values (and their count).
-        Op::StoreEnvironmentBinding { .. } | Op::AppendEnvironmentBinding => constraints.temps = 1,
-        // The array, then its prototypes.
-        Op::CheckAppendableArray => constraints.temps = 2,
-        // The object's prototypes.
-        Op::Branch {
-            condition: BranchCondition::PlainArrayPrototypeChain,
-            ..
-        } => constraints.temps = 1,
-        // The object's shape.
-        Op::Branch {
-            condition: BranchCondition::ArrayWithRealmArrayPrototypeAndNoNamedProperties,
-            ..
-        } => constraints.temps = 1,
-        // The object's elements.
-        Op::LoadElementsCapacity | Op::AppendElement => constraints.temps = 1,
-        // The object, then its elements or element address.
-        Op::CheckElements { .. }
-        | Op::CheckTypedArray
-        | Op::CheckArray
-        | Op::CheckIdentityComparable
-        | Op::CheckClosure { .. } => {
-            constraints.temps = 1;
-        }
-        // The elements or the element address.
-        Op::LoadElementAt { .. } => {
-            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
-            constraints.temps = 1;
-        }
-        // NB: Stores of integer and tagged constants store immediates.
-        Op::StoreElementAt { kind } => {
-            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
-            if kind.stored_repr() != Repr::Float64 {
-                constraints.inputs[2] = InputConstraint::RegisterOrConstant;
-            }
-            constraints.temps = 1;
-        }
-        Op::CheckBounds => {
-            constraints.inputs[0] = InputConstraint::RegisterOrConstant;
-            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
-        }
-        // The heap and a value.
-        Op::AllocateObject { .. } => constraints.temps = 2,
-        // The object's property storage.
-        Op::InitializeNamed { .. } => constraints.temps = 1,
-        // The element storage and a value.
-        Op::AllocateArray { .. } => constraints.temps = 2,
-        // The function and a value.
-        Op::AllocateFunction { .. } | Op::AllocateEnvironment { .. } => constraints.temps = 2,
-        // The array's elements.
-        Op::InitializeElement { .. } => constraints.temps = 1,
-        // The function object.
-        Op::Branch {
-            condition: BranchCondition::Builtin(_),
-            ..
-        } => constraints.temps = 1,
-        _ => {}
+/// The slot of the compiled function's frame that holds `value` wherever it is live, if there is one: a value loaded
+/// from one of the slots whose frame memory never changes (`Graph::unwritten_slots`).
+///
+/// OPTIMIZATION: Such a value needs no spill slot, and no store right after its definition: where no register holds
+///               it, it is reloaded from the frame. Exits find it there too (`code::ValueLocation::Frame`).
+pub fn frame_home(graph: &Graph, value: NodeId) -> Option<u32> {
+    match graph.node(value).op {
+        Op::LoadSlot { slot } if graph.is_unwritten_slot(slot) => Some(slot),
+        _ => None,
     }
-    constraints
 }
 
 /// Assigns locations to the values of `graph`. The verifier checks the
@@ -611,7 +389,7 @@ impl<'a> Allocator<'a> {
             {
                 let live_in = self.liveness.live_in[index].iter().collect::<Vec<_>>();
                 for value in live_in {
-                    self.ensure_spill_slot(NodeId::from_index(value));
+                    self.ensure_home(NodeId::from_index(value));
                 }
             }
         }
@@ -675,6 +453,14 @@ impl<'a> Allocator<'a> {
         };
         self.allocation.nodes[value.index()].spill_slot = Some(slot);
         slot
+    }
+
+    /// Makes sure that `value` is available outside of registers: in its frame slot (see `frame_home()`), or in a
+    /// spill slot.
+    fn ensure_home(&mut self, value: NodeId) {
+        if frame_home(self.graph, value).is_none() {
+            self.ensure_spill_slot(value);
+        }
     }
 
     fn set_contents(&mut self, contents: Vec<Option<NodeId>>) {
@@ -778,10 +564,10 @@ impl<'a> Allocator<'a> {
     }
 
     /// Removes the value in `register` from it. The value stays available in
-    /// its spill slot, which it gets if it had none.
+    /// its frame slot or its spill slot, which it gets if it had none.
     fn evict(&mut self, register: u8) {
         if let Some(value) = self.contents[register as usize] {
-            self.ensure_spill_slot(value);
+            self.ensure_home(value);
             self.free_register(register);
         }
     }
@@ -841,6 +627,9 @@ impl<'a> Allocator<'a> {
         if let Some(register) = self.value_registers[value.index()] {
             return Location::Register(register);
         }
+        if let Some(slot) = frame_home(self.graph, value) {
+            return Location::Frame(slot);
+        }
         let slot = self.allocation.nodes[value.index()]
             .spill_slot
             .unwrap_or_else(|| panic!("v{} is neither in a register nor spilled", value.0));
@@ -866,17 +655,27 @@ impl<'a> Allocator<'a> {
     fn allocate_node(&mut self, node_id: NodeId) {
         let node = self.graph.node(node_id);
         self.position = self.liveness.positions[node_id.index()];
-        let constraints = constraints(node, self.registers);
+        let constraints = lowering_info(node);
+        let input_constraints = constraints
+            .inputs
+            .iter()
+            .zip(&node.inputs)
+            .map(|(constraint, input)| {
+                self.registers
+                    .resolve(*constraint, self.graph.constant_value(*input).is_some())
+            })
+            .collect::<InlineVec<_, 4>>();
         let mut moves = Vec::new();
         let mut blocked = RegisterMask::default();
         let mut inputs = InlineVec::from_elem(Location::Register(0), node.inputs.len());
 
         // Fixed register inputs first, so that inputs in any register do not
         // take their registers.
-        for (index, (input, constraint)) in node.inputs.iter().zip(&constraints.inputs).enumerate() {
-            let InputConstraint::FixedRegister(register) = *constraint else {
+        for (index, (input, constraint)) in node.inputs.iter().zip(&input_constraints).enumerate() {
+            let InputConstraint::Fixed(register) = *constraint else {
                 continue;
             };
+            let register = self.registers.fixed(register);
             let is_value = is_allocated_value(self.graph, *input);
             if !is_value || self.value_registers[input.index()] != Some(register) {
                 debug_assert!(!blocked.contains(register), "two inputs need the same register");
@@ -900,7 +699,7 @@ impl<'a> Allocator<'a> {
             blocked = blocked.with(register);
             inputs[index] = Location::Register(register);
         }
-        for (index, (input, constraint)) in node.inputs.iter().zip(&constraints.inputs).enumerate() {
+        for (index, (input, constraint)) in node.inputs.iter().zip(&input_constraints).enumerate() {
             if *constraint == InputConstraint::RegisterOrConstant
                 && let Some(bits) = self.graph.constant_value(*input)
             {
@@ -911,7 +710,7 @@ impl<'a> Allocator<'a> {
                 inputs[index] = self.current_location(*input);
                 continue;
             }
-            if matches!(constraint, InputConstraint::FixedRegister(_)) {
+            if matches!(constraint, InputConstraint::Fixed(_)) {
                 continue;
             }
             let register = match self.value_registers[input.index()] {
@@ -945,7 +744,7 @@ impl<'a> Allocator<'a> {
         let first_input_register = match inputs.first() {
             Some(Location::Register(register))
                 if node.frame_state.is_none()
-                    && reuses_first_input(&node.op)
+                    && constraints.reuses_first_input
                     && is_allocated_value(self.graph, node.inputs[0])
                     && self.liveness.dies_at[node_id.index()].contains(&node.inputs[0])
                     && RegisterClass::of_register(*register) == RegisterClass::of(node.repr)
@@ -964,24 +763,24 @@ impl<'a> Allocator<'a> {
             OutputConstraint::Register => Some(
                 first_input_register.unwrap_or_else(|| allocator.pick_register(blocked, RegisterClass::of(node.repr))),
             ),
-            OutputConstraint::FixedRegister(register) => {
-                debug_assert!(constraints.is_call || !blocked.contains(register));
+            OutputConstraint::Return => {
+                let register = allocator.registers.return_gpr;
+                debug_assert!(constraints.clobbers == Clobbers::CallerSaved || !blocked.contains(register));
                 allocator.evict(register);
                 Some(register)
             }
         };
-        let clobbered = if constraints.is_call {
-            self.registers.caller_saved()
-        } else if saves_only_gprs(&node.op) {
-            self.registers.allocatable(RegisterClass::Float)
-        } else {
-            RegisterMask::default()
+        let clobbered = match constraints.clobbers {
+            Clobbers::CallerSaved => self.registers.caller_saved(),
+            Clobbers::Floats => self.registers.allocatable(RegisterClass::Float),
+            Clobbers::Nothing => RegisterMask::default(),
         };
         {
             for register in clobbered.iter() {
                 if let Some(value) = self.contents.get(register as usize).copied().flatten() {
                     debug_assert!(
                         self.allocation.nodes[value.index()].spill_slot.is_some()
+                            || frame_home(self.graph, value).is_some()
                             || !self.is_live_after(value, node_id),
                         "v{} is live across a call that clobbers its register without a spill slot",
                         value.0
@@ -1006,7 +805,7 @@ impl<'a> Allocator<'a> {
         if let Some(register) = output {
             self.assign_register(register, node_id);
             if self.liveness.needs_spill.contains(node_id.index()) {
-                self.ensure_spill_slot(node_id);
+                self.ensure_home(node_id);
             }
             if self.liveness.dead_outputs.contains(node_id.index()) {
                 self.free_register(register);
@@ -1142,6 +941,7 @@ pub fn dump_allocation(graph: &Graph, allocation: &Allocation) -> String {
         Location::Register(register) => format!("r{register}"),
         Location::Stack(slot) => format!("s{slot}"),
         Location::Constant(bits) => format!("#{}", crate::ir::value::describe(*bits)),
+        Location::Frame(slot) => format!("frame{slot}"),
     };
     let moves_text = |moves: &[Move]| {
         moves

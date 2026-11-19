@@ -28,11 +28,11 @@ pub const NO_YIELD_CONTINUATION: u32 = u32::MAX;
 
 /// The `kind` of a `CreateArguments` that creates a mapped arguments object
 /// (`ArgumentsKind::Mapped` in `Libraries/LibJS/ABI`).
-pub const MAPPED_ARGUMENTS: u32 = 0;
+pub const MAPPED_ARGUMENTS: u8 = 0;
 
 /// The `kind` of a `PutByValue` or `PutById` of a plain assignment
 /// (`PutKind::Normal` in `Libraries/LibJS/ABI`).
-pub const PUT_KIND_NORMAL: u32 = 0;
+pub const PUT_KIND_NORMAL: u8 = 0;
 
 /// How an executable's flat slot indices are partitioned. Operands index the
 /// frame's value array laid out as `[registers | locals | constants | arguments]`.
@@ -196,7 +196,7 @@ pub(crate) mod test_support {
 
         let mut bytes = Vec::new();
         for instruction in build(&|index| Label(offsets[index])) {
-            instruction.encode(false, &mut bytes);
+            instruction.encode(&mut bytes);
         }
         assert_eq!(bytes.len(), offset as usize);
 

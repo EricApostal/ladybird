@@ -15,7 +15,7 @@
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <AK/Weakable.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCompositing/DisplayList/DisplayListResources.h>
 #include <LibCompositing/Types.h>
 #include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibGfx/Bitmap.h>
@@ -29,12 +29,16 @@
 #include <LibWeb/Forward.h>
 #include <LibWebCommon/Page/InputTrace.h>
 
+namespace Web::Layout::RustFFI {
+
+struct DocumentHost;
+struct FfiImageRasterization;
+
+}
+
 namespace Web::Compositor {
 
-class CompositorFrameSink;
 class CompositorHost;
-class NavigablePresenter;
-struct CompositorFrame;
 
 // Whether the compositor took a requested screenshot, so painted the bitmap the request handed it.
 enum class ScreenshotResult : u8 {
@@ -101,6 +105,7 @@ public:
     bool request_rendering_opportunity(double maximum_frames_per_second);
     void hurry_rendering_opportunity();
     void request_screenshot(NonnullRefPtr<Gfx::Bitmap>, Function<void(ScreenshotResult)>&& callback);
+    void prepare_remote_descendants_for_screenshot(Function<void()>&& callback);
     // Sends the canvas commands a frame may sample ahead of it, and answers whether the compositor can be reached.
     bool ready_for_frame();
 
@@ -136,9 +141,12 @@ public:
     void commit_placeholder_canvas(PlaceholderCanvasLink, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize, bool origin_clean);
     PlaceholderCanvasPixels read_placeholder_canvas_pixels(Compositing::CanvasId, Gfx::IntRect);
 
-    // Has the compositor draw a display list that belongs to no compositor context into the target, which must be a
-    // shareable BGRA8888 bitmap with premultiplied alpha. Returns false if nothing was drawn.
-    bool rasterize_display_list(Compositing::DisplayListResource const&, Compositing::DisplayListResourceStorage const&, NonnullRefPtr<Gfx::Bitmap> target) const;
+    // Has the compositor draw an image into the target, which must be a shareable BGRA8888 bitmap with premultiplied
+    // alpha. Returns false if nothing was drawn.
+    bool rasterize_image(Layout::RustFFI::FfiImageRasterization const&, NonnullRefPtr<Gfx::Bitmap> target) const;
+    // Has the compositor draw the recording the document of the host took in last into the target, a bitmap as
+    // rasterize_image() takes, the size of the document's viewport. Returns false if nothing was drawn.
+    bool rasterize_last_recording(Layout::RustFFI::DocumentHost const&, Layout::BegunRead const&, NonnullRefPtr<Gfx::Bitmap> target) const;
 
     void destroy_context(Web::CompositorContextId);
     void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>);
@@ -153,7 +161,8 @@ public:
     // A new compositor process has heard of none of the images.
     void register_animated_images_with_new_compositor();
 
-    void add_video_sink(Media::VideoSinkHandle, NonnullRefPtr<Compositing::VideoFramePresentationPage>);
+    // Returns whether a compositor heard of the sink, which one that connects later will not have.
+    [[nodiscard]] bool add_video_sink(Media::VideoSinkHandle, NonnullRefPtr<Compositing::VideoFramePresentationPage>);
     void remove_video_sink(Media::VideoSinkHandle);
     void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
     Compositing::VideoFrameHold::ReleaseThroughCompositor video_frame_hold_releaser_for_current_connection() const;
@@ -173,6 +182,7 @@ public:
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
     void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void(ScreenshotResult)>&& callback);
+    void prepare_remote_descendants_for_screenshot(Web::CompositorContextId, Function<void()>&& callback);
 
 protected:
     CompositorHost();

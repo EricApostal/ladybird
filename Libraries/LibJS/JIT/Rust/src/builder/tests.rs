@@ -217,15 +217,15 @@ fn straight_line_code_renames_moves_and_passes_values_to_slow_paths() {
         &dump_of(&program),
         "
         [[B0]]:
+          [[V5]] = LoadSlot a0
           Jump [[B1]]
         [[B1]] (pc 0) <- [[B0]]:
-          [[V5]] = LoadSlot a0
           InitializeFrame
-          [[V6]] = CallSlowPath Exp @40 (#10, [[V5]]) [[[FS0]]]
+          [[V6]] = CallSlowPath Exp @7 (#10, [[V5]]) [[[FS0]]]
           [[V7]] = EmptyToUndefined ([[V6]])
           Return ([[V7]])
         frame states:
-          [[FS0]]: pc 40 after -> r7 {} frame [r7]
+          [[FS0]]: pc 7 after -> r7 {} frame [r7]
         ",
     );
 }
@@ -256,10 +256,10 @@ fn if_else_merges_with_phis() {
         &dump_of(&program),
         "
         [[B0]]:
+          [[V2]] = LoadSlot r5
+          [[V1]] = LoadSlot a0
           Jump [[B1]]
         [[B1]] (pc 0) <- [[B0]]:
-          [[V1]] = LoadSlot a0
-          [[V2]] = LoadSlot r5
           BranchTruthy ([[V2]]) -> [[B2]], [[B3]], fallback [[B4]]
         [[B2]] <- [[B1]]:
           Jump [[B8]]
@@ -272,17 +272,17 @@ fn if_else_merges_with_phis() {
           Jump [[B8]]
         [[B6]] <- [[B4]]:
           Jump [[B7]]
-        [[B7]] (pc 56) <- [[B3]], [[B6]]:
+        [[B7]] (pc 21) <- [[B3]], [[B6]]:
           Jump [[B9]]
-        [[B8]] (pc 32) <- [[B2]], [[B5]]:
+        [[B8]] (pc 13) <- [[B2]], [[B5]]:
           Jump [[B9]]
-        [[B9]] (pc 72) <- [[B7]], [[B8]]:
+        [[B9]] (pc 24) <- [[B7]], [[B8]]:
           [[V14]] = Phi (#10, #0)
-          [[V15]] = CallSlowPath Exp @72 ([[V14]], [[V1]]) [[[FS0]]]
+          [[V15]] = CallSlowPath Exp @24 ([[V14]], [[V1]]) [[[FS0]]]
           [[V16]] = EmptyToUndefined ([[V15]])
           Return ([[V16]])
         frame states:
-          [[FS0]]: pc 72 after -> r6 {} frame [r6]
+          [[FS0]]: pc 24 after -> r6 {} frame [r6]
         ",
     );
 }
@@ -302,17 +302,17 @@ fn writes_to_constant_operands_go_to_the_frame() {
         &dump_of(&program),
         "
         [[B0]]:
+          [[V1]] = LoadSlot a0
           Jump [[B1]]
         [[B1]] (pc 0) <- [[B0]]:
-          [[V1]] = LoadSlot a0
           StoreSlot c0 ([[V1]])
           [[V3]] = LoadSlot c0
-          CallSlowPath ToString @16 ([[V3]]) [[[FS0]]]
+          CallSlowPath ToString @3 ([[V3]]) [[[FS0]]]
           [[V5]] = LoadSlot c1
           [[V6]] = EmptyToUndefined ([[V5]])
           Return ([[V6]])
         frame states:
-          [[FS0]]: pc 16 after -> c1 {}
+          [[FS0]]: pc 3 after -> c1 {}
         ",
     );
 }
@@ -447,42 +447,42 @@ fn nested_loops_get_phis_for_slots_slow_paths_assign() {
         &dump_of(&program),
         "
         [[B0]]:
+          [[V7]] = LoadSlot a0
           Jump [[B1]]
         [[B1]] (pc 0) <- [[B0]]:
-          [[V7]] = LoadSlot a0
           Jump [[B2]]
-        [[B2]] (pc 24) <- [[B1]], [[B10]] loop:
+        [[B2]] (pc 4) <- [[B1]], [[B10]] loop:
           [[V6]] = Phi (#0, [[V20]])
           EnsureFrameInitialized
-          [[V8]]:int32 = CallSlowPath JumpLessThan @24 ([[V6]], [[V7]]) [[[FS0]]]
-          BranchOnPc @48 ([[V8]]) -> [[B3]], [[B4]]
+          [[V8]]:int32 = CallSlowPath JumpLessThan @4 ([[V6]], [[V7]]) [[[FS0]]]
+          BranchOnPc @17 ([[V8]]) -> [[B3]], [[B4]]
         [[B3]] <- [[B2]]:
           Jump [[B6]]
         [[B4]] <- [[B2]]:
           Jump [[B5]]
-        [[B5]] (pc 136) <- [[B4]]:
+        [[B5]] (pc 55) <- [[B4]]:
           Return ([[V6]])
-        [[B6]] (pc 48) <- [[B3]]:
+        [[B6]] (pc 17) <- [[B3]]:
           Jump [[B7]]
-        [[B7]] (pc 64) <- [[B6]], [[B11]] loop:
+        [[B7]] (pc 20) <- [[B6]], [[B11]] loop:
           [[V14]] = Phi (#0, [[V22]])
-          [[V15]]:int32 = CallSlowPath JumpLessThan @64 ([[V14]], [[V7]]) [[[FS1]]]
-          BranchOnPc @88 ([[V15]]) -> [[B8]], [[B9]]
+          [[V15]]:int32 = CallSlowPath JumpLessThan @20 ([[V14]], [[V7]]) [[[FS1]]]
+          BranchOnPc @33 ([[V15]]) -> [[B8]], [[B9]]
         [[B8]] <- [[B7]]:
           Jump [[B11]]
         [[B9]] <- [[B7]]:
           Jump [[B10]]
-        [[B10]] (pc 112) <- [[B9]]:
-          [[V20]] = CallSlowPath Exp @112 ([[V6]], #10) [[[FS2]]]
+        [[B10]] (pc 44) <- [[B9]]:
+          [[V20]] = CallSlowPath Exp @44 ([[V6]], #10) [[[FS2]]]
           Jump [[B2]]
-        [[B11]] (pc 88) <- [[B8]]:
-          [[V22]] = CallSlowPath Exp @88 ([[V14]], #10) [[[FS3]]]
+        [[B11]] (pc 33) <- [[B8]]:
+          [[V22]] = CallSlowPath Exp @33 ([[V14]], #10) [[[FS3]]]
           Jump [[B7]]
         frame states:
-          [[FS0]]: pc 24 after {r5=[[V6]]} frame [a0]
-          [[FS1]]: pc 64 after {r5=[[V6]], r6=[[V14]]} frame [a0]
-          [[FS2]]: pc 112 after -> r5 {r5=[[V6]]} frame [a0]
-          [[FS3]]: pc 88 after -> r6 {r5=[[V6]], r6=[[V14]]} frame [a0]
+          [[FS0]]: pc 4 after {r5=[[V6]]} frame [a0]
+          [[FS1]]: pc 20 after {r5=[[V6]], r6=[[V14]]} frame [a0]
+          [[FS2]]: pc 44 after -> r5 {r5=[[V6]]} frame [a0]
+          [[FS3]]: pc 33 after -> r6 {r5=[[V6]], r6=[[V14]]} frame [a0]
         ",
     );
 }
@@ -505,9 +505,9 @@ fn truthiness_values_and_tag_branches() {
         &dump_of(&program),
         "
         [[B0]]:
+          [[V1]] = LoadSlot a0
           Jump [[B1]]
         [[B1]] (pc 0) <- [[B0]]:
-          [[V1]] = LoadSlot a0
           BranchTruthy ([[V1]]) -> [[B2]], [[B3]], fallback [[B4]]
         [[B2]] <- [[B1]]:
           Jump [[B7]]
@@ -527,9 +527,9 @@ fn truthiness_values_and_tag_branches() {
           Jump [[B11]]
         [[B9]] <- [[B7]]:
           Jump [[B10]]
-        [[B10]] (pc 40) <- [[B9]]:
+        [[B10]] (pc 15) <- [[B9]]:
           Return ([[V1]])
-        [[B11]] (pc 32) <- [[B8]]:
+        [[B11]] (pc 13) <- [[B8]]:
           Return ([[V11]])
         ",
     );
@@ -612,7 +612,7 @@ fn numeric_feedback_and_failed_speculations_use_double_arithmetic() {
     );
     assert!(!text.contains("CallSlowPath"), "{text}");
     // An overflow at the addition: it adds doubles.
-    let text = counting_loop(1, vec![(48, ExitKind::Overflow)]);
+    let text = counting_loop(1, vec![(17, ExitKind::Overflow)]);
     assert!(text.contains("Int32LessThan"), "{text}");
     assert!(text.contains("Float64Add") && !text.contains("Int32Add"), "{text}");
 }
@@ -701,12 +701,12 @@ fn instructions_that_never_ran_exit_with_the_live_values() {
         &dump(&graph, &test_layout()),
         "
         [[B0]]:
+          [[V2]] = LoadSlot a0
           Jump [[B1]]
         [[B1]] (pc 0) <- [[B0]]:
-          [[V2]] = LoadSlot a0
           Exit NoFeedback [[[FS0]]]
         frame states:
-          [[FS0]]: pc 32 at {r5=#10, r6=[[V2]]}
+          [[FS0]]: pc 6 at {r5=#10, r6=[[V2]]}
         ",
     );
 }
@@ -717,13 +717,11 @@ fn calls_write_back_their_arguments_and_values_survive_them() {
         vec![
             Instruction::Mov { dst: r(6), src: a(0) },
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(7),
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                expression_string: None,
                 arguments: vec![r(6)],
             },
             Instruction::Mov { dst: l(0), src: r(7) },
@@ -734,14 +732,14 @@ fn calls_write_back_their_arguments_and_values_survive_them() {
         &dump_of(&program),
         "
         [[B0]]:
+          [[V2]] = LoadSlot r5
+          [[V1]] = LoadSlot a0
           Jump [[B1]]
         [[B1]] (pc 0) <- [[B0]]:
-          [[V1]] = LoadSlot a0
-          [[V2]] = LoadSlot r5
-          [[V3]] = CallSlowPath Call @16 ([[V2]], [[V2]], [[V1]]) [[[FS0]]]
+          [[V3]] = CallSlowPath Call @3 ([[V2]], [[V2]], [[V1]]) [[[FS0]]]
           Return ([[V1]])
         frame states:
-          [[FS0]]: pc 16 after -> r7 {r6=[[V1]]} frame [r7]
+          [[FS0]]: pc 3 after -> r7 {r6=[[V1]]} frame [r7]
         ",
     );
 }
@@ -770,14 +768,52 @@ fn trivial_frame_operations_are_native() {
         [[B1]] (pc 0) <- [[B0]]:
           [[V1]]:pointer = LoadFrameField LexicalEnvironment
           [[V2]] = BoxCell ([[V1]])
-          StoreSlot r3 (#undefined)
           [[V5]] = IsCallable ([[V2]])
           [[V6]]:pointer = SetLexicalEnvironment ([[V2]])
           LeavePrivateEnvironment
-          CallSlowPath Throw @104 ([[V5]]) [[[FS0]]]
+          CallSlowPath Throw @21 ([[V5]]) [[[FS0]]]
           Unreachable
         frame states:
-          [[FS0]]: pc 104 after {}
+          [[FS0]]: pc 21 after {r3=#undefined}
+        ",
+    );
+}
+
+#[test]
+fn reserved_registers_hold_values_like_other_registers() {
+    // A slow path gives its output as a value, also where it writes a reserved register, and frame states list the
+    // value, which frame memory does not hold.
+    let program = assemble(|_| {
+        vec![
+            Instruction::Exp {
+                arith_feedback: 0,
+                dst: r(4),
+                lhs: a(0),
+                rhs: a(0),
+            },
+            Instruction::Exp {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: r(4),
+                rhs: a(0),
+            },
+            Instruction::Return { value: r(4) },
+        ]
+    });
+    assert_dump(
+        &dump_of(&program),
+        "
+        [[B0]]:
+          [[A]] = LoadSlot a0
+          Jump [[B1]]
+        [[B1]] (pc 0) <- [[B0]]:
+          [[X]] = CallSlowPath Exp @0 ([[A]], [[A]]) [[[FS0]]]
+          [[Y]] = CallSlowPath Exp @6 ([[X]], [[A]]) [[[FS1]]]
+          [[RESULT]] = EmptyToUndefined ([[X]])
+          Return ([[RESULT]])
+        frame states:
+          [[FS0]]: pc 0 after -> r4 {} frame [a0]
+          [[FS1]]: pc 6 after -> r5 {r4=[[X]]}
         ",
     );
 }
@@ -794,11 +830,9 @@ pub(crate) mod property_access {
 
     pub(crate) fn get_by_id(dst: Operand, base: Operand, cache: u32) -> Instruction {
         Instruction::GetById {
-            value_feedback: 0,
             dst,
             base,
             property: PropertyKeyTableIndex(0),
-            base_identifier: None,
             cache,
         }
     }
@@ -810,7 +844,6 @@ pub(crate) mod property_access {
             src,
             kind: 0,
             cache,
-            base_identifier: None,
         }
     }
 
@@ -886,9 +919,9 @@ pub(crate) mod property_access {
             &dump_with_caches(&program, caches, Vec::new()),
             "
             [[B0]]:
+              [[V1]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V1]] = LoadSlot a0
               CheckObject ([[V1]]) [[[FS0]]]
               [[V3]]:pointer = CellAddress ([[V1]])
               CheckShape [0x100] ([[V1]], [[V3]]) [[[FS0]]]
@@ -898,7 +931,7 @@ pub(crate) mod property_access {
               Return ([[V17]])
             frame states:
               [[FS0]]: pc 0 at {} frame [a0]
-              [[FS1]]: pc 48 at {r5=[[V6]], r6=[[V6]]} frame [a0]
+              [[FS1]]: pc 14 at {r5=[[V6]], r6=[[V6]]} frame [a0]
             ",
         );
     }
@@ -921,9 +954,9 @@ pub(crate) mod property_access {
             &dump_with_caches(&program, caches, Vec::new()),
             "
             [[B0]]:
+              [[V1]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V1]] = LoadSlot a0
               CheckObject ([[V1]]) [[[FS0]]]
               [[V3]]:pointer = CellAddress ([[V1]])
               CheckShape [0x100, 0x200] ([[V1]], [[V3]]) [[[FS0]]]
@@ -941,7 +974,7 @@ pub(crate) mod property_access {
               Return ([[V19]])
             frame states:
               [[FS0]]: pc 0 at {} frame [a0]
-              [[FS1]]: pc 24 at {r5=[[V6]]} frame [a0]
+              [[FS1]]: pc 7 at {r5=[[V6]]} frame [a0]
             ",
         );
     }
@@ -1028,9 +1061,9 @@ pub(crate) mod property_access {
             &dump_with_caches(&program, vec![cache(vec![entry])], Vec::new()),
             "
             [[B0]]:
+              [[V1]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V1]] = LoadSlot a0
               CheckObject ([[V1]]) [[[FS0]]]
               [[V3]]:pointer = CellAddress ([[V1]])
               CheckShape [0x100@3] ([[V1]], [[V3]]) [[[FS0]]]
@@ -1087,11 +1120,9 @@ pub(crate) mod property_access {
         let get_length = assemble(|_| {
             vec![
                 Instruction::GetLength {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(5),
                     base: a(0),
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: r(5) },
@@ -1248,9 +1279,9 @@ pub(crate) mod property_access {
             &dump_with_caches(&program, vec![cache(vec![entry])], Vec::new()),
             "
             [[B0]]:
+              [[V1]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V1]] = LoadSlot a0
               CheckObject ([[V1]]) [[[FS0]]]
               [[V3]]:pointer = CellAddress ([[V1]])
               CheckShape [0x100] ([[V1]], [[V3]]) [[[FS0]]]
@@ -1276,12 +1307,10 @@ pub(crate) mod property_access {
 
     fn get_by_value(dst: Operand, base: Operand, property: Operand) -> Instruction {
         Instruction::GetByValue {
-            value_feedback: 0,
             keyed_feedback: 0,
             dst,
             base,
             property,
-            base_identifier: None,
             cache: 0,
         }
     }
@@ -1351,7 +1380,7 @@ pub(crate) mod property_access {
             (1 | (1 << 5) | (1 << 9), Vec::new()),
             (
                 1 | (1 << 5),
-                vec![(0, ExitKind::BadElements), (32, ExitKind::OutOfBounds)],
+                vec![(0, ExitKind::BadElements), (8, ExitKind::OutOfBounds)],
             ),
         ] {
             let text = dump_element_loads(bits, exit_sites);
@@ -1407,9 +1436,9 @@ pub(crate) mod property_access {
             &dump_keyed(&program, vec![other_key, keyed(GetOwnProperty, 2)], Vec::new()),
             "
             [[B0]]:
+              [[V2]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V2]] = LoadSlot a0
               CheckObject ([[V2]]) [[[FS0]]]
               [[V4]]:pointer = CellAddress ([[V2]])
               CheckShape [0x100] ([[V2]], [[V4]]) [[[FS0]]]
@@ -1444,7 +1473,6 @@ pub(crate) mod property_access {
                     property: c(1),
                     src: c(0),
                     kind: 0,
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: a(0) },
@@ -1466,7 +1494,6 @@ pub(crate) mod property_access {
                     property: c(1),
                     src: r(6),
                     kind: 0,
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: a(0) },
@@ -1546,23 +1573,23 @@ pub(crate) mod property_access {
             &dump_with_caches(&program, caches, Vec::new()),
             "
             [[B0]]:
+              [[V13]] = LoadSlot l1
+              [[V1]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V1]] = LoadSlot a0
               CheckObject ([[V1]]) [[[FS0]]]
               [[V4]]:pointer = CellAddress ([[V1]])
               CheckShape [0x100] ([[V1]], [[V4]]) [[[FS0]]]
               StoreNamed +2 ([[V1]], #10, [[V4]]) [[[FS0]]]
-              [[V13]] = LoadSlot l1
-              [[V14]] = CallSlowPath Exp @56 ([[V13]], #10) [[[FS1]]]
+              [[V14]] = CallSlowPath Exp @15 ([[V13]], #10) [[[FS1]]]
               CheckShape [0x100] ([[V1]], [[V4]]) [[[FS2]]]
               [[V19]] = LoadNamed +2 ([[V1]], [[V4]]) [[[FS2]]]
               [[V20]] = EmptyToUndefined ([[V19]])
               Return ([[V20]])
             frame states:
               [[FS0]]: pc 0 at {} frame [l1, a0]
-              [[FS1]]: pc 56 after -> l1 {r5=#10} frame [a0]
-              [[FS2]]: pc 72 at {r5=#10} frame [a0]
+              [[FS1]]: pc 15 after -> l1 {r5=#10} frame [a0]
+              [[FS2]]: pc 21 at {r5=#10} frame [a0]
             ",
         );
     }
@@ -1579,13 +1606,16 @@ pub(crate) mod property_access {
                 Instruction::Return { value: r(7) },
             ]
         });
-        let missing = own(PropertyCacheEntryType::GetMissingProperty, 0x100, 1);
+        let shapeless = PropertyCacheEntrySnapshot {
+            shape: None,
+            ..own(GetOwnProperty, 0x100, 1)
+        };
         let megamorphic = PropertyCacheSnapshot {
             kind: PropertyCacheKind::Megamorphic,
             entries: vec![own(GetOwnProperty, 0x100, 1)],
         };
         let caches = vec![
-            cache(vec![missing]),
+            cache(vec![shapeless]),
             megamorphic,
             cache(vec![own(GetOwnProperty, 0x100, 1)]),
             cache(vec![own(PropertyCacheEntryType::AddOwnProperty, 0x100, 1)]),
@@ -1627,19 +1657,19 @@ pub(crate) mod inlining {
 
     pub(crate) fn call(dst: Operand, callee: Operand, this_value: Operand, arguments: Vec<Operand>) -> Instruction {
         Instruction::Call {
-            value_feedback: 0,
             call_feedback: 0,
             dst,
             callee,
             this_value,
             argument_count: u32::try_from(arguments.len()).unwrap(),
-            expression_string: None,
             arguments,
         }
     }
 
     pub(crate) fn function(strict: bool, uses_this: bool) -> InlinedFunctionSnapshot {
         InlinedFunctionSnapshot {
+            super_base: None,
+            has_own_new_target: true,
             function: CellId(CALLEE_FUNCTION),
             formal_parameter_count: 1,
             strict,
@@ -1830,9 +1860,9 @@ pub(crate) mod inlining {
             &dump_inlined(&caller(), &callee, function(true, false)),
             "
             [[B0]]:
+              [[V4]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V4]] = LoadSlot a0
               CheckValue 0xfff9000000005000 ([[V4]]) [[[FS0]]]
               Jump [[B2]]
             [[B2]] (pc 0) <- [[B1]]:
@@ -1840,7 +1870,7 @@ pub(crate) mod inlining {
             [[B3]] <- [[B2]]:
               Return (#10)
             frame states:
-              [[FS0]]: pc 8 at {} frame [a0]
+              [[FS0]]: pc 1 at {} frame [a0]
             ",
         );
     }
@@ -1864,22 +1894,22 @@ pub(crate) mod inlining {
             &dump_inlined(&caller(), &callee, function(true, false)),
             "
             [[B0]]:
+              [[V4]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V4]] = LoadSlot a0
               CheckValue 0xfff9000000005000 ([[V4]]) [[[FS0]]]
               Jump [[B2]]
             [[B2]] (pc 0) <- [[B1]]:
               PublishFrame
-              [[V9]] = CallSlowPath Exp @e1:8 (#10, #10) [[[FS2]]]
+              [[V9]] = CallSlowPath Exp @e1:1 (#10, #10) [[[FS2]]]
               [[V10]] = EmptyToUndefined ([[V9]])
               Jump [[B3]]
             [[B3]] <- [[B2]]:
               Return ([[V10]])
             frame states:
-              [[FS0]]: pc 8 at {} frame [a0]
-              [[FS1]]: pc 8 after -> r5 {}
-              [[FS2]]: e1 pc 8 after -> r5 {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r5=#empty} in [[FS1]]
+              [[FS0]]: pc 1 at {} frame [a0]
+              [[FS1]]: pc 1 after -> r5 {}
+              [[FS2]]: e1 pc 1 after -> r5 {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r5=#empty} in [[FS1]]
             ",
         );
 
@@ -1893,7 +1923,7 @@ pub(crate) mod inlining {
             ]
         });
         let text = dump_inlined(&caller(), &resolves_this, function(true, false));
-        assert!(text.contains("CallSlowPath ResolveThisBinding @e1:8 [fs2]"), "{text}");
+        assert!(text.contains("CallSlowPath ResolveThisBinding @e1:1 [fs2]"), "{text}");
         assert!(!text.contains("Generic"), "{text}");
     }
 
@@ -1953,7 +1983,7 @@ pub(crate) mod inlining {
             [[B3]] <- [[B2]], [[B7]]:
               [[V15]] = Phi ([[V9]], [[V12]])
               EnsureFrameInitialized
-              [[V16]] = CallSlowPath Add @48 ([[V6]], [[V15]]) [[[FS1]]]
+              [[V16]] = CallSlowPath Add @18 ([[V6]], [[V15]]) [[[FS1]]]
               BranchBindingMutable 2 ([[V5]]) -> [[B4]], [[B8]]
             [[B4]] <- [[B3]]:
               [[V20]] = LoadEnvironmentBinding 2 ([[V5]])
@@ -1965,19 +1995,19 @@ pub(crate) mod inlining {
               [[V29]] = EmptyToUndefined ([[V16]])
               Return ([[V29]])
             [[B7]] <- [[B1]] cold:
-              [[V12]] = CallSlowPath GetGlobal @32 [[[FS0]]]
+              [[V12]] = CallSlowPath GetGlobal @10 [[[FS0]]]
               Jump [[B3]]
             [[B8]] <- [[B3]] cold:
               Jump [[B10]]
             [[B9]] <- [[B4]] cold:
               Jump [[B10]]
             [[B10]] <- [[B8]], [[B9]] cold:
-              CallSlowPath SetLexicalBinding @64 ([[V16]]) [[[FS2]]]
+              CallSlowPath SetLexicalBinding @24 ([[V16]]) [[[FS2]]]
               Jump [[B6]]
             frame states:
-              [[FS0]]: pc 32 at {r5=[[V6]]}
-              [[FS1]]: pc 48 after -> r7 {} frame [r7]
-              [[FS2]]: pc 64 at {r7=[[V16]]}
+              [[FS0]]: pc 10 at {r5=[[V6]]}
+              [[FS1]]: pc 18 after -> r7 {} frame [r7]
+              [[FS2]]: pc 24 at {r7=[[V16]]}
             ",
         );
         // Inlined callees have constant ones: those of their function.
@@ -1985,9 +2015,9 @@ pub(crate) mod inlining {
             &dump_inlined(&caller(), &program(r(7)), function(true, false)),
             "
             [[B0]]:
+              [[V4]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V4]] = LoadSlot a0
               CheckValue 0xfff9000000005000 ([[V4]]) [[[FS0]]]
               Jump [[B2]]
             [[B2]] (pc 0) <- [[B1]]:
@@ -2000,7 +2030,7 @@ pub(crate) mod inlining {
             [[B4]] <- [[B3]], [[B9]]:
               [[V20]] = Phi ([[V14]], [[V17]])
               PublishFrame
-              [[V21]] = CallSlowPath Add @e1:48 ([[V11]], [[V20]]) [[[FS3]]]
+              [[V21]] = CallSlowPath Add @e1:18 ([[V11]], [[V20]]) [[[FS3]]]
               BranchBindingMutable 2 ([[V10]]) -> [[B5]], [[B10]]
             [[B5]] <- [[B4]]:
               [[V25]] = LoadEnvironmentBinding 2 ([[V10]])
@@ -2015,21 +2045,21 @@ pub(crate) mod inlining {
               Return ([[V34]])
             [[B9]] <- [[B2]] cold:
               PublishFrame
-              [[V17]] = CallSlowPath GetGlobal @e1:32 [[[FS2]]]
+              [[V17]] = CallSlowPath GetGlobal @e1:10 [[[FS2]]]
               Jump [[B4]]
             [[B10]] <- [[B4]] cold:
               Jump [[B12]]
             [[B11]] <- [[B5]] cold:
               Jump [[B12]]
             [[B12]] <- [[B10]], [[B11]] cold:
-              CallSlowPath SetLexicalBinding @e1:64 ([[V21]]) [[[FS4]]]
+              CallSlowPath SetLexicalBinding @e1:24 ([[V21]]) [[[FS4]]]
               Jump [[B7]]
             frame states:
-              [[FS0]]: pc 8 at {} frame [a0]
-              [[FS1]]: pc 8 after -> r5 {}
-              [[FS2]]: e1 pc 32 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r5=[[V11]]} in [[FS1]]
-              [[FS3]]: e1 pc 48 after -> r7 {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r7=#empty} in [[FS1]]
-              [[FS4]]: e1 pc 64 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r7=[[V21]]} in [[FS1]]
+              [[FS0]]: pc 1 at {} frame [a0]
+              [[FS1]]: pc 1 after -> r5 {}
+              [[FS2]]: e1 pc 10 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r5=[[V11]]} in [[FS1]]
+              [[FS3]]: e1 pc 18 after -> r7 {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r7=#empty} in [[FS1]]
+              [[FS4]]: e1 pc 24 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r7=[[V21]]} in [[FS1]]
             ",
         );
     }
@@ -2071,17 +2101,17 @@ pub(crate) mod inlining {
             &dump(&optimized_graph(&snapshot), &test_layout()),
             "
             [[B0]]:
+              [[V5]] = LoadSlot a0
               Jump [[B1]]
             [[B1]] (pc 0) <- [[B0]]:
-              [[V5]] = LoadSlot a0
               CheckValue 0xfff9000000005000 ([[V5]]) [[[FS0]]]
               Jump [[B2]]
             [[B2]] (pc 0) <- [[B1]]:
               Exit NoFeedback [[[FS2]]]
             frame states:
-              [[FS0]]: pc 24 at {r6=#0} frame [a0]
-              [[FS1]]: pc 24 after -> r5 {r6=#0}
-              [[FS2]]: e1 pc 24 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, l0=#10} in [[FS1]]
+              [[FS0]]: pc 4 at {r6=#0} frame [a0]
+              [[FS1]]: pc 4 after -> r5 {r6=#0}
+              [[FS2]]: e1 pc 4 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, l0=#10} in [[FS1]]
             ",
         );
     }
@@ -2142,8 +2172,8 @@ pub(crate) mod inlining {
         // The caller's `this` is loaded once, and the callee's flows through
         // the merge without being reloaded.
         let dump = dump_inlined(&caller, &callee, function(true, true));
-        assert!(dump.contains("v2 = LoadSlot r2\n"), "{dump}");
-        assert!(dump.contains("v16 = EmptyToUndefined (v2)\n"), "{dump}");
+        assert!(dump.contains("v3 = LoadSlot r2\n"), "{dump}");
+        assert!(dump.contains("v20 = EmptyToUndefined (v3)\n"), "{dump}");
         assert_eq!(dump.matches("LoadSlot r2").count(), 1, "{dump}");
     }
 
@@ -2219,8 +2249,8 @@ pub(crate) mod inlining {
         let mutual = dump(&optimized_graph(&snapshot), &test_layout());
         assert_eq!(mutual.matches("CallSlowPath Call").count(), 1, "{mutual}");
         assert!(mutual.contains("CallSlowPath Call @e2:"), "{mutual}");
-        assert_eq!(mutual.matches("e1 pc 8 after").count(), 3, "{mutual}");
-        assert_eq!(mutual.matches("e2 pc 8 after").count(), 3, "{mutual}");
+        assert_eq!(mutual.matches("e1 pc 1 after").count(), 3, "{mutual}");
+        assert_eq!(mutual.matches("e2 pc 1 after").count(), 3, "{mutual}");
 
         // A callee too big to inline.
         let big = assemble(|_| {
@@ -2370,7 +2400,7 @@ pub(crate) mod inlining {
         snapshot.executables[0].feedback.call[0].forwarded = Some(forwarded(Forwarding::Call));
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         // The function `call` is called on is checked, and gets the second argument.
-        assert!(text.contains("CheckValue 0xfff9000000005000 (v4)"), "{text}");
+        assert!(text.contains("CheckValue 0xfff9000000005000 (v6)"), "{text}");
         assert!(text.contains("Return (#10)"), "{text}");
 
         // A bound function in a0 called with c1, bound to 7.
@@ -2443,7 +2473,7 @@ pub(crate) mod inlining {
         let text = dump(&graph, &test_layout());
         // NB: The callee, the `this` value (the sloppy callee reads it) and
         //     the argument are inputs.
-        let expected = format!("CallDirect @{} (v4, #0, #10) [fs", caller().offsets[1]);
+        let expected = format!("CallDirect @{} (v6, #0, #10) [fs", caller().offsets[1]);
         assert!(text.contains(&expected), "{text}");
         // NB: The call's value is its result.
         assert!(!text.contains("LoadSlot r5"), "{text}");
@@ -2465,7 +2495,7 @@ pub(crate) mod inlining {
         many.executables[0].feedback.call[0].direct_call = Some(target);
         let text = dump(&optimized_graph(&many), &test_layout());
         let expected = format!(
-            "CallDirect @{} storing operands (v4, #0, #10, #10, #10, #10, #10, #10) [fs",
+            "CallDirect @{} storing operands (v6, #0, #10, #10, #10, #10, #10, #10) [fs",
             many_arguments.offsets[1]
         );
         assert!(text.contains(&expected), "{text}");
@@ -2490,7 +2520,7 @@ mod arguments {
     fn create_arguments(mapped: bool) -> Instruction {
         Instruction::CreateArguments {
             dst: Some(l(0)),
-            kind: u32::from(!mapped),
+            kind: u8::from(!mapped),
             is_immutable: false,
             creates_parameter_bindings: false,
         }
@@ -2543,6 +2573,29 @@ mod arguments {
     }
 
     #[test]
+    fn generic_nodes_are_followed_by_loads_of_the_slots_they_write() {
+        // Where the node does not continue, the frame holds what it wrote to its outputs, or their old values.
+        let program = assemble(|_| {
+            vec![
+                Instruction::Enter,
+                create_arguments(true),
+                Instruction::Return { value: l(0) },
+            ]
+        });
+        assert_dump(
+            &build(&program, |_| {}),
+            "
+            Generic CreateArguments @1 [[[FS0]]]
+            [[ARGUMENTS]] = LoadSlot l0
+            [[RESULT]] = EmptyToUndefined ([[ARGUMENTS]])
+            Return ([[RESULT]])
+            frame states:
+              [[FS0]]: pc 1 after -> l0 {} frame [l0]
+            ",
+        );
+    }
+
+    #[test]
     fn spreads_forward_the_frame_arguments() {
         let program = assemble(|_| {
             vec![
@@ -2559,13 +2612,11 @@ mod arguments {
                     is_spread: true,
                 },
                 Instruction::CallWithArgumentArray {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: r(5),
                     callee: a(0),
                     this_value: c(0),
                     arguments: r(7),
-                    expression_string: None,
                 },
                 Instruction::Return { value: r(5) },
             ]
@@ -2598,11 +2649,9 @@ mod arguments {
                 create_arguments(false),
                 Instruction::Mov { dst: a(0), src: c(1) },
                 Instruction::GetLength {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(5),
                     base: l(0),
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: r(5) },
@@ -2615,11 +2664,9 @@ mod arguments {
                     Instruction::Enter,
                     create_arguments(mapped),
                     Instruction::GetLength {
-                        value_feedback: 0,
                         keyed_feedback: 0,
                         dst: r(5),
                         base: l(0),
-                        base_identifier: None,
                         cache: 0,
                     },
                     Instruction::Return { value: r(5) },
@@ -2720,6 +2767,7 @@ fn captured_object_bindings_are_guarded_before_becoming_constants() {
             bits,
             cell: Some(object),
             intrinsic: None,
+            inline_executable: None,
             typed_array: None,
             has_instance: None,
         },
@@ -2752,12 +2800,10 @@ fn captured_typed_arrays_use_guarded_fixed_lengths() {
                 cache: coordinate,
             },
             Instruction::GetByValue {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst: r(6),
                 base: r(5),
                 property: c(0),
-                base_identifier: None,
                 cache: 0,
             },
             Instruction::Return { value: r(6) },
@@ -2776,6 +2822,7 @@ fn captured_typed_arrays_use_guarded_fixed_lengths() {
             bits,
             cell: Some(object),
             intrinsic: None,
+            inline_executable: None,
             has_instance: None,
             typed_array: Some(TypedArraySnapshot {
                 element: TypedArrayElement::Uint16,
@@ -2817,18 +2864,16 @@ fn array_length_specialization_requires_monomorphic_receivers_and_exit_gates() {
     let program = assemble(|_| {
         vec![
             Instruction::GetLength {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst: r(5),
                 base: a(0),
-                base_identifier: None,
                 cache: 0,
             },
             Instruction::Return { value: r(5) },
         ]
     });
     let mut snapshot = snapshot_for(&program, test_layout());
-    snapshot.executables[0].feedback.value = vec![crate::snapshot::value_feedback::INT32];
+    snapshot.executables[0].feedback.cache_value = vec![crate::snapshot::value_feedback::INT32];
     for bits in [
         0,
         keyed_feedback_bits::OTHER_ELEMENTS,
@@ -2906,6 +2951,7 @@ mod globals {
             assigned: true,
             value: GlobalValueSnapshot {
                 bits: crate::ir::value::UNDEFINED,
+                inline_executable: None,
                 cell: None,
                 intrinsic: None,
                 has_instance: None,

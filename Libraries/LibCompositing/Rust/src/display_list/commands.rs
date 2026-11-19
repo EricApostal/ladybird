@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use super::builder::read_command;
 use crate::display_list::ffi_bytes::FfiBytes;
+use crate::display_list_record_fields;
 use crate::ffi_bytes_fields;
 use crate::ffi_enum_bytes;
 use libgfx_rust::*;
@@ -40,7 +42,7 @@ pub enum DisplayListCommandType {
     DrawLine,
     BackdropFilterRegion,
     DrawRect,
-    PaintNestedDisplayList,
+    PaintVectorImage,
     DrawIsolatedGroup,
     DeclareMaskContent,
     CompositorWheelHitTestTarget,
@@ -142,7 +144,7 @@ impl DisplayListCommandType {
             Self::DrawLine => "DrawLine",
             Self::BackdropFilterRegion => "BackdropFilterRegion",
             Self::DrawRect => "DrawRect",
-            Self::PaintNestedDisplayList => "PaintNestedDisplayList",
+            Self::PaintVectorImage => "PaintVectorImage",
             Self::DrawIsolatedGroup => "DrawIsolatedGroup",
             Self::DeclareMaskContent => "DeclareMaskContent",
             Self::CompositorWheelHitTestTarget => "CompositorWheelHitTestTarget",
@@ -223,9 +225,10 @@ pub struct ContextRef {
 }
 ffi_bytes_fields!(ContextRef { spatial, clip, effect });
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ClipMode {
+    #[default]
     Intersect,
     Difference,
 }
@@ -244,6 +247,7 @@ pub struct ReplayClip {
 pub struct ReplayLayer {
     pub opacity: f32,
     pub blend_mode: CompositingAndBlendingOperator,
+    pub can_draw_directly_for_lcd_text: bool,
     pub filter_bytes: *const u8,
     pub filter_bytes_size: usize,
     pub backdrop_filter_bytes: *const u8,
@@ -255,7 +259,8 @@ pub struct ReplayLayer {
     /// Where a blur() in the backdrop filter mirrors: the region as the clips around the box leave it, in the
     /// effect's space. None when the filter holds no such blur.
     pub backdrop_blur_edge: OptionalFloatRect,
-    pub effect: EffectNodeIndex,
+    /// The same for as long as the effect's filters are, which lets a painter keep what it builds from them.
+    pub filter_cache_key: u64,
     /// Bounds of everything replay draws into the layer, in the effect's space, when known.
     pub content_bounds: OptionalFloatRect,
 }
@@ -301,9 +306,9 @@ impl FfiBytes for ImageFrameResourceId {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct VideoSinkResourceId(pub u64);
+pub struct VideoSinkHandle(pub u64);
 
-impl FfiBytes for VideoSinkResourceId {
+impl FfiBytes for VideoSinkHandle {
     #[inline]
     fn write_ffi_bytes(&self, out: &mut [u8]) {
         self.0.write_ffi_bytes(out);
@@ -555,7 +560,7 @@ pub struct DisplayListGlyph {
     pub position: FloatPoint,
     pub glyph_id: u32,
 }
-ffi_bytes_fields!(DisplayListGlyph { position, glyph_id });
+display_list_record_fields!(DisplayListGlyph { position, glyph_id });
 
 impl From<text_layout::PlacedGlyph> for DisplayListGlyph {
     fn from(placed: text_layout::PlacedGlyph) -> Self {
@@ -607,7 +612,7 @@ pub struct DisplayListGradientPaintStyle {
     pub color_space: InterpolationColorSpace,
     pub color_stops: DisplayListGradientColorStops,
 }
-ffi_bytes_fields!(DisplayListGradientPaintStyle {
+display_list_record_fields!(DisplayListGradientPaintStyle {
     gradient_transform,
     spread_method,
     color_space,
@@ -630,7 +635,7 @@ pub struct DisplayListPaintStyle {
     pub pattern_content_scale: FloatSize,
     pub pattern_transform: OptionalAffineTransform,
 }
-ffi_bytes_fields!(DisplayListPaintStyle {
+display_list_record_fields!(DisplayListPaintStyle {
     paint_style_type,
     gradient,
     linear_gradient_start_point,
@@ -641,7 +646,10 @@ ffi_bytes_fields!(DisplayListPaintStyle {
     radial_gradient_end_radius,
     pattern_tile,
     pattern_tile_rect,
-    pattern_content_scale,
+    pattern_content_scale = FloatSize {
+        width: 1.0,
+        height: 1.0
+    },
     pattern_transform
 });
 
@@ -673,9 +681,9 @@ pub struct Repeat {
     pub x: bool,
     pub y: bool,
 }
-ffi_bytes_fields!(Repeat { x, y });
+display_list_record_fields!(Repeat { x, y });
 
-pub trait DisplayListCommand: Copy + FfiBytes {
+pub trait DisplayListCommand: Copy + FfiBytes + super::record_fields::RecordFields {
     const COMMAND_TYPE: DisplayListCommandType;
     // Encloses everything the command draws. Only compositor metadata, which draws nothing, and the commands of the
     // canvas 2D stream, which draw under state that only replay knows, have none.
@@ -690,9 +698,72 @@ pub trait DisplayListCommand: Copy + FfiBytes {
     }
 }
 
+pub fn command_bounding_rect_computed_from_payload(
+    command_type: DisplayListCommandType,
+    payload: &[u8],
+) -> Option<IntRect> {
+    fn of<C: DisplayListCommand>(payload: &[u8]) -> Option<IntRect> {
+        read_command::<C>(payload).bounding_rect()
+    }
+    use DisplayListCommandType as T;
+    match command_type {
+        T::DrawGlyphRun => of::<DrawGlyphRun>(payload),
+        T::FillRect => of::<FillRect>(payload),
+        T::PaintCaret => of::<PaintCaret>(payload),
+        T::DrawScaledDecodedImageFrame => of::<DrawScaledDecodedImageFrame>(payload),
+        T::DrawRepeatedDecodedImageFrame => of::<DrawRepeatedDecodedImageFrame>(payload),
+        T::DrawRepeatedTile => of::<DrawRepeatedTile>(payload),
+        T::DrawTiledDecodedImageFrame => of::<DrawTiledDecodedImageFrame>(payload),
+        T::DrawCompositedContext => of::<DrawCompositedContext>(payload),
+        T::DrawCanvas => of::<DrawCanvas>(payload),
+        T::DrawVideoFrame => of::<DrawVideoFrame>(payload),
+        T::PaintLinearGradient => of::<PaintLinearGradient>(payload),
+        T::PaintRadialGradient => of::<PaintRadialGradient>(payload),
+        T::PaintConicGradient => of::<PaintConicGradient>(payload),
+        T::PaintOuterBoxShadow => of::<PaintOuterBoxShadow>(payload),
+        T::PaintInnerBoxShadow => of::<PaintInnerBoxShadow>(payload),
+        T::PaintPathBoxShadow => of::<PaintPathBoxShadow>(payload),
+        T::PaintTextShadow => of::<PaintTextShadow>(payload),
+        T::FillRectWithRoundedCorners => of::<FillRectWithRoundedCorners>(payload),
+        T::FillRoundedRectRing => of::<FillRoundedRectRing>(payload),
+        T::FillPath => of::<FillPath>(payload),
+        T::StrokePath => of::<StrokePath>(payload),
+        T::DrawEllipse => of::<DrawEllipse>(payload),
+        T::DrawLine => of::<DrawLine>(payload),
+        T::BackdropFilterRegion => of::<BackdropFilterRegion>(payload),
+        T::DrawRect => of::<DrawRect>(payload),
+        T::PaintVectorImage => of::<PaintVectorImage>(payload),
+        T::DrawIsolatedGroup => of::<DrawIsolatedGroup>(payload),
+        T::DeclareMaskContent => of::<DeclareMaskContent>(payload),
+        T::CompositorWheelHitTestTarget => of::<CompositorWheelHitTestTarget>(payload),
+        T::CompositorWheelHitTestTargetWithCornerRadii => of::<CompositorWheelHitTestTargetWithCornerRadii>(payload),
+        T::CompositorMainThreadWheelEventRegion => of::<CompositorMainThreadWheelEventRegion>(payload),
+        T::CompositorScrollbar => of::<CompositorScrollbar>(payload),
+        T::CompositorBlockingWheelEventRegion => of::<CompositorBlockingWheelEventRegion>(payload),
+        T::PaintScrollBar => of::<PaintScrollBar>(payload),
+        T::CompositorNestedContextWheelRegion => of::<CompositorNestedContextWheelRegion>(payload),
+        T::Canvas2DFillPath => of::<Canvas2DFillPath>(payload),
+        T::Canvas2DStrokePath => of::<Canvas2DStrokePath>(payload),
+        T::Canvas2DDrawGlyphRuns => of::<Canvas2DDrawGlyphRuns>(payload),
+        T::Canvas2DClearRect => of::<Canvas2DClearRect>(payload),
+        T::Canvas2DDrawImageFrame => of::<Canvas2DDrawImageFrame>(payload),
+        T::Canvas2DDrawCanvas => of::<Canvas2DDrawCanvas>(payload),
+        T::Canvas2DDrawVideoFrame => of::<Canvas2DDrawVideoFrame>(payload),
+        T::Canvas2DSetTransform => of::<Canvas2DSetTransform>(payload),
+        T::Canvas2DSave => of::<Canvas2DSave>(payload),
+        T::Canvas2DRestore => of::<Canvas2DRestore>(payload),
+        T::Canvas2DClipPath => of::<Canvas2DClipPath>(payload),
+        T::Canvas2DReset => of::<Canvas2DReset>(payload),
+        T::Canvas2DClearCanvas => of::<Canvas2DClearCanvas>(payload),
+        T::Canvas2DPutImageFrame => of::<Canvas2DPutImageFrame>(payload),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct DrawGlyphRun {
+    /// Zero fills the glyphs; a positive device-pixel width strokes their outlines.
+    pub stroke_width: f32,
     pub font_id: FontResourceId,
     pub glyphs: DisplayListDataSpan,
     pub rect: IntRect,
@@ -703,13 +774,14 @@ pub struct DrawGlyphRun {
     pub orientation: Orientation,
     pub font_smoothing: u8,
 }
-ffi_bytes_fields!(DrawGlyphRun {
+display_list_record_fields!(DrawGlyphRun {
+    stroke_width,
     font_id,
     glyphs,
     rect,
     glyph_bounding_rect,
     translation,
-    scale,
+    scale = 1.0,
     color,
     orientation,
     font_smoothing
@@ -730,7 +802,7 @@ pub struct FillRect {
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub background_color_animation_effect: EffectNodeIndex,
 }
-ffi_bytes_fields!(FillRect {
+display_list_record_fields!(FillRect {
     rect,
     color,
     compositing_and_blending_operator,
@@ -752,7 +824,7 @@ pub struct PaintCaret {
     pub blink_cycle_start_time_ns: i64,
     pub should_blink: bool,
 }
-ffi_bytes_fields!(PaintCaret {
+display_list_record_fields!(PaintCaret {
     rect,
     color,
     blink_cycle_start_time_ns,
@@ -777,7 +849,7 @@ pub struct DrawScaledDecodedImageFrame {
     pub isolated_backdrop_color: OptionalColor,
     pub apply_force_dark: bool,
 }
-ffi_bytes_fields!(DrawScaledDecodedImageFrame {
+display_list_record_fields!(DrawScaledDecodedImageFrame {
     dst_rect,
     src_rect,
     frame_id,
@@ -806,7 +878,7 @@ pub struct DrawRepeatedDecodedImageFrame {
     pub isolated_backdrop_color: OptionalColor,
     pub apply_force_dark: bool,
 }
-ffi_bytes_fields!(DrawRepeatedDecodedImageFrame {
+display_list_record_fields!(DrawRepeatedDecodedImageFrame {
     dst_rect,
     clip_rect,
     frame_id,
@@ -837,7 +909,7 @@ pub struct DrawRepeatedTile {
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub repeat: Repeat,
 }
-ffi_bytes_fields!(DrawRepeatedTile {
+display_list_record_fields!(DrawRepeatedTile {
     dst_rect,
     clip_rect,
     tile_size,
@@ -868,7 +940,7 @@ pub struct DrawTiledDecodedImageFrame {
     pub tile_count_y: OptionalU32,
     pub apply_force_dark: bool,
 }
-ffi_bytes_fields!(DrawTiledDecodedImageFrame {
+display_list_record_fields!(DrawTiledDecodedImageFrame {
     tile_rect,
     clip_rect,
     src_rect,
@@ -896,7 +968,7 @@ pub struct DrawCompositedContext {
     pub spatial_node_index: SpatialNodeIndex,
     pub snap_origin_if_untransformed: bool,
 }
-ffi_bytes_fields!(DrawCompositedContext {
+display_list_record_fields!(DrawCompositedContext {
     dst_rect,
     child_context_id,
     scaling_mode,
@@ -916,16 +988,11 @@ impl DisplayListCommand for DrawCompositedContext {
 pub struct DrawCanvas {
     pub dst_rect: IntRect,
     pub canvas_id: CanvasId,
-    // NB: The canvas pixels live in the compositor's canvas surface registry, so the command bytes don't
-    //     change when the canvas content does. The content generation encodes content changes so that display
-    //     list damage computation can tell that the canvas needs to be repainted.
-    pub content_generation: u64,
     pub scaling_mode: ScalingMode,
 }
-ffi_bytes_fields!(DrawCanvas {
+display_list_record_fields!(DrawCanvas {
     dst_rect,
     canvas_id,
-    content_generation,
     scaling_mode
 });
 
@@ -940,12 +1007,12 @@ impl DisplayListCommand for DrawCanvas {
 #[repr(C)]
 pub struct DrawVideoFrame {
     pub dst_rect: IntRect,
-    pub video_sink_id: VideoSinkResourceId,
+    pub video_sink_handle: VideoSinkHandle,
     pub scaling_mode: ScalingMode,
 }
-ffi_bytes_fields!(DrawVideoFrame {
+display_list_record_fields!(DrawVideoFrame {
     dst_rect,
-    video_sink_id,
+    video_sink_handle,
     scaling_mode
 });
 
@@ -967,7 +1034,7 @@ pub struct PaintLinearGradient {
     pub interpolation_method: GradientInterpolationMethod,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
-ffi_bytes_fields!(PaintLinearGradient {
+display_list_record_fields!(PaintLinearGradient {
     gradient_rect,
     gradient_angle,
     color_stops,
@@ -994,7 +1061,7 @@ pub struct PaintOuterBoxShadow {
     pub shadow_rect: IntRect,
     pub shadow_corner_radii: CornerRadii,
 }
-ffi_bytes_fields!(PaintOuterBoxShadow {
+display_list_record_fields!(PaintOuterBoxShadow {
     color,
     blur_radius,
     device_content_rect,
@@ -1025,7 +1092,7 @@ pub struct PaintInnerBoxShadow {
     pub inner_shadow_rect: IntRect,
     pub inner_shadow_corner_radii: CornerRadii,
 }
-ffi_bytes_fields!(PaintInnerBoxShadow {
+display_list_record_fields!(PaintInnerBoxShadow {
     color,
     blur_radius,
     device_content_rect,
@@ -1056,7 +1123,7 @@ pub struct PaintPathBoxShadow {
     pub shape_path_data: DisplayListDataSpan,
     pub inner: bool,
 }
-ffi_bytes_fields!(PaintPathBoxShadow {
+display_list_record_fields!(PaintPathBoxShadow {
     color,
     blur_radius,
     spread_distance,
@@ -1096,7 +1163,7 @@ pub struct TextShadowLayer {
     pub blur_radius: i32,
     pub color: Color,
 }
-ffi_bytes_fields!(TextShadowLayer {
+display_list_record_fields!(TextShadowLayer {
     offset,
     rounded_offset,
     blur_radius,
@@ -1117,14 +1184,14 @@ pub struct PaintTextShadow {
     pub orientation: Orientation,
     pub font_smoothing: u8,
 }
-ffi_bytes_fields!(PaintTextShadow {
+display_list_record_fields!(PaintTextShadow {
     font_id,
     glyphs,
     layers,
     shadows_bounding_rect,
     rect,
     translation,
-    scale,
+    scale = 1.0,
     orientation,
     font_smoothing
 });
@@ -1144,7 +1211,7 @@ pub struct FillRectWithRoundedCorners {
     pub corner_radii: CornerRadii,
     pub background_color_animation_effect: EffectNodeIndex,
 }
-ffi_bytes_fields!(FillRectWithRoundedCorners {
+display_list_record_fields!(FillRectWithRoundedCorners {
     rect,
     color,
     corner_radii,
@@ -1172,7 +1239,7 @@ pub struct FillRoundedRectRing {
     pub left_width: i32,
     pub color: Color,
 }
-ffi_bytes_fields!(FillRoundedRectRing {
+display_list_record_fields!(FillRoundedRectRing {
     rect,
     corner_radii,
     top_width,
@@ -1202,10 +1269,10 @@ pub struct FillPath {
     pub should_anti_alias: ShouldAntiAlias,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
-ffi_bytes_fields!(FillPath {
+display_list_record_fields!(FillPath {
     path_bounding_rect,
     path_data,
-    opacity,
+    opacity = 1.0,
     paint_kind,
     color,
     paint_style,
@@ -1238,15 +1305,15 @@ pub struct StrokePath {
     pub thickness: f32,
     pub should_anti_alias: ShouldAntiAlias,
 }
-ffi_bytes_fields!(StrokePath {
+display_list_record_fields!(StrokePath {
     cap_style,
     join_style,
-    miter_limit,
+    miter_limit = 4.0,
     dash_array,
     dash_offset,
     path_bounding_rect,
     path_data,
-    opacity,
+    opacity = 1.0,
     paint_kind,
     color,
     paint_style,
@@ -1282,7 +1349,7 @@ pub struct DrawEllipse {
     pub color: Color,
     pub thickness: i32,
 }
-ffi_bytes_fields!(DrawEllipse { rect, color, thickness });
+display_list_record_fields!(DrawEllipse { rect, color, thickness });
 
 impl DisplayListCommand for DrawEllipse {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawEllipse;
@@ -1301,13 +1368,13 @@ pub struct DrawLine {
     pub style: LineStyle,
     pub alternate_color: Color,
 }
-ffi_bytes_fields!(DrawLine {
+display_list_record_fields!(DrawLine {
     color,
     from,
     to,
     thickness,
     style,
-    alternate_color
+    alternate_color = Color::TRANSPARENT
 });
 
 impl DisplayListCommand for DrawLine {
@@ -1324,7 +1391,7 @@ impl DisplayListCommand for DrawLine {
 pub struct BackdropFilterRegion {
     pub rect: IntRect,
 }
-ffi_bytes_fields!(BackdropFilterRegion { rect });
+display_list_record_fields!(BackdropFilterRegion { rect });
 
 impl DisplayListCommand for BackdropFilterRegion {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::BackdropFilterRegion;
@@ -1340,7 +1407,7 @@ pub struct DrawRect {
     pub color: Color,
     pub rough: bool,
 }
-ffi_bytes_fields!(DrawRect { rect, color, rough });
+display_list_record_fields!(DrawRect { rect, color, rough });
 
 impl DisplayListCommand for DrawRect {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawRect;
@@ -1359,7 +1426,7 @@ pub struct PaintRadialGradient {
     pub size: IntSize,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
-ffi_bytes_fields!(PaintRadialGradient {
+display_list_record_fields!(PaintRadialGradient {
     rect,
     color_stops,
     interpolation_method,
@@ -1385,7 +1452,7 @@ pub struct PaintConicGradient {
     pub position: IntPoint,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
-ffi_bytes_fields!(PaintConicGradient {
+display_list_record_fields!(PaintConicGradient {
     rect,
     start_angle,
     color_stops,
@@ -1401,22 +1468,31 @@ impl DisplayListCommand for PaintConicGradient {
     }
 }
 
+// Paints the records an SVG image's document was recorded as, scaled from the size they were recorded at into `rect`.
+// The records name no visual context of their own and sit in this command's payload. The process that records a tape
+// leaves them out and names them by `vector_image_id` until it sends the tape, so that a tape it keeps does not hold a
+// copy of the image for each place that draws it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
-pub struct PaintNestedDisplayList {
-    pub display_list_id: DisplayListResourceId,
+pub struct PaintVectorImage {
+    pub vector_image_id: DisplayListResourceId,
     pub rect: FloatRect,
-    // The size the nested list was recorded at; replay scales it into the destination rect.
-    pub list_size: IntSize,
+    pub recorded_size: IntSize,
+    pub records: DisplayListDataSpan,
+    // Whether a raster of the records can differ from replaying them in place: they read what was painted before them,
+    // or draw content that changes under them.
+    pub requires_direct_replay: bool,
 }
-ffi_bytes_fields!(PaintNestedDisplayList {
-    display_list_id,
+display_list_record_fields!(PaintVectorImage {
+    vector_image_id,
     rect,
-    list_size
+    recorded_size,
+    records,
+    requires_direct_replay
 });
 
-impl DisplayListCommand for PaintNestedDisplayList {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintNestedDisplayList;
+impl DisplayListCommand for PaintVectorImage {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintVectorImage;
     fn bounding_rect(&self) -> Option<IntRect> {
         Some(enclosing_int_rect(self.rect))
     }
@@ -1438,12 +1514,12 @@ pub struct DrawIsolatedGroup {
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub mask_kind: MaskKind,
 }
-ffi_bytes_fields!(DrawIsolatedGroup {
+display_list_record_fields!(DrawIsolatedGroup {
     clip_rect,
     content,
     mask,
     filter,
-    opacity,
+    opacity = 1.0,
     compositing_and_blending_operator,
     mask_kind
 });
@@ -1462,7 +1538,7 @@ pub struct DeclareMaskContent {
     pub effect: EffectNodeIndex,
     pub content: DisplayListDataSpan,
 }
-ffi_bytes_fields!(DeclareMaskContent { rect, effect, content });
+display_list_record_fields!(DeclareMaskContent { rect, effect, content });
 
 impl DisplayListCommand for DeclareMaskContent {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DeclareMaskContent;
@@ -1476,7 +1552,7 @@ impl DisplayListCommand for DeclareMaskContent {
 pub struct CompositorBlockingWheelEventRegion {
     pub rect: FloatRect,
 }
-ffi_bytes_fields!(CompositorBlockingWheelEventRegion { rect });
+display_list_record_fields!(CompositorBlockingWheelEventRegion { rect });
 
 impl DisplayListCommand for CompositorBlockingWheelEventRegion {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorBlockingWheelEventRegion;
@@ -1488,7 +1564,7 @@ pub struct CompositorWheelHitTestTarget {
     pub target_scroll_node_index: SpatialNodeIndex,
     pub rect: FloatRect,
 }
-ffi_bytes_fields!(CompositorWheelHitTestTarget {
+display_list_record_fields!(CompositorWheelHitTestTarget {
     target_scroll_node_index,
     rect
 });
@@ -1504,7 +1580,7 @@ pub struct CompositorWheelHitTestTargetWithCornerRadii {
     pub rect: FloatRect,
     pub corner_radii: CornerRadii,
 }
-ffi_bytes_fields!(CompositorWheelHitTestTargetWithCornerRadii {
+display_list_record_fields!(CompositorWheelHitTestTargetWithCornerRadii {
     target_scroll_node_index,
     rect,
     corner_radii
@@ -1523,7 +1599,7 @@ pub struct CompositorNestedContextWheelRegion {
     pub corner_radii: CornerRadii,
     pub child_context_id: CompositorContextId,
 }
-ffi_bytes_fields!(CompositorNestedContextWheelRegion {
+display_list_record_fields!(CompositorNestedContextWheelRegion {
     rect,
     corner_radii,
     child_context_id
@@ -1538,7 +1614,7 @@ impl DisplayListCommand for CompositorNestedContextWheelRegion {
 pub struct CompositorMainThreadWheelEventRegion {
     pub rect: FloatRect,
 }
-ffi_bytes_fields!(CompositorMainThreadWheelEventRegion { rect });
+display_list_record_fields!(CompositorMainThreadWheelEventRegion { rect });
 
 impl DisplayListCommand for CompositorMainThreadWheelEventRegion {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorMainThreadWheelEventRegion;
@@ -1563,7 +1639,7 @@ pub struct CompositorScrollbar {
     pub vertical: bool,
     pub is_painted_by_compositor: bool,
 }
-ffi_bytes_fields!(CompositorScrollbar {
+display_list_record_fields!(CompositorScrollbar {
     scroll_node_index,
     gutter_rect,
     thumb_rect,
@@ -1600,7 +1676,7 @@ pub struct PaintScrollBar {
     pub track_color: Color,
     pub vertical: bool,
 }
-ffi_bytes_fields!(PaintScrollBar {
+display_list_record_fields!(PaintScrollBar {
     scroll_node_index,
     gutter_rect,
     thumb_rect,
@@ -1666,7 +1742,7 @@ pub struct Canvas2DPaint {
     pub pattern_image_id: ImageFrameResourceId,
     pub pattern_transform: OptionalAffineTransform,
 }
-ffi_bytes_fields!(Canvas2DPaint {
+display_list_record_fields!(Canvas2DPaint {
     kind,
     pattern_repetition,
     pattern_has_image,
@@ -1691,7 +1767,7 @@ pub struct Canvas2DShadow {
     pub offset_y: f32,
     pub blur: f32,
 }
-ffi_bytes_fields!(Canvas2DShadow {
+display_list_record_fields!(Canvas2DShadow {
     color,
     offset_x,
     offset_y,
@@ -1711,10 +1787,10 @@ pub struct Canvas2DCompositing {
     pub has_shadow: bool,
     pub shadow: Canvas2DShadow,
 }
-ffi_bytes_fields!(Canvas2DCompositing {
+display_list_record_fields!(Canvas2DCompositing {
     filter,
     has_filter,
-    global_alpha,
+    global_alpha = 1.0,
     compositing_and_blending_operator,
     has_shadow,
     shadow
@@ -1728,7 +1804,7 @@ pub struct Canvas2DFillPath {
     pub winding_rule: WindingRule,
     pub compositing: Canvas2DCompositing,
 }
-ffi_bytes_fields!(Canvas2DFillPath {
+display_list_record_fields!(Canvas2DFillPath {
     path_data,
     paint,
     winding_rule,
@@ -1752,7 +1828,7 @@ pub struct Canvas2DStrokePath {
     pub dash_offset: f32,
     pub compositing: Canvas2DCompositing,
 }
-ffi_bytes_fields!(Canvas2DStrokePath {
+display_list_record_fields!(Canvas2DStrokePath {
     path_data,
     paint,
     thickness,
@@ -1775,7 +1851,7 @@ pub struct Canvas2DGlyphRun {
     pub font_id: FontResourceId,
     pub glyph_count: u64,
 }
-ffi_bytes_fields!(Canvas2DGlyphRun { font_id, glyph_count });
+display_list_record_fields!(Canvas2DGlyphRun { font_id, glyph_count });
 
 // The glyphs of a text, positioned relative to the translation, with the top of the line box at the glyph position.
 // The text is a single draw, so that its runs of different fonts share one shadow and one composite. The horizontal
@@ -1790,11 +1866,11 @@ pub struct Canvas2DDrawGlyphRuns {
     pub paint: Canvas2DPaint,
     pub compositing: Canvas2DCompositing,
 }
-ffi_bytes_fields!(Canvas2DDrawGlyphRuns {
+display_list_record_fields!(Canvas2DDrawGlyphRuns {
     runs,
     glyphs,
     translation,
-    horizontal_scale,
+    horizontal_scale = 1.0,
     paint,
     compositing
 });
@@ -1809,7 +1885,7 @@ pub struct Canvas2DClearRect {
     pub rect: FloatRect,
     pub color: Color,
 }
-ffi_bytes_fields!(Canvas2DClearRect { rect, color });
+display_list_record_fields!(Canvas2DClearRect { rect, color });
 
 impl DisplayListCommand for Canvas2DClearRect {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DClearRect;
@@ -1824,7 +1900,7 @@ pub struct Canvas2DDrawImageFrame {
     pub scaling_mode: ScalingMode,
     pub compositing: Canvas2DCompositing,
 }
-ffi_bytes_fields!(Canvas2DDrawImageFrame {
+display_list_record_fields!(Canvas2DDrawImageFrame {
     frame_id,
     dst_rect,
     src_rect,
@@ -1846,7 +1922,7 @@ pub struct Canvas2DDrawCanvas {
     pub scaling_mode: ScalingMode,
     pub compositing: Canvas2DCompositing,
 }
-ffi_bytes_fields!(Canvas2DDrawCanvas {
+display_list_record_fields!(Canvas2DDrawCanvas {
     source_canvas_id,
     dst_rect,
     src_rect,
@@ -1869,7 +1945,7 @@ pub struct Canvas2DDrawVideoFrame {
     pub scaling_mode: ScalingMode,
     pub compositing: Canvas2DCompositing,
 }
-ffi_bytes_fields!(Canvas2DDrawVideoFrame {
+display_list_record_fields!(Canvas2DDrawVideoFrame {
     video_sink_handle,
     generation,
     dst_rect,
@@ -1887,7 +1963,7 @@ impl DisplayListCommand for Canvas2DDrawVideoFrame {
 pub struct Canvas2DSetTransform {
     pub transform: AffineTransform,
 }
-ffi_bytes_fields!(Canvas2DSetTransform { transform });
+display_list_record_fields!(Canvas2DSetTransform { transform });
 
 impl DisplayListCommand for Canvas2DSetTransform {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DSetTransform;
@@ -1900,7 +1976,7 @@ impl DisplayListCommand for Canvas2DSetTransform {
 pub struct Canvas2DSave {
     pub padding: u32,
 }
-ffi_bytes_fields!(Canvas2DSave { padding });
+display_list_record_fields!(Canvas2DSave { padding });
 
 impl DisplayListCommand for Canvas2DSave {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DSave;
@@ -1911,7 +1987,7 @@ impl DisplayListCommand for Canvas2DSave {
 pub struct Canvas2DRestore {
     pub padding: u32,
 }
-ffi_bytes_fields!(Canvas2DRestore { padding });
+display_list_record_fields!(Canvas2DRestore { padding });
 
 impl DisplayListCommand for Canvas2DRestore {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DRestore;
@@ -1923,7 +1999,7 @@ pub struct Canvas2DClipPath {
     pub path_data: DisplayListDataSpan,
     pub winding_rule: WindingRule,
 }
-ffi_bytes_fields!(Canvas2DClipPath {
+display_list_record_fields!(Canvas2DClipPath {
     path_data,
     winding_rule
 });
@@ -1938,7 +2014,7 @@ impl DisplayListCommand for Canvas2DClipPath {
 pub struct Canvas2DReset {
     pub padding: u32,
 }
-ffi_bytes_fields!(Canvas2DReset { padding });
+display_list_record_fields!(Canvas2DReset { padding });
 
 impl DisplayListCommand for Canvas2DReset {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DReset;
@@ -1950,7 +2026,7 @@ impl DisplayListCommand for Canvas2DReset {
 pub struct Canvas2DClearCanvas {
     pub color: Color,
 }
-ffi_bytes_fields!(Canvas2DClearCanvas { color });
+display_list_record_fields!(Canvas2DClearCanvas { color });
 
 impl DisplayListCommand for Canvas2DClearCanvas {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DClearCanvas;
@@ -1964,7 +2040,7 @@ pub struct Canvas2DPutImageFrame {
     pub frame_id: ImageFrameResourceId,
     pub position: IntPoint,
 }
-ffi_bytes_fields!(Canvas2DPutImageFrame { frame_id, position });
+display_list_record_fields!(Canvas2DPutImageFrame { frame_id, position });
 
 impl DisplayListCommand for Canvas2DPutImageFrame {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DPutImageFrame;

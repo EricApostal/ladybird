@@ -24,9 +24,12 @@ use core::ptr::NonNull;
 use std::collections::HashMap;
 
 use libjs_abi::register;
-use libjs_jit::code::{CALLEE_SLOT, FrameState, Repr, ResumeMode, Site, SiteKind, ValueLocation};
+use libjs_jit::code::{
+    CALLEE_SLOT, FrameState, Repr, ResumeMode, Site, SiteKind, ValueLocation, VirtualObjectDescriptorKind,
+};
 use libjs_runtime_macros::Trace;
 
+use super::allocation::clone_function;
 use super::code::{
     CompileState, EXIT_COUNT_BEFORE_DISCARD, FRUITLESS_LOOP_CHECKS_AFTER_EXIT, InlinedFunction, JitCode,
 };
@@ -104,10 +107,42 @@ impl RegisterDump {
     }
 }
 
-/// Reads a value that is not an object the code never created.
-fn read_location(location: ValueLocation, dump: &RegisterDump) -> Value {
+/// Reads a value that is not an object the code never created, with the compiled function's frame at `root`.
+fn read_location(location: ValueLocation, dump: &RegisterDump, root: NonNull<ExecutionContext>) -> Value {
     let (bits, repr) = match location {
         ValueLocation::Constant(bits) => return Value::from_bits(bits),
+        // NB: Nothing writes such a slot, so it still holds the value while frames are written.
+        ValueLocation::Frame(slot) => return frame_of(root).slots()[slot as usize].get(),
+        _ => read_bits(location, dump),
+    };
+    match repr {
+        Repr::Tagged => Value::from_bits(bits),
+        Repr::Int32 => Value::from_i32(bits as i32),
+        Repr::Float64 => Value::from_f64(f64::from_bits(bits)),
+        Repr::Bool => Value::from_bool(bits as u32 != 0),
+        Repr::Pointer => unreachable!("only virtual closures have cell addresses in frame states"),
+    }
+}
+
+/// Reads the cell address at `location`, null or the address of a live cell, which only the environments of a closure
+/// the code never created are (see `libjs_jit::code::VirtualObjectDescriptorKind::Closure`).
+fn read_cell_address<T>(location: ValueLocation, dump: &RegisterDump) -> Option<Gc<T>> {
+    // NB: Closures that inlined callees create have the environments of the callee, which the code embeds.
+    let bits = match location {
+        ValueLocation::Constant(bits) => bits,
+        _ => {
+            let (bits, repr) = read_bits(location, dump);
+            assert_eq!(repr, Repr::Pointer);
+            bits
+        }
+    };
+    // SAFETY: The code keeps the cell alive until the site, which is where it is read.
+    NonNull::new(bits as *mut T).map(|cell| unsafe { Gc::from_non_null(cell) })
+}
+
+/// The bits and representation of a value in a register or stack slot.
+fn read_bits(location: ValueLocation, dump: &RegisterDump) -> (u64, Repr) {
+    match location {
         ValueLocation::Register(encoding, repr) => {
             let bits = if repr == Repr::Float64 {
                 dump.fprs[usize::from(encoding)]
@@ -122,16 +157,12 @@ fn read_location(location: ValueLocation, dump: &RegisterDump) -> Value {
             // SAFETY: The JIT frame of the site is still on the stack, and the slot holds the value.
             (unsafe { address.read() }, repr)
         }
+        ValueLocation::Constant(_) | ValueLocation::Frame(_) => {
+            unreachable!("only registers and stack slots hold bits")
+        }
         ValueLocation::ArgumentsObject { .. } | ValueLocation::VirtualObject(_) => {
             unreachable!("objects are created by SiteValues")
         }
-    };
-    match repr {
-        Repr::Tagged => Value::from_bits(bits),
-        Repr::Int32 => Value::from_i32(bits as i32),
-        Repr::Float64 => Value::from_f64(f64::from_bits(bits)),
-        Repr::Bool => Value::from_bool(bits as u32 != 0),
-        Repr::Pointer => unreachable!("frame states hold no pointers"),
     }
 }
 
@@ -141,7 +172,7 @@ fn read_location(location: ValueLocation, dump: &RegisterDump) -> Value {
 struct SiteValues<'a> {
     vm: &'a Vm,
     code: &'a JitCode,
-    root: *const ExecutionContext,
+    root: NonNull<ExecutionContext>,
     site: &'a Site,
     dump: &'a RegisterDump,
     created: Deferred<'a, HashMap<u32, Gc<Object>>>,
@@ -165,7 +196,7 @@ impl<'a> SiteValues<'a> {
         Self {
             vm,
             code,
-            root: root.as_ptr(),
+            root,
             site,
             dump,
             created: defer_gc.cover(HashMap::new()),
@@ -176,25 +207,48 @@ impl<'a> SiteValues<'a> {
 
     fn value(&mut self, location: ValueLocation) -> Value {
         let ValueLocation::VirtualObject(index) = location else {
-            return read_location(location, self.dump);
+            return read_location(location, self.dump, self.root);
         };
         if let Some(object) = self.created.get(&index) {
             return Value::from_object(*object);
         }
         let description = &self.site.objects[index as usize];
         // NB: An object created for the frame before is the one the frame has, with whatever happened to it since.
-        if let Some(object) = self.code.materialized_object(self.root, description.allocation) {
+        if let Some(object) = self
+            .code
+            .materialized_object(self.root.as_ptr(), description.allocation)
+        {
             self.created.insert(index, object);
             return Value::from_object(object);
         }
+        let shape = match description.kind {
+            VirtualObjectDescriptorKind::Object { shape } => shape,
+            VirtualObjectDescriptorKind::Closure { sample } => {
+                // SAFETY: The code embeds the sample, which keeps it alive.
+                let sample = unsafe { Gc::from_non_null(NonNull::new(sample.0 as *mut _).expect("a sample")) };
+                let closure = clone_function(
+                    self.vm,
+                    sample,
+                    read_cell_address(description.properties[0], self.dump),
+                    read_cell_address(description.properties[1], self.dump),
+                )
+                .upcast::<Object>();
+                self.created.insert(index, closure);
+                if self.remember {
+                    self.code
+                        .remember_materialized_object(self.root.as_ptr(), description.allocation, closure);
+                }
+                return Value::from_object(closure);
+            }
+        };
         // SAFETY: The code embeds the shape, which keeps it alive.
-        let shape = unsafe { Gc::from_non_null(NonNull::new(description.shape.0 as *mut _).expect("a shape")) };
+        let shape = unsafe { Gc::from_non_null(NonNull::new(shape.0 as *mut _).expect("a shape")) };
         let object = Object::create_with_premade_shape(self.vm, shape);
         // NB: The object exists before its properties, which may refer to it.
         self.created.insert(index, object);
         if self.remember {
             self.code
-                .remember_materialized_object(self.root, description.allocation, object);
+                .remember_materialized_object(self.root.as_ptr(), description.allocation, object);
         }
         let property_count = shape.property_count();
         for index in 0..property_count {
@@ -289,26 +343,44 @@ struct CallLinkage {
     return_pc: u32,
     dst: u32,
     is_construct: bool,
+    /// Whether the call is the super() of a derived constructor, whose new target is the caller's.
+    is_super_call: bool,
 }
 
-/// The argument count, length and kind of the Call or CallConstruct instruction at the start of `bytes`, or of the call
-/// of a getter a GetById instruction or of a setter a PutById instruction makes.
-fn call_instruction_shape(executable: &Executable, pc: u32) -> (u32, u32, bool) {
+/// The kind of call an instruction that an inlined call is made for makes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallKind {
+    Call,
+    Construct,
+    SuperCall,
+}
+
+/// The argument count, length and kind of the Call, CallConstruct or SuperCall* instruction at `pc`, or of the call of
+/// a getter a GetById instruction or of a setter a PutById instruction makes.
+fn call_instruction_shape(executable: &Executable, pc: u32) -> (u32, u32, CallKind) {
     let opcode = executable.bytecode()[pc as usize];
     if opcode == OpCode::GetById as u8 {
         let get = instruction_at::<op::GetById>(executable, pc);
-        return (0, get.length(), false);
+        return (0, get.length(), CallKind::Call);
     }
     if opcode == OpCode::PutById as u8 {
         let put = instruction_at::<op::PutById>(executable, pc);
-        return (1, put.length(), false);
+        return (1, put.length(), CallKind::Call);
     }
     if opcode == OpCode::CallConstruct as u8 {
         let call = instruction_at::<op::CallConstruct>(executable, pc);
-        return (call.argument_count, call.length(), true);
+        return (u32::from(call.argument_count), call.length(), CallKind::Construct);
+    }
+    if opcode == OpCode::SuperCall as u8 {
+        let call = instruction_at::<op::SuperCall>(executable, pc);
+        return (u32::from(call.argument_count), call.length(), CallKind::SuperCall);
+    }
+    // NB: Frame states at it list how many arguments it passes on.
+    if opcode == OpCode::SuperCallWithForwardedArguments as u8 {
+        return (0, op::SuperCallWithForwardedArguments::LENGTH, CallKind::SuperCall);
     }
     let call = instruction_at::<op::Call>(executable, pc);
-    (call.argument_count, call.length(), false)
+    (u32::from(call.argument_count), call.length(), CallKind::Call)
 }
 
 /// The linkage of the frame of `executable` at the call of `frame_state`: its frame continues after the call (or
@@ -319,12 +391,13 @@ fn call_linkage(executable: &Executable, frame_state: &FrameState) -> CallLinkag
         unreachable!("frames at calls resume after them");
     };
     let pc = frame_state.pc;
-    let (argument_count, length, is_construct) = call_instruction_shape(executable, pc);
+    let (argument_count, length, kind) = call_instruction_shape(executable, pc);
     CallLinkage {
         passed_argument_count: frame_state.passed_argument_count.unwrap_or(argument_count),
         return_pc: pc + length,
         dst,
-        is_construct,
+        is_construct: kind != CallKind::Call,
+        is_super_call: kind == CallKind::SuperCall,
     }
 }
 
@@ -360,8 +433,14 @@ enum FrameSlots {
     Uninitialized,
 }
 
-/// Pushes the frame of an inlined call, linked to the running frame like an interpreter inline call.
-fn push_frame(vm: &Vm, callee: InlinedFunction, linkage: CallLinkage, slots: FrameSlots) -> NonNull<ExecutionContext> {
+/// Pushes the frame of an inlined call, linked to the running frame, `caller`, like an interpreter inline call.
+fn push_frame(
+    vm: &Vm,
+    caller: &ExecutionContext,
+    callee: InlinedFunction,
+    linkage: CallLinkage,
+    slots: FrameSlots,
+) -> NonNull<ExecutionContext> {
     // NB: JIT code checks at entry that the interpreter stack has room for every frame it may materialize.
     let frame = match callee {
         InlinedFunction::Ecmascript(callee) => {
@@ -375,7 +454,13 @@ fn push_frame(vm: &Vm, callee: InlinedFunction, linkage: CallLinkage, slots: Fra
             } else {
                 callee.inline_call_executable()
             };
-            let new_target = linkage.is_construct.then(|| callee.upcast());
+            // NB: The super() of a derived constructor constructs with the derived constructor's new target, like
+            //     the interpreter's SuperCall does.
+            let new_target = if linkage.is_super_call {
+                Some(caller.new_target.get().as_object())
+            } else {
+                linkage.is_construct.then(|| callee.upcast())
+            };
             vm.push_inline_frame_without_this(
                 callee,
                 executable,
@@ -556,6 +641,7 @@ fn push_site_frames(
             let function = values.function(code, frame_state);
             frame = push_frame(
                 vm,
+                frame_of(frame),
                 function,
                 linkage.expect("callers of inlined calls link them"),
                 FrameSlots::Initialize,
@@ -778,9 +864,11 @@ pub(super) fn publish(vm: &Vm, root: NonNull<ExecutionContext>, code: &JitCode, 
     let root_frame_state = frame_states.last().expect("a frame state");
     frame_of(root).program_counter.set(root_frame_state.pc);
     let mut linkage = call_linkage(&executable_of(frame_of(root)), root_frame_state);
+    let mut caller = root;
     for (index, frame_state) in frame_states.iter().enumerate().rev().skip(1) {
         let function = values.function(code, frame_state);
-        let frame = push_frame(vm, function, linkage, FrameSlots::Uninitialized);
+        let frame = push_frame(vm, frame_of(caller), function, linkage, FrameSlots::Uninitialized);
+        caller = frame;
         let frame_ref = frame_of(frame);
         let executable = executable_of(frame_ref);
         let arguments_base = arguments_base_of(&executable);
@@ -920,7 +1008,9 @@ pub fn call_site_frames<'vm>(
             .iter()
             .find(|(slot, _)| *slot == CALLEE_SLOT)
             .and_then(|(_, location)| match location {
-                ValueLocation::Stack(..) | ValueLocation::Constant(_) => Some(read_location(*location, &dump)),
+                ValueLocation::Stack(..) | ValueLocation::Constant(_) | ValueLocation::Frame(_) => {
+                    Some(read_location(*location, &dump, NonNull::from(frame)))
+                }
                 _ => None,
             });
         let function = match closure {

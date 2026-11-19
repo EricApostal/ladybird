@@ -76,6 +76,7 @@ pub mod identities;
 pub mod index;
 mod inputs;
 mod installed_records;
+pub(crate) use inputs::LayoutInputsPrefetch;
 pub(crate) use inputs::next_declaration_block_version;
 pub mod instrumentation;
 pub(crate) mod layout_style;
@@ -327,14 +328,10 @@ pub struct RetainedState {
     /// The elements a style() container query asked as containers with a value counting their place among their
     /// siblings. A fork shares them, as too many only walk more. An element's identity used again stays here too.
     containers_counted_by_style_queries: Arc<Mutex<HashSet<StyleNodeID>>>,
-    /// What the last cold pass measured.
-    cold_pass_report: pipeline::Report,
     /// What the engine keeps of the document it owns, which a fork goes on keeping.
     live_style: Option<Box<pipeline::Live>>,
     /// Whether this is the state the host writes, on which alone the engine starts.
     live_style_may_start: crate::fork::ForkReset<crate::fork::IsOriginal>,
-    /// How many cold passes the engine started from, on this state and on every fork of it.
-    cold_passes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// What the engine did on this state, for tests to read.
     live_counters: pipeline::counters::Counters,
     /// The threads style passes run on, which the process shares where a render state holds the
@@ -443,6 +440,11 @@ pub struct StyleEngine {
 impl RetainedState {
     pub(crate) fn deepest_element_depth(&self) -> u32 {
         self.deepest_element.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One past the greatest element slot the document holds a row for: about how many elements it has.
+    pub(crate) fn element_slot_count(&self) -> usize {
+        self.projection.element_slot_count()
     }
 
     pub(crate) fn started_style_layout_pool(&self) -> Option<std::sync::Arc<rayon::ThreadPool>> {

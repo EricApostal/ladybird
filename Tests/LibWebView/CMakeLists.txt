@@ -2,6 +2,7 @@ if (BUILD_TESTING AND NOT WIN32)
     if (APPLE OR LINUX)
         ladybird_python_test(test-devtools-catch-up-layout.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-devtools-client-follows-the-tab.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-devtools-network-events.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-iframe-console.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-console-previews.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-message-port-collection.py ARGS $<TARGET_FILE:WebDriver>)
@@ -23,11 +24,18 @@ if (BUILD_TESTING AND NOT WIN32)
     endif()
 
     ladybird_python_test(test-webdriver-bidi.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-command-privileges.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-content-blockers.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
     ladybird_python_test(test-webdriver-delete-session.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-element-screenshot.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-error-keep-alive.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-force-dark.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-permissions-settings.py ARGS $<TARGET_FILE:WebDriver>)
+    if (PDFJS_FOUND)
+        ladybird_python_test(test-webdriver-pdf-viewer-ignores-the-csp-of-its-pdf.py ARGS $<TARGET_FILE:WebDriver>)
+    endif()
+    ladybird_python_test(test-webdriver-rejects-web-page-requests.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-screenshot-with-cross-site-iframe.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-search-engine-settings.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-set-permission.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-settings-changes.py ARGS $<TARGET_FILE:WebDriver>)
@@ -64,12 +72,15 @@ set(TEST_SOURCES
     TestHistoryStore.cpp
     TestHSTSStore.cpp
     TestLingeringIndicator.cpp
+    TestMediaSessionCoordinator.cpp
     TestNavigationLoader.cpp
     TestNotificationAttribution.cpp
     TestNotificationFreedesktopArguments.cpp
+    TestNowPlayingInfo.cpp
     TestOmnibox.cpp
     TestPermissionManager.cpp
     TestPictureInPictureWindow.cpp
+    TestPlatformFeatures.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
     TestSessionHistoryTraversalQueue.cpp
@@ -79,8 +90,10 @@ set(TEST_SOURCES
     TestStorageJar.cpp
     TestTabIndicators.cpp
     TestTabPerformanceStats.cpp
+    TestUpdateCheck.cpp
     TestWebDriverBiDiNetwork.cpp
     TestWebViewURL.cpp
+    TestWebWorkerClient.cpp
 )
 
 if (APPLE OR LINUX)
@@ -94,7 +107,7 @@ if (APPLE OR LINUX)
 endif()
 
 if (APPLE)
-    list(APPEND TEST_SOURCES TestProcessReaper.cpp)
+    list(APPEND TEST_SOURCES TestPageBackingStores.cpp TestProcessReaper.cpp)
 endif()
 
 if (LINUX)
@@ -125,6 +138,7 @@ if (NOT WIN32)
         TestAutocomplete.cpp
         TestBeforeUnload.cpp
         TestBrowserHistoryTraversal.cpp
+        TestCompositorStartup.cpp
         TestCrashOverlay.cpp
         TestCrashReportSubmission.cpp
         TestFavicon.cpp
@@ -142,11 +156,13 @@ if (NOT WIN32)
         TestRendererAttentionClaims.cpp
         TestRendererCookieAccess.cpp
         TestRendererOriginClaims.cpp
+        TestRendererResponseBodyClaims.cpp
         TestRendererViolationReports.cpp
         TestRequestServerClientSessions.cpp
         TestRequestServerDiskCaches.cpp
         TestShadowTreeTooltipsAndLinks.cpp
         TestSharedWorkerHost.cpp
+        TestSpareWebContentProcess.cpp
         TestTitleElementChanges.cpp
         TestUserActivation.cpp
         TestViewSource.cpp

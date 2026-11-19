@@ -566,8 +566,8 @@ pub(crate) fn set_svg_filter_bounds(
         bounds,
     );
     if previous != bounds {
-        use crate::painting::record::damage::PaintDamage;
-        layout_arena.push_paint_damage(slot, PaintDamage::SCOPE_PREAMBLE | PaintDamage::SVG);
+        use crate::painting::record::change_ticks::RowPaintChange;
+        layout_arena.note_paint_change(slot, RowPaintChange::DRAWING);
     }
 }
 
@@ -578,6 +578,224 @@ fn svg_filter_bounds(layout_arena: &impl PaintRead, slot: NodeSlotId) -> Option<
     }
     paintable_geometry::committed_svg_geometry(layout_arena, slot)
         .map(|geometry| crate::layout::svg_formatting_context::css_pixel_rect_of(geometry.viewport_user_rect))
+}
+
+/// What a `<filter>` applied to the box in `slot` resolves its region and subregions against. An SVG element's own user
+/// space is the space it paints in, and its object bounding box comes from its geometry. Any other box has its user
+/// space start at its border box's top-left corner, one unit to a CSS pixel, with its border box as the viewport its
+/// percentages resolve against. Its object bounding box is its border box, grown to what overflows it unclipped (a
+/// transformed child, e.g.), so the filter region covers what the box paints.
+// https://drafts.csswg.org/filter-effects-1/#FilterEffectsRegion
+fn svg_filter_target(
+    layout_arena: &impl PaintRead,
+    slot: NodeSlotId,
+    region: crate::painting::host::visual_context::FfiSvgFilterRegion,
+) -> crate::painting::svg_filter::SvgFilterTarget {
+    // NB: An outer <svg> element is a CSS box, whose effects apply above the transform its viewBox sets up.
+    let is_outer_svg_element =
+        layout_arena.node_kind_if_live(slot) == Some(crate::layout::node_data::NodeKind::SVGSVGBox);
+    if let Some(geometry) = paintable_geometry::committed_svg_geometry(layout_arena, slot)
+        && !is_outer_svg_element
+    {
+        return crate::painting::svg_filter::SvgFilterTarget {
+            region,
+            object_bounding_box: geometry.object_bounding_box,
+            user_space_origin: (0.0, 0.0),
+            user_space_viewport: (geometry.viewport_user_rect.width, geometry.viewport_user_rect.height),
+        };
+    }
+    let to_float_rect = |rect: crate::css::css_pixels::CssPixelRect| {
+        libgfx_rust::FloatRect::new(
+            rect.x.to_float(),
+            rect.y.to_float(),
+            rect.width.to_float(),
+            rect.height.to_float(),
+        )
+    };
+    let border_box = to_float_rect(paintable_geometry::absolute_border_box_rect(layout_arena, slot));
+    let mut object_bounding_box = border_box;
+    if !is_outer_svg_element {
+        // What the box and its descendants paint before effects: their border boxes and outer shadows, each cut to
+        // the clips it's under and moved by the transforms it's under, in that order.
+        let mut grow = |rect: crate::css::css_pixels::CssPixelRect| {
+            let rect = to_float_rect(rect);
+            if !rect.is_empty() {
+                object_bounding_box = object_bounding_box.united(rect);
+            }
+        };
+        for shadow in outer_box_shadow_rects(layout_arena, slot) {
+            grow(shadow);
+        }
+        // A box that clips both axes cuts everything inside it to its padding box, which its border box already
+        // covers, so neither its text nor its descendants can grow the bounding box.
+        let clips_both_axes = matches!(overflow_clip_extents(layout_arena, slot), (Some(_), Some(_)));
+        if !clips_both_axes {
+            for rect in line_text_rects(layout_arena, slot) {
+                if let Some(rect) = clipped_by_overflow(layout_arena, slot, rect) {
+                    grow(rect);
+                }
+            }
+            let mut filtered_ancestors = Vec::new();
+            let mut ancestor = layout_arena.node_parent_if_live(slot);
+            while let Some(node) = ancestor {
+                filtered_ancestors.push(node);
+                ancestor = layout_arena.node_parent_if_live(node);
+            }
+            let mut pending: Vec<NodeSlotId> = layout_arena.children(slot).collect();
+            while let Some(descendant) = pending.pop() {
+                pending.extend(layout_arena.children(descendant));
+                if !layout_arena.paintable_row_is_populated(descendant) {
+                    continue;
+                }
+                // An inline box paints its border boxes too, around the text of each line it's on. And a block paints the
+                // text of its lines, which can overflow it (a long line that can't wrap, e.g.), cut to its own clip.
+                for rect in line_text_rects(layout_arena, descendant) {
+                    if let Some(rect) = clipped_by_overflow(layout_arena, descendant, rect).and_then(|rect| {
+                        rect_in_filtered_box_space(layout_arena, slot, &filtered_ancestors, descendant, rect)
+                    }) {
+                        grow(rect);
+                    }
+                }
+                let painted: Vec<CssPixelRect> = match layout_arena.node_kind_if_live(descendant) {
+                    Some(kind)
+                        if crate::layout::node_facts::kind_is_box(kind)
+                            || kind == crate::layout::node_data::NodeKind::InlineNode =>
+                    {
+                        paintable_geometry::absolute_border_box_rects_of_fragments(layout_arena, descendant)
+                            .into_iter()
+                            .chain(outer_box_shadow_rects(layout_arena, descendant))
+                            .collect()
+                    }
+                    _ => continue,
+                };
+                for rect in painted {
+                    if let Some(rect) =
+                        rect_in_filtered_box_space(layout_arena, slot, &filtered_ancestors, descendant, rect)
+                    {
+                        grow(rect);
+                    }
+                }
+            }
+        }
+    }
+    crate::painting::svg_filter::SvgFilterTarget {
+        region,
+        object_bounding_box,
+        user_space_origin: (border_box.x, border_box.y),
+        user_space_viewport: (border_box.width, border_box.height),
+    }
+}
+
+/// Where a box clips along one axis, as start and end coordinates, or `None` where it doesn't clip along it.
+type ClipExtent = Option<(CssPixels, CssPixels)>;
+
+/// The axes along which `node` clips what overflows it, as its padding box's extent along each: Only "overflow: clip"
+/// can clip one axis alone.
+fn overflow_clip_extents(layout_arena: &impl PaintRead, node: NodeSlotId) -> (ClipExtent, ClipExtent) {
+    use crate::css::css_enums::overflow;
+    let Some(style) = layout_arena.node_style_if_live(node) else {
+        return (None, None);
+    };
+    let clips_x = style.overflow_x() != overflow::VISIBLE;
+    let clips_y = style.overflow_y() != overflow::VISIBLE;
+    if !clips_x && !clips_y {
+        return (None, None);
+    }
+    let padding_box = paintable_geometry::absolute_padding_box_rect(layout_arena, node);
+    (
+        clips_x.then_some((padding_box.x, padding_box.x + padding_box.width)),
+        clips_y.then_some((padding_box.y, padding_box.y + padding_box.height)),
+    )
+}
+
+/// `rect`, which `node` paints, as it lands in the space of `filtered`, the box it's under: moved by `node`'s own
+/// transform, and then cut by each containing block's clip and moved by its transform, up to and including the clip
+/// of `filtered`. `None` where a clip leaves nothing of it. A box that's positioned out of a clipping box's subtree
+/// (one whose containing block is above that box) isn't cut by it, since its containing block chain skips that box.
+fn rect_in_filtered_box_space(
+    layout_arena: &impl PaintRead,
+    filtered: NodeSlotId,
+    filtered_ancestors: &[NodeSlotId],
+    node: NodeSlotId,
+    rect: CssPixelRect,
+) -> Option<CssPixelRect> {
+    let mut rect = crate::painting::scroll_snap::map_rect_through_node_transform(layout_arena, node, rect);
+    let mut block = layout_arena.node_containing_block_if_live(node)?;
+    while block != filtered {
+        // An inline box isn't a containing block, so the climb from inside a filtered inline box passes it by. It
+        // ends at the first containing block that's an ancestor of the filtered box instead, since an inline box has
+        // no clip or transform of its own to apply.
+        if filtered_ancestors.contains(&block) {
+            return Some(rect);
+        }
+        rect = clipped_by_overflow(layout_arena, block, rect)?;
+        rect = crate::painting::scroll_snap::map_rect_through_node_transform(layout_arena, block, rect);
+        block = layout_arena.node_containing_block_if_live(block)?;
+    }
+    clipped_by_overflow(layout_arena, filtered, rect)
+}
+
+/// `rect` cut to the overflow clip of `block` along the axes it clips, or `None` where that leaves nothing.
+fn clipped_by_overflow(layout_arena: &impl PaintRead, block: NodeSlotId, rect: CssPixelRect) -> Option<CssPixelRect> {
+    let (horizontal, vertical) = overflow_clip_extents(layout_arena, block);
+    let (mut left, mut right) = (rect.x, rect.x + rect.width);
+    let (mut top, mut bottom) = (rect.y, rect.y + rect.height);
+    if let Some((start, end)) = horizontal {
+        left = left.max(start);
+        right = right.min(end);
+    }
+    if let Some((start, end)) = vertical {
+        top = top.max(start);
+        bottom = bottom.min(end);
+    }
+    (right > left && bottom > top).then(|| CssPixelRect::new(left, top, right - left, bottom - top))
+}
+
+/// Where the text of the lines that `root` lays out sits, fragment by fragment, if it lays out any.
+fn line_text_rects(layout_arena: &impl PaintRead, root: NodeSlotId) -> Vec<CssPixelRect> {
+    if !crate::painting::node_painting::has_lines(layout_arena, root) {
+        return Vec::new();
+    }
+    let side = layout_arena.committed_side_data(root);
+    let positions = paintable_geometry::LineRootPositions::new(layout_arena, root);
+    side.fragments()
+        .iter()
+        .filter(|fragment| fragment.glyph_run.is_some())
+        .map(|fragment| {
+            crate::painting::text_fragment::rect_in_containing_block(fragment)
+                .translated_by(positions.of_line(side.lines(), fragment.line_index as usize))
+        })
+        .collect()
+}
+
+/// Where the outer box shadows of `node` reach, around each of its border box fragments.
+fn outer_box_shadow_rects(layout_arena: &impl PaintRead, node: NodeSlotId) -> Vec<CssPixelRect> {
+    let Some(style) = layout_arena.node_style_if_live(node) else {
+        return Vec::new();
+    };
+    let shadows = style.effects().box_shadows.as_slice();
+    if shadows.iter().all(|layer| layer.is_inner()) {
+        return Vec::new();
+    }
+    let mut rects = Vec::new();
+    for border_box in paintable_geometry::absolute_border_box_rects_of_fragments(layout_arena, node) {
+        for layer in shadows.iter().filter(|layer| !layer.is_inner()) {
+            let geometry =
+                crate::painting::record::paint::shadow::box_shadow_layer_geometry(layer, border_box, border_box);
+            // A blur reaches three standard deviations (half the blur radius each) out, and the spread, which can be
+            // negative, moves the shadow's edge in or out before that.
+            let blur_reach = CssPixels::nearest_value_for_f32((geometry.blur_radius.to_float() * 1.5).ceil());
+            let reach = blur_reach + geometry.spread_distance;
+            let rect = geometry
+                .content_rect
+                .inflated(reach, reach, reach, reach)
+                .translated(geometry.offset_x, geometry.offset_y);
+            if rect.width > CssPixels::default() && rect.height > CssPixels::default() {
+                rects.push(rect);
+            }
+        }
+    }
+    rects
 }
 
 fn published_svg_filter(
@@ -601,14 +819,24 @@ fn published_svg_filter(
     }
     let mut builder = crate::painting::svg_filter::SvgFilterGraphBuilder::new(device_pixels_per_css_pixel);
     if layout_arena.paintable_row_is_populated(slot) {
-        let absolute_rect = paintable_geometry::absolute_rect(layout_arena, slot);
-        let dest_rect = libgfx_rust::enclosing_int_rect(libgfx_rust::FloatRect::new(
-            absolute_rect.x.to_float(),
-            absolute_rect.y.to_float(),
-            absolute_rect.width.to_float(),
-            absolute_rect.height.to_float(),
-        ));
-        builder.set_image_target(dest_rect, style.image_rendering());
+        if kind == crate::painting::svg_paint_resources::SvgPaintResourceKind::Filter {
+            builder.set_target(
+                svg_filter_target(layout_arena, slot, published.region),
+                style.image_rendering(),
+            );
+        } else {
+            // FIXME: Resolve the filter region and subregions of a backdrop filter too, once it's settled what they're
+            //        relative to there. Until then, an feImage draws over the box.
+            let absolute_rect = paintable_geometry::absolute_rect(layout_arena, slot);
+            let scale = device_pixels_per_css_pixel as f32;
+            let image_rect = libgfx_rust::enclosing_int_rect(libgfx_rust::FloatRect::new(
+                absolute_rect.x.to_float() * scale,
+                absolute_rect.y.to_float() * scale,
+                absolute_rect.width.to_float() * scale,
+                absolute_rect.height.to_float() * scale,
+            ));
+            builder.set_image_rect_without_target(image_rect.to_float(), style.image_rendering());
+        }
     }
     for primitive in published.primitives.iter().cloned() {
         builder.push(primitive);
@@ -622,9 +850,11 @@ fn published_svg_filter(
     }
 }
 
-/// A box's effects, and the bounds of the SVG filter it references.
+/// A box's effects, if it references an SVG filter, and that filter's bounds. A filter can be referenced and still have
+/// no bounds (on a box with an empty border box, e.g.).
 pub(crate) struct ResolvedEffects {
     pub(crate) effects: Option<EffectsData>,
+    pub(crate) references_svg_filter: bool,
     pub(crate) svg_filter_bounds: Option<crate::layout::used_values::FfiCssPixelRect>,
 }
 
@@ -666,6 +896,7 @@ pub(crate) fn resolve_effects_data(
     let style = layout_arena.node_style_if_live(slot)?;
     let effects_values = style.effects();
     let isolation = stacking_context_needs_isolation(layout_arena, slot);
+    let mut references_svg_filter = false;
     let mut svg_filter_bounds = None;
     let filter = if crate::painting::css_filter::contains_url(&effects_values.filter) {
         let resolved_svg_filter = published_svg_filter(
@@ -675,6 +906,7 @@ pub(crate) fn resolve_effects_data(
             style,
             device_pixels_per_css_pixel,
         );
+        references_svg_filter = !resolved_svg_filter.failed;
         svg_filter_bounds = resolved_svg_filter
             .svg_filter_bounds
             .has_value
@@ -702,6 +934,7 @@ pub(crate) fn resolve_effects_data(
     {
         return Some(ResolvedEffects {
             effects: None,
+            references_svg_filter,
             svg_filter_bounds,
         });
     }
@@ -715,6 +948,7 @@ pub(crate) fn resolve_effects_data(
     let needs_effects_node = effects.needs_layer() || keeps_effects_node_for_later_values;
     Some(ResolvedEffects {
         effects: needs_effects_node.then_some(effects),
+        references_svg_filter,
         svg_filter_bounds,
     })
 }
@@ -875,8 +1109,14 @@ fn used_overflow(
     (overflow_x, overflow_y)
 }
 
-/// The rect a box's overflow clips its content to, unbounded along an axis it does not clip.
-pub(crate) fn overflow_clip_rect(layout_arena: &impl PaintRead, slot: NodeSlotId) -> Option<CssPixelRect> {
+/// The range of each axis that a box's overflow clip keeps, in absolute layout CSS pixels.
+pub(crate) struct OverflowClipRanges {
+    pub horizontal: Option<(CssPixels, CssPixels)>,
+    pub vertical: Option<(CssPixels, CssPixels)>,
+}
+
+/// `None` when the box clips neither axis.
+pub(crate) fn overflow_clip_ranges(layout_arena: &impl PaintRead, slot: NodeSlotId) -> Option<OverflowClipRanges> {
     use crate::css::css_enums::overflow;
     let style = layout_arena.node_style_if_live(slot)?;
     let (overflow_x, overflow_y) = used_overflow(layout_arena, slot, style);
@@ -891,20 +1131,29 @@ pub(crate) fn overflow_clip_rect(layout_arena: &impl PaintRead, slot: NodeSlotId
 
     let padding_box = paintable_geometry::absolute_padding_box_rect(layout_arena, slot);
     let overflow_clip_edge = overflow_clip_edge_rect(style, layout_arena, slot);
+    Some(OverflowClipRanges {
+        horizontal: match overflow_x {
+            overflow::VISIBLE => None,
+            overflow::CLIP => Some((overflow_clip_edge.x, overflow_clip_edge.x + overflow_clip_edge.width)),
+            _ => Some((padding_box.x, padding_box.x + padding_box.width)),
+        },
+        vertical: match overflow_y {
+            overflow::VISIBLE => None,
+            overflow::CLIP => Some((overflow_clip_edge.y, overflow_clip_edge.y + overflow_clip_edge.height)),
+            _ => Some((padding_box.y, padding_box.y + padding_box.height)),
+        },
+    })
+}
+
+/// The rect a box's overflow clips its content to, unbounded along an axis it does not clip.
+pub(crate) fn overflow_clip_rect(layout_arena: &impl PaintRead, slot: NodeSlotId) -> Option<CssPixelRect> {
+    let ranges = overflow_clip_ranges(layout_arena, slot)?;
     // NB: An axis that is not clipped must extend into negative coordinates too, since content can be laid out above or
     //     to the left of the origin (e.g. inside a scroll container with flex-direction: column-reverse). Half the
     //     range on each side keeps the rect's size from saturating.
     let extent_limit = CssPixels::from_integer(crate::css::css_pixels::MAX_INTEGER_VALUE as i64 / 2);
-    let (left, right) = match overflow_x {
-        overflow::VISIBLE => (-extent_limit, extent_limit),
-        overflow::CLIP => (overflow_clip_edge.x, overflow_clip_edge.x + overflow_clip_edge.width),
-        _ => (padding_box.x, padding_box.x + padding_box.width),
-    };
-    let (top, bottom) = match overflow_y {
-        overflow::VISIBLE => (-extent_limit, extent_limit),
-        overflow::CLIP => (overflow_clip_edge.y, overflow_clip_edge.y + overflow_clip_edge.height),
-        _ => (padding_box.y, padding_box.y + padding_box.height),
-    };
+    let (left, right) = ranges.horizontal.unwrap_or((-extent_limit, extent_limit));
+    let (top, bottom) = ranges.vertical.unwrap_or((-extent_limit, extent_limit));
     Some(CssPixelRect::new(left, top, right - left, bottom - top))
 }
 

@@ -77,6 +77,7 @@ private:
     // ^WebView::Application
     virtual Core::EventLoop& create_platform_event_loop() override;
     virtual void create_platform_arguments(Core::ArgsParser&) override;
+    virtual Optional<pid_t> ui_process_id() const override;
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
     virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab, WebView::ViewImplementation const* related_view = nullptr) const override;
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab, WebView::ViewImplementation const* source_view = nullptr) const override;
@@ -88,6 +89,7 @@ private:
     virtual NonnullRefPtr<Core::Promise<ByteString>> ask_user_for_download_path(ByteString const& file) const override;
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const override;
     virtual void display_error_dialog(StringView error_message) const override;
+    virtual void display_update_check_result(WebView::UpdateCheckResult const&, WebView::UpdateCheckTrigger) override;
     virtual void set_clipboard_text(String, ClipboardType) override;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem) override;
     virtual void read_clipboard_text(ClipboardType, Function<void(Utf16String)>) const override;
@@ -97,6 +99,7 @@ private:
     virtual void quit_for_signal() override;
     virtual NonnullOwnPtr<WebView::MicrophoneAuthorizer> create_microphone_authorizer() override;
     virtual NonnullOwnPtr<WebView::NotificationBackend> create_notification_backend() override;
+    virtual OwnPtr<WebView::MediaSessionPlatformBackend> create_media_session_platform_backend() override;
     virtual bool captures_browser_crashes() const override { return true; }
     virtual void on_devtools_enabled() const override;
     virtual void on_devtools_disabled() const override;
@@ -124,6 +127,7 @@ private:
     ApplicationHost* m_host { nullptr };
     StringView m_encoded_ui_info;
     StringView m_ui_mach_server_name;
+    StringView m_ui_pid;
     mutable Optional<Hub::UIInfo> m_ui_info;
     HashMap<u64, NonnullOwnPtr<View>> m_views;
     Optional<u64> m_active_view_id;

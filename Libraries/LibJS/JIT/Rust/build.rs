@@ -31,6 +31,7 @@ use flapc::rust_bytecode::generate_opcode_enum;
 use flapc::rust_bytecode::generate_opcode_method;
 use flapc::rust_bytecode::read_expr_for_type;
 use flapc::rust_bytecode::rust_field_name;
+use flapc::rust_bytecode::scaled;
 use flapc::rust_bytecode::wildcard_pattern;
 use std::env;
 use std::error::Error;
@@ -151,7 +152,11 @@ fn generate_decode_function(mut w: impl Write, ops: &[InstructionDefinition]) ->
             writeln!(w, "            if {name}_end > length {{")?;
             writeln!(w, "                return Err(DecodeErrorKind::InvalidLength);")?;
             writeln!(w, "            }}")?;
-            let element = read_expr_for_type(&field.ty, &format!("at + {offset} + index * {element_size}"), READER);
+            let element = read_expr_for_type(
+                &field.ty,
+                &format!("at + {offset} + {}", scaled("index", element_size)),
+                READER,
+            );
             writeln!(
                 w,
                 "            let {name} = (0..{name}_len).map(|index| {element}).collect::<Vec<_>>();"
@@ -341,11 +346,12 @@ fn generate_slow_path_layout_function(
 }
 
 fn generate_feedback_slots_method(mut w: impl Write, ops: &[InstructionDefinition]) -> GeneratorResult {
-    const KINDS: [(&str, &str); 4] = [
+    const KINDS: [(&str, &str); 5] = [
         ("ArithFeedbackIndex", "arith"),
         ("ValueFeedbackIndex", "value"),
         ("CallFeedbackIndex", "call"),
         ("KeyedFeedbackIndex", "keyed"),
+        ("ProfiledPropertyLookupCacheIndex", "cache_value"),
     ];
     writeln!(
         w,
@@ -373,7 +379,11 @@ fn generate_feedback_slots_method(mut w: impl Write, ops: &[InstructionDefinitio
             .join(", ");
         let slots = feedback_fields
             .iter()
-            .map(|(name, kind)| format!("{kind}: Some(*{name})"))
+            .map(|(name, kind)| match *kind {
+                // NB: Cache indices take two bytes in the bytecode.
+                "cache_value" => format!("{kind}: u16::try_from(*{name}).ok()"),
+                _ => format!("{kind}: Some(*{name})"),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         writeln!(
@@ -419,7 +429,7 @@ fn generate_rust_code(mut w: impl Write, ops: &[InstructionDefinition], record_f
     generate_encoded_size_method(&mut w, ops)?;
     writeln!(
         w,
-        "    pub fn encode(&self, strict: bool, bytes: &mut Vec<u8>) {{ self.encode_with(strict, &mut TestEncoder {{ bytes }}); }}"
+        "    pub fn encode(&self, bytes: &mut Vec<u8>) {{ self.encode_with(&mut TestEncoder {{ bytes }}); }}"
     )?;
     writeln!(w, "}}")?;
     writeln!(w)?;

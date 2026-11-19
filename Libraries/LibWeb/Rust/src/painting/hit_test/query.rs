@@ -9,14 +9,13 @@ use crate::painting::chrome_geometry::{ChromeGeometry, scrollbar_is_hidden};
 use crate::painting::ffi::ScrollDirection;
 use crate::painting::host::FfiHitTestQueryCallbacks;
 use crate::painting::paint_read::PaintRead;
-use crate::painting::viewport_mapping::ViewportSpace;
 use crate::painting::visual_context::{
-    ClipBehavior, NO_SORTING_CONTEXT, SortingContexts, SpatialNodeIndex, VisualContextTree, WorldTransforms,
+    NO_SORTING_CONTEXT, SortingContexts, SpatialNodeIndex, VisualContextTree, WorldTransforms,
 };
 use libgfx_rust::FloatPoint;
 use std::collections::HashMap;
 
-struct DepthSortingState<'a> {
+pub(super) struct DepthSortingState<'a> {
     tree: &'a VisualContextTree,
     point: CssPixelPoint,
     device_pixels_per_css_pixel: f32,
@@ -26,7 +25,11 @@ struct DepthSortingState<'a> {
 }
 
 impl<'a> DepthSortingState<'a> {
-    fn new(callbacks: &'a FfiHitTestQueryCallbacks, tree: &'a VisualContextTree, point: CssPixelPoint) -> Self {
+    pub(super) fn new(
+        callbacks: &'a FfiHitTestQueryCallbacks,
+        tree: &'a VisualContextTree,
+        point: CssPixelPoint,
+    ) -> Self {
         Self {
             tree,
             point,
@@ -42,7 +45,7 @@ impl<'a> DepthSortingState<'a> {
             .get_or_insert_with(|| self.tree.resolve_sorting_contexts())
     }
 
-    fn group_for(&mut self, spatial: SpatialNodeIndex) -> Option<u32> {
+    pub(super) fn group_for(&mut self, spatial: SpatialNodeIndex) -> Option<u32> {
         let contexts = self.sorting_contexts();
         if contexts.is_empty() || contexts.leaf_by_node[spatial.0 as usize] == NO_SORTING_CONTEXT {
             None
@@ -55,7 +58,7 @@ impl<'a> DepthSortingState<'a> {
         }
     }
 
-    fn depth_key_for(&mut self, spatial: SpatialNodeIndex) -> Option<i64> {
+    pub(super) fn depth_key_for(&mut self, spatial: SpatialNodeIndex) -> Option<i64> {
         let contexts = self.sorting_contexts();
         if contexts.is_empty() {
             return None;
@@ -82,273 +85,68 @@ impl<'a> DepthSortingState<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TopmostItem {
-    pub index: usize,
-    pub local_point: CssPixelPoint,
-}
-
-impl HitTestList {
-    fn item_contains(
-        &self,
-        layout_arena: &impl PaintRead,
-        callbacks: &FfiHitTestQueryCallbacks,
-        item: &HitTestItem,
-        local: FloatPoint,
-    ) -> bool {
-        let local_point = to_css_point(local);
-        match item.kind {
-            HitTestItemKind::Box => {
-                item.rect.contains_point(local_point) && item.border_radii.contains(local_point, item.rect)
-            }
-            HitTestItemKind::SvgPath => {
-                // SVG paths test in float: their local units can map to many device pixels each.
-                let rect = item.rect;
-                let FloatPoint { x, y } = local;
-                let in_rect = x >= rect.left().to_float()
-                    && x < rect.right().to_float()
-                    && y >= rect.top().to_float()
-                    && y < rect.bottom().to_float();
-                if !in_rect {
-                    return false;
-                }
-                let Some(path) = item.path.as_ref() else {
-                    return false;
-                };
-                (item.svg_hit_areas & svg_hit_area::FILL != 0 && path.contains(x, y, item.winding_rule))
-                    || (item.svg_hit_areas & svg_hit_area::STROKE != 0
-                        && item
-                            .svg_stroke
-                            .as_ref()
-                            .is_some_and(|stroke| stroke.contains(path, x, y)))
-            }
-            HitTestItemKind::TextFragment => item.rect.contains_point(local_point),
-            HitTestItemKind::EmptyEditable => item.rect.contains_point(local_point),
-            HitTestItemKind::ChromeWidget => {
-                if !layout_arena.paintable_row_is_populated(item.paintable) {
-                    return false;
-                }
-                assert!(
-                    callbacks.has_chrome_metrics,
-                    "chrome widget hit testing needs the chrome metrics"
-                );
-                let node = item.paintable;
-                let rows = layout_arena;
-                let chrome_geometry = ChromeGeometry::for_hit_test_query(rows, callbacks);
-                match item.chrome_widget_kind {
-                    1 => chrome_geometry.resizer_contains(node, local_point),
-                    2 | 3 => {
-                        let direction = if item.chrome_widget_kind == 2 {
-                            ScrollDirection::Horizontal
-                        } else {
-                            ScrollDirection::Vertical
-                        };
-                        // An overlay scrollbar that has faded out takes no pointer input, as in Chromium. The
-                        // compositor grows a hovered scrollbar, which is hit tested here as it is before it grows.
-                        !scrollbar_is_hidden(rows, node, direction)
-                            && chrome_geometry
-                                .absolute_scrollbar_rect(node, direction, false)
-                                .is_some_and(|rect| rect.contains_point(local_point))
-                    }
-                    _ => false,
-                }
-            }
+pub(super) fn item_contains_point(
+    layout_arena: &impl PaintRead,
+    callbacks: &FfiHitTestQueryCallbacks,
+    item: &HitTestItem,
+    local: FloatPoint,
+) -> bool {
+    let local_point = to_css_point(local);
+    match item.kind {
+        HitTestItemKind::Box => {
+            item.rect.contains_point(local_point) && item.border_radii.contains(local_point, item.rect)
         }
-    }
-
-    fn find_topmost_item_in_list(
-        &self,
-        layout_arena: &impl PaintRead,
-        callbacks: &FfiHitTestQueryCallbacks,
-        item_indices: &[usize],
-        local: FloatPoint,
-        topmost: &mut Option<usize>,
-    ) {
-        for item_index in item_indices.iter().rev() {
-            if topmost.is_some_and(|topmost| *item_index <= topmost) {
-                return;
+        HitTestItemKind::SvgPath => {
+            // SVG paths test in float: their local units can map to many device pixels each.
+            let rect = item.rect;
+            let FloatPoint { x, y } = local;
+            let in_rect = x >= rect.left().to_float()
+                && x < rect.right().to_float()
+                && y >= rect.top().to_float()
+                && y < rect.bottom().to_float();
+            if !in_rect {
+                return false;
             }
-            if self.item_contains(layout_arena, callbacks, &self.items[*item_index], local) {
-                *topmost = Some(*item_index);
-                return;
-            }
-        }
-    }
-
-    fn candidate_item_lists(spatial_index: &SpatialIndex, local_point: CssPixelPoint) -> [Option<&[usize]>; 2] {
-        let x = spatial_index_cell_for(local_point.x);
-        let y = spatial_index_cell_for(local_point.y);
-        let bucket = spatial_index.cells.get(&spatial_index_cell_key(x, y));
-        [
-            Some(spatial_index.unbucketed_items.as_slice()),
-            bucket.map(|bucket| bucket.as_slice()),
-        ]
-    }
-
-    fn find_topmost(
-        &self,
-        layout_arena: &impl PaintRead,
-        visual_context_tree: &VisualContextTree,
-        callbacks: &FfiHitTestQueryCallbacks,
-        point: CssPixelPoint,
-    ) -> Option<TopmostItem> {
-        debug_assert!(self.spatial_indexes_built);
-        let mut topmost: Option<TopmostItem> = None;
-        let mut topmost_index: Option<usize> = None;
-        let viewport_mapping = callbacks.viewport_mapping(visual_context_tree);
-        for (context, spatial_index) in &self.spatial_indexes_by_context {
-            let Some(local) =
-                viewport_mapping.point_to_local(*context, point, ViewportSpace::VisualViewport, ClipBehavior::Respect)
-            else {
-                continue;
+            let Some(path) = item.path.as_ref() else {
+                return false;
             };
-            let local_point = to_css_point(local);
-            let previous = topmost_index;
-            for candidate_list in Self::candidate_item_lists(spatial_index, local_point)
-                .into_iter()
-                .flatten()
-            {
-                self.find_topmost_item_in_list(layout_arena, callbacks, candidate_list, local, &mut topmost_index);
-            }
-            if topmost_index != previous {
-                topmost = topmost_index.map(|index| TopmostItem { index, local_point });
-            }
+            (item.svg_hit_areas & svg_hit_area::FILL != 0 && path.contains(x, y, item.winding_rule))
+                || (item.svg_hit_areas & svg_hit_area::STROKE != 0
+                    && item
+                        .svg_stroke
+                        .as_ref()
+                        .is_some_and(|stroke| stroke.contains(path, x, y)))
         }
-        topmost
-    }
-
-    // Planes of a 3D rendering context paint depth sorted, so the front-most plane at the point wins over a
-    // plane recorded later. Coplanar planes compare equal and fall back to record order.
-    fn depth_sort_key(&self, depth_sorting: &mut DepthSortingState<'_>, item_index: usize) -> (Option<i64>, usize) {
-        (
-            depth_sorting.depth_key_for(self.items[item_index].context.spatial),
-            item_index,
-        )
-    }
-
-    fn topmost_item_by_plane_depth(
-        &self,
-        layout_arena: &impl PaintRead,
-        visual_context_tree: &VisualContextTree,
-        callbacks: &FfiHitTestQueryCallbacks,
-        point: CssPixelPoint,
-        topmost: TopmostItem,
-    ) -> TopmostItem {
-        let mut depth_sorting = DepthSortingState::new(callbacks, visual_context_tree, point);
-        let Some(group) = depth_sorting.group_for(self.items[topmost.index].context.spatial) else {
-            return topmost;
-        };
-        let mut winner = topmost;
-        let viewport_mapping = callbacks.viewport_mapping(visual_context_tree);
-        for (context, spatial_index) in &self.spatial_indexes_by_context {
-            if depth_sorting.group_for(context.spatial) != Some(group) {
-                continue;
+        HitTestItemKind::TextFragment => item.rect.contains_point(local_point),
+        HitTestItemKind::EmptyEditable => item.rect.contains_point(local_point),
+        HitTestItemKind::ChromeWidget => {
+            if !layout_arena.paintable_row_is_populated(item.paintable) {
+                return false;
             }
-            let Some(local) =
-                viewport_mapping.point_to_local(*context, point, ViewportSpace::VisualViewport, ClipBehavior::Respect)
-            else {
-                continue;
-            };
-            let local_point = to_css_point(local);
-            for candidate_list in Self::candidate_item_lists(spatial_index, local_point)
-                .into_iter()
-                .flatten()
-            {
-                for item_index in candidate_list {
-                    if *item_index == winner.index
-                        || !self.item_contains(layout_arena, callbacks, &self.items[*item_index], local)
-                    {
-                        continue;
-                    }
-                    let candidate_key = self.depth_sort_key(&mut depth_sorting, *item_index);
-                    let winner_key = self.depth_sort_key(&mut depth_sorting, winner.index);
-                    if candidate_key > winner_key {
-                        winner = TopmostItem {
-                            index: *item_index,
-                            local_point,
-                        };
-                    }
+            assert!(
+                callbacks.has_chrome_metrics,
+                "chrome widget hit testing needs the chrome metrics"
+            );
+            let node = item.paintable;
+            let rows = layout_arena;
+            let chrome_geometry = ChromeGeometry::for_hit_test_query(rows, callbacks);
+            match item.chrome_widget_kind {
+                1 => chrome_geometry.resizer_contains(node, local_point),
+                2 | 3 => {
+                    let direction = if item.chrome_widget_kind == 2 {
+                        ScrollDirection::Horizontal
+                    } else {
+                        ScrollDirection::Vertical
+                    };
+                    // An overlay scrollbar that has faded out takes no pointer input, as in Chromium. The
+                    // compositor grows a hovered scrollbar, which is hit tested here as it is before it grows.
+                    !scrollbar_is_hidden(rows, node, direction)
+                        && chrome_geometry
+                            .absolute_scrollbar_rect(node, direction, false)
+                            .is_some_and(|rect| rect.contains_point(local_point))
                 }
+                _ => false,
             }
-        }
-        winner
-    }
-
-    pub(crate) fn find_topmost_item(
-        &self,
-        layout_arena: &impl PaintRead,
-        visual_context_tree: &VisualContextTree,
-        callbacks: &FfiHitTestQueryCallbacks,
-        point: CssPixelPoint,
-    ) -> Option<TopmostItem> {
-        let topmost = self.find_topmost(layout_arena, visual_context_tree, callbacks, point)?;
-        // Record order misranks content inside a 3D rendering context, whose planes paint depth sorted. A winner
-        // on such a plane is re-resolved against every hit plane of its outermost context. Content outside the
-        // context keeps record order, which stays correct because a context's items are recorded contiguously.
-        Some(self.topmost_item_by_plane_depth(layout_arena, visual_context_tree, callbacks, point, topmost))
-    }
-
-    pub(crate) fn hit_test_all(
-        &self,
-        layout_arena: &impl PaintRead,
-        visual_context_tree: &VisualContextTree,
-        callbacks: &FfiHitTestQueryCallbacks,
-        point: CssPixelPoint,
-    ) -> Vec<TopmostItem> {
-        debug_assert!(self.spatial_indexes_built);
-        let mut hits: Vec<TopmostItem> = Vec::new();
-        let viewport_mapping = callbacks.viewport_mapping(visual_context_tree);
-        for (context, spatial_index) in &self.spatial_indexes_by_context {
-            let Some(local) =
-                viewport_mapping.point_to_local(*context, point, ViewportSpace::VisualViewport, ClipBehavior::Respect)
-            else {
-                continue;
-            };
-            let local_point = to_css_point(local);
-            for candidate_list in Self::candidate_item_lists(spatial_index, local_point)
-                .into_iter()
-                .flatten()
-            {
-                for item_index in candidate_list {
-                    if self.item_contains(layout_arena, callbacks, &self.items[*item_index], local) {
-                        hits.push(TopmostItem {
-                            index: *item_index,
-                            local_point,
-                        });
-                    }
-                }
-            }
-        }
-        hits.sort_by_key(|hit| std::cmp::Reverse(hit.index));
-        hits.dedup_by_key(|hit| hit.index);
-        self.sort_hits_within_sorting_contexts(visual_context_tree, callbacks, point, &mut hits);
-        hits
-    }
-
-    // Runs of hits on the planes of one 3D rendering context are reordered front to back. A context's items
-    // are recorded contiguously, so after the record-order sort its hits sit adjacent.
-    fn sort_hits_within_sorting_contexts(
-        &self,
-        visual_context_tree: &VisualContextTree,
-        callbacks: &FfiHitTestQueryCallbacks,
-        point: CssPixelPoint,
-        hits: &mut [TopmostItem],
-    ) {
-        let mut depth_sorting = DepthSortingState::new(callbacks, visual_context_tree, point);
-        let mut run_begin = 0;
-        while run_begin < hits.len() {
-            let group = depth_sorting.group_for(self.items[hits[run_begin].index].context.spatial);
-            let mut run_end = run_begin + 1;
-            if group.is_some() {
-                while run_end < hits.len()
-                    && depth_sorting.group_for(self.items[hits[run_end].index].context.spatial) == group
-                {
-                    run_end += 1;
-                }
-                hits[run_begin..run_end]
-                    .sort_by_key(|hit| std::cmp::Reverse(self.depth_sort_key(&mut depth_sorting, hit.index)));
-            }
-            run_begin = run_end;
         }
     }
 }

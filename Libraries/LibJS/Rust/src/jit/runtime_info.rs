@@ -25,14 +25,16 @@ use super::entry_table::{JIT_ENTRY_SLOT_MASK, JIT_ENTRY_TABLE_OWNERS_OFFSET};
 use super::offset;
 use crate::build_configuration::{HEAP_REGION_OFFSET_MASK, PRIMITIVE_STORAGE_CAGE_OFFSET_MASK};
 use crate::bytecode::executable::{
-    MAX_NUMBER_OF_SHAPES_TO_REMEMBER, MEGAMORPHIC_DATA_TAG, MEGAMORPHIC_HASH_MULTIPLIER, MEGAMORPHIC_INDEX_BITS,
-    MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET, MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET,
+    MAX_MEGAMORPHIC_VM_CACHE_LESSONS, MAX_NUMBER_OF_SHAPES_TO_REMEMBER, MEGAMORPHIC_DATA_TAG,
+    MEGAMORPHIC_HASH_MULTIPLIER, MEGAMORPHIC_INDEX_BITS, MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET,
+    MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET, MEGAMORPHIC_VM_CACHE_LESSONS_OFFSET,
 };
 use crate::gc::class::{BLOCK_CLASS_OFFSET, BLOCK_CLASS_TAIL_TAG, BLOCK_SIZE, Class, GcCell};
 use crate::gc::defer_gc::DeferGc;
 use crate::interpreter::runtime_functions::runtime_function_addresses;
 use crate::interpreter::vm::{
-    FLY_STRING_CACHE_SIZE, LARGE_NUMERIC_STRING_CACHE_SIZE, NUMERIC_STRING_CACHE_SIZE, NumericStringCacheEntry, Vm,
+    FLY_STRING_CACHE_SIZE, KEY_CONCATENATION_CACHE_SIZE, KeyConcatenationCacheEntry, LARGE_NUMERIC_STRING_CACHE_SIZE,
+    NUMERIC_STRING_CACHE_SIZE, NumericStringCacheEntry, Vm,
 };
 use crate::layout::accessor::Accessor;
 use crate::layout::cell::Gc;
@@ -68,7 +70,7 @@ use crate::runtime::function_environment::{
 };
 use crate::runtime::generator_object::GeneratorObject;
 use crate::runtime::module_environment::ModuleEnvironment;
-use crate::runtime::object::{ORDINARY_OBJECT_METHODS, ObjectMethods, PropertyKind};
+use crate::runtime::object::{ObjectMethods, PropertyKind};
 use crate::runtime::string_object::StringObject;
 use crate::runtime::string_prototype::StringPrototype;
 
@@ -123,6 +125,7 @@ fn runtime_offsets() -> RuntimeOffsets {
         execution_context_private_environment: offset(offset_of!(ExecutionContext, private_environment)),
         execution_context_frame_initialized: offset(offset_of!(ExecutionContext, frame_initialized)),
         execution_context_executable: offset(offset_of!(ExecutionContext, executable)),
+        executable_idle_collection_count: offset(offset_of!(ExecutableHead, idle_collection_count)),
         execution_context_slots: offset(size_of::<ExecutionContext>()),
         vm_running_execution_context: offset(offset_of!(VmHead, running_execution_context)),
         vm_jit_native_stack_limit: offset(offset_of!(Vm, jit_native_stack_limit)),
@@ -164,6 +167,11 @@ fn runtime_offsets() -> RuntimeOffsets {
         execution_context_argument_count: offset(offset_of!(ExecutionContext, argument_count)),
         execution_context_returns_to_native_caller: offset(offset_of!(ExecutionContext, returns_to_native_caller)),
         execution_context_runs_jit_code: offset(offset_of!(ExecutionContext, runs_jit_code)),
+        execution_context_caller_is_derived_construct: offset(offset_of!(
+            ExecutionContext,
+            caller_is_derived_construct
+        )),
+        execution_context_new_target: offset(offset_of!(ExecutionContext, new_target)),
         ecmascript_function_environment: offset(ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT_OFFSET),
         ecmascript_function_private_environment: offset(offset_of!(
             EcmascriptFunctionObjectWithRareData,
@@ -251,6 +259,12 @@ fn runtime_layout() -> RuntimeLayout {
         typeof_strings: TypeofStrings::default(),
         fly_string_cache: 0,
         fly_string_cache_mask: (FLY_STRING_CACHE_SIZE - 1) as u32,
+        key_concatenation_cache: 0,
+        key_concatenation_cache_mask: (KEY_CONCATENATION_CACHE_SIZE - 1) as u32,
+        key_concatenation_cache_entry_size: size_of::<KeyConcatenationCacheEntry>() as u32,
+        key_concatenation_cache_lhs: offset(offset_of!(KeyConcatenationCacheEntry, lhs)),
+        key_concatenation_cache_rhs: offset(offset_of!(KeyConcatenationCacheEntry, rhs)),
+        key_concatenation_cache_string: offset(offset_of!(KeyConcatenationCacheEntry, string)),
         numeric_string_cache: 0,
         numeric_string_cache_size: NUMERIC_STRING_CACHE_SIZE as u32,
         large_numeric_string_cache: 0,
@@ -323,6 +337,7 @@ fn runtime_layout() -> RuntimeLayout {
             ObjectPropertyIteratorCacheData,
             property_values.size
         )),
+        property_iterator_property_offsets: offset(offset_of!(ObjectPropertyIteratorCacheData, property_offsets)),
         property_iterator_fast_path_none: ObjectPropertyIteratorFastPath::None as u8,
         property_iterator_fast_path_packed_indexed: ObjectPropertyIteratorFastPath::PackedIndexed as u8,
         executable_property_lookup_caches: offset(offset_of!(ExecutableHead, property_lookup_caches.data)),
@@ -348,6 +363,8 @@ fn runtime_layout() -> RuntimeLayout {
         property_lookup_cache_entry_type_add_own_property: PropertyLookupCacheEntryType::AddOwnProperty as u32,
         property_lookup_cache_entry_type_get_own_property: PropertyLookupCacheEntryType::GetOwnProperty as u32,
         property_lookup_cache_entry_type_change_own_property: PropertyLookupCacheEntryType::ChangeOwnProperty as u32,
+        property_lookup_cache_entry_type_get_property_in_prototype_chain:
+            PropertyLookupCacheEntryType::GetPropertyInPrototypeChain as u32,
         cell_block_mask: !(BLOCK_SIZE as u64 - 1),
         block_class_offset: offset(BLOCK_CLASS_OFFSET),
         block_class_tail_tag: BLOCK_CLASS_TAIL_TAG as u64,
@@ -358,8 +375,6 @@ fn runtime_layout() -> RuntimeLayout {
             ObjectMethods,
             is_cacheable_for_property_absence
         )),
-        default_is_cacheable_for_property_absence: ORDINARY_OBJECT_METHODS.is_cacheable_for_property_absence as usize
-            as u64,
         property_lookup_cache_polymorphic_tag: PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG as u64,
         property_lookup_cache_polymorphic_entry_count: MAX_NUMBER_OF_SHAPES_TO_REMEMBER as u32,
         property_lookup_cache_entry_size: offset(size_of::<PropertyLookupCacheEntry>()),
@@ -369,6 +384,8 @@ fn runtime_layout() -> RuntimeLayout {
         property_lookup_cache_megamorphic_tag: MEGAMORPHIC_DATA_TAG as u64,
         property_lookup_cache_megamorphic_primary_entries: offset(MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET),
         property_lookup_cache_megamorphic_secondary_entries: offset(MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET),
+        property_lookup_cache_megamorphic_vm_cache_lessons: offset(MEGAMORPHIC_VM_CACHE_LESSONS_OFFSET),
+        property_lookup_cache_megamorphic_max_vm_cache_lessons: MAX_MEGAMORPHIC_VM_CACHE_LESSONS,
         property_lookup_cache_megamorphic_index_bits: MEGAMORPHIC_INDEX_BITS,
         property_lookup_cache_megamorphic_hash_multiplier: MEGAMORPHIC_HASH_MULTIPLIER,
         // NB: Filled in by runtime_info().
@@ -383,6 +400,7 @@ fn runtime_layout() -> RuntimeLayout {
         keyed_lookup_cache_dictionary_generation: 0,
         keyed_lookup_cache_shape: 0,
         keyed_lookup_cache_name: 0,
+        keyed_lookup_cache_prototype: 0,
         keyed_lookup_cache_prototype_chain_validity: 0,
         keyed_lookup_cache_new_shape: 0,
     }
@@ -392,6 +410,9 @@ const _: () = assert!(
     libjs_jit::bytecode::NO_YIELD_CONTINUATION
         == crate::layout::execution_context::ExecutionContext::NO_YIELD_CONTINUATION
 );
+
+// NB: JIT code takes an offset of 0 to mean that there is no such field for it to read.
+const _: () = assert!(offset_of!(ObjectMethods, is_cacheable_for_property_absence) != 0);
 
 // NB: The compiler has its own copy of the bits of the interpreter's feedback.
 const _: () = {
@@ -478,10 +499,12 @@ pub fn runtime_info(
     layout.keyed_lookup_cache_dictionary_generation = keyed_lookup_cache.shape_dictionary_generation;
     layout.keyed_lookup_cache_shape = keyed_lookup_cache.shape;
     layout.keyed_lookup_cache_name = keyed_lookup_cache.property_name;
+    layout.keyed_lookup_cache_prototype = keyed_lookup_cache.prototype;
     layout.keyed_lookup_cache_prototype_chain_validity = keyed_lookup_cache.prototype_chain_validity;
     layout.keyed_lookup_cache_new_shape = keyed_lookup_cache.new_shape;
     layout.single_ascii_character_strings = vm.single_ascii_character_strings_address();
     layout.fly_string_cache = vm.fly_string_cache().as_ptr().expose_provenance() as u64;
+    layout.key_concatenation_cache = vm.key_concatenation_cache().as_ptr().expose_provenance() as u64;
     layout.numeric_string_cache = vm.numeric_string_cache().as_ptr().expose_provenance() as u64;
     layout.large_numeric_string_cache = vm.large_numeric_string_cache().as_ptr().expose_provenance() as u64;
     let strings = vm.cached_strings();
@@ -502,6 +525,12 @@ pub fn runtime_info(
         jit_call: jit_function_address!(super::calls::libjs_jit_call),
         call_forwarding_arguments: jit_function_address!(super::calls::libjs_jit_call_forwarding_arguments),
         finish_direct_call: jit_function_address!(super::calls::libjs_jit_finish_direct_call),
+        prepare_construct: jit_function_address!(super::calls::libjs_jit_prepare_construct),
+        construct_result_error: jit_function_address!(super::calls::libjs_jit_construct_result_error),
+        finish_direct_construct: jit_function_address!(super::calls::libjs_jit_finish_direct_construct),
+        construct_stub: 0,
+        construct_this: jit_function_address!(super::calls::libjs_jit_construct_this),
+        throw_call_stack_size_exceeded: jit_function_address!(super::calls::libjs_jit_throw_call_stack_size_exceeded),
         raw_native_exception: addresses.raw_native_exception,
         push_inlined_call_frames: jit_function_address!(super::entry_exit::libjs_jit_push_inlined_call_frames),
         finish_inlined_direct_call: jit_function_address!(super::entry_exit::libjs_jit_finish_inlined_direct_call),
@@ -526,6 +555,7 @@ pub fn runtime_info(
         helper_calls: HelperCallAddresses(super::helper_calls::address),
         float64_functions: Float64FunctionAddresses(super::calls::float64_function_address),
         to_object: jit_function_address!(super::calls::libjs_jit_to_object),
+        remember_vm_cache_get: jit_function_address!(super::calls::libjs_jit_remember_vm_cache_get),
         array_create: jit_function_address!(super::calls::libjs_jit_array_create),
         intrinsic_helpers: IntrinsicHelpers {
             has_own_property: jit_function_address!(super::intrinsics::libjs_jit_has_own_property),
@@ -552,6 +582,7 @@ pub fn runtime_info(
         dynamic_calls: dynamic_call_layout(vm),
     };
     info.dynamic_calls.call_stub = vm.jit.call_stub(&info);
+    info.construct_stub = vm.jit.construct_stub(&info);
     info
 }
 

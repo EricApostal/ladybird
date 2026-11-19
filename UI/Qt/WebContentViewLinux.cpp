@@ -1307,6 +1307,10 @@ bool WebContentView::page_surface_can_show_frames() const
 
 void WebContentView::hide_page_surface()
 {
+    // NB: Qt paints the page from here on, and shows it once the browser window commits. The page surface stays on
+    //     screen until that commit, as hiding it any sooner would show whatever Qt last painted under it.
+    if (m_page_surface->is_showing())
+        m_page_surface->set_synchronized(true);
     m_page_surface->hide();
     if (!m_page_surface_rect.isEmpty()) {
         m_page_surface_rect = {};
@@ -1355,7 +1359,7 @@ void WebContentView::update_page_surface(PageSurfaceContent content)
     }
 
     auto to_logical = [&](int device_pixels) { return max(1, qRound(device_pixels / device_pixel_ratio())); };
-    auto view_position = mapTo(window(), QPoint { 0, 0 });
+    auto view_position = position_in_surface_of(*parent, QPoint { 0, 0 });
     WaylandPageSurface::Frame frame {
         .shared_image_buffer = *paintable->shared_image_buffer,
         .dmabuf = *dmabuf,
@@ -1370,7 +1374,9 @@ void WebContentView::update_page_surface(PageSurfaceContent content)
     // NB: The layout of the browser window changes on screen when it commits next, and so does the position of the page
     //     surface. Whatever else changes in where the frame goes waits for that commit too, such as the crop to a
     //     shrinking window, which would otherwise show before the window has shrunk.
-    if (m_page_surface->is_showing() && m_page_surface->would_change_placement(frame))
+    // NB: A page surface that comes back covers what Qt painted over the page, such as the address field's suggestions,
+    //     which also come off the rest of the browser window with its next commit.
+    if (!m_page_surface->is_showing() || m_page_surface->would_change_placement(frame))
         m_page_surface->set_synchronized(true);
 
     m_page_surface->forget_buffers_except(backing_stores().shared_image_buffers());
@@ -1409,10 +1415,16 @@ QRect WebContentView::rect_shown_in_window() const
     return shown;
 }
 
+QPoint WebContentView::position_in_surface_of(QWindow const& parent, QPoint position) const
+{
+    auto frame_margins = parent.frameMargins();
+    return mapTo(window(), position) + QPoint { frame_margins.left(), frame_margins.top() };
+}
+
 bool WebContentView::show_image_over_page(QImage const& image, QPoint position)
 {
     auto* parent = window()->windowHandle();
-    if (!m_page_surface || !parent || !m_page_surface->show_overlay(*parent, image, mapTo(window(), position)))
+    if (!m_page_surface || !parent || !m_page_surface->show_overlay(*parent, image, position_in_surface_of(*parent, position)))
         return false;
     // NB: The overlay changes on screen when the browser window commits next, so have Qt repaint a pixel of it.
     update(0, 0, 1, 1);

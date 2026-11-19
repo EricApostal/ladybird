@@ -3,11 +3,16 @@ set(SOURCES
     CodecParameters.cpp
     Codecs/AAC.cpp
     Codecs/AV1.cpp
+    Codecs/DolbyVision.cpp
     Codecs/H264.cpp
     Codecs/H265.cpp
+    Codecs/HDR10Plus.cpp
+    Codecs/HighDynamicRangeMetadataTracker.cpp
     Codecs/MPEG4Audio.cpp
+    Codecs/SupplementalEnhancementInformation.cpp
     Codecs/VP9.cpp
     Color/CodingIndependentCodePoints.cpp
+    Color/ColorMetadata.cpp
     DecoderCapabilities.cpp
     DecoderError.cpp
     FFmpeg/FFmpegFunctions.cpp
@@ -55,7 +60,7 @@ compile_ipc(../../Services/VideoDecoderServer/VideoDecoderServerControl.ipc ../.
 compile_ipc(../../Services/VideoDecoderServer/VideoDecoderServerControlClient.ipc ../../Services/VideoDecoderServer/VideoDecoderServerControlClientEndpoint.h)
 
 ladybird_lib(LibMediaCodecs mediacodecs EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibMediaCodecs PRIVATE LibCore LibGfx LibIPC LibThreading)
+target_link_libraries(LibMediaCodecs PRIVATE LibCore LibGfx LibIPC LibPlatformFeatures LibThreading)
 target_link_libraries(LibMediaCodecs PUBLIC LibAudio)
 
 if (NOT ANDROID)

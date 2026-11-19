@@ -312,6 +312,16 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
             if (auto legacy_event_type = legacy_event_type_for_event_type(event.type()); legacy_event_type.has_value())
                 should_dispatch = has_listener_on_event_path(*legacy_event_type);
         }
+
+        // NB: The script that dispatched an untrusted event can read the target that dispatch leaves on it. For a node
+        //     outside any shadow tree, with no related target or touch targets, that's targetOverride itself, so set
+        //     it, and skip the dispatch. Anywhere else, retargeting decides what's left, so dispatch.
+        if (!should_dispatch && !event.is_trusted()) {
+            if (is<ShadowRoot>(node->root()) || event.related_target() || !event.touch_target_list().is_empty())
+                should_dispatch = true;
+            else
+                event.set_target(target_override.ptr());
+        }
     }
 
     // 6. If target is not relatedTarget or target is event’s relatedTarget, then:

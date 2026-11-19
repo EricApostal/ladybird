@@ -90,6 +90,7 @@ groups! {
     AnchorValues => ANCHOR,
     BorderValues => BORDER,
     InheritedTextValues => INHERITED_TEXT,
+    TransformValues => TRANSFORM,
 }
 
 /// A style for layout's own use, which no record holds: a base style's groups, with those an edit
@@ -166,6 +167,18 @@ impl ScratchGroups {
 
     pub(crate) fn border_mut(&mut self) -> &mut BorderValues {
         self.group_mut()
+    }
+
+    pub(crate) fn anchor_mut(&mut self) -> &mut AnchorValues {
+        self.group_mut()
+    }
+
+    pub(crate) fn set_position(&mut self, position: u8) {
+        let reset = self
+            .groups
+            .reset_bits()
+            .with(crate::css::computed_values::StyleBitField::Position, position);
+        self.groups.set_reset_bits(reset);
     }
 
     pub(crate) fn set_white_space_collapse(&mut self, collapse: u8) {
@@ -270,6 +283,7 @@ impl LayoutStyle {
             self.payloads.write_group::<InheritedTextValues>(index, |values| {
                 values.color = fade(values.color);
                 values.webkit_text_fill_color = fade(values.webkit_text_fill_color);
+                values.webkit_text_stroke_color.rgba = fade(values.webkit_text_stroke_color.rgba);
             });
         };
         self.changed = true;
@@ -385,7 +399,7 @@ impl LayoutStyle {
         });
     }
 
-    // CSS table wrappers carry positioning and margins, and act as the table's grid item.
+    // CSS table wrappers carry positioning and margins, and act as the table's flex or grid item.
     // z-index and vertical-align also follow the wrapper for interoperable painting and
     // inline alignment; clip only applies on the wrapper that receives position.
     fn transfer_table_properties(&mut self, source: &Self) {
@@ -456,10 +470,20 @@ impl LayoutStyle {
             target.align_self_overflow = alignment.align_self_overflow;
             target.justify_self_overflow = alignment.justify_self_overflow;
             target.order = alignment.order;
+            // https://drafts.csswg.org/css-flexbox-1/#flex-items
+            // "In the case of flex items with display: table, the table wrapper box becomes the flex item"
+            // NB: The flex longhands follow the wrapper, which the flex container sizes as the flex item.
+            target.flex_basis = alignment.flex_basis.clone();
+            target.flex_grow = alignment.flex_grow;
+            target.flex_shrink = alignment.flex_shrink;
         });
         self.edit::<GridValues>(|target| {
             crate::css::computed_values::copy_grid_placements(source.group::<GridValues>(), target);
         });
+        // INTEROP: Like other engines, transform the table wrapper box, so the captions move with the table and
+        //          the transform origin is relative to the wrapper.
+        let transform = source.group::<TransformValues>();
+        self.edit::<TransformValues>(|target| *target = transform.clone());
         self.edit::<EffectsValues>(|target| {
             let source = source.group::<EffectsValues>();
             target.clip_is_rect = source.clip_is_rect;
@@ -647,6 +671,11 @@ impl StyleEngine {
 
     pub(crate) fn pin_layout_style_record(&mut self, record: u64) {
         self.pin_style_record(record);
+    }
+
+    /// Pins `record` `times` times, as many calls of [`Self::pin_layout_style_record`] would.
+    pub(crate) fn pin_layout_style_record_times(&mut self, record: u64, times: u32) {
+        self.pin_style_record_times(record, times);
     }
 
     pub(crate) fn unpin_layout_style_record(&mut self, record: u64) {

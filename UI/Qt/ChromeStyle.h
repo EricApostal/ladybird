@@ -27,12 +27,14 @@ constexpr inline int LOCATION_EDIT_CORNER_RADIUS = 7;
 constexpr inline int LOADING_RING_PERIOD_MS = 900;
 // Before the site responds, the ring turns more slowly, at half opacity.
 constexpr inline int LOADING_RING_WAITING_PERIOD_MS = 1600;
+
 enum class LoadingRingSize : u8 {
     // 20 px, reaching 2 px past a tab's favicon slot.
     Favicon,
     // 23 px, filling a toolbar button.
     ToolbarButton,
 };
+
 enum class LoadingPhase : u8 {
     WaitingForResponse,
     Receiving,
@@ -46,9 +48,13 @@ constexpr qreal drop_shadow_blur_radius(qreal css_blur_radius)
 {
     return css_blur_radius * 2.5;
 }
+
 QColor mix(QColor const& from, QColor const& to, double amount);
 QColor chrome_text(QPalette const&);
 QColor chrome_button_text(QPalette const&);
+QColor chrome_destructive_hover();
+QColor chrome_destructive_text();
+
 enum class WindowActivity : u8 {
     Active,
     Inactive,
@@ -65,7 +71,6 @@ QColor chrome_surface_pressed(QPalette const&);
 QColor chrome_control_border(QPalette const&);
 QColor chrome_active_tab_surface(QPalette const&);
 QColor chrome_border(QPalette const&);
-QColor location_edit_border(QPalette const&);
 QColor chrome_separator(QPalette const&);
 QColor chrome_window_outline(QPalette const&);
 QColor chrome_accent();
@@ -114,7 +119,7 @@ QString primary_button_style_sheet();
 
 // Installs the application style, which keeps the platform's look but follows the design's timing.
 void install_application_style();
-QString restore_session_card_style_sheet();
+QString page_card_style_sheet();
 QString screenshot_selection_style_sheet(QPalette const&);
 QString screenshot_viewer_style_sheet();
 

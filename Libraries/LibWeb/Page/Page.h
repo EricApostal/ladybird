@@ -11,7 +11,9 @@
 
 #include <AK/Assertions.h>
 #include <AK/ByteBuffer.h>
+#include <AK/Function.h>
 #include <AK/JsonValue.h>
+#include <AK/NonnullOwnPtr.h>
 #include <AK/Queue.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
@@ -48,7 +50,6 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
-#include <LibWeb/Geolocation/GeolocationPositionError.h>
 #include <LibWeb/HTML/DedicatedWorkerThreadLink.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
@@ -112,10 +113,24 @@
 namespace Web {
 
 class PageClient;
+
+namespace Bindings {
+
+enum class MediaSessionAction : u8;
+
+}
+
 namespace Compositor {
 
 class CompositorContextHandle;
 class CompositorHost;
+
+}
+
+namespace MediaSession {
+
+class ActiveMediaSessionTracker;
+struct MediaSessionState;
 
 }
 
@@ -201,7 +216,6 @@ public:
     CSSPixelRect device_to_css_rect(DevicePixelRect) const;
     CSSPixelSize device_to_css_size(DevicePixelSize) const;
     DevicePixelRect enclosing_device_rect(CSSPixelRect) const;
-    DevicePixelRect rounded_device_rect(CSSPixelRect) const;
     ChromeMetrics chrome_metrics() const;
 
     EventResult handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target);
@@ -289,6 +303,8 @@ public:
     void did_complete_window_rect_request(u64 completion_id);
     void set_window_rect_observer(GC::Ptr<GC::Function<void(DevicePixelRect, u64)>> window_rect_observer) { m_window_rect_observer = window_rect_observer; }
 
+    void did_receive_network_activity(Fetch::Engine::Event::NetworkActivity const&);
+
     void did_request_alert(Utf16String const& message);
     void alert_closed();
 
@@ -370,7 +386,7 @@ public:
     // For tests: Calls the callback when the next writing suggestion request goes to the UI process.
     void when_writing_suggestion_requested(GC::Ref<GC::Function<void()>>);
 
-    using GeolocationPositionResult = Variant<Geolocation::CoordinatesData, Geolocation::GeolocationPositionError::ErrorCode>;
+    using GeolocationPositionResult = Variant<Geolocation::CoordinatesData, Geolocation::GeolocationPositionErrorCode>;
     using GeolocationPositionCallback = GC::Ref<GC::Function<void(GeolocationPositionResult)>>;
     enum class GeolocationRequestType : u8 {
         OneShot,
@@ -417,10 +433,13 @@ public:
 
     void register_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
     void unregister_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
+    void for_each_media_element(Function<void(HTML::HTMLMediaElement&)> const&);
+    MediaSession::ActiveMediaSessionTracker& active_media_session_tracker() { return *m_active_media_session_tracker; }
+    void handle_media_session_action(Bindings::MediaSessionAction, Optional<double> seek_offset = {}, Optional<double> seek_time = {}, Optional<bool> fast_seek = {});
     bool has_media_element_playing_audio(DOM::Document const&) const;
     Vector<GC::Root<HTML::HTMLVideoElement>> video_elements_of(DOM::Document const&);
 
-    void sync_media_element_video_sink_ticking();
+    void sync_media_element_video_sink_ticking(ReadonlySpan<GC::Root<DOM::Document>> laid_out_documents);
     void restore_all_media_element_video_sinks();
     void detach_all_media_element_video_sinks_after_compositor_lost();
 
@@ -476,6 +495,11 @@ public:
     void invalidate_user_style();
     void invalidate_style_for_preference_change();
 
+    // Whether force-dark applies to the local roots of a page that embeds out-of-process iframes of a tab, which takes it
+    // from the UI process rather than from a local traversable of its own.
+    bool force_dark_for_local_roots() const { return m_force_dark_for_local_roots; }
+    void set_force_dark_for_local_roots(bool);
+
     bool content_blocking_enabled_for_url(Optional<URL::URL> const&) const;
     void set_content_blocking_policy(bool enabled, ReadonlySpan<String> disabled_sites);
 
@@ -512,7 +536,6 @@ public:
     void container_fullscreen_complete(HTML::CrossProcessId hosted_root_id);
     void container_unfullscreen_complete(HTML::CrossProcessId hosted_root_id);
 
-    ViewportIsFullscreen viewport_is_fullscreen() const { return m_viewport_is_fullscreen; }
     void set_viewport_is_fullscreen(ViewportIsFullscreen);
     void did_deny_fullscreen_window();
 
@@ -524,9 +547,6 @@ private:
     void update_focused_navigable(GC::Ptr<HTML::Navigable>);
 
     GC::Ptr<HTML::HTMLMediaElement> media_context_menu_element();
-
-    template<typename Callback>
-    void for_each_media_element(Callback&& callback);
 
     template<typename Callback>
     void for_each_canvas_element(Callback&& callback);
@@ -655,11 +675,12 @@ private:
 
     // AD-HOC: Denied until the UI process sends the browser-wide setting, so a request cannot observe the test
     //         position in the short window before that arrives.
-    Geolocation::EmulatedPositionData m_emulated_position_data { Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied };
+    Geolocation::EmulatedPositionData m_emulated_position_data { Geolocation::GeolocationPositionErrorCode::PermissionDenied };
     HashMap<u64, GC::Ref<GC::Function<void()>>> m_emulated_position_data_observers;
     u64 m_next_emulated_position_data_observer_id { 0 };
 
     Vector<UniqueNodeID> m_media_elements;
+    NonnullOwnPtr<MediaSession::ActiveMediaSessionTracker> m_active_media_session_tracker;
     Vector<UniqueNodeID> m_canvas_elements;
     Vector<GC::Ref<HTML::OffscreenCanvas>> m_offscreen_canvases_pending_placeholder_commit;
     Optional<UniqueNodeID> m_media_context_menu_element_id;
@@ -691,6 +712,7 @@ private:
     bool m_listen_for_dom_mutations { false };
     bool m_accessibility_interested { false };
     Optional<CSS::PreferredColorScheme> m_preferred_color_scheme_override_for_testing;
+    bool m_force_dark_for_local_roots { false };
 
     // The chain of containers above a document leaves this process at a hosted root, and the process holding the
     // container above runs the steps for the rest of it.
@@ -776,6 +798,8 @@ public:
     virtual double device_pixels_per_css_pixel() const = 0;
     virtual double maximum_frames_per_second() const { return 60.0; }
     virtual CSS::PreferredColorScheme preferred_color_scheme() const = 0;
+    // Whether the screen the page is shown on can show colors brighter than SDR white.
+    virtual bool screen_shows_high_dynamic_range() const { return false; }
     virtual CSS::PreferredContrast preferred_contrast() const = 0;
     virtual CSS::PreferredMotion preferred_motion() const = 0;
     virtual size_t screen_count() const = 0;
@@ -864,6 +888,7 @@ public:
     virtual void page_did_enter_tooltip_area(ByteString const&) { }
     virtual void page_did_leave_tooltip_area() { }
     virtual void page_did_change_favicon(Gfx::Bitmap const&) { }
+    virtual void page_did_change_media_session_state(Optional<MediaSession::MediaSessionState> const&) { }
     virtual void page_did_request_alert(Utf16String const&) { }
     virtual void page_did_request_before_unload(String const&) { }
     virtual void page_did_request_confirm(Utf16String const&) { }
@@ -921,13 +946,15 @@ public:
     virtual void page_did_request_set_system_visibility_state([[maybe_unused]] HTML::VisibilityState visibility_state) { }
     virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
     virtual bool page_did_request_has_populated_document_for_testing([[maybe_unused]] HTML::CrossProcessId navigable_id) { return false; }
+    virtual Optional<Web::MediaSession::MediaSessionState> page_did_request_now_playing_state_for_testing();
+    virtual void page_did_trigger_now_playing_action_for_testing(Web::Bindings::MediaSessionAction, Optional<double>, Optional<double>, Optional<bool>) { }
     virtual bool page_did_request_tab_is_playing_audio_for_testing() { return false; }
     virtual bool page_did_request_tab_is_heard_playing_audio_for_testing() { return false; }
     virtual bool page_did_request_tab_is_using_microphone_for_testing() { return false; }
     virtual bool page_did_request_tab_is_capturing_audio_for_testing() { return false; }
     virtual void page_did_report_audio_capture_for_testing([[maybe_unused]] Web::PageId labelled_page_id, [[maybe_unused]] bool capturing) { }
     virtual void page_did_retire_picture_in_picture_window_for_testing() { }
-    virtual u64 page_did_request_tab_audibility_change_count_for_testing() { return 0; }
+    virtual Vector<bool> page_did_request_tab_audibility_transitions_for_testing() { return {}; }
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() { return false; }
     virtual bool page_did_request_restore_session_history_snapshot_for_testing() { return false; }
     virtual bool page_did_request_record_reported_session_history_for_testing() { return false; }
@@ -974,6 +1001,8 @@ public:
     virtual void page_did_request_click_notification_for_testing([[maybe_unused]] u64 notification_id) { }
     virtual void page_did_request_click_notification_by_id_for_testing([[maybe_unused]] u64 browser_notification_id) { }
     virtual void page_did_request_dismiss_notification_for_testing([[maybe_unused]] u64 notification_id) { }
+    virtual void page_did_request_hold_next_notification_show_for_testing() { }
+    virtual void page_did_request_fail_held_notification_show_for_testing() { }
 
     virtual void page_did_finish_test([[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_set_test_timeout([[maybe_unused]] double milliseconds) { }
@@ -1028,6 +1057,7 @@ public:
     virtual void page_did_report_violation_of_remote_client([[maybe_unused]] u64 policy_index, [[maybe_unused]] String effective_directive, [[maybe_unused]] URL::URL resource) { }
     // A navigation whose source another process hosts violated the policy at policy_index in the source's CSP list.
     virtual void page_did_report_navigation_violation_of_remote_client([[maybe_unused]] HTML::RemoteClientNavigation const& navigation, [[maybe_unused]] u64 policy_index, [[maybe_unused]] ContentSecurityPolicy::RemoteViolationDirective directive, [[maybe_unused]] bool url_is_https) { }
+    virtual void page_did_report_navigation_violation_of_container_document([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Utf16String const& navigation_id, [[maybe_unused]] u64 policy_index, [[maybe_unused]] ContentSecurityPolicy::RemoteViolationDirective directive, [[maybe_unused]] bool url_is_https) { }
     virtual void page_did_register_javascript_source([[maybe_unused]] DOM::Document&, [[maybe_unused]] HTML::ScriptRegistry::Description const&) { }
     virtual void page_did_post_broadcast_channel_message([[maybe_unused]] HTML::PostedBroadcastChannelMessage const& message) { }
     virtual void page_did_close_shared_worker() { }

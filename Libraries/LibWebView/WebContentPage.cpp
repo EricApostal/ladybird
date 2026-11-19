@@ -367,12 +367,22 @@ bool WebContentPage::continue_navigation_population_in_selected_process(Web::HTM
             navigable->did_cancel_navigation(navigation_id);
             return;
         }
+        weak_loader->let_host_adopt_response_body(*host, [host, navigable_id, navigation_id, weak_loader] {
+            if (!weak_loader || !host->is_open())
+                return;
+            auto navigable = host->traversable().top_level_traversable().find(navigable_id);
+            if (!navigable.has_value())
+                return;
+            auto navigation = navigable->navigation_with_id(navigation_id);
+            if (!navigation || !navigation->state.has<CanonicalNavigation::Populating>() || navigation->loader().ptr() != weak_loader.ptr())
+                return;
 
-        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
-        // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run
-        //    these steps:
-        // NB: The page to host the document runs the task.
-        host->async_populate_navigation(weak_loader->request(), weak_loader->take_result());
+            // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
+            // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run
+            //    these steps:
+            // NB: The page to host the document runs the task.
+            host->async_populate_navigation(weak_loader->request(), weak_loader->take_result());
+        });
     };
     // Wait for the destination RequestServer to acknowledge the import before the host adopts it.
     weak_loader->move_response_body_to(host->client().request_server_site_bindings(), move(finish_handoff));
@@ -575,6 +585,12 @@ void WebContentPage::did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect 
     release_presented_bitmap(bitmap_id);
 }
 
+void WebContentPage::did_present_frame_in_remote_layer(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, double device_pixel_ratio)
+{
+    if (displays_tab())
+        view().server_did_present_frame_in_remote_layer({}, content_rect.size(), damage_rect, device_pixel_ratio);
+}
+
 void WebContentPage::did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
 {
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received {} backing stores for page {}", backing_stores.size(), m_id);
@@ -646,12 +662,19 @@ void WebContentPage::fail_renderer_owned_downloads()
 
 void WebContentPage::close()
 {
+    if (m_traversable) {
+        if (auto view = m_traversable->view(); view.has_value())
+            Application::the().media_session_coordinator().remove({ view->view_id(), m_id, view->is_private() == IsPrivate::Yes });
+    }
     PictureInPictureManager::the().close_window(*this);
     NotificationManager::the().page_did_close(*this);
     m_is_open = false;
     // NB: The process can outlive the page, for the shared workers it runs, or for other pages.
-    if (m_client)
+    if (m_client) {
         WorkerAgentManager::the().remove_web_content_page_owner(*m_client, m_id);
+        // NB: This may have been the only page of the process with a tab that is shown.
+        m_client->did_change_visibility_of_a_tab();
+    }
     // NB: Nothing finishes the input this page held, including a page discarded while its process hosts other pages.
     if (m_traversable) {
         if (auto view = m_traversable->view(); view.has_value())
@@ -765,6 +788,20 @@ static bool navigation_can_violate(Web::ContentSecurityPolicy::RemoteViolationDi
     VERIFY_NOT_REACHED();
 }
 
+// The request's URL can be upgraded from http to https before the check, by upgrade-insecure-requests or HSTS, so the
+// report then names the upgraded URL.
+static URL::URL reported_navigation_url(Web::HTML::NavigationPopulationRequest const& request, bool url_is_https)
+{
+    auto url = request.history_entry.url;
+    if (url_is_https && url.scheme() == "http"sv) {
+        url.set_scheme("https"_string);
+        // NB: Unlike the URL parser, setting the scheme does not remove a port that is the new scheme's default port.
+        if (url.port() == 443)
+            url.set_port({});
+    }
+    return url;
+}
+
 // The process populating a navigation reports a violation of a policy of its source, which goes to the page found
 // hosting the source when the navigation was requested, while that page still hosts it.
 void WebContentPage::did_report_navigation_violation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https)
@@ -788,16 +825,36 @@ void WebContentPage::did_report_navigation_violation(Web::HTML::CrossProcessId n
     if (!source_page || !source_page->is_open() || !source_page->hosted_environment(fetch_client->id).has_value())
         return;
 
-    // The request's URL can be upgraded from http to https before the check, by upgrade-insecure-requests or HSTS, so
-    // the report then names the upgraded URL.
-    auto url = request.history_entry.url;
-    if (url_is_https && url.scheme() == "http"sv) {
-        url.set_scheme("https"_string);
-        // NB: Unlike the URL parser, setting the scheme does not remove a port that is the new scheme's default port.
-        if (url.port() == 443)
-            url.set_port({});
+    source_page->async_report_violation_of_environment(fetch_client->id, policy_index, directive, reported_navigation_url(request, url_is_https));
+}
+
+// The process populating a child navigable's navigation reports a violation of a policy of the navigable's container's
+// node document, which goes to the page hosting that document.
+void WebContentPage::did_report_container_document_navigation_violation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https)
+{
+    auto navigable = population_worker_navigable(navigable_id);
+    if (!navigable.has_value())
+        return;
+    auto navigation = navigable->navigation_with_id(navigation_id);
+    auto* creating = navigation ? navigation->state.get_pointer<CanonicalNavigation::CreatingNavigationParams>() : nullptr;
+    if (!creating || navigation->worker() != this)
+        return;
+
+    auto const& request = creating->loader->request();
+    if (directive == Web::ContentSecurityPolicy::RemoteViolationDirective::FormAction || !navigation_can_violate(directive, *navigable, request)) {
+        client().did_misbehave("did_report_container_document_navigation_violation"sv, "violation the navigation cannot have"sv);
+        return;
     }
-    source_page->async_report_violation_of_environment(fetch_client->id, policy_index, directive, move(url));
+
+    auto* container_document = navigable->container_document();
+    if (!container_document)
+        return;
+    auto const& host = container_document->host();
+    if (!host || !host->is_open())
+        return;
+
+    auto const& environment_id = container_document->relevant_global_object().relevant_settings_object().id();
+    host->async_report_violation_of_environment(environment_id, policy_index, directive, reported_navigation_url(request, url_is_https));
 }
 
 void WebContentPage::did_post_message_to_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor posted_message)
@@ -1054,7 +1111,7 @@ void WebContentPage::did_click_link(Web::HTML::PreparedNavigationDescriptor navi
         // NB: The renderer sends a link to open in a new tab only for the user's own click, which the view delivered.
         //     That click opens the link whatever activation the page used up for other things, such as a popup its
         //     click handler opened.
-        if (!view().take_input_to_open_link_in_new_tab({}))
+        if (!view().take_input_to_open_link_in_new_tab({}, *this))
             return;
         view().open_navigation_in_new_tab(verified_navigation.release_value(), open_in_background ? Web::HTML::ActivateTab::No : Web::HTML::ActivateTab::Yes);
     } else {
@@ -1075,7 +1132,7 @@ void WebContentPage::did_middle_click_link(Web::HTML::PreparedNavigationDescript
     }
     // NB: The renderer sends a link to open in a new tab only for the user's own click, which the view delivered.
     //     That click opens the link whatever activation the page used up for other things.
-    if (!view().take_input_to_open_link_in_new_tab({}))
+    if (!view().take_input_to_open_link_in_new_tab({}, *this))
         return;
     view().open_navigation_in_new_tab(verified_navigation.release_value(), Web::HTML::ActivateTab::No);
 }
@@ -1395,10 +1452,20 @@ void WebContentPage::notify_about_user_activation(Web::HTML::CrossProcessId docu
     async_notify_about_user_activation(document_id);
 }
 
+// NB: The internals object of a test, and a WebDriver input command in the page it runs in, dispatch input as though
+//     the user produced it.
+static bool may_synthesize_input(WebContentPage const& page)
+{
+    if (WebContentClient::renderers_may_synthesize_input_for_testing())
+        return true;
+    auto view = page.traversable().view();
+    return view.has_value() && view->is_running_webdriver_input_command_in(page);
+}
+
 bool WebContentPage::has_transient_user_activation() const
 {
     // NB: Automation lets a renderer synthesize the input that gives it activation.
-    if (WebContentClient::renderers_may_synthesize_input())
+    if (may_synthesize_input(*this))
         return true;
     if (m_last_user_activation.has_value() && MonotonicTime::now() - *m_last_user_activation < transient_activation_duration)
         return true;
@@ -1449,7 +1516,7 @@ void WebContentPage::did_notify_about_user_activation(Web::HTML::CrossProcessId 
     // NB: The renderer runs the steps for input the view is delivering to it, and it sends this before it reports that
     //     it finished handling that input. So any other claim is a renderer handing out activation for input it never
     //     got, unless automation lets it synthesize input.
-    if (!WebContentClient::renderers_may_synthesize_input()) {
+    if (!may_synthesize_input(*this)) {
         auto view = traversable().view();
         if (!view.has_value() || !view->is_delivering_user_activation_to(*this))
             return;
@@ -1507,7 +1574,9 @@ void WebContentPage::did_update_resource_count(i32 count_waiting)
 // Only WebDriver's window commands and the internals object of a test ask for a change to the window.
 static bool may_change_window(WebContentPage& page, StringView message)
 {
-    if (WebContentClient::renderers_may_synthesize_input())
+    if (WebContentClient::renderers_may_synthesize_input_for_testing())
+        return true;
+    if (auto view = page.traversable().view(); view.has_value() && view->is_running_webdriver_window_command_in(page))
         return true;
     page.client().did_misbehave(message, "not driven by WebDriver or a test"sv);
     return false;
@@ -1560,7 +1629,10 @@ void WebContentPage::did_request_fullscreen_window()
 {
     // Element fullscreen needs and consumes the activation of the user's input, which the renderer checks. A
     // compromised renderer skips that check. The process of an isolated iframe asks for the window of its tab itself.
-    if (!consume_transient_user_activation()) {
+    // NB: WebDriver's Fullscreen Window command makes the document element fullscreen with no input from the user.
+    auto tab_view = traversable().view();
+    auto is_webdriver_window_command = tab_view.has_value() && tab_view->is_running_webdriver_window_command_in(*this);
+    if (!is_webdriver_window_command && !consume_transient_user_activation()) {
         async_deny_fullscreen_window();
         return;
     }
@@ -1612,9 +1684,14 @@ bool WebContentPage::populates_a_navigation_to_local_file(ByteString const& path
 void WebContentPage::did_request_file(ByteString path, i32 request_id)
 {
     // NB: The renderer's sandbox keeps it out of the local file system, so this is the only way it can read a file.
-    //     Answer only a process that has hosted local file content, or one reading the file a navigation it populates
-    //     names: any other could read every file the user can.
-    if (!client().may_read_local_files() && !populates_a_navigation_to_local_file(path)) {
+    //     Answer only a process that has hosted local file content, one reading the file a navigation it populates
+    //     names, or one selecting a file that WebDriver's Element Send Keys command it runs names: any other could
+    //     read every file the user can.
+    auto selects_file_for_webdriver = [&] {
+        auto view = traversable().view();
+        return view.has_value() && view->is_running_webdriver_command_to_select_file(*this, path);
+    };
+    if (!client().may_read_local_files() && !populates_a_navigation_to_local_file(path) && !selects_file_for_webdriver()) {
         async_handle_file_return(EACCES, {}, request_id);
         return;
     }
@@ -2032,6 +2109,18 @@ void WebContentPage::did_request_dismiss_notification_for_testing(u64 notificati
         recording_backend->dismiss(*id);
 }
 
+void WebContentPage::did_request_hold_next_notification_show_for_testing()
+{
+    if (auto* recording_backend = NotificationManager::the().backend().as_recording_backend())
+        recording_backend->hold_next_show_of(id());
+}
+
+void WebContentPage::did_request_fail_held_notification_show_for_testing()
+{
+    if (auto* recording_backend = NotificationManager::the().backend().as_recording_backend())
+        recording_backend->fail_held_shows_of(id());
+}
+
 void WebContentPage::did_cancel_geolocation_position_request(u64 request_id)
 {
     if (view().on_cancel_geolocation_position_request)
@@ -2140,6 +2229,16 @@ void WebContentPage::set_capturing_audio(bool capturing)
     }
 }
 
+void WebContentPage::did_change_media_session_state(Optional<Web::MediaSession::MediaSessionState> state)
+{
+    if (!m_is_open || !m_traversable)
+        return;
+    auto view = m_traversable->view();
+    if (!view.has_value())
+        return;
+    Application::the().media_session_coordinator().update({ view->view_id(), m_id, view->is_private() == IsPrivate::Yes }, move(state), view->title().to_utf8());
+}
+
 void WebContentPage::did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
 {
     if (displays_tab())
@@ -2188,8 +2287,8 @@ void WebContentPage::did_request_key_event_for_testing(Web::KeyEvent event)
 {
     // NB: The event enters the tab's input path as the user's own, reaching the focused navigable in whatever process
     //     hosts it and granting user activation, so only automation may ask for one.
-    if (!WebContentClient::renderers_may_synthesize_input()) {
-        client().did_misbehave("did_request_key_event_for_testing"sv, "not driven by WebDriver or a test"sv);
+    if (!WebContentClient::renderers_may_synthesize_input_for_testing()) {
+        client().did_misbehave("did_request_key_event_for_testing"sv, "not a test"sv);
         return;
     }
     // Only the compositor sets these, on its way to WebContent.
@@ -2450,7 +2549,7 @@ void WebContentPage::did_update_indexed_database(String update)
 void WebContentPage::did_request_clipboard_entries_for_paste(u64 request_id)
 {
     Vector<Web::Clipboard::SystemClipboardItem> items;
-    if (!WebContentClient::renderers_may_synthesize_input() && !view().take_paste_shortcut_handled_by({}, *this)) {
+    if (!may_synthesize_input(*this) && !view().take_paste_shortcut_handled_by({}, *this)) {
         async_retrieved_clipboard_entries(request_id, items);
         return;
     }
@@ -2486,8 +2585,8 @@ void WebContentPage::did_request_clipboard_entries(u64 request_id, Web::HTML::Cr
 void WebContentPage::did_request_paste_from_clipboard_for_testing()
 {
     // NB: This stands in for the browser's Paste command, which hands the page the system clipboard data.
-    if (!WebContentClient::renderers_may_synthesize_input()) {
-        client().did_misbehave("did_request_paste_from_clipboard_for_testing"sv, "not driven by WebDriver or a test"sv);
+    if (!WebContentClient::renderers_may_synthesize_input_for_testing()) {
+        client().did_misbehave("did_request_paste_from_clipboard_for_testing"sv, "not a test"sv);
         return;
     }
     view().paste_from_clipboard(Web::Clipboard::PasteMode::AllMimeTypes);
@@ -2644,7 +2743,7 @@ void WebContentPage::did_complete_navigation_unload_check(Web::HTML::CrossProces
         Application::the().allocate_ui_process_cross_process_id());
     population_request.target_snapshot_params.sandboxing_flags |= navigable->snapshot_target_snapshot_params().sandboxing_flags;
     ongoing_navigation->history_entry = MUST(CanonicalSessionHistoryEntry::create_from_descriptor(Web::HTML::create_session_history_entry_descriptor(population_request.history_entry, 0)));
-    ongoing_navigation->state = CanonicalNavigation::CreatingNavigationParams { NavigationLoader::create(client().is_private(), move(population_request)) };
+    ongoing_navigation->state = CanonicalNavigation::CreatingNavigationParams { NavigationLoader::create(move(population_request)) };
     async_create_navigation_params(ongoing_navigation->loader()->request());
 
     // Requesting navigation params starts the fetch, so a view's top-level population begins its recorded
@@ -2657,10 +2756,15 @@ void WebContentPage::did_complete_navigation_unload_check(Web::HTML::CrossProces
 
 void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Optional<Web::HTML::NavigationPopulationResult> result)
 {
+    if (result.has_value() && NavigationLoader::response_body_belongs_to_another_process(*result, client())) {
+        client().did_misbehave("did_finish_navigation_params_creation"sv, "response body fetched by another process"sv);
+        return;
+    }
+
     auto navigable = population_worker_navigable(navigable_id);
     if (!navigable.has_value()) {
         if (result.has_value())
-            NavigationLoader::discard(client().is_private(), *result);
+            NavigationLoader::discard(client(), *result);
         return;
     }
 
@@ -2668,7 +2772,7 @@ void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProce
     auto* creating = ongoing_navigation ? ongoing_navigation->state.get_pointer<CanonicalNavigation::CreatingNavigationParams>() : nullptr;
     if (!creating || ongoing_navigation->worker() != this) {
         if (result.has_value())
-            NavigationLoader::discard(client().is_private(), *result);
+            NavigationLoader::discard(client(), *result);
         return;
     }
 
@@ -2682,17 +2786,18 @@ void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProce
     auto loader = move(creating->loader);
     ongoing_navigation->state = CanonicalNavigation::AcquiringResponseBody { move(loader) };
     NonnullRefPtr acquiring_loader = *ongoing_navigation->loader();
+    acquiring_loader->refuse_made_up_local_file_urls(client(), *result);
     acquiring_loader->did_finish_navigation_params_creation(result.release_value());
     if (ongoing_navigation->history_entry->update_from_descriptor(Web::HTML::create_session_history_entry_descriptor(acquiring_loader->request().history_entry, 0)).is_error()) {
         auto rejected_result = acquiring_loader->take_result();
-        NavigationLoader::discard(client().is_private(), rejected_result);
+        NavigationLoader::discard(client(), rejected_result);
         navigable->did_cancel_navigation(navigation_id);
         client().did_misbehave("did_finish_navigation_params_creation"sv, "replacement document state forms a cycle"sv);
         return;
     }
     ongoing_navigation->url = ongoing_navigation->history_entry->url;
 
-    acquiring_loader->acquire_response_body([page = NonnullRefPtr<WebContentPage>(*this), navigable_id, navigation_id = move(navigation_id)](bool succeeded) {
+    acquiring_loader->acquire_response_body(client(), [page = NonnullRefPtr<WebContentPage>(*this), navigable_id, navigation_id = move(navigation_id)](bool succeeded) {
         // The page may have closed while the body was fetched; its navigation then has nothing left to finish.
         if (!page->is_open())
             return;
@@ -2705,6 +2810,11 @@ void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProce
 
 void WebContentPage::did_finish_history_navigation_params_creation(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationPopulationResult result)
 {
+    if (NavigationLoader::response_body_belongs_to_another_process(result, client())) {
+        client().did_misbehave("did_finish_history_navigation_params_creation"sv, "response body fetched by another process"sv);
+        return;
+    }
+
     auto& host = this->traversable();
     host.top_level_traversable().did_finish_history_navigation_params_creation(*this, operation_id, navigable_id, move(result));
 }
@@ -2851,9 +2961,17 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
     // identifiers preserve the original RequestServer transfer lease, so only the process and navigation that
     // received that response may claim it, and only while its population is in flight.
     FileDownloader::ResponseFinished on_response_finished;
-    bool matches_in_flight_navigation = false;
+    Optional<int> owner_client_id;
     if (auto navigable = traversable().top_level_traversable().find(navigable_id); navigable.has_value()) {
         auto ongoing_navigation = navigation_id.has_value() ? navigable->navigation_with_id(*navigation_id) : nullptr;
+        bool names_in_flight_response_body = ongoing_navigation
+            && ongoing_navigation->state.has<CanonicalNavigation::Populating>()
+            && ongoing_navigation->loader()->response_body_matches(request_server_client_id, request_server_request_id);
+        if (names_in_flight_response_body && ongoing_navigation->loader()->response_body_was_handed_to_another_process(client())) {
+            client().did_misbehave("did_start_download"sv, "response body handed to another process"sv);
+            return { Optional<u64> {} };
+        }
+
         bool owns_navigation = ongoing_navigation
             && ((ongoing_navigation->state.has<CanonicalNavigation::CreatingNavigationParams>() && ongoing_navigation->worker() == this)
                 || (ongoing_navigation->state.has<CanonicalNavigation::Populating>() && ongoing_navigation->host() == this));
@@ -2874,12 +2992,12 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
                         timing, error);
             };
         }
-        if (owns_navigation && ongoing_navigation->loader()->response_body_matches(request_server_client_id, request_server_request_id)) {
-            matches_in_flight_navigation = true;
+        if (owns_navigation && names_in_flight_response_body) {
+            owner_client_id = ongoing_navigation->loader()->response_body_adopter_client_id();
             navigable->did_cancel_navigation(*navigation_id);
         }
     }
-    if (!matches_in_flight_navigation) {
+    if (!owner_client_id.has_value()) {
         if (on_response_finished)
             on_response_finished(
                 0, nullptr,
@@ -2896,7 +3014,7 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
     }
 
     auto& file_downloader = Application::the().file_downloader();
-    auto download_id = file_downloader.adopt_download(client().is_private(), url, destination.release_value(), total_size, same_site_context, request_server_client_id, request_server_request_id, initial_data.bytes(),
+    auto download_id = file_downloader.adopt_download(client().is_private(), url, destination.release_value(), total_size, same_site_context, request_server_client_id, request_server_request_id, *owner_client_id, initial_data.bytes(),
         move(on_response_finished));
     if (!is_download_in_progress(file_downloader, download_id))
         return { Optional<u64> {} };
@@ -3026,8 +3144,8 @@ void WebContentPage::did_request_context_menu(Web::HTML::CrossProcessId local_ro
 void WebContentPage::did_request_spelling_menu_action_for_testing(Web::SpellingMenuActionForTesting action, u32 guess_index)
 {
     // NB: This activates the tab's own menu actions, so only automation may ask for it.
-    if (!WebContentClient::renderers_may_synthesize_input()) {
-        client().did_misbehave("did_request_spelling_menu_action_for_testing"sv, "not driven by WebDriver or a test"sv);
+    if (!WebContentClient::renderers_may_synthesize_input_for_testing()) {
+        client().did_misbehave("did_request_spelling_menu_action_for_testing"sv, "not a test"sv);
         return;
     }
     view().activate_spelling_menu_action_for_testing({}, *this, action, guess_index);
@@ -3036,8 +3154,8 @@ void WebContentPage::did_request_spelling_menu_action_for_testing(Web::SpellingM
 void WebContentPage::did_request_page_translation_for_testing(String target_language)
 {
     // NB: This translates the tab as its menu would, so only automation may ask for it.
-    if (!WebContentClient::renderers_may_synthesize_input()) {
-        client().did_misbehave("did_request_page_translation_for_testing"sv, "not driven by WebDriver or a test"sv);
+    if (!WebContentClient::renderers_may_synthesize_input_for_testing()) {
+        client().did_misbehave("did_request_page_translation_for_testing"sv, "not a test"sv);
         return;
     }
     view().page_translation().translate_for_testing({}, move(target_language));
@@ -3225,8 +3343,11 @@ void WebContentPage::did_change_favicon(Gfx::ShareableBitmap favicon)
 
 void WebContentPage::did_request_delete_all_cookies(u64 request_id, URL::URL url)
 {
-    if (!WebContentClient::renderers_may_access_cookies_like_http()) {
-        client().did_misbehave("did_request_delete_all_cookies"sv, "not driven by WebDriver"sv);
+    if (auto access = client().http_cookie_access_for(url); access != WebContentClient::HTTPCookieAccess::Allowed) {
+        if (access == WebContentClient::HTTPCookieAccess::Refused)
+            client().did_misbehave("did_request_delete_all_cookies"sv, "not running a WebDriver cookie command"sv);
+        else
+            async_did_delete_all_cookies(request_id);
         return;
     }
 
@@ -3353,8 +3474,8 @@ void WebContentPage::did_update_session_history_entry_scroll_restoration_mode(We
 void WebContentPage::did_request_pinch_event_for_testing(Web::HTML::CrossProcessId local_root_id, Web::PinchEvent event)
 {
     // NB: As for a key event for testing, the event is dispatched as the user's own.
-    if (!WebContentClient::renderers_may_synthesize_input()) {
-        client().did_misbehave("did_request_pinch_event_for_testing"sv, "not driven by WebDriver or a test"sv);
+    if (!WebContentClient::renderers_may_synthesize_input_for_testing()) {
+        client().did_misbehave("did_request_pinch_event_for_testing"sv, "not a test"sv);
         return;
     }
 
@@ -3369,24 +3490,49 @@ void WebContentPage::did_request_pinch_event_for_testing(Web::HTML::CrossProcess
 void WebContentPage::did_request_webdriver_mouse_event(u64 request_id, Web::HTML::CrossProcessId local_root_id, Web::MouseEvent event)
 {
     // NB: As for a key event for testing, the event is dispatched as the user's own.
-    if (!WebContentClient::renderers_may_synthesize_input()) {
+    if (!may_synthesize_input(*this)) {
         client().did_misbehave("did_request_webdriver_mouse_event"sv, "not driven by WebDriver or a test"sv);
         return;
     }
-    auto on_handled = [page = NonnullRefPtr<WebContentPage>(*this), request_id]() {
-        page->async_did_handle_webdriver_mouse_event(request_id);
-    };
+
+    // NB: The renderer dispatches the event to a local root it hosts, so naming another would aim it at a document of
+    //     another page. The renderer reports the viewports of the child navigables it hosts with their parents, so
+    //     only a local root's viewport bounds the event below.
+    auto root = hosted_navigable(local_root_id);
+    if (!root.has_value() || (!root->is_top_level_traversable() && !root->has_remote_host())) {
+        client().did_misbehave("did_request_webdriver_mouse_event"sv, "not a local root hosted by the page"sv);
+        return;
+    }
+
+    // NB: The event enters the tab's input path at its position in the tab, so a position outside the viewport of the
+    //     local root would reach whatever the tab shows there. A legitimate one is inside, as WebDriver's actions move
+    //     the pointer only within the viewport. The viewport of an isolated iframe may not be known yet.
+    auto viewport_size = root->is_top_level_traversable() ? view().viewport_size() : root->viewport_rect().map([](auto const& rect) { return rect.size(); }).value_or({});
+    Web::DevicePixelRect viewport { {}, viewport_size };
+    if (!viewport.contains(event.position)) {
+        // NB: The viewport can shrink while a button is pressed, and the page must still get the button's release, so
+        //     it goes to the nearest position in the viewport.
+        if (event.type != Web::MouseEvent::Type::MouseUp || viewport.is_empty()) {
+            async_did_handle_webdriver_mouse_event(request_id);
+            return;
+        }
+        auto clamped_x = clamp(event.position.x(), viewport.left(), viewport.right() - 1);
+        auto clamped_y = clamp(event.position.y(), viewport.top(), viewport.bottom() - 1);
+        event.screen_position.translate_by(Web::DevicePixelPoint { clamped_x, clamped_y } - event.position);
+        event.position = { clamped_x, clamped_y };
+    }
 
     // The event is relative to the viewport of the local root its page dispatches input to.
-    if (auto root = view().traversable().find(local_root_id); root.has_value()) {
-        auto offset = view().traversable().local_root_offset(*root);
-        event.position.translate_by(offset);
-        event.screen_position.translate_by(offset);
-    }
+    auto offset = view().traversable().local_root_offset(*root);
+    event.position.translate_by(offset);
+    event.screen_position.translate_by(offset);
     // Only the compositor sets these, on its way to WebContent.
     event.async_scroll_performed_default_action = false;
     event.scrollbar_dragged_by_compositor = {};
     event.wheel_gesture_mark = {};
+    auto on_handled = [page = NonnullRefPtr<WebContentPage>(*this), request_id]() {
+        page->async_did_handle_webdriver_mouse_event(request_id);
+    };
     view().enqueue_webdriver_mouse_event({}, move(event), move(on_handled));
 }
 
@@ -3475,6 +3621,24 @@ Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResp
     return { dump_process_tree() };
 }
 
+Messages::WebContentTestClient::DidRequestNowPlayingStateForTestingResponse WebContentPage::did_request_now_playing_state_for_testing()
+{
+    if (!m_traversable)
+        return Optional<Web::MediaSession::MediaSessionState> {};
+    auto view = m_traversable->view();
+    if (!view.has_value())
+        return Optional<Web::MediaSession::MediaSessionState> {};
+    return Application::the().media_session_coordinator().state_for_view(view->view_id());
+}
+
+void WebContentPage::trigger_now_playing_action_for_testing(Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek)
+{
+    if (!m_traversable)
+        return;
+    if (auto view = m_traversable->view(); view.has_value())
+        Application::the().media_session_coordinator().handle_action_for_view(view->view_id(), action, seek_offset, seek_time, fast_seek);
+}
+
 Messages::WebContentTestClient::DidRequestTabIsPlayingAudioForTestingResponse WebContentPage::did_request_tab_is_playing_audio_for_testing()
 {
     auto view = traversable().view();
@@ -3509,10 +3673,10 @@ void WebContentPage::retire_picture_in_picture_window_for_testing()
     PictureInPictureManager::the().close_window(*this);
 }
 
-Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResponse WebContentPage::did_request_tab_audibility_change_count_for_testing()
+Messages::WebContentTestClient::DidRequestTabAudibilityTransitionsForTestingResponse WebContentPage::did_request_tab_audibility_transitions_for_testing()
 {
     auto view = traversable().view();
-    return view.has_value() ? view->playing_audio_indicator_change_count() : 0;
+    return view.has_value() ? view->playing_audio_indicator_transitions() : Vector<bool> {};
 }
 
 void WebContentPage::did_request_close_tab_for_testing()
@@ -3698,8 +3862,9 @@ void WebContentPage::did_set_cookie(Optional<Web::HTML::EnvironmentId> environme
 {
     // NB: Only WebDriver sets cookies like HTTP does, for the top-level documents it drives.
     if (source == HTTP::Cookie::Source::Http) {
-        if (!WebContentClient::renderers_may_access_cookies_like_http()) {
-            client().did_misbehave("did_set_cookie"sv, "HTTP cookie source"sv);
+        if (auto access = client().http_cookie_access_for(url); access != WebContentClient::HTTPCookieAccess::Allowed) {
+            if (access == WebContentClient::HTTPCookieAccess::Refused)
+                client().did_misbehave("did_set_cookie"sv, "HTTP cookie source"sv);
             return;
         }
         client().session().cookie_jar->set_cookie(url, cookie, source, {}, HTTP::Cookie::SameSiteContext::same_site());

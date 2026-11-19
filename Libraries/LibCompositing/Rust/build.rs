@@ -104,7 +104,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "ReplayLayer",
             "ReplayMask",
             "CanvasId",
-            "VideoSinkResourceId",
+            "VideoSinkHandle",
             "Canvas2DPaintKind",
             "Canvas2DPatternRepetition",
             "PathGeometryData",
@@ -158,7 +158,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("ReplayLayer", "Compositing::ReplayLayer"),
         ("ReplayMask", "Compositing::ReplayMask"),
         ("CanvasId", "Compositing::CanvasId"),
-        ("VideoSinkResourceId", "Compositing::VideoSinkResourceId"),
+        ("VideoSinkHandle", "Media::VideoSinkHandle"),
         ("Canvas2DPaintKind", "Compositing::Canvas2DPaintKind"),
         ("Canvas2DPatternRepetition", "Compositing::Canvas2DPatternRepetition"),
         ("CapStyle", "Gfx::CapStyle"),
@@ -194,7 +194,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "LibGfx/StrokeStyle.h",
             "LibGfx/Vector3.h",
             "LibGfx/WindingRule.h",
-            "LibCompositing/DisplayList/AccumulatedVisualContext.h",
+            "LibCompositing/DisplayList/ContextRef.h",
             "LibCompositing/Forward.h",
             "LibCompositing/DisplayList/DisplayListCommandsGenerated.h",
         ]
@@ -401,13 +401,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiFilterFunctionKind",
         "FfiVisualContextTreeInputs",
         "FfiVisualAnimationTargetKind",
-        "FfiVisualAnimationPlaybackDirection",
-        "FfiVisualAnimationFillMode",
         "FfiVisualAnimationTransformOperationKind",
         "FfiCompositorAnimationPublishOutcome",
         "FfiVisualAnimationSummary",
-        "FfiDisplayListReplayCallbacks",
-        "FfiDisplayList",
+        "FfiRasterPainter",
+        "RecordSpan",
+        "FfiReplaySelection",
         "FfiEasingDescriptor",
         "FfiEasingKind",
         "FfiLinearEasingPoint",
@@ -415,14 +414,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     ]
     .map(String::from)
     .to_vec();
-    let mut test_builder_config = ffi_config.clone();
-    test_builder_config.export.include.clear();
-    generate_ffi_header(
-        test_builder_config,
-        &[manifest_dir.join("src/test_builder.rs")],
-        &out_dir,
-        Path::new("TestBuilderRustFFI.h"),
-    );
     generate_ffi_header(
         ffi_config,
         &[
@@ -432,6 +423,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/filter_bytes.rs"),
             manifest_dir.join("src/visual_context/ffi_types.rs"),
             manifest_dir.join("src/host/replay.rs"),
+            manifest_dir.join("src/overlays.rs"),
             manifest_dir.join("src/display_list/storage.rs"),
             manifest_dir.join("src/display_list/canvas_2d.rs"),
             manifest_dir.join("src/display_list/canvas_2d_recorder.rs"),
@@ -477,7 +469,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "OptionalAffineTransform",
             "FontResourceId",
             "ImageFrameResourceId",
-            "VideoSinkResourceId",
+            "VideoSinkHandle",
             "DisplayListResourceId",
             "CanvasId",
             "CompositorContextId",
@@ -498,7 +490,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ContextRef",
         "FontResourceId",
         "ImageFrameResourceId",
-        "VideoSinkResourceId",
+        "VideoSinkHandle",
         "DisplayListResourceId",
         "CanvasId",
         "CompositorContextId",
@@ -562,6 +554,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("OptionalAffineTransform", "Optional<Gfx::AffineTransform>"),
         ("CompositorContextId", "Web::CompositorContextId"),
         ("UniqueNodeId", "Web::UniqueNodeID"),
+        ("VideoSinkHandle", "Media::VideoSinkHandle"),
     ];
     for (rust_name, cpp_name) in references_renamed_to_real_types {
         commands_config
@@ -592,6 +585,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "LibCompositing/DisplayList/ContextRef.h",
         "LibCompositing/DisplayList/DisplayListResourceIds.h",
         "LibCompositing/Forward.h",
+        "LibMedia/VideoSinkHandle.h",
         "LibWebCommon/PixelUnits.h",
         "LibCompositing/Types.h",
     ]
@@ -601,12 +595,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The commands of the canvas 2D stream go into a list of their own, as only the canvas player plays them.
     let variants = display_list_command_type_variants(&commands_source)?;
     let mut after_includes = String::new();
-    for (macro_name, canvas_2d) in [
-        ("ENUMERATE_DISPLAY_LIST_COMMANDS", false),
-        ("ENUMERATE_CANVAS_2D_COMMANDS", true),
+    // The replay resolves these commands for the frame and hands the painter what they draw, or plays them itself.
+    let commands_the_replay_resolves = [
+        "FillRect",
+        "FillRectWithRoundedCorners",
+        "PaintScrollBar",
+        "DrawCompositedContext",
+        "DeclareMaskContent",
+        "DrawIsolatedGroup",
+        "PaintVectorImage",
+    ];
+    let belongs_to_list = |macro_name: &str, name: &str| {
+        let is_canvas_2d_command = name.starts_with("Canvas2D");
+        match macro_name {
+            "ENUMERATE_CANVAS_2D_COMMANDS" => is_canvas_2d_command,
+            "ENUMERATE_DISPLAY_LIST_COMMANDS_PLAYED_AS_RECORDED" => {
+                !is_canvas_2d_command
+                    && !name.starts_with("Compositor")
+                    && !commands_the_replay_resolves.contains(&name)
+            }
+            _ => !is_canvas_2d_command,
+        }
+    };
+    for macro_name in [
+        "ENUMERATE_DISPLAY_LIST_COMMANDS",
+        "ENUMERATE_DISPLAY_LIST_COMMANDS_PLAYED_AS_RECORDED",
+        "ENUMERATE_CANVAS_2D_COMMANDS",
     ] {
         after_includes.push_str(&format!("\n#define {macro_name}(V)"));
-        for name in variants.iter().filter(|name| name.starts_with("Canvas2D") == canvas_2d) {
+        for name in variants.iter().filter(|name| belongs_to_list(macro_name, name)) {
             after_includes.push_str(&format!(" \\\n    V({name})"));
         }
         after_includes.push('\n');

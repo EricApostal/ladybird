@@ -212,19 +212,43 @@ impl ContextState {
         );
     }
 
-    pub fn viewport_size_updated(&mut self, viewport_size: IntSize) {
+    // Returns whether the overlays have to repaint all of the viewport. The page's next frame repaints all of it when its
+    // size changes, but the paused debugger's page does not paint again, and a new pixel ratio alone need not repaint
+    // the page.
+    pub fn viewport_size_updated(&mut self, viewport_size: IntSize, device_pixel_ratio: f64) -> bool {
+        let only_the_pixel_ratio_changed =
+            viewport_size == self.viewport_size && device_pixel_ratio != self.device_pixel_ratio;
         self.scene.forget_whether_animated_content_may_affect_viewport();
         if self.viewport_size != viewport_size {
             self.keyboard_scroll_controller.forget_target();
         }
         self.viewport_size = viewport_size;
+        self.device_pixel_ratio = device_pixel_ratio;
+        let ui_overlays = self.overlays.ui_overlays();
+        ui_overlays.paused_debugger.is_some()
+            || (only_the_pixel_ratio_changed && ui_overlays.picture_in_picture_controls.is_some())
     }
 
-    pub fn set_paused_debugger_overlay_is_shown(&mut self, is_shown: bool) {
-        if is_shown {
+    // Returns false, changing nothing, for the overlays already shown.
+    pub fn set_ui_overlays(&mut self, ui_overlays: UIOverlays, now: MonotonicTime) -> bool {
+        let shows_paused_debugger = ui_overlays.paused_debugger.is_some();
+        if !self.overlays.set_ui_overlays(ui_overlays, now) {
+            return false;
+        }
+        if shows_paused_debugger {
             self.end_keyboard_scroll_gesture();
         }
-        self.paused_debugger_overlay_is_shown = is_shown;
+        true
+    }
+
+    // What the fades of the overlays repaint of the viewport as they advance to the frame.
+    pub fn advance_overlay_fades(&mut self, frame_time: MonotonicTime) -> Option<IntRect> {
+        self.overlays
+            .advance_fades(frame_time, self.viewport_size, self.device_pixel_ratio)
+    }
+
+    pub fn viewport_rect(&self) -> IntRect {
+        IntRect::new(0, 0, self.viewport_size.width, self.viewport_size.height)
     }
 
     pub fn set_visibility(&mut self, visibility: ContextVisibility) -> bool {
@@ -254,18 +278,26 @@ impl ContextState {
         scroll_offsets
     }
 
-    fn frame_inputs_as_presented_now(&mut self) -> FrameInputs {
+    fn frame_inputs_as_presented_now(&mut self, now: MonotonicTime) -> FrameInputs {
         let stretched_scroll_state_snapshot = self.scroll_state_snapshot_stretched_by_elastic_overscrolls();
         let presented_scroll_state_snapshot =
             stretched_scroll_state_snapshot.unwrap_or_else(|| self.scroll_state_snapshot.clone());
         let scrollbars = self
             .scrollbar_controller
             .scrollbars_of_frame(&presented_scroll_state_snapshot);
+        let overlays = self.overlays.picture_of_frame(
+            &scrollbars,
+            self.viewport_size,
+            self.device_pixel_ratio,
+            &self.host.overlay_label_shaper(self.context_id),
+        );
         FrameInputs {
             visual_context_tree: self.scene.visual_context_tree_for_compositing().clone(),
             presented_scroll_state_snapshot,
             scrollbars,
             viewport_scroll_node_index: self.async_scroll_tree.viewport_scroll_node_index(),
+            painted_at: now,
+            overlays,
         }
     }
 
@@ -329,7 +361,40 @@ impl ContextState {
     pub fn frame_inputs(&mut self, now: MonotonicTime) -> Option<FrameInputs> {
         self.update_scrollbar_visibility(now);
         self.scene.display_list().as_ref()?;
-        Some(self.frame_inputs_as_presented_now())
+        self.ask_render_clock_for_display_list_where_scrolled_past_its_window();
+        Some(self.frame_inputs_as_presented_now(now))
+    }
+
+    fn ask_render_clock_for_display_list_where_scrolled_past_its_window(&mut self) {
+        if !self.has_async_scrolling_state {
+            return;
+        }
+        let (Some(display_list), Some(visual_context_tree)) =
+            (self.scene.display_list(), self.scene.visual_context_tree())
+        else {
+            return;
+        };
+        let Some(window) = display_list.window() else {
+            return;
+        };
+        let asks = self
+            .display_list_coverage_watch
+            .asks_for_display_list_where_scrolled(&ShownOfDisplayList {
+                display_list_id: display_list.id(),
+                window,
+                visual_context_tree: visual_context_tree.as_arc(),
+                scroll_state_snapshot: &self.scroll_state_snapshot,
+                viewport_size: self.viewport_size,
+            });
+        if asks {
+            self.host.post_to_render_clock_of_web_content(
+                self.web_content_client_id,
+                render_clock_client::messages::DisplayListCoverageRunsOut {
+                    context_id: self.context_id,
+                    scroll_offsets: self.scroll_offsets(),
+                },
+            );
+        }
     }
 
     pub fn frame_inputs_for_screenshot(&mut self, now: MonotonicTime) -> ScreenshotInputs {
@@ -341,7 +406,7 @@ impl ContextState {
         self.update_scrollbar_visibility(now);
         let scrollbar_fade_damage_rect = self.advance_scrollbar_fades_and_return_damage_rect(capture_time);
         ScreenshotInputs {
-            frame_inputs: self.frame_inputs_as_presented_now(),
+            frame_inputs: self.frame_inputs_as_presented_now(capture_time),
             scrollbar_fade_damage_rect,
         }
     }

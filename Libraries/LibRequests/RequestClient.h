@@ -51,7 +51,7 @@ public:
 
     // Best-effort index into the resolved address pool.
     RefPtr<Request> start_request(ByteString const& method, URL::URL const&, HTTP::Cookie::SameSiteContext, Optional<HTTP::HeaderList const&> request_headers = {}, ReadonlyBytes request_body = {}, HTTP::CacheMode = HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials = HTTP::Cookie::IncludeCredentials::Yes, TransferLease = TransferLease::No, Optional<u32> address_selection_hint = {}, CacheMissNotification = CacheMissNotification::No, u64 originating_page_id = 0, Optional<HTTP::NetworkIsolationKey> = {});
-    RefPtr<Request> adopt_request(int source_client_id, u64 source_request_id, TransferLease = TransferLease::No);
+    RefPtr<Request> adopt_request(int source_client_id, u64 source_request_id, TransferLease = TransferLease::No, Optional<int> owner_client_id = {});
 
     // Moves a response between RequestServers. The request leaves this client on export; the imported one is a new
     // request of the importing client.
@@ -64,6 +64,9 @@ public:
     // Calls back with no addresses when the lookup fails or a proxy is configured.
     void resolve_host(ByteString const& host, Function<void(Vector<ByteString>)> on_resolved);
     int request_server_client_id() const { return m_request_server_client_id; }
+
+    // No other client this process creates has the same epoch, so a request is known by its id and this epoch.
+    u64 transport_epoch() const { return m_transport_epoch; }
 
     RefPtr<WebSocket> websocket_connect(URL::URL const&, Optional<HTTP::NetworkIsolationKey> const&, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers, HTTP::Cookie::SameSiteContext);
 
@@ -80,7 +83,7 @@ private:
     virtual void request_body_file_available(u64 request_id, IPC::File, u64 offset, u64 size) override;
     virtual void request_cached_body_file_available(u64 request_id, IPC::File, u64 offset, u64 size) override;
     virtual void request_finished(u64 request_id, u64, RequestTimingInfo, Optional<NetworkError>) override;
-    virtual void headers_became_available(u64 request_id, Vector<HTTP::Header>, Optional<u32>, Optional<String>, CacheState, ByteString http_version) override;
+    virtual void headers_became_available(u64 request_id, URL::URL, Vector<HTTP::Header>, Optional<u32>, Optional<String>, CacheState, ByteString http_version) override;
     virtual void request_transferred(u64 request_id) override;
     virtual void host_resolved(u64 lookup_id, Vector<ByteString> addresses) override;
 
@@ -95,6 +98,7 @@ private:
     HashMap<u64, RefPtr<Request>> m_requests;
     u64 m_next_request_id { 0 };
     int m_request_server_client_id { -1 };
+    u64 m_transport_epoch { 0 };
 
     HashMap<u64, NonnullRefPtr<WebSocket>> m_websockets;
     u64 m_next_websocket_id { 0 };

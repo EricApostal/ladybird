@@ -14,7 +14,6 @@
 #include <LibCore/File.h>
 #include <LibCrypto/Authentication/HMAC.h>
 #include <LibFileSystem/FileSystem.h>
-#include <LibHTTP/Cache/DiskCache.h>
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HelperProcess.h>
@@ -54,9 +53,6 @@ RequestServerManager::RequestServerManager()
 {
     if (!uses_site_request_servers())
         return;
-
-    // Older versions kept the responses of every site in the cache of the RequestServer with no site.
-    HTTP::DiskCache::remove(HTTP::DiskCache::Mode::Normal, LexicalPath { Application::request_server_options().cache_path });
 
     m_site_cache_key = load_or_create_site_cache_key();
 }
@@ -169,7 +165,7 @@ ErrorOr<RequestServerClientConnection> RequestServerManager::connect_new_client(
 
     // Random client IDs can collide across RequestServers. The UI identifies clients by ID alone, so retry collisions.
     for (size_t attempt = 0; attempt < 8; ++attempt) {
-        auto response = instance.control_client().send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClient>(is_private, site_binding);
+        auto response = send_sync_to_helper<Messages::RequestServerControl::ConnectNewClient>(instance.control_client(), is_private, site_binding);
         if (!response || response->client_id() < 0)
             return Error::from_string_literal("Failed to connect to RequestServer");
 
@@ -279,9 +275,8 @@ ByteString RequestServerManager::sites_directory() const
 // itself would tell it which other sites the user has visited.
 ByteString RequestServerManager::cache_path_for_site(Utf16String const& site) const
 {
-    Crypto::Authentication::HMAC hmac(Crypto::Hash::HashKind::SHA256, m_site_cache_key);
     auto site_bytes = site.to_byte_string();
-    auto digest = hmac.process(site_bytes.view());
+    auto digest = MUST(Crypto::Authentication::hmac(Crypto::Hash::HashKind::SHA256, m_site_cache_key, site_bytes.bytes()));
     return LexicalPath::join(sites_directory(), encode_hex(digest.bytes())).string();
 }
 
@@ -294,7 +289,7 @@ ByteBuffer RequestServerManager::load_or_create_site_cache_key() const
             return key.release_value();
     }
 
-    // Nothing can find the caches of sites that were named with another key, or by older versions.
+    // Nothing can find the caches of sites that were named with another key.
     (void)FileSystem::remove(sites_directory(), FileSystem::RecursionMode::Allowed);
 
     auto key = MUST(ByteBuffer::create_uninitialized(site_cache_key_size));

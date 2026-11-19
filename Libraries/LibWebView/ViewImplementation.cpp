@@ -14,6 +14,7 @@
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <LibCompositing/FrameFitting.h>
 #include <LibCompositing/PausedDebuggerOverlay.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/StandardPaths.h>
@@ -120,7 +121,7 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
 
     m_tab_indicators.on_visibility_change = [this](TabIndicator indicator, bool visible) {
         if (indicator == TabIndicator::PlayingAudio)
-            ++m_playing_audio_indicator_change_count;
+            m_playing_audio_indicator_transitions.append(visible);
         if (on_tab_indicator_change)
             on_tab_indicator_change(indicator, visible);
     };
@@ -128,6 +129,7 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
 
 ViewImplementation::~ViewImplementation()
 {
+    Application::the().media_session_coordinator().remove_view(view_id());
     // The frontend may be torn down already, so clearing the ongoing navigation must not report a URL change to it, nor
     // cancelling the view's location requests or closing the view's page (which revokes its audio playback and capture)
     // a change in what the tab shows.
@@ -147,6 +149,9 @@ ViewImplementation::~ViewImplementation()
         Application::the().notify_webdriver_window_closed(m_window_handle);
 
     reset_spell_checking();
+
+    if (m_remote_layer_id.has_value())
+        Application::the().destroy_remote_layer(*m_remote_layer_id);
 
     // NB: WebDriver BiDi may activate another top-level traversable, which must not be this one that is going away.
     if (!m_window_handle.is_empty() && !m_owner_view_id.has_value()) {
@@ -408,6 +413,7 @@ void ViewImplementation::set_title(Utf16String title)
         return;
 
     m_title = move(title);
+    Application::the().media_session_coordinator().set_fallback_title(view_id(), m_title.to_utf8());
 
     if (on_title_change)
         on_title_change(m_title);
@@ -440,6 +446,109 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
 
     if (did_swap_bitmap && on_ready_to_paint)
         on_ready_to_paint();
+}
+
+void ViewImplementation::server_did_present_frame_in_remote_layer(Badge<WebContentPage>, Gfx::IntSize size, Gfx::IntRect, double device_pixel_ratio)
+{
+    m_backing_stores->present_frame_shown_in_remote_layer(size, device_pixel_ratio);
+    if (m_crash_state.has_value() && m_crash_state->recovery_started)
+        set_crash_state({});
+    TabPerformanceMonitor::did_present(view_id());
+    did_present_frame_in_remote_layer(size, device_pixel_ratio);
+}
+
+void ViewImplementation::set_hosts_remote_layer(bool hosts_remote_layer)
+{
+    if (m_hosts_remote_layer == hosts_remote_layer)
+        return;
+    m_hosts_remote_layer = hosts_remote_layer;
+
+    if (!hosts_remote_layer) {
+        if (auto remote_layer_id = exchange(m_remote_layer_id, {}); remote_layer_id.has_value()) {
+            Application::the().destroy_remote_layer(*remote_layer_id);
+            did_create_remote_layer({});
+        }
+        return;
+    }
+
+    auto remote_layer = Application::the().create_remote_layer();
+    if (!remote_layer.has_value()) {
+        did_create_remote_layer({});
+        return;
+    }
+    m_remote_layer_id = remote_layer->id;
+    update_remote_layer_fit();
+    Application::the().show_context_in_remote_layer(remote_layer->id, page().compositor_context_id());
+    did_create_remote_layer(remote_layer->host_handle);
+}
+
+void ViewImplementation::take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)> callback)
+{
+    Application::the().take_frame_snapshot(page().compositor_context_id(), maximum_size, move(callback));
+}
+
+ViewImplementation* ViewImplementation::find_view_showing_remote_layer(u64 remote_layer_id)
+{
+    for (auto& [_, view] : all_views()) {
+        if (view->m_remote_layer_id == remote_layer_id)
+            return view;
+    }
+    return nullptr;
+}
+
+void ViewImplementation::begin_synchronized_resize(u64 token)
+{
+    if (m_remote_layer_id.has_value())
+        Application::the().begin_synchronized_resize(*m_remote_layer_id, token);
+}
+
+void ViewImplementation::await_synchronized_resize_frame(u64 token, Gfx::IntSize size)
+{
+    if (!m_remote_layer_id.has_value()) {
+        did_hold_synchronized_resize_frame(token);
+        return;
+    }
+    Application::the().await_synchronized_resize_frame(*m_remote_layer_id, token, size);
+}
+
+void ViewImplementation::commit_synchronized_resize(u64 token)
+{
+    if (!m_remote_layer_id.has_value()) {
+        did_commit_synchronized_resize(token);
+        return;
+    }
+    Application::the().commit_synchronized_resize(*m_remote_layer_id, token);
+}
+
+void ViewImplementation::set_scales_frames_to_fit(bool scales_frames_to_fit)
+{
+    if (m_scales_frames_to_fit == scales_frames_to_fit)
+        return;
+
+    m_scales_frames_to_fit = scales_frames_to_fit;
+    if (has_traversable())
+        Application::the().update_compositor_context_scales_frames_to_fit(page().compositor_context_id(), scales_frames_to_fit);
+    update_remote_layer_fit();
+}
+
+// The Compositor fits the frames into the view itself, for a view that scales them to fit.
+void ViewImplementation::update_remote_layer_fit()
+{
+    if (!m_remote_layer_id.has_value())
+        return;
+    Optional<Gfx::IntSize> fit_within;
+    if (m_scales_frames_to_fit && !viewport_size().is_empty())
+        fit_within = viewport_size().to_type<int>();
+    Application::the().set_remote_layer_fit(*m_remote_layer_id, fit_within);
+}
+
+void ViewImplementation::recreate_remote_layer_after_compositor_reconnect(Badge<WebContentClient>)
+{
+    if (!m_hosts_remote_layer)
+        return;
+    m_hosts_remote_layer = false;
+    m_remote_layer_id = {};
+    set_hosts_remote_layer(true);
 }
 
 void ViewImplementation::release_backing_store(i32 bitmap_id)
@@ -804,12 +913,14 @@ void ViewImplementation::reset_zoom()
         Application::settings().set_zoom_for_host(current_host_for_settings(), m_zoom_level);
 }
 
-void ViewImplementation::set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second)
+void ViewImplementation::set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second, bool screen_shows_high_dynamic_range)
 {
     m_display_id = display_id;
     m_maximum_frames_per_second = maximum_frames_per_second;
+    m_screen_shows_high_dynamic_range = screen_shows_high_dynamic_range;
     traversable().for_each_hosting_page([&](WebContentPage& page) {
         page.async_set_maximum_frames_per_second(m_maximum_frames_per_second);
+        page.async_set_screen_shows_high_dynamic_range(m_screen_shows_high_dynamic_range);
         update_compositor_display_metadata(page);
     });
 }
@@ -1368,10 +1479,10 @@ void ViewImplementation::consume_user_activation_of_input_handled_by(Badge<WebCo
         m_pending_input_events[*index].user_activation_time.clear();
 }
 
-bool ViewImplementation::take_input_to_open_link_in_new_tab(Badge<WebContentPage>)
+bool ViewImplementation::take_input_to_open_link_in_new_tab(Badge<WebContentPage>, WebContentPage const& page)
 {
     // NB: Automation lets a renderer synthesize the input that opens a link.
-    if (WebContentClient::renderers_may_synthesize_input())
+    if (WebContentClient::renderers_may_synthesize_input_for_testing() || is_running_webdriver_input_command_in(page))
         return true;
     // NB: Each press opens at most one link, the earliest press first, and only while a page could still be handling it.
     auto now = MonotonicTime::now();
@@ -3011,7 +3122,9 @@ void ViewImplementation::did_allocate_backing_stores(Badge<WebContentPage>, Vect
 
 void ViewImplementation::did_add_backing_stores(Badge<WebContentPage>, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
 {
-    m_backing_stores->add(move(bitmap_ids), move(backing_stores));
+    // The compositor's presentations from backing stores that were refused are handed straight back.
+    if (auto result = m_backing_stores->add(move(bitmap_ids), move(backing_stores)); result.is_error())
+        warnln("Could not add backing stores for page {}: {}", page().id(), result.error());
 }
 
 void ViewImplementation::did_retire_backing_stores(Badge<WebContentPage>, ReadonlySpan<i32> bitmap_ids)
@@ -3023,7 +3136,13 @@ void ViewImplementation::install_backing_stores(Vector<i32> bitmap_ids, Vector<G
 {
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI installing {} backing stores for page {} had_usable_bitmap={}",
         backing_stores.size(), page().id(), m_backing_stores->has_usable_front_bitmap());
-    m_backing_stores->install(move(bitmap_ids), move(backing_stores));
+    // A publication that can't be imported is refused, and its front backing store goes straight back, since nothing
+    // here will ever present from it.
+    auto front_bitmap_id = bitmap_ids.first();
+    if (auto result = m_backing_stores->install(move(bitmap_ids), move(backing_stores)); result.is_error()) {
+        warnln("Could not install backing stores for page {}: {}", page().id(), result.error());
+        page().release_presented_bitmap(front_bitmap_id);
+    }
 }
 
 void ViewImplementation::update_zoom()
@@ -3054,14 +3173,13 @@ void ViewImplementation::set_device_pixel_ratio_for_testing(WebContentPage& page
 
 Gfx::IntRect ViewImplementation::rect_fitting_frame(Gfx::IntSize frame_size, Gfx::IntSize target_size)
 {
-    auto scale = min(static_cast<float>(target_size.width()) / frame_size.width(), static_cast<float>(target_size.height()) / frame_size.height());
-    auto fitted_size = frame_size.to_type<float>().scaled(scale).to_rounded<int>();
-    return Gfx::IntRect { {}, fitted_size }.centered_within({ {}, target_size });
+    return Compositing::rect_fitting_frame(frame_size, target_size);
 }
 
 void ViewImplementation::handle_resize()
 {
     page().async_set_viewport(viewport_size(), m_device_pixel_ratio, m_is_fullscreen);
+    update_remote_layer_fit();
 
     // The page forwards its new size to the compositor once it has laid it out. Until then, scaling frames to fit needs
     // the compositor to keep presenting them whole at the size they were laid out for.
@@ -3410,6 +3528,31 @@ void ViewImplementation::complete_webdriver_input_command(u64 command_id, Web::W
     Application::the().complete_webdriver_content_command(command_id, move(response));
 }
 
+static bool is_webdriver_cookie_command(StringView name)
+{
+    return name.is_one_of("get_all_cookies"sv, "get_named_cookie"sv, "add_cookie"sv, "delete_cookie"sv, "delete_all_cookies"sv);
+}
+
+// https://w3c.github.io/webdriver/#dfn-element-send-keys
+// NB: The renderer splits the text on newlines into the paths of the files to select, if the element is a file input.
+static Vector<ByteString> files_named_by_element_send_keys(StringView name, JsonValue const& envelope)
+{
+    if (name != "element_send_keys"sv || !envelope.is_object())
+        return {};
+    auto payload = envelope.as_object().get_object("__webdriver_input_payload"sv);
+    if (!payload.has_value())
+        return {};
+    auto text = payload->get_string("text"sv);
+    if (!text.has_value())
+        return {};
+
+    Vector<ByteString> files;
+    text->bytes_as_string_view().for_each_split_view('\n', SplitBehavior::KeepEmpty, [&](StringView path) {
+        files.append(path);
+    });
+    return files;
+}
+
 void ViewImplementation::dispatch_webdriver_content_command(u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String const& name, JsonValue payload, Vector<String> arguments, WebDriverProtocol protocol)
 {
     if (m_crash_state.has_value() && !m_crash_state->recovery_started) {
@@ -3451,8 +3594,13 @@ void ViewImplementation::dispatch_webdriver_content_command(u64 command_id, Opti
 
     if (name == "crash_current_page"sv)
         m_pending_webdriver_crash_commands.set(command_id, { *target, name, navigable_id });
-    else
-        m_pending_webdriver_commands.set(command_id, { *target, name, navigable_id });
+    else {
+        // NB: A cookie command is for the cookies of the active document of its browsing context when it starts.
+        Optional<URL::URL> cookie_document_url;
+        if (is_webdriver_cookie_command(name))
+            cookie_document_url = navigable->active_document_url();
+        m_pending_webdriver_commands.set(command_id, { *target, name, navigable_id, protocol, false, files_named_by_element_send_keys(name, payload), false, move(cookie_document_url) });
+    }
     target->async_run_webdriver_command(command_id, navigable_id, name, move(payload), move(arguments));
 }
 
@@ -3463,6 +3611,44 @@ void ViewImplementation::run_webdriver_commands_waiting_for_a_document(Badge<Can
         dispatch_webdriver_content_command(command_id, command.navigable_id, command.name, move(command.payload), move(command.arguments), command.protocol);
 }
 
+bool ViewImplementation::is_running_webdriver_command_to_select_file(WebContentPage const& page, StringView path) const
+{
+    for (auto const& [command_id, command] : m_pending_webdriver_commands) {
+        if (command.page.ptr() == &page && command.files_to_select.contains_slow(path))
+            return true;
+    }
+    return false;
+}
+
+// NB: An input command dispatches its input in the page it runs in, until any navigation it started takes that page
+//     away.
+bool ViewImplementation::is_running_webdriver_input_command_in(WebContentPage const& page) const
+{
+    if (!m_webdriver_input_command_running || m_webdriver_input_commands.is_empty())
+        return false;
+    auto command = m_pending_webdriver_commands.get(m_webdriver_input_commands.first().command_id);
+    return command.has_value() && command->page.ptr() == &page && !command->only_waits_for_navigation;
+}
+
+Optional<URL::URL> ViewImplementation::url_of_webdriver_cookie_command_running_in(WebContentClient const& client) const
+{
+    for (auto const& [command_id, command] : m_pending_webdriver_commands) {
+        if (&command.page->client() == &client && command.cookie_document_url.has_value())
+            return command.cookie_document_url;
+    }
+    return {};
+}
+
+bool ViewImplementation::is_running_webdriver_window_command_in(WebContentPage const& page) const
+{
+    for (auto const& [command_id, command] : m_pending_webdriver_commands) {
+        if (command.page.ptr() == &page && command.protocol == WebDriverProtocol::Classic
+            && command.name.is_one_of("set_window_rect"sv, "maximize_window"sv, "minimize_window"sv, "fullscreen_window"sv))
+            return true;
+    }
+    return false;
+}
+
 void ViewImplementation::prepare_page_for_navigable(WebContentPage& page)
 {
     page.async_set_zoom_level(m_zoom_level);
@@ -3471,6 +3657,8 @@ void ViewImplementation::prepare_page_for_navigable(WebContentPage& page)
     if (m_window_size.has_value())
         page.async_set_window_size(m_window_size->to_type<Web::DevicePixels>());
     page.async_set_maximum_frames_per_second(m_maximum_frames_per_second);
+    if (m_screen_shows_high_dynamic_range)
+        page.async_set_screen_shows_high_dynamic_range(true);
     if (m_frame_rate_capped)
         page.async_set_frame_rate_capped(true);
     page.async_set_has_focus(traversable().has_system_focus());
@@ -3497,6 +3685,7 @@ void ViewImplementation::prepare_page_for_tab(WebContentPage& page)
     // The window handle names the tab to WebDriver, and the viewport is the tab's: both belong to the page displaying
     // it, whose traversable is local.
     page.async_set_window_handle(m_window_handle);
+    Application::the().update_compositor_context_scales_frames_to_fit(page.compositor_context_id(), m_scales_frames_to_fit);
     page.async_set_viewport(viewport_size(), m_device_pixel_ratio, m_is_fullscreen);
     Application::the().update_compositor_viewport(page.compositor_context_id(), viewport_size().to_type<int>(), m_device_pixel_ratio);
 }
@@ -3573,6 +3762,10 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
         install_backing_stores(move(backing_stores->bitmap_ids), move(backing_stores->backing_stores));
 
     auto compositor_context_id = page.compositor_context_id();
+    Application::the().update_compositor_context_scales_frames_to_fit(compositor_context_id, m_scales_frames_to_fit);
+    // The remote layer goes on showing the outgoing page's last frame until the page presents its first one.
+    if (m_remote_layer_id.has_value())
+        Application::the().show_context_in_remote_layer(*m_remote_layer_id, compositor_context_id);
     Application::the().update_compositor_viewport(compositor_context_id, viewport_size().to_type<int>(), m_device_pixel_ratio);
     Application::the().update_compositor_context_visibility(compositor_context_id, traversable().system_visibility_state());
     Application::the().update_compositor_context_presents_from_cpu_memory(compositor_context_id, m_presents_from_cpu_memory);
@@ -3656,6 +3849,7 @@ void ViewImplementation::move_pending_webdriver_commands_to_new_host(Badge<Canon
             continue;
 
         command.page = new_host;
+        command.only_waits_for_navigation = true;
         new_host.async_run_webdriver_command(command_id, navigable_id, "wait_for_navigation"_string, JsonValue {}, {});
     }
 }
@@ -4181,7 +4375,7 @@ void ViewImplementation::dump_session_history(StringView reason, SessionHistoryD
         history_log_entries(traversable().session_history()));
 }
 
-void ViewImplementation::handle_web_content_process_crash()
+void ViewImplementation::handle_web_content_process_crash(WebContentCrashReason crash_reason)
 {
     auto failed_url = url();
     if (auto browser_ui_load_url = this->browser_ui_load_url(); browser_ui_load_url.has_value())
@@ -4234,8 +4428,12 @@ void ViewImplementation::handle_web_content_process_crash()
     if (auto const& headless_mode = Application::browser_options().headless_mode; headless_mode.has_value())
         recovery_mode = *headless_mode == HeadlessMode::Test ? RecoveryMode::PrepareForNextNavigation : RecoveryMode::Restore;
 
-    if (recovery_mode == RecoveryMode::ShowOverlay)
-        dbgln("\033[31;1mWebContent process crashed!\033[0m Last page loaded: {}", failed_url);
+    if (recovery_mode == RecoveryMode::ShowOverlay) {
+        if (crash_reason == WebContentCrashReason::ExceededMemoryLimit)
+            dbgln("\033[31;1mWebContent process was ended for its memory use!\033[0m Last page loaded: {}", failed_url);
+        else
+            dbgln("\033[31;1mWebContent process crashed!\033[0m Last page loaded: {}", failed_url);
+    }
 
     reset_page_media_state();
 
@@ -4253,14 +4451,17 @@ void ViewImplementation::handle_web_content_process_crash()
     respawn_web_content_process_after_crash();
 
     // A repeatedly crashing headless page is left dormant so the next WebDriver test or explicit navigation can
-    // proceed without feeding an automatic restore loop.
-    if (recovery_mode == RecoveryMode::Restore && !crashed_repeatedly) {
+    // proceed without feeding an automatic restore loop. So is a page that was ended for its memory use, because
+    // the restored page would grow to the limit again.
+    auto restores_page = !crashed_repeatedly && crash_reason != WebContentCrashReason::ExceededMemoryLimit;
+    if (recovery_mode == RecoveryMode::Restore && restores_page) {
         recover_current_session_history_entry_with_history_operation();
     } else if (recovery_mode == RecoveryMode::ShowOverlay) {
         traversable().abandon_history_operations();
         set_crash_state(CrashState {
             .failed_url = move(failed_url),
             .navigation_to_retry = move(navigation_to_retry),
+            .exceeded_memory_limit = crash_reason == WebContentCrashReason::ExceededMemoryLimit,
         });
     } else {
         traversable().abandon_history_operations();
@@ -4405,6 +4606,22 @@ void ViewImplementation::content_settings_changed()
     // The page displaying the tab, and any page chosen to host its next document, host the tab's traversable.
     send_force_dark(page());
     traversable().for_each_pending_host(send_force_dark);
+    send_force_dark_to_embedded_pages();
+}
+
+// A page embedding out-of-process iframes of the tab has no local traversable to resolve force-dark for, so it takes the
+// tab's own: what applies to the host of the tab's top-level document.
+void ViewImplementation::send_force_dark_to_embedded_page(WebContentPage& page) const
+{
+    page.async_set_force_dark_for_local_roots(Application::settings().force_dark_for_host(current_host_for_settings()));
+}
+
+void ViewImplementation::send_force_dark_to_embedded_pages() const
+{
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        if (&page != &this->page())
+            send_force_dark_to_embedded_page(page);
+    });
 }
 
 void ViewImplementation::browsing_behavior_changed()

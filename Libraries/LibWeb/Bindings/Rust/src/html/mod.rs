@@ -57,6 +57,10 @@ pub(crate) mod canvas_transform;
 #[cfg(not(test))]
 pub(crate) mod exports;
 #[cfg(not(test))]
+pub(crate) mod global_event_handlers;
+#[cfg(not(test))]
+pub(crate) mod html_form_element;
+#[cfg(not(test))]
 pub(crate) mod image_bitmap;
 #[cfg(not(test))]
 pub(crate) mod image_bitmap_rendering_context;
@@ -66,6 +70,8 @@ pub(crate) mod image_data;
 pub(crate) mod message_channel;
 #[cfg(not(test))]
 pub(crate) mod message_port;
+#[cfg(not(test))]
+pub(crate) mod navigable;
 #[cfg(not(test))]
 pub(crate) mod numbers;
 #[cfg(not(test))]
@@ -77,6 +83,10 @@ pub(crate) mod path2d;
 #[cfg(not(test))]
 pub(crate) mod port_channel;
 #[cfg(not(test))]
+pub(crate) mod sanitizer;
+#[cfg(not(test))]
+pub(crate) mod sanitizer_configuration;
+#[cfg(not(test))]
 pub(crate) mod storage;
 #[cfg(not(test))]
 pub(crate) mod storage_event;
@@ -84,6 +94,10 @@ pub(crate) mod storage_event;
 pub(crate) mod structured_serialize;
 #[cfg(not(test))]
 pub(crate) mod text_metrics;
+#[cfg(not(test))]
+pub(crate) mod visibility_state;
+#[cfg(not(test))]
+pub(crate) mod visibility_state_entry;
 #[cfg(not(test))]
 pub(crate) mod window;
 #[cfg(not(test))]

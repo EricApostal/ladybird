@@ -42,7 +42,6 @@ flatpak_transitive_deps = [
 # List of libraries that are in the Flatpak runtime and therefore not in the manifest
 # See: https://docs.flatpak.org/en/latest/available-runtimes.html#check-software-available-in-runtimes
 flatpak_runtime_libs = [
-    "curl",
     "dbus",
     "fontconfig",
     "freetype",
@@ -60,12 +59,18 @@ flatpak_runtime_libs = [
     "zlib",
 ]
 
+# List of build tools that vcpkg installs for its own builds, which the Flatpak SDK provides
+vcpkg_host_tools = [
+    "vcpkg-tool-meson",
+]
+
 # List of libraries that are in vcpkg but not needed for the Linux platform
 vcpkg_not_linux = [
     "dirent",
     "md4c",
     "mman",
     "pthread",
+    "sparkle",
 ]
 
 
@@ -206,7 +211,7 @@ def check_vcpkg_vs_flatpak_versioning(vcpkg_repo: Path):
                     flatpak.append(name)
 
         # Remove excluded dependencies from the vcpkg list
-        for name in flatpak_runtime_libs + vcpkg_not_linux:
+        for name in flatpak_runtime_libs + vcpkg_host_tools + vcpkg_not_linux:
             if name in vcpkg:
                 del vcpkg[name]
 

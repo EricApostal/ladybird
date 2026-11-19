@@ -6,35 +6,15 @@
 
 //! What a frame is painted with besides the display list and its resources.
 
-use libcompositing_rust::display_list::damage::{DisplayListFrame, LiveContentChanges, compute_display_list_damage};
+use crate::overlays::OverlayPicture;
+use libcompositing_rust::display_list::damage::{
+    DisplayListDamage, DisplayListFrame, LayerPlans, LiveContentChanges, compute_display_list_damage,
+};
+use libcompositing_rust::display_list::replay::ScrollbarShownByFrame;
 use libcompositing_rust::display_list::storage::DisplayListStorage;
 use libcompositing_rust::scrolling::{AccumulatedVisualContextTree, ScrollStateSnapshot, SpatialNodeIndex};
+use libcompositing_rust::time::MonotonicTime;
 use libgfx_rust::{Color, FloatRect, IntRect};
-
-// A scrollbar as it is painted, somewhere between its thin and its expanded geometry.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct PresentedScrollbar {
-    pub gutter_rect: FloatRect,
-    pub thumb_rect: FloatRect,
-    pub thumb_color: Color,
-    pub thumb_outline_color: Color,
-    pub track_color: Color,
-    pub opacity: f32,
-}
-
-impl Default for PresentedScrollbar {
-    fn default() -> Self {
-        Self {
-            gutter_rect: Default::default(),
-            thumb_rect: Default::default(),
-            thumb_color: Default::default(),
-            thumb_outline_color: Default::default(),
-            track_color: Default::default(),
-            opacity: 1.0,
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -70,21 +50,7 @@ impl Default for ScrollbarOfFrame {
     }
 }
 
-// A scroll offset outside the scroll range moves the thumb past an end of its track, where it is cut short instead.
-pub fn thumb_rect_kept_inside_track(mut thumb_rect: IntRect, track_rect: IntRect, vertical: bool) -> IntRect {
-    if vertical {
-        let top = thumb_rect.y.max(track_rect.y);
-        let bottom = thumb_rect.bottom().min(track_rect.bottom());
-        thumb_rect.y = top;
-        thumb_rect.height = 0.max(bottom - top);
-    } else {
-        let left = thumb_rect.x.max(track_rect.x);
-        let right = thumb_rect.right().min(track_rect.right());
-        thumb_rect.x = left;
-        thumb_rect.width = 0.max(right - left);
-    }
-    thumb_rect
-}
+pub use libcompositing_rust::display_list::replay::thumb_rect_kept_inside_track;
 
 // What a frame is painted with besides the display list and its resources.
 pub struct FrameInputs {
@@ -92,11 +58,32 @@ pub struct FrameInputs {
     pub presented_scroll_state_snapshot: ScrollStateSnapshot,
     pub scrollbars: Vec<ScrollbarOfFrame>,
     pub viewport_scroll_node_index: Option<SpatialNodeIndex>,
+    // When the frame is painted, which is the time a blinking caret shows as of.
+    pub painted_at: MonotonicTime,
+    // What the compositor draws over the page in the frame.
+    pub overlays: OverlayPicture,
 }
 
 impl FrameInputs {
+    // The scrollbars of the page that the frame presents, which replace the geometry the display list recorded for
+    // them.
+    pub fn scrollbars_shown_for_the_page(&self) -> Vec<ScrollbarShownByFrame> {
+        self.scrollbars
+            .iter()
+            .filter(|scrollbar| !scrollbar.is_painted_by_compositor)
+            .map(|scrollbar| ScrollbarShownByFrame {
+                scroll_node_index: scrollbar.scroll_node_index,
+                vertical: scrollbar.vertical,
+                gutter_rect: scrollbar.gutter_rect,
+                thumb_rect: scrollbar.thumb_rect,
+                expansion: scrollbar.expansion,
+                opacity: scrollbar.opacity,
+            })
+            .collect()
+    }
+
     // What a frame painted with these inputs repaints of the frame `last_frame_inputs` painted `last_display_list`
-    // with, or none where that has no bounds.
+    // with, none where that has no bounds, and given the frames' layer plans, what it repaints of each layer.
     pub fn damage_since(
         &self,
         display_list: &DisplayListStorage,
@@ -104,7 +91,8 @@ impl FrameInputs {
         last_display_list: &DisplayListStorage,
         viewport_rect: IntRect,
         mut live_content_changes: LiveContentChanges<'_>,
-    ) -> Option<IntRect> {
+        layer_plans: Option<LayerPlans<'_>>,
+    ) -> DisplayListDamage {
         let scroll_offset_changed = |index: SpatialNodeIndex| {
             last_frame_inputs
                 .presented_scroll_state_snapshot
@@ -112,7 +100,7 @@ impl FrameInputs {
                 != self.presented_scroll_state_snapshot.device_offset_for_index(index)
         };
         if self.viewport_scroll_node_index.is_some_and(scroll_offset_changed) {
-            return None;
+            return DisplayListDamage::unbounded(layer_plans.map_or(0, |plans| plans.new.layers.len()));
         }
         for scrollbar in &self.scrollbars {
             if scrollbar.is_painted_by_compositor && scroll_offset_changed(scrollbar.scroll_node_index) {
@@ -126,15 +114,27 @@ impl FrameInputs {
             self.frame_of(display_list),
             viewport_rect,
             live_content_changes,
+            layer_plans,
         )
     }
 
+    // Whether a frame painted with these inputs places content where one painted with `other` does: the same tree,
+    // scrolled the same.
+    pub fn places_content_like(&self, other: &FrameInputs) -> bool {
+        std::sync::Arc::ptr_eq(self.visual_context_tree.as_arc(), other.visual_context_tree.as_arc())
+            && self.presented_scroll_state_snapshot.device_offsets()
+                == other.presented_scroll_state_snapshot.device_offsets()
+    }
+
     fn frame_of<'a>(&'a self, display_list: &'a DisplayListStorage) -> DisplayListFrame<'a> {
+        let tree = self.visual_context_tree.as_arc();
         DisplayListFrame {
             command_bytes: display_list.bytes(),
             command_runs: display_list.command_runs(),
+            chunks: display_list.chunks(),
+            effect_clip_plan: display_list.effect_clip_plan(tree),
             summary: display_list.summary(),
-            visual_context_tree: self.visual_context_tree.as_arc(),
+            visual_context_tree: tree,
             scroll_offsets: self.presented_scroll_state_snapshot.device_offsets(),
         }
     }

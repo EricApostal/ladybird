@@ -7,12 +7,9 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
 #include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
-#include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibMediaCodecs/VideoFrame.h>
 #include <LibWeb/Compositor/CompositorConnection.h>
-#include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
-#include <LibWeb/Compositor/NavigablePresenter.h>
 #include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/HTML/Canvas/RemoteCanvas2DTransport.h>
 #include <LibWeb/WebGL/RemoteWebGLTransport.h>
@@ -130,6 +127,11 @@ void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::Bitmap> targ
 {
     m_host.flush_canvas_2d_stream();
     m_host.request_screenshot(m_context_id, move(target_bitmap), move(callback));
+}
+
+void CompositorContextHandle::prepare_remote_descendants_for_screenshot(Function<void()>&& callback)
+{
+    m_host.prepare_remote_descendants_for_screenshot(m_context_id, move(callback));
 }
 
 CompositorHost::CompositorHost()
@@ -398,17 +400,20 @@ void CompositorHost::send_canvas_2d_stream(Compositing::Canvas2DCommandStream& s
         connection->update_canvas_2d_stream(stream);
 }
 
-bool CompositorHost::rasterize_display_list(Compositing::DisplayListResource const& display_list, Compositing::DisplayListResourceStorage const& resource_storage, NonnullRefPtr<Gfx::Bitmap> target) const
+bool CompositorHost::rasterize_image(Layout::RustFFI::FfiImageRasterization const& image, NonnullRefPtr<Gfx::Bitmap> target) const
 {
     auto* connection = compositor_connection();
     if (!connection)
         return false;
-    auto resource_transaction = resource_storage.create_self_contained_transaction(*display_list.display_list, display_list.visual_context_tree);
-    if (resource_transaction.is_error()) {
-        dbgln("WebContent: Not rasterizing a display list: {}", resource_transaction.error());
+    return connection->rasterize_image(image, move(target));
+}
+
+bool CompositorHost::rasterize_last_recording(Layout::RustFFI::DocumentHost const& document_host, Layout::BegunRead const& read, NonnullRefPtr<Gfx::Bitmap> target) const
+{
+    auto* connection = compositor_connection();
+    if (!connection)
         return false;
-    }
-    return connection->rasterize_display_list(*display_list.display_list, display_list.visual_context_tree, resource_transaction.release_value(), move(target));
+    return connection->rasterize_last_recording(document_host, read, move(target));
 }
 
 void CompositorHost::destroy_context(Web::CompositorContextId context_id)
@@ -480,10 +485,13 @@ void CompositorHost::register_animated_images_with_new_compositor()
     }
 }
 
-void CompositorHost::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
+bool CompositorHost::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
 {
-    if (auto* connection = compositor_connection())
-        connection->add_video_sink(video_sink_handle, move(presentation_page));
+    auto* connection = compositor_connection();
+    if (!connection)
+        return false;
+    connection->add_video_sink(video_sink_handle, move(presentation_page));
+    return true;
 }
 
 void CompositorHost::remove_video_sink(Media::VideoSinkHandle video_sink_handle)
@@ -604,6 +612,15 @@ void CompositorHost::hurry_rendering_opportunity(Web::CompositorContextId contex
 {
     if (auto* connection = compositor_connection())
         connection->hurry_rendering_opportunity(context_id);
+}
+
+void CompositorHost::prepare_remote_descendants_for_screenshot(Web::CompositorContextId context_id, Function<void()>&& callback)
+{
+    if (auto* connection = compositor_connection()) {
+        connection->prepare_remote_descendants_for_screenshot(context_id, move(callback));
+        return;
+    }
+    callback();
 }
 
 void CompositorHost::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void(ScreenshotResult)>&& callback)

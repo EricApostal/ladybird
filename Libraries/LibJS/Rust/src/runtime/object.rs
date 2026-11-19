@@ -31,13 +31,14 @@ pub use crate::layout::object::{INDEXED_ELEMENTS_HEADER_SIZE, IndexedStorageKind
 use crate::layout::value::Value;
 use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::abstract_operations::{
-    call, call_function_object, function_object_as_object, validate_and_apply_property_descriptor,
+    call, call_function_object, function_object_as_object, get_prototype_from_constructor,
+    validate_and_apply_property_descriptor,
 };
 use crate::runtime::accessor::Accessor;
 use crate::runtime::array::{ARRAY_OBJECT_METHODS, Array};
 use crate::runtime::class_field_definition::{ClassElementName, ClassFieldDefinition, ClassFieldInitializer};
 use crate::runtime::completion::{Must, ThrowCompletionOr};
-use crate::runtime::ecmascript_function_object::ECMASCRIPT_FUNCTION_OBJECT_METHODS;
+use crate::runtime::ecmascript_function_object::{ECMASCRIPT_FUNCTION_OBJECT_METHODS, as_ecmascript_function_object};
 use crate::runtime::error::{ErrorKind, error_data_of_error};
 use crate::runtime::error_data::ErrorData;
 use crate::runtime::error_types::ErrorType;
@@ -238,7 +239,9 @@ pub struct ObjectMethods {
     pub name_for_call_stack: fn(&Object) -> Utf16String,
     /// The virtual methods of NativeFunction, which only native functions have.
     pub native_function: Option<&'static NativeFunctionMethods>,
-    pub is_cacheable_for_property_absence: fn(&Object) -> bool,
+    /// Whether the absence of a property from the shape of an object of this class may be cached: false for classes
+    /// whose objects have other properties than those of their shape. JIT code reads it (see RuntimeLayout).
+    pub is_cacheable_for_property_absence: bool,
     /// Whether the absence of a property from objects of this object's shape may be cached, for objects that answer
     /// for a few names whatever their shape holds.
     pub is_cacheable_for_absence_of: fn(&Object, &Vm, &PropertyKey) -> bool,
@@ -254,6 +257,8 @@ pub struct ObjectMethods {
     /// [[PrivateElements]], for a class whose fields do not tell: one whose fields only cache, or one with a slot that
     /// holds nothing. None leaves it to the fields, which Object::has_internal_slots() reads.
     pub has_internal_slots: Option<bool>,
+    /// What Object::preserve_identity() runs, for the objects of an embedder that drops objects it can recreate.
+    pub preserve_identity: Option<fn(&Object)>,
 }
 
 /// [[GetPrototypeOf]].
@@ -282,7 +287,7 @@ pub static ORDINARY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     function_realm: |_| None,
     name_for_call_stack: |_| unreachable!("FunctionObject::name_for_call_stack is pure virtual"),
     native_function: None,
-    is_cacheable_for_property_absence: |_| true,
+    is_cacheable_for_property_absence: true,
     is_cacheable_for_absence_of: |object, _, _| object.is_cacheable_for_property_absence(),
     is_cacheable_for_inherited_property: |_| true,
     is_cacheable_across_realms: |_| true,
@@ -290,6 +295,7 @@ pub static ORDINARY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     as_builtin_iterator_if_next_is_not_redefined: |_, _| None,
     error_data: error_data_of_error,
     has_internal_slots: None,
+    preserve_identity: None,
 };
 
 define_cell!(
@@ -690,6 +696,40 @@ impl Object {
         }
         let reserve = shared_data.construct_reserve(shape);
         Self::create_in_size_class(vm, shape, reserve)
+    }
+
+    /// OrdinaryCreateFromConstructor(constructor, "%Object.prototype%") for the `this` of a construction of the
+    /// function with `shared_data` and `constructor` as the new target, in the current realm (see
+    /// create_for_construct()).
+    pub fn create_from_constructor_for_construct(
+        vm: &Vm,
+        constructor: Gc<FunctionObject>,
+        shared_data: Gc<SharedFunctionInstanceData>,
+    ) -> ThrowCompletionOr<Gc<Object>> {
+        let realm = vm.current_realm().expect("a construction runs in a realm");
+        let constructor_object = function_object_as_object(constructor);
+        // OPTIMIZATION: The shape a construct with the constructor gave its object before, while the constructor's
+        //               "prototype" still holds its prototype. Reading the own data property has no side effects.
+        let cache = vm.construct_shape_cache();
+        if let Some(shape) = cache.get(constructor_object, realm) {
+            let reserve = shared_data.construct_reserve(shape);
+            return Ok(Self::create_in_size_class(vm, shape, reserve));
+        }
+        let prototype = get_prototype_from_constructor(
+            vm,
+            constructor,
+            crate::runtime::intrinsics::Intrinsics::object_prototype,
+        )?;
+        let object = Self::create_for_construct(vm, realm, prototype, shared_data);
+        if as_ecmascript_function_object(constructor).is_some()
+            && let Some(metadata) = constructor_object.shape().lookup(&vm.names.prototype)
+            && let value = constructor_object.get_direct(metadata.offset)
+            && value.is_object()
+            && value.as_object() == prototype
+        {
+            cache.set(constructor_object, metadata.offset, object.shape());
+        }
+        Ok(object)
     }
 
     /// Like create_with_premade_shape(), in the size class for at least `reserve` properties, for properties that will
@@ -1709,6 +1749,8 @@ impl Object {
             &name.property_key(),
             ValueAndAttributes::new(value, PropertyAttributes::new(Attribute::WRITABLE)),
         );
+        // NB: The private element is state of the object that the embedder can't recreate.
+        self.preserve_identity();
 
         // 5. Return unused.
         Ok(())
@@ -1741,6 +1783,8 @@ impl Object {
             &element.key.property_key(),
             ValueAndAttributes::new(element.value, PropertyAttributes::default()),
         );
+        // NB: The private element is state of the object that the embedder can't recreate.
+        self.preserve_identity();
 
         // 6. Return unused.
         Ok(())
@@ -1910,6 +1954,11 @@ impl Object {
 
     // The internal methods, which dispatch through the object's class.
 
+    /// Whether [[GetPrototypeOf]] of the object is OrdinaryGetPrototypeOf(), which reads the prototype of its shape.
+    pub fn has_ordinary_get_prototype_of(&self) -> bool {
+        self.methods().internal_get_prototype_of.is_none()
+    }
+
     pub fn internal_get_prototype_of(&self, vm: &Vm) -> ThrowCompletionOr<Option<Gc<Object>>> {
         match self.methods().internal_get_prototype_of {
             Some(internal_get_prototype_of) => internal_get_prototype_of(self, vm),
@@ -2015,7 +2064,7 @@ impl Object {
     }
 
     pub fn is_cacheable_for_property_absence(&self) -> bool {
-        (self.methods().is_cacheable_for_property_absence)(self)
+        self.methods().is_cacheable_for_property_absence
     }
 
     pub fn is_cacheable_for_absence_of(&self, vm: &Vm, property_key: &PropertyKey) -> bool {
@@ -2054,6 +2103,15 @@ impl Object {
 
     pub fn error_data(&self) -> Option<&ErrorData> {
         (self.methods().error_data)(self)
+    }
+
+    /// Tells the object that script made its identity outlive the references to it: it is held weakly, or has a
+    /// private element. An embedder may drop an object of its own while script holds no reference to it and create an
+    /// equal one when script asks for it again, which is unobservable only until then.
+    pub fn preserve_identity(&self) {
+        if let Some(preserve_identity) = self.methods().preserve_identity {
+            preserve_identity(self);
+        }
     }
 
     /// Whether the object has an [[ErrorData]] internal slot.

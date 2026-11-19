@@ -2,18 +2,9 @@ include(libweb_generators)
 
 set(SOURCES
     Animations/Animatable.cpp
-    Animations/Animation.cpp
     Animations/AnimationEffect.cpp
-    Animations/AnimationPlaybackEvent.cpp
-    Animations/AnimationTimeline.cpp
-    Animations/TimeValue.cpp
-    Animations/DocumentTimeline.cpp
-    Animations/KeyframeEffect.cpp
     Animations/NamedTimelines.cpp
-    Animations/PseudoElementParsing.cpp
-    Animations/ScrollTimeline.cpp
-    Animations/TimelineRange.cpp
-    Animations/ViewTimeline.cpp
+    Animations/RecordHandles.cpp
     ARIA/AriaData.cpp
     ARIA/ARIAMixin.cpp
     ARIA/AttributeNames.cpp
@@ -35,7 +26,6 @@ set(SOURCES
     Bindings/WrapperWorld.cpp
     Clipboard/Clipboard.cpp
     Clipboard/ClipboardEvent.cpp
-    Clipboard/ClipboardItem.cpp
     Compositor/CompositorConnection.cpp
     Compositor/CompositorHost.cpp
     Compositor/NavigablePresenter.cpp
@@ -55,14 +45,8 @@ set(SOURCES
     ContentSecurityPolicy/PolicyList.cpp
     ContentSecurityPolicy/SecurityPolicyViolationEvent.cpp
     ContentSecurityPolicy/Violation.cpp
-    CookieStore/CookieChangeEvent.cpp
     CookieStore/CookieStore.cpp
-    CredentialManagement/Credential.cpp
     CredentialManagement/CredentialsContainer.cpp
-    CredentialManagement/FederatedCredential.cpp
-    CredentialManagement/FederatedCredentialOperations.cpp
-    CredentialManagement/PasswordCredential.cpp
-    CredentialManagement/PasswordCredentialOperations.cpp
     Crypto/Crypto.cpp
     Crypto/CryptoKey.cpp
     CSS/Angle.cpp
@@ -73,9 +57,7 @@ set(SOURCES
     CSS/ContainerQuery.cpp
     CSS/CountersSet.cpp
     CSS/CustomPropertyRegistration.cpp
-    CSS/GeneratedContent.cpp
     CSS/CSS.cpp
-    CSS/CSSAnimation.cpp
     CSS/CSSDescriptors.cpp
     CSS/CSSFontFaceRule.cpp
     CSS/CSSFontFeatureValuesRule.cpp
@@ -90,7 +72,6 @@ set(SOURCES
     CSS/CSSStyleProperties.cpp
     CSS/CSSStyleRule.cpp
     CSS/CSSStyleSheet.cpp
-    CSS/CSSTransition.cpp
     CSS/ColorFunctionDescriptor.cpp
     CSS/CustomPropertyData.cpp
     CSS/Descriptor.cpp
@@ -185,7 +166,6 @@ set(SOURCES
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
     CSS/Time.cpp
-    CSS/TypedOM.cpp
     CSS/URL.cpp
     CSS/UpdateStyle.cpp
     CSS/ValueType.cpp
@@ -291,13 +271,12 @@ set(SOURCES
     EncryptedMediaExtensions/Algorithms.cpp
     EncryptedMediaExtensions/MediaKeySystemAccess.cpp
     EntriesAPI/FileSystemEntry.cpp
-    EventTiming/EventCounts.cpp
     EventTiming/EventTiming.cpp
-    EventTiming/PerformanceEventTiming.cpp
     Fetch/Body.cpp
     Fetch/BodyInit.cpp
     Fetch/Engine/FetchBodyDeliveryGate.cpp
     Fetch/Engine/FetchByteChannel.cpp
+    Fetch/Engine/FetchEngineRecord.cpp
     Fetch/Engine/FetchExecutor.cpp
     Fetch/Engine/InlineFetchExecutor.cpp
     Fetch/Engine/NetworkTransportHandle.cpp
@@ -307,6 +286,7 @@ set(SOURCES
     Fetch/Fetching/ClientContextSnapshots.cpp
     Fetch/Fetching/NetworkBodyPump.cpp
     Fetch/Fetching/FetchEngine.cpp
+    Fetch/Fetching/FetchEventSink.cpp
     Fetch/Fetching/Fetching.cpp
     Fetch/Fetching/PendingResponse.cpp
     Fetch/Fetching/RefCountedFlag.cpp
@@ -349,8 +329,6 @@ set(SOURCES
     Gamepad/NavigatorGamepad.cpp
     Geolocation/Geolocation.cpp
     Geolocation/GeolocationCoordinates.cpp
-    Geolocation/GeolocationPosition.cpp
-    Geolocation/GeolocationPositionError.cpp
     Geometry/DOMMatrix.cpp
     Geometry/DOMMatrixReadOnly.cpp
     Geometry/DOMPoint.cpp
@@ -359,7 +337,6 @@ set(SOURCES
     Geometry/DOMRectList.cpp
     Geometry/DOMRectReadOnly.cpp
     GPC/GlobalPrivacyControl.cpp
-    HighResolutionTime/Performance.cpp
     HighResolutionTime/TimeOrigin.cpp
     HTML/AbstractWorker.cpp
     HTML/BitmapDecodedImageData.cpp
@@ -571,7 +548,6 @@ set(SOURCES
     HTML/RadioNodeList.cpp
     HTML/RemoteNavigable.cpp
     HTML/RemoteWindow.cpp
-    HTML/Sanitizer.cpp
     HTML/SanitizerConfiguration.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
@@ -653,7 +629,6 @@ set(SOURCES
     IndexedDB/RustIntegration.cpp
     Infra/ByteSequences.cpp
     Infra/JSON.cpp
-    Internals/InternalAnimationTimeline.cpp
     Internals/InternalGamepad.cpp
     Internals/Internals.cpp
     Internals/InternalsBase.cpp
@@ -690,6 +665,10 @@ set(SOURCES
     MediaCapture/MediaStream.cpp
     MediaCapture/MediaStreamTrack.cpp
     MediaCapture/MediaStreamTrackEvent.cpp
+    MediaSession/ActiveMediaSessionTracker.cpp
+    MediaSession/ChapterInformation.cpp
+    MediaSession/MediaMetadata.cpp
+    MediaSession/MediaSession.cpp
     MediaSourceExtensions/BufferedChangeEvent.cpp
     MediaSourceExtensions/EventNames.cpp
     MediaSourceExtensions/ManagedMediaSource.cpp
@@ -700,12 +679,8 @@ set(SOURCES
     MediaSourceExtensions/SourceBufferList.cpp
     MixedContent/AbstractOperations.cpp
     Namespace.cpp
-    NavigationTiming/EntryNames.cpp
-    NavigationTiming/PerformanceNavigation.cpp
     NavigationTiming/PerformanceNavigationTiming.cpp
-    NavigationTiming/PerformanceTiming.cpp
     NotificationsAPI/Notification.cpp
-    NotificationsAPI/NotificationPermission.cpp
     Page/AutoScrollHandler.cpp
     Page/DragAndDropEventHandler.cpp
     Page/ElementResizeAction.cpp
@@ -724,22 +699,15 @@ set(SOURCES
     Painting/PaintFacts.cpp
     Painting/ChromeWidget.cpp
     Painting/DocumentPaintState.cpp
-    Painting/HitTestDisplayList.cpp
+    Painting/HitTestQuery.cpp
     Painting/HitTestResult.cpp
-    Painting/CompositorAnimationEffectState.cpp
     Painting/PaintingRustBridge.cpp
     Painting/ResizeHandle.cpp
     Painting/Scrolling.cpp
     Painting/ScrollSnap.cpp
     Painting/SvgPaintResources.cpp
-    PerformanceTimeline/EntryTypes.cpp
-    PerformanceTimeline/EventNames.cpp
-    PerformanceTimeline/PerformanceEntry.cpp
-    PerformanceTimeline/PerformanceObserver.cpp
-    PerformanceTimeline/PerformanceObserverEntryList.cpp
     PermissionsAPI/Permissions.cpp
     PermissionsAPI/PermissionStore.cpp
-    PermissionsAPI/PermissionStatus.cpp
     PictureInPicture/PictureInPictureController.cpp
     PictureInPicture/PictureInPictureEvent.cpp
     PictureInPicture/PictureInPictureWindow.cpp
@@ -759,7 +727,6 @@ set(SOURCES
     Selection/Selection.cpp
     Selection/CaretNavigation.cpp
     Selection/SelectionModifier.cpp
-    ServerTiming/PerformanceServerTiming.cpp
     ServiceWorker/Cache.cpp
     ServiceWorker/CacheStorage.cpp
     ServiceWorker/EventNames.cpp
@@ -771,16 +738,7 @@ set(SOURCES
     ServiceWorker/ServiceWorkerGlobalScope.cpp
     ServiceWorker/ServiceWorkerRecord.cpp
     ServiceWorker/ServiceWorkerRegistration.cpp
-    Speech/SpeechGrammar.cpp
-    Speech/SpeechGrammarList.cpp
-    Speech/SpeechRecognition.cpp
-    Speech/SpeechRecognitionAlternative.cpp
-    Speech/SpeechRecognitionEvent.cpp
-    Speech/SpeechRecognitionResult.cpp
-    Speech/SpeechRecognitionResultList.cpp
     Speech/SpeechSynthesis.cpp
-    Speech/SpeechSynthesisUtterance.cpp
-    Speech/SpeechSynthesisVoice.cpp
     SRI/IntegrityPolicy.cpp
     SRI/SRI.cpp
     StorageAPI/NavigatorStorage.cpp
@@ -793,7 +751,6 @@ set(SOURCES
     SVG/AttributeNames.cpp
     SVG/AttributeParsing.cpp
     SVG/Path.cpp
-    SVG/SMILAnimation.cpp
     SVG/SMILTimeContainer.cpp
     SVG/SVGAElement.cpp
     SVG/SVGAngle.cpp
@@ -873,6 +830,7 @@ set(SOURCES
     SVG/SVGPreserveAspectRatio.cpp
     SVG/SVGRadialGradientElement.cpp
     SVG/SVGRectElement.cpp
+    SVG/SVGResourceDocument.cpp
     SVG/SVGScriptElement.cpp
     SVG/SVGSetElement.cpp
     SVG/SVGStopElement.cpp
@@ -918,8 +876,6 @@ set(SOURCES
     UIEvents/TouchList.cpp
     UIEvents/UIEvent.cpp
     UIEvents/WheelEvent.cpp
-    UserTiming/PerformanceMark.cpp
-    UserTiming/PerformanceMeasure.cpp
     ViewTransition/ViewTransition.cpp
     WebLocks/AbstractOperations.cpp
     WebLocks/LockManager.cpp
@@ -1048,7 +1004,7 @@ target_sources(LibWeb PRIVATE $<TARGET_OBJECTS:LibJSObjects>)
 target_compile_definitions(LibWeb PRIVATE LibJS_EXPORTS)
 target_link_libraries(LibWeb PUBLIC LibCompositing LibWebCommon LibJSHeaders)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibWebRTCClient LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibWebRTCClient)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile
@@ -1093,6 +1049,7 @@ sync_rust_crate_ffi_headers(
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
         Compositor/RenderClockRustFFI.h
+        Animations/RustFFI.h
 )
 add_dependencies(LibWeb libweb_rust-ffi-headers)
 target_link_libraries(libweb_bindings_rust INTERFACE LibGfx LibGC LibUnicode)

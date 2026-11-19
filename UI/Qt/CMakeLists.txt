@@ -46,6 +46,7 @@ add_library(ladybird_impl STATIC
     Menu.cpp
     NativeTextEditingLineEdit.cpp
     NativeWindowContainer.cpp
+    PageCard.cpp
     PerformanceMonitorWidget.cpp
     PermissionPromptPopover.cpp
     PictureInPictureWindow.cpp
@@ -55,7 +56,6 @@ add_library(ladybird_impl STATIC
     RemoteDownloads.cpp
     RemoteView.cpp
     ReportReview.cpp
-    RestoreSessionCard.cpp
     SandboxOffBar.cpp
     ScreenshotSelectionOverlay.cpp
     ScreenshotViewer.cpp
@@ -154,17 +154,20 @@ if (APPLE)
         Menu.mm
         PlatformColorsMac.mm
         ScrollbarPreferencesMac.mm
+        SoftwareUpdaterMac.mm
         SpellCheckerMac.mm
         SystemAppearanceMac.mm
         TranslateIconMac.mm
         WebContentViewAccessibility.mm
         WebContentViewMac.mm
     )
-    target_link_libraries(ladybird_impl PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework AVFoundation" "-framework Carbon" "-framework Cocoa" "-framework CoreServices" "-framework IOSurface" "-framework QuartzCore")
+    find_package(unofficial-sparkle CONFIG REQUIRED)
+    target_link_libraries(ladybird_impl PRIVATE Qt::GuiPrivate unofficial::sparkle::Sparkle "-framework ApplicationServices" "-framework AVFoundation" "-framework Carbon" "-framework Cocoa" "-framework CoreServices" "-framework IOSurface" "-framework QuartzCore")
     set_source_files_properties(
         LadybirdAccessibilityElement.mm
         MicrophoneAuthorizerMacOS.mm
         PlatformColorsMac.mm
+        SoftwareUpdaterMac.mm
         SpellCheckerMac.mm
         TranslateIconMac.mm
         TranslatorMac.mm

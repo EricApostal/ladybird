@@ -54,6 +54,8 @@ impl ExecutionContext {
                 argument_count: Cell::new(argument_count),
                 returns_to_native_caller: Cell::new(false),
                 runs_jit_code: Cell::new(false),
+                caller_is_derived_construct: Cell::new(false),
+                new_target: Cell::new(Value::UNDEFINED),
             });
             // NB: Enter initializes the remaining registers, locals, and constants.
             for slot in (*context)
@@ -105,8 +107,11 @@ impl ExecutionContext {
         copy.yield_value_is_iterator_result
             .set(self.yield_value_is_iterator_result.get());
         copy.caller_is_construct.set(self.caller_is_construct.get());
+        copy.caller_is_derived_construct
+            .set(self.caller_is_derived_construct.get());
         copy.frame_initialized.set(self.frame_initialized.get());
         copy.this_value.set(self.this_value.get());
+        copy.new_target.set(self.new_target.get());
         copy.executable.set(self.executable.get());
         copy.passed_argument_count.set(self.passed_argument_count.get());
         let frame_initialized = self.frame_initialized.get();
@@ -135,7 +140,10 @@ impl ExecutionContext {
         copy.program_counter.set(self.program_counter.get());
         copy.frame_id.set(self.frame_id.get());
         copy.caller_is_construct.set(self.caller_is_construct.get());
+        copy.caller_is_derived_construct
+            .set(self.caller_is_derived_construct.get());
         copy.this_value.set(self.this_value.get());
+        copy.new_target.set(self.new_target.get());
         copy.executable.set(self.executable.get());
         // NB: An uninitialized frame holds values only in its reserved registers, which the new context starts with
         //     empty, and its arguments.
@@ -156,6 +164,7 @@ unsafe impl Trace for ExecutionContext {
         self.lexical_environment.trace(visitor);
         self.private_environment.trace(visitor);
         self.this_value.trace(visitor);
+        self.new_target.trace(visitor);
         self.executable.trace(visitor);
         match self.script_or_module.get() {
             ScriptOrModule::Empty => {}

@@ -91,7 +91,7 @@ pub(crate) fn derived_replaced_content_facts(data: &NodeData, input: ReplacedCon
         return svg_image_facts(input);
     }
     node_style_view(data).map_or_else(Default::default, |style| {
-        replaced_content_facts(data.kind.get(), ReplacedContentStyle::of(style), input)
+        replaced_content_facts(data.kind.get(), ReplacedContentStyle::of(style, input), input)
     })
 }
 
@@ -103,6 +103,8 @@ struct ReplacedContentStyle {
     size_contained: Option<(CssPixels, CssPixels)>,
     /// The `ch` unit.
     zero_advance: CssPixels,
+    average_advance: CssPixels,
+    maximum_advance: CssPixels,
     line_height: CssPixels,
     is_horizontal: bool,
     appearance_is_none: bool,
@@ -110,7 +112,7 @@ struct ReplacedContentStyle {
 }
 
 impl ReplacedContentStyle {
-    fn of(style: ComputedValuesView<'_>) -> Self {
+    fn of(style: ComputedValuesView<'_>, input: ReplacedContentInput) -> Self {
         // https://drafts.csswg.org/css-contain-2/#containment-size
         // Replaced elements must be treated as having a natural width and height of 0 and no natural aspect ratio.
         // https://drafts.csswg.org/css-sizing-4/#intrinsic-size-override
@@ -122,6 +124,15 @@ impl ReplacedContentStyle {
             } else {
                 CssPixels::default()
             }
+        };
+        let (average_advance, maximum_advance) = match input {
+            ReplacedContentInput::Input {
+                is_text_entry: true, ..
+            } => style
+                .font()
+                .first_available_font()
+                .map_or((0.0, 0.0), |font| font.character_advances()),
+            _ => (0.0, 0.0),
         };
         Self {
             size_contained: style_has_size_containment(style).then(|| {
@@ -137,6 +148,8 @@ impl ReplacedContentStyle {
                 )
             }),
             zero_advance: CssPixels::nearest_value_for_f32(style.font_zero_advance()),
+            average_advance: CssPixels::nearest_value_for_f32(average_advance),
+            maximum_advance: CssPixels::nearest_value_for_f32(maximum_advance),
             line_height: style.line_height(),
             is_horizontal: style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB,
             appearance_is_none: style.appearance() == crate::css::css_enums::appearance::NONE,
@@ -160,15 +173,25 @@ impl ReplacedContentStyle {
 
     // https://html.spec.whatwg.org/multipage/rendering.html#the-input-element-as-a-text-entry-widget
     fn text_control_default_preferred_size(self, size: u32) -> (CssPixels, CssPixels) {
-        // [...] If the element has a size attribute, and parsing that attribute's value using the rules for parsing
-        // non-negative integers doesn't generate an error, return the value obtained from applying the converting a
-        // character width to pixels algorithm to the value of the attribute. Otherwise, return the value obtained from
-        // applying the converting a character width to pixels algorithm to the number 20.
-        // FIXME: Implement the specified "converting a character width to pixels" algorithm.
+        // INTEROP: Match Firefox's allowance for wide glyphs. Cap it so an unusually wide glyph
+        // (for example, a ligature) cannot make a proportional-font input excessively wide.
+        let average = self
+            .average_advance
+            .round()
+            .min(self.maximum_advance)
+            .max(self.zero_advance);
+        let allowance = if self.maximum_advance - average > CssPixels::from_integer(1) {
+            (self.maximum_advance.min(average * 2) - CssPixels::from_integer(4))
+                .max(CssPixels::default())
+                .round()
+        } else {
+            CssPixels::default()
+        };
+        let inline_size = CssPixels::nearest_value_for(f64::from(size) * average.to_double() + allowance.to_double());
         // FIXME: HTML does not yet detail the primitive appearance of text inputs. Use one line for the default
         //        preferred block size, matching the native appearance described by HTML and the behavior of other
         //        engines.
-        self.in_writing_mode(self.characters(size), self.line_height)
+        self.in_writing_mode(inline_size, self.line_height)
     }
 }
 
@@ -203,9 +226,11 @@ fn replaced_content_facts(
     if let ReplacedContentInput::Input {
         size,
         is_text_entry: true,
+        include_number_stepper,
     } = input
     {
         facts.text_entry_content_is_ordinary_box = style.appearance_is_none || style.field_sizing_is_content;
+        facts.include_number_stepper = include_number_stepper && !style.field_sizing_is_content;
         if style.appearance_is_none && !style.field_sizing_is_content {
             let (width, height) = style.text_control_default_preferred_size(size);
             facts.default_preferred_width = Some(width);
@@ -222,6 +247,7 @@ pub(crate) struct ReplacedContentFacts {
     pub(crate) default_preferred_width: Option<CssPixels>,
     pub(crate) default_preferred_height: Option<CssPixels>,
     pub(crate) text_entry_content_is_ordinary_box: bool,
+    pub(crate) include_number_stepper: bool,
     /// The default object size of an SVG `<image>`, which applies once something has decoded. The SVG formatting
     /// context reads it as it is: it is no preferred size the sizing of an ordinary replaced box would take.
     pub(crate) svg_image_default_object_size: CssPixelSize,
@@ -555,6 +581,12 @@ pub(crate) fn node_creates_block_formatting_context(
         // "If the list item is a block container: the marker box is a block container"
         || data.kind.get() == NodeKind::ListItemMarkerBox
         || has_flag(data, NodeFlag::UsesButtonLayout)
+        // https://www.w3.org/TR/CSS22/visuren.html#floats
+        // "The border box of a table, a block-level replaced element, or an element in the normal flow that establishes
+        // a new block formatting context [...] must not overlap the margin box of any floats in the same block
+        // formatting context as the element itself."
+        // NB: A native control whose box hosts its internal shadow tree is a replaced element all the same.
+        || has_flag(data, NodeFlag::IsReplacedElement)
     {
         return true;
     }
@@ -621,7 +653,10 @@ pub(crate) fn construction_flags(kind: NodeKind, is_anonymous: bool, constructio
     let has_style = kind != NodeKind::Node && !kind_is_text(kind);
     // Some native controls use a generic box so they can host their internal shadow tree, but
     // remain replaced elements for CSS box generation and inline layout.
-    let is_replaced_element = kind_is_replaced_box(kind) || has(fact::IS_HTML_INPUT_ELEMENT);
+    // NB: A progress or meter element lays out its internal shadow tree on its own, as other engines do, so no margin
+    //     inside it collapses with the content around it.
+    let is_replaced_element =
+        kind_is_replaced_box(kind) || has(fact::IS_HTML_INPUT_ELEMENT) || has(fact::IS_HTML_PROGRESS_OR_METER_ELEMENT);
     [
         (NodeFlag::Anonymous, is_anonymous),
         (NodeFlag::HasStyle, has_style),
@@ -717,9 +752,11 @@ pub(crate) fn kind_and_style_make_scroll_container(kind: NodeKind, style: Option
     if kind == NodeKind::Viewport {
         return true;
     }
-    let Some(style) = style else {
-        return false;
-    };
+    style.is_some_and(style_makes_scroll_container)
+}
+
+/// Whether the overflow values of `style` make a box other than the viewport a scroll container.
+pub(crate) fn style_makes_scroll_container(style: ComputedValuesView<'_>) -> bool {
     let overflow_value_makes_box_a_scroll_container =
         |overflow_keyword: u8| matches!(overflow_keyword, overflow::AUTO | overflow::HIDDEN | overflow::SCROLL);
     overflow_value_makes_box_a_scroll_container(style.overflow_x())
@@ -787,6 +824,11 @@ pub(crate) fn kind_is_svg_resource_box(kind: NodeKind) -> bool {
         kind,
         NodeKind::SVGMaskBox | NodeKind::SVGClipBox | NodeKind::SVGPatternBox
     )
+}
+
+/// Whether a box of `kind` is SVG content: an `<svg>` box or a box below one.
+pub(crate) fn kind_is_svg_content(kind: NodeKind) -> bool {
+    kind_is_svg_box(kind) || kind == NodeKind::SVGSVGBox
 }
 
 pub(crate) fn kind_is_svg_box(kind: NodeKind) -> bool {
@@ -956,9 +998,67 @@ impl<'pass> NodeFacts<'pass> {
         if self.data().kind.get() == NodeKind::SVGSVGBox {
             return self.svg_root_replaced_content();
         }
-        self.pass
+        let mut facts = self
+            .pass
             .replaced_content_facts(self.node)
-            .expect("replaced content facts were not synced to the arena before layout")
+            .expect("replaced content facts were not synced to the arena before layout");
+        if facts.include_number_stepper && !self.node_has_size_containment() {
+            let decoration = self.number_stepper_inline_size();
+            if self
+                .computed_values_view_if_styled()
+                .is_some_and(|style| style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB)
+            {
+                facts.auto_content_size.width = facts.auto_content_size.width.map(|width| width + decoration);
+                facts.default_preferred_width = facts.default_preferred_width.map(|width| width + decoration);
+            } else {
+                facts.auto_content_size.height = facts.auto_content_size.height.map(|height| height + decoration);
+                facts.default_preferred_height = facts.default_preferred_height.map(|height| height + decoration);
+            }
+        }
+        facts
+    }
+
+    fn number_stepper_inline_size(&self) -> CssPixels {
+        let zero = CssPixels::default();
+        let first_child = |node| {
+            if node == Node::INVALID {
+                Node::INVALID
+            } else {
+                self.pass.node_data(node).first_child.get()
+            }
+        };
+        let wrapper = first_child(self.node);
+        if wrapper == Node::INVALID {
+            return zero;
+        }
+        // The number input's shadow wrapper ends with the stepper container. Its buttons contain fixed-size SVG
+        // arrows; use their computed dimensions and padding so the decoration follows its own font and zoom.
+        let stepper = self.pass.node_data(wrapper).last_child.get();
+        let button = first_child(stepper);
+        let arrow = first_child(button);
+        if arrow == Node::INVALID || self.pass.node_data(arrow).kind.get() != NodeKind::SVGSVGBox {
+            return zero;
+        }
+        let (Some(arrow_style), Some(button_style), Some(input_style)) = (
+            self.pass.computed_values_view_if_styled(arrow),
+            self.pass.computed_values_view_if_styled(button),
+            self.computed_values_view_if_styled(),
+        ) else {
+            return zero;
+        };
+        if input_style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB {
+            arrow_style.width().to_px(zero)
+                + button_style.padding_left().to_px(zero)
+                + button_style.padding_right().to_px(zero)
+                + button_style.border_left_width()
+                + button_style.border_right_width()
+        } else {
+            arrow_style.height().to_px(zero)
+                + button_style.padding_top().to_px(zero)
+                + button_style.padding_bottom().to_px(zero)
+                + button_style.border_top_width()
+                + button_style.border_bottom_width()
+        }
     }
 
     /// An <svg> root's natural size resolves the lengths its element published against its style and the
@@ -1018,13 +1118,33 @@ impl<'pass> NodeFacts<'pass> {
 
     /// https://drafts.csswg.org/css-sizing-3/#min-content-zero
     /// A box whose cyclic percentage width resolves against zero for its min-content contribution: a replaced box, or a
-    /// compressible text control (a text entry input or a textarea).
+    /// compressible form control (a text entry input, a textarea, or a select).
     pub(crate) fn resolves_cyclic_percentages_like_replaced_box(&self) -> bool {
-        self.is_replaced_box() || self.is_text_input() || self.data().kind.get() == NodeKind::TextAreaBox
+        self.is_replaced_box()
+            || self.is_text_input()
+            || self.data().kind.get() == NodeKind::TextAreaBox
+            || self.is_select_box()
+    }
+
+    /// Whether the box is a select element's own box. Its kind is that of any box with its display type, so only the
+    /// element's construction facts tell it apart, and reading them takes a lookup in the style store.
+    pub(crate) fn is_select_box(&self) -> bool {
+        use crate::css::style::bridge::element_construction_fact;
+        let arena = self.pass.arena();
+        arena.dom_node_style_node(self.node).is_some_and(|element| {
+            arena.with_style_store(|engine| engine.element_construction_facts(element))
+                & element_construction_fact::IS_HTML_SELECT_ELEMENT
+                != 0
+        })
     }
 
     pub(crate) fn is_range_input_box(&self) -> bool {
         self.data().kind.get() == NodeKind::RangeInputBox
+    }
+
+    /// A checkbox or radio button box, which only exists while the control keeps its native appearance.
+    pub(crate) fn is_non_devolvable_widget(&self) -> bool {
+        kind_is_non_devolvable_widget(self.data().kind.get())
     }
 
     pub(crate) fn is_native_form_control_box(&self) -> bool {
@@ -1128,9 +1248,7 @@ impl<'pass> NodeFacts<'pass> {
         if kind_is_svg_box(data.kind.get()) || data.kind.get() == NodeKind::SVGForeignObjectBox {
             return false;
         }
-        if data.kind.get() == NodeKind::SVGSVGBox
-            && (kind_is_svg_box(parent.kind.get()) || parent.kind.get() == NodeKind::SVGSVGBox)
-        {
+        if data.kind.get() == NodeKind::SVGSVGBox && kind_is_svg_content(parent.kind.get()) {
             return false;
         }
         if kind_is_replaced_box(parent.kind.get()) && node_can_have_children(parent) {
@@ -1188,8 +1306,8 @@ impl<'pass> NodeFacts<'pass> {
         has_flag(self.data(), NodeFlag::Anonymous)
     }
 
-    pub(crate) fn has_anchor_names(&self) -> bool {
-        has_flag(self.data(), NodeFlag::HasAnchorNames)
+    pub(crate) fn is_anchor_candidate(&self) -> bool {
+        self.pass.arena().node_is_anchor_candidate(self.node)
     }
 
     pub(crate) fn can_have_children(&self) -> bool {
@@ -1413,10 +1531,6 @@ impl<'pass> NodeFacts<'pass> {
         self.replaced_content().default_preferred_height
     }
 
-    pub(crate) fn initial_containing_block_inline_size(&self) -> crate::layout::CssPixels {
-        self.pass.initial_containing_block_inline_size
-    }
-
     pub(crate) fn is_scroll_container(&self) -> bool {
         kind_and_style_make_scroll_container(self.data().kind.get(), self.computed_values_view_if_styled())
     }
@@ -1539,6 +1653,8 @@ mod node_facts_tests {
         super::ReplacedContentStyle {
             size_contained: None,
             zero_advance: CssPixels::from_integer(8),
+            average_advance: CssPixels::from_integer(8),
+            maximum_advance: CssPixels::from_integer(8),
             line_height: CssPixels::from_integer(16),
             is_horizontal: true,
             appearance_is_none: false,
@@ -1569,6 +1685,7 @@ mod node_facts_tests {
         let input = ReplacedContentInput::Input {
             size: 20,
             is_text_entry: true,
+            include_number_stepper: false,
         };
         let text_input = super::replaced_content_facts(NodeKind::TextInputBox, horizontal_style(), input);
         assert_eq!(auto_content_size(text_input), Some((160, 16)));
@@ -1586,9 +1703,31 @@ mod node_facts_tests {
         let checkbox_input = ReplacedContentInput::Input {
             size: 20,
             is_text_entry: false,
+            include_number_stepper: false,
         };
         let checkbox = super::replaced_content_facts(NodeKind::BlockContainer, primitive_style, checkbox_input);
         assert!(checkbox.default_preferred_width.is_none());
+    }
+
+    #[test]
+    fn a_text_entry_input_caps_the_allowance_for_wide_glyphs() {
+        let input = ReplacedContentInput::Input {
+            size: 2,
+            is_text_entry: true,
+            include_number_stepper: false,
+        };
+        for (maximum_advance, expected_width) in [(11, 20), (12, 28), (100, 36)] {
+            let style = super::ReplacedContentStyle {
+                average_advance: CssPixels::from_integer(10),
+                maximum_advance: CssPixels::from_integer(maximum_advance),
+                ..horizontal_style()
+            };
+            let facts = super::replaced_content_facts(NodeKind::TextInputBox, style, input);
+            assert_eq!(
+                facts.auto_content_size.width,
+                Some(CssPixels::from_integer(expected_width))
+            );
+        }
     }
 
     #[test]

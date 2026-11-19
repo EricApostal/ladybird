@@ -36,22 +36,6 @@ QIcon load_icon_from_uri(StringView uri)
     return QIcon { path };
 }
 
-QIcon icon_from_png(ReadonlyBytes favicon_png, int logical_size)
-{
-    QPixmap pixmap;
-    if (!pixmap.loadFromData(favicon_png.data(), static_cast<uint>(favicon_png.size()), "PNG"))
-        return {};
-
-    QIcon icon;
-    for (auto device_pixel_ratio : ICON_DEVICE_PIXEL_RATIOS) {
-        auto size = logical_size * device_pixel_ratio;
-        auto scaled_pixmap = pixmap.scaled(size, size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        scaled_pixmap.setDevicePixelRatio(device_pixel_ratio);
-        icon.addPixmap(scaled_pixmap);
-    }
-    return icon;
-}
-
 // Favicons get slightly rounded corners, so that square ones sit well in the round shapes of the chrome around them.
 static constexpr qreal FAVICON_CORNER_RADIUS_FRACTION = 3.0 / 16.0;
 
@@ -74,15 +58,20 @@ QPixmap favicon_with_rounded_corners(QPixmap const& favicon)
     return QPixmap::fromImage(rounded);
 }
 
-QIcon favicon_with_rounded_corners(QIcon const& favicon, int logical_size)
+QIcon favicon_from_png(ReadonlyBytes favicon_png, int logical_size)
 {
-    if (favicon.isNull())
+    QPixmap pixmap;
+    if (!pixmap.loadFromData(favicon_png.data(), static_cast<uint>(favicon_png.size()), "PNG"))
         return {};
 
-    QIcon rounded;
-    for (auto device_pixel_ratio : ICON_DEVICE_PIXEL_RATIOS)
-        rounded.addPixmap(favicon_with_rounded_corners(favicon.pixmap(QSize(logical_size, logical_size), device_pixel_ratio)));
-    return rounded;
+    QIcon icon;
+    for (auto device_pixel_ratio : ICON_DEVICE_PIXEL_RATIOS) {
+        auto size = logical_size * device_pixel_ratio;
+        auto scaled_pixmap = pixmap.scaled(size, size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        scaled_pixmap.setDevicePixelRatio(device_pixel_ratio);
+        icon.addPixmap(favicon_with_rounded_corners(scaled_pixmap));
+    }
+    return icon;
 }
 
 // Parses the path data of an SVG <path> element. Only the commands used by the icons below are understood: moveto,
@@ -290,6 +279,7 @@ static constexpr auto ALL_TABS_ICON_PATH = "M2.5 6.5h11a1 1 0 0 1 1 1v5a1 1 0 0 
 static constexpr auto CLOSE_ICON_PATH = "M3.5 3.5l8 8M11.5 3.5l-8 8"sv;
 static constexpr auto CHEVRON_DOWN_ICON_PATH = "M3.5 5.5l4 4 4-4"sv;
 static constexpr auto CHEVRON_UP_ICON_PATH = "M3.5 9.5l4-4 4 4"sv;
+static constexpr auto DOUBLE_CHEVRON_RIGHT_ICON_PATH = "M4.5 4.5l3 3-3 3M8.5 4.5l3 3-3 3"sv;
 static constexpr auto SIDEBAR_ICON_PATH = "M3.5 2.5h9a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2zM5.5 2.5v11"sv;
 static constexpr auto DOWNLOAD_ICON_PATH = "M7.5 1.5v9M3.5 6.5l4 4 4-4M2.5 13.5h10"sv;
 static constexpr auto AUDIO_ICON_PATH = "M1.5 5.5h2l4-3v10l-4-3h-2zM10.5 4.5c1.3.8 2 1.8 2 3s-.7 2.2-2 3"sv;
@@ -341,6 +331,7 @@ static StringView chrome_icon_path(ChromeIcon icon)
     case ChromeIcon::Close:
     case ChromeIcon::TabClose:
         return CLOSE_ICON_PATH;
+    case ChromeIcon::Bookmarks:
     case ChromeIcon::Star:
     case ChromeIcon::StarFilled:
         return STAR_ICON_PATH;
@@ -370,6 +361,8 @@ static StringView chrome_icon_path(ChromeIcon icon)
         return CHEVRON_UP_ICON_PATH;
     case ChromeIcon::ChevronDown:
         return CHEVRON_DOWN_ICON_PATH;
+    case ChromeIcon::DoubleChevronRight:
+        return DOUBLE_CHEVRON_RIGHT_ICON_PATH;
     case ChromeIcon::ContentBlocking:
         return CONTENT_BLOCKING_ICON_PATH;
     case ChromeIcon::Moon:

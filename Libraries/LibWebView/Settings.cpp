@@ -87,6 +87,7 @@ static constexpr auto CRASH_REPORT_SENDING_KEY = "crashReportSending"sv;
 static constexpr auto BACKGROUND_NETWORKING_KEY = "backgroundNetworking"sv;
 static constexpr auto BACKGROUND_NETWORKING_ENABLED_KEY = "enabled"sv;
 static constexpr auto BACKGROUND_NETWORKING_FEATURES_KEY = "features"sv;
+static constexpr auto UPDATE_CHECKS_KEY = "updateChecks"sv;
 
 static constexpr auto CONTENT_BLOCKERS_KEY = "contentBlockers"sv;
 static constexpr auto CONTENT_BLOCKER_SUBSCRIPTION_UPDATES_KEY = "contentBlockerSubscriptionUpdates"sv;
@@ -197,6 +198,22 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
         .title = "Restart stalled download connections"sv,
         .description = "When one connection of a multi-connection download stops receiving data, drop it and request the rest of its byte range over a new connection."sv,
         .default_value = true,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::DisableHighDynamicRangeSurfaces,
+        .name = "debug.compositor.disable_high_dynamic_range_surfaces"sv,
+        .title = "Disable HDR surfaces"sv,
+        .description = "Draw HDR content into the page tone-mapped to SDR, instead of letting the window server show it in high dynamic range."sv,
+        .default_value = false,
+        .array_element_type = {},
+    },
+    {
+        .id = ConfigVariableID::UpdateCheckInterval,
+        .name = "updates.check_interval_minutes"sv,
+        .title = "Update check interval"sv,
+        .description = "How many minutes Ladybird waits after one check for a newer release before it checks again, while it checks for updates by itself. At least 5."sv,
+        .default_value = 4 * 60,
         .array_element_type = {},
     },
 } };
@@ -371,6 +388,11 @@ static bool config_variable_value_is_valid(ConfigVariableDefinition const& varia
         return milliseconds.has_value() && *milliseconds >= 0 && value.get_double_with_precision_loss().value() == *milliseconds;
     }
 
+    if (variable.id == ConfigVariableID::UpdateCheckInterval) {
+        auto minutes = value.get_integer<u32>();
+        return minutes.has_value() && *minutes >= 5 && value.get_double_with_precision_loss() == minutes;
+    }
+
     if (variable.id == ConfigVariableID::MaximumDiskCacheSize) {
         auto size = value.get_integer<u64>();
         return size.has_value() && *size > 0 && *size <= NumericLimits<i64>::max() / MiB
@@ -426,25 +448,10 @@ void Settings::load_from_json(JsonValue const& json_value)
             });
         }
 
-        auto selected_engine = search_engine->get(SEARCH_ENGINE_SELECTION_KEY);
-        auto search_engine_name = selected_engine.has_value()
-            ? search_engine->get_string(SEARCH_ENGINE_SELECTION_KEY)
-            : search_engine->get_string(SEARCH_ENGINE_NAME_KEY);
-        if (search_engine_name.has_value())
+        if (auto search_engine_name = search_engine->get_string(SEARCH_ENGINE_SELECTION_KEY); search_engine_name.has_value())
             m_search_engine_settings.engine = find_search_engine_by_name(*search_engine_name);
 
-        if (auto enabled = search_engine->get(SEARCH_SUGGESTIONS_ENABLED_KEY); enabled.has_value()) {
-            m_search_engine_settings.suggestions = enabled->is_bool() && enabled->as_bool();
-        } else if (m_search_engine_settings.engine.has_value() && m_search_engine_settings.engine->suggestions.has_value()) {
-            // NB: Only migrate suggestions when the old provider matches the selected search engine, so typed text
-            //     does not start going to a different provider without the user's consent.
-            if (auto legacy_engine = json.get_object("autocompleteEngine"sv); legacy_engine.has_value()) {
-                auto legacy_name = legacy_engine->get_string("name"sv);
-                m_search_engine_settings.suggestions = legacy_name.has_value()
-                    && legacy_name->is_one_of("DuckDuckGo"sv, "Google"sv, "Kagi"sv, "Yahoo"sv)
-                    && *legacy_name == m_search_engine_settings.engine->name;
-            }
-        }
+        m_search_engine_settings.suggestions = search_engine->get_bool(SEARCH_SUGGESTIONS_ENABLED_KEY).value_or(false);
     }
 
     auto load_site_setting = [&](AutoplaySiteSetting& site_setting, StringView key) {
@@ -501,6 +508,8 @@ void Settings::load_from_json(JsonValue const& json_value)
         if (auto features = background_networking->get_object(BACKGROUND_NETWORKING_FEATURES_KEY); features.has_value()) {
             if (auto filter_list_updates_enabled = features->get_bool(CONTENT_BLOCKER_SUBSCRIPTION_UPDATES_KEY); filter_list_updates_enabled.has_value())
                 m_filter_list_updates_enabled = *filter_list_updates_enabled;
+            if (auto update_checks_enabled = features->get_bool(UPDATE_CHECKS_KEY); update_checks_enabled.has_value())
+                m_update_checks_enabled = *update_checks_enabled;
         }
     }
 
@@ -845,8 +854,8 @@ JsonValue Settings::serialize_json() const
         JsonObject search_engine;
         search_engine.set(SEARCH_ENGINE_NAME_KEY, engine.name);
         search_engine.set(SEARCH_ENGINE_URL_KEY, engine.query_url);
-        if (engine.suggestions.has_value())
-            search_engine.set(SEARCH_SUGGESTIONS_URL_KEY, engine.suggestions->query_url);
+        if (engine.suggestions_url.has_value())
+            search_engine.set(SEARCH_SUGGESTIONS_URL_KEY, *engine.suggestions_url);
 
         custom_search_engines.must_append(move(search_engine));
     }
@@ -890,6 +899,7 @@ JsonValue Settings::serialize_json() const
 
     JsonObject background_network_features;
     background_network_features.set(CONTENT_BLOCKER_SUBSCRIPTION_UPDATES_KEY, m_filter_list_updates_enabled);
+    background_network_features.set(UPDATE_CHECKS_KEY, m_update_checks_enabled);
 
     JsonObject background_networking;
     background_networking.set(BACKGROUND_NETWORKING_ENABLED_KEY, m_background_networking_enabled);
@@ -1311,28 +1321,42 @@ void Settings::set_search_engine_settings(SearchEngineSettings search_engine_set
 
 Optional<SearchEngine> Settings::parse_custom_search_engine(JsonValue const& search_engine)
 {
+
+    auto validate_url = [](StringView url) {
+        if (!url.contains("%s"sv))
+            return false;
+
+        auto parsed_url = URL::Parser::basic_parse(url);
+        if (!parsed_url.has_value())
+            return false;
+        if (!parsed_url->scheme().is_one_of("http"sv, "https"sv))
+            return false;
+
+        return true;
+    };
+
     if (!search_engine.is_object())
         return {};
 
     auto name = search_engine.as_object().get_string(SEARCH_ENGINE_NAME_KEY);
+    if (!name.has_value())
+        return {};
+
     auto url = search_engine.as_object().get_string(SEARCH_ENGINE_URL_KEY);
-    if (!name.has_value() || !url.has_value())
+    if (!url.has_value() || !validate_url(*url))
         return {};
 
-    auto parsed_url = URL::Parser::basic_parse(*url);
-    if (!parsed_url.has_value())
+    auto suggestions_url = search_engine.as_object().get_string(SEARCH_SUGGESTIONS_URL_KEY).map([&](auto value) { return value; });
+    if (suggestions_url.has_value() && suggestions_url->is_empty())
+        suggestions_url.clear();
+    if (suggestions_url.has_value() && !validate_url(*suggestions_url))
         return {};
 
-    Optional<SearchSuggestions> suggestions;
-    if (auto suggestions_url = search_engine.as_object().get_string(SEARCH_SUGGESTIONS_URL_KEY); suggestions_url.has_value() && !suggestions_url->is_empty()) {
-        auto parsed_suggestions_url = URL::Parser::basic_parse(*suggestions_url);
-        if (!parsed_suggestions_url.has_value() || !parsed_suggestions_url->scheme().is_one_of("http"sv, "https"sv)
-            || !suggestions_url->contains("%s"sv))
-            return {};
-        suggestions = SearchSuggestions { suggestions_url.release_value() };
-    }
-
-    return SearchEngine { .name = name.release_value(), .query_url = url.release_value(), .suggestions = move(suggestions) };
+    return SearchEngine {
+        .name = name.release_value(),
+        .query_url = url.release_value(),
+        .suggestions_url = move(suggestions_url),
+    };
 }
 
 void Settings::add_custom_search_engine(SearchEngine search_engine)
@@ -1503,6 +1527,18 @@ void Settings::set_filter_list_updates_enabled(bool enabled)
         return;
 
     m_filter_list_updates_enabled = enabled;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.background_networking_settings_changed();
+}
+
+void Settings::set_update_checks_enabled(bool enabled)
+{
+    if (m_update_checks_enabled == enabled)
+        return;
+
+    m_update_checks_enabled = enabled;
     persist_settings();
 
     for (auto& observer : m_observers)

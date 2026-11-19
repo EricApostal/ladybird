@@ -146,15 +146,29 @@ pub(crate) fn committed_collapsed_table_borders(
 pub(crate) fn committed_svg_path(
     arena: &impl GeometryRead,
     slot: NodeSlotId,
-) -> Option<std::sync::Arc<libgfx_rust::path::Path>> {
+) -> Option<std::sync::Arc<crate::layout::fragment_tree::CommittedSvgPath>> {
     if !arena.node_kind_if_live(slot).is_some_and(node_painting::is_svg_path) {
         return None;
     }
     arena.with_committed_fragment_link(slot, |link| link.and_then(|link| link.fragment.svg()?.path.clone()))
 }
 
-/// The glyph cell of every code unit of a text content element's own character data, as its box
-/// committed them; None for any other box, and for a text box that has not been committed.
+/// The parts a text content element's path paints in, as its box committed them; None for a box whose path paints in
+/// one go.
+pub(crate) fn committed_svg_text_segments(
+    arena: &impl GeometryRead,
+    slot: NodeSlotId,
+) -> Option<std::sync::Arc<Vec<crate::layout::fragment_tree::SvgTextSegment>>> {
+    if arena.node_kind_if_live(slot) != Some(crate::layout::node_data::NodeKind::SVGTextBox) {
+        return None;
+    }
+    arena.with_committed_fragment_link(slot, |link| {
+        link.and_then(|link| link.fragment.svg()?.text_segments.clone())
+    })
+}
+
+/// The glyph cell of every code unit of the character data in a text content element's subtree, in document order, as
+/// its box committed them; None for any other box, and for a text box that has not been committed.
 pub(crate) fn committed_svg_text_character_cells(
     arena: &impl GeometryRead,
     slot: NodeSlotId,

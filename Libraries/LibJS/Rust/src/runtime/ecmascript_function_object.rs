@@ -28,9 +28,7 @@ use crate::layout::function_object::{RawNativeFunction, ecmascript_function_flag
 use crate::layout::member::NullableMember;
 use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
-use crate::runtime::abstract_operations::{
-    create_unmapped_arguments_object, get_prototype_from_constructor, new_call_environment,
-};
+use crate::runtime::abstract_operations::{create_unmapped_arguments_object, new_call_environment};
 use crate::runtime::async_function_driver_wrapper::AsyncFunctionDriverWrapper;
 use crate::runtime::async_generator::AsyncGenerator;
 use crate::runtime::class_field_definition::{ClassElementName, ClassFieldDefinition};
@@ -41,7 +39,6 @@ use crate::runtime::function_environment::FunctionEnvironment;
 use crate::runtime::function_object::{FUNCTION_OBJECT_METHODS, FunctionObject};
 use crate::runtime::function_prototype::FunctionPrototype;
 use crate::runtime::generator_object::{GeneratingFunction, GeneratorObject};
-use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::object::{
     MayInterfereWithIndexedPropertyAccess, ObjectMethods, PrivateElement, StackFrameInfo, allocate_object,
 };
@@ -64,6 +61,10 @@ struct ClassData {
     private_methods: Vec<PrivateElement>, // [[PrivateMethods]]
     /// The [[ClassFieldInitializerName]] of an initializer of a field whose key is computed.
     class_field_initializer_name: ClassFieldInitializerName,
+    /// The shape of the objects InitializeInstanceElements initialized for this derived constructor, while it was
+    /// always the same one (see record_instance_elements_shape()).
+    instance_elements_shape: Option<Gc<Shape>>,
+    instance_elements_shape_varies: bool,
 }
 
 /// The parts of a class constructor, or of a field initializer, that the interpreter does not read.
@@ -635,7 +636,6 @@ impl EcmascriptFunctionObject {
         if should_dump_bytecode() {
             rust_executable.dump();
         }
-        shared_data.clear_compile_inputs();
         Ok(rust_executable)
     }
 
@@ -657,8 +657,6 @@ impl EcmascriptFunctionObject {
         this_argument: Value,
     ) -> ThrowCompletionOr<Value> {
         let function = as_ecmascript_function(object);
-
-        debug_assert!(function.bytecode_executable().is_some());
 
         // 1. Let callerContext be the running execution context.
         // NOTE: No-op, kept by the VM in its execution context stack.
@@ -712,8 +710,6 @@ impl EcmascriptFunctionObject {
     ) -> ThrowCompletionOr<Gc<Object>> {
         let function = as_ecmascript_function(object);
 
-        debug_assert!(function.bytecode_executable().is_some());
-
         // 1. Let callerContext be the running execution context.
         // NOTE: No-op, kept by the VM in its execution context stack.
 
@@ -726,13 +722,11 @@ impl EcmascriptFunctionObject {
         if kind == ConstructorKind::Base {
             // a. Let thisArgument be ? OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%").
             // NB: With room for the properties the constructor is known to add.
-            let prototype = get_prototype_from_constructor(vm, new_target, Intrinsics::object_prototype)?;
-            this_argument = Some(Object::create_for_construct(
+            this_argument = Some(Object::create_from_constructor_for_construct(
                 vm,
-                vm.current_realm().expect("a construction runs in a realm"),
-                prototype,
+                new_target,
                 function.shared_data(),
-            ));
+            )?);
         }
 
         // 4. Let calleeContext be PrepareForOrdinaryCall(F, newTarget).
@@ -800,9 +794,19 @@ impl EcmascriptFunctionObject {
         }
 
         // 15. Let thisBinding be ? constructorEnv.GetThisBinding().
-        let this_binding = constructor_env
-            .expect("a constructor runs in an environment")
-            .get_this_binding(vm)?;
+        // OPTIMIZATION: The frame answers for an environment without a this binding, with its this value, which is
+        //               empty while it is not initialized.
+        let this_binding = if function.shared_data().function_environment_has_this_binding() {
+            constructor_env
+                .expect("a constructor runs in an environment")
+                .get_this_binding(vm)?
+        } else {
+            let this_value = callee_context.this_value.get();
+            if this_value.is_empty() {
+                return vm.throw_completion(ErrorKind::ReferenceError, ErrorType::ThisHasNotBeenInitialized, &[]);
+            }
+            this_value
+        };
 
         // 16. Assert: Type(thisBinding) is Object.
         debug_assert!(this_binding.is_object());
@@ -840,6 +844,11 @@ impl EcmascriptFunctionObject {
 
         // 6. Set the ScriptOrModule of calleeContext to F.[[ScriptOrModule]].
         callee_context.script_or_module.set(self.script_or_module());
+
+        // NB: Frames of functions whose environment has no this binding answer for new.target themselves.
+        callee_context
+            .new_target
+            .set(new_target.map_or(Value::UNDEFINED, Value::from_object));
 
         if self.function_environment_needed() {
             // 7. Let localEnv be NewFunctionEnvironment(F, newTarget).
@@ -980,9 +989,9 @@ impl EcmascriptFunctionObject {
     // 10.2.1.4 OrdinaryCallEvaluateBody ( F, argumentsList ), https://tc39.es/ecma262/#sec-ordinarycallevaluatebody
     // 15.8.4 Runtime Semantics: EvaluateAsyncFunctionBody, https://tc39.es/ecma262/#sec-runtime-semantics-evaluatefunctionbody
     fn ordinary_call_evaluate_body(&self, vm: &Vm, context: &ExecutionContext) -> ThrowCompletionOr<Value> {
-        let executable = self
-            .bytecode_executable()
-            .expect("a function is compiled before it is called");
+        // NB: The function was compiled before the call, but its code may have been flushed since (see
+        //     `bytecode::flushing`), as nothing held it while the call allocated.
+        let executable = self.compiled_executable(vm)?;
         let result = vm.run_executable(NonNull::from(context), executable, 0);
 
         // NOTE: Running the bytecode should eventually return a completion.
@@ -1090,6 +1099,33 @@ impl EcmascriptFunctionObject {
             .storage
             .class_data
             .get_or_init(Box::default)
+    }
+
+    /// Remembers that InitializeInstanceElements for this derived constructor initializes an object of `shape`, which
+    /// JIT code can rely on while it is always the same one (see instance_elements_shape()).
+    pub fn record_instance_elements_shape(&self, vm: &Vm, shape: Gc<Shape>) {
+        let Some(class_data) = self.class_data() else {
+            return;
+        };
+        {
+            let class_data = class_data.borrow();
+            if class_data.instance_elements_shape_varies || class_data.instance_elements_shape == Some(shape) {
+                return;
+            }
+        }
+        let mut class_data = class_data.borrow_mut(vm);
+        if class_data.instance_elements_shape.is_some() {
+            class_data.instance_elements_shape = None;
+            class_data.instance_elements_shape_varies = true;
+        } else {
+            class_data.instance_elements_shape = Some(shape);
+        }
+    }
+
+    /// The shape of every object InitializeInstanceElements initialized for this derived constructor so far, if there
+    /// was one and it was always the same.
+    pub fn instance_elements_shape(&self) -> Option<Gc<Shape>> {
+        self.class_data()?.borrow().instance_elements_shape
     }
 
     pub fn has_class_data(&self) -> bool {

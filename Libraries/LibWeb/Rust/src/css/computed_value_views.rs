@@ -79,7 +79,7 @@ impl LengthPercentageRef<'_> {
         };
         let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
         assert!(ratio.is_finite(), "computed length is not absolute");
-        CssPixels::nearest_value_for(value * ratio)
+        CssPixels::truncated_value_for(f64::from((value * ratio) as f32))
     }
 
     /// Matches Percentage::as_fraction(); the multiplication order is
@@ -115,6 +115,24 @@ impl LengthPercentageRef<'_> {
                 })
             }
             _ => unreachable!("computed length-percentage holds a non-length-percentage style value"),
+        }
+    }
+
+    /// The percentage the value is, as a fraction, when it is a percentage or a calculation that simplified to one,
+    /// as `calc(10% + 15%)` does.
+    pub(crate) fn percentage_fraction(self) -> Option<f64> {
+        match self.value {
+            StyleValueData::Percentage { .. } => Some(self.as_fraction()),
+            StyleValueData::Calculated(calculated_payload) => {
+                let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
+                match rust_calculation.node() {
+                    crate::css::calc::CalcNode::Numeric(crate::css::calc::CalcNumericValue::Percentage(value)) => {
+                        Some(value * 0.01)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -161,7 +179,7 @@ impl InlineLengthPercentage {
                 let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
                 ratio
                     .is_finite()
-                    .then(|| Self::Length(CssPixels::nearest_value_for(value * ratio)))
+                    .then(|| Self::Length(CssPixels::truncated_value_for(f64::from((value * ratio) as f32))))
             }
             StyleValueData::Percentage { value } => {
                 let narrowed = *value as f32;
@@ -289,6 +307,16 @@ impl ComputedSize {
         self.value
             .length_percentage()
             .expect("computed length-percentage size lost its style value")
+    }
+
+    /// The percentage the size is, as a fraction, when it is a percentage or a calculation that simplified to one.
+    pub(crate) fn percentage_fraction(&self) -> Option<f64> {
+        match self.kind {
+            ComputedSizeKind::Percentage | ComputedSizeKind::Calculated => {
+                self.length_percentage().percentage_fraction()
+            }
+            _ => None,
+        }
     }
 
     /// The fit-content argument; None for the keyword-only form.
@@ -1045,6 +1073,16 @@ impl<'a> ComputedValuesView<'a> {
     #[inline]
     pub(crate) fn word_break(self) -> u8 {
         self.bit(StyleBitField::WordBreak)
+    }
+
+    #[inline]
+    pub(crate) fn text_align_last(self) -> u8 {
+        self.bit(StyleBitField::TextAlignLast)
+    }
+
+    #[inline]
+    pub(crate) fn hyphens(self) -> u8 {
+        self.bit(StyleBitField::Hyphens)
     }
 
     #[inline]

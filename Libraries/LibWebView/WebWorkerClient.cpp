@@ -21,17 +21,16 @@
 
 namespace WebView {
 
-WebWorkerClient::WebWorkerClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, Web::HTML::WorkerAgentId agent_id)
+WebWorkerClient::WebWorkerClient(NonnullOwnPtr<IPC::Transport> transport, BrowsingSession& session, Web::HTML::WorkerAgentId agent_id)
     : IPC::ConnectionToServer<WebWorkerClientEndpoint, WebWorkerServerEndpoint>(*this, move(transport))
-    , m_is_private(is_private)
+    , m_is_private(session.is_private())
+    , m_session(session.make_weak_ptr())
     , m_request_server_site_bindings([this](RequestServerClientConnection& connection, Optional<Utf16String> const& top_level_site) {
         async_connect_to_request_server(move(connection.handle), connection.client_id, top_level_site);
     })
     , m_agent_id(agent_id)
     , m_audio_tab_id(allocate_audio_tab_id())
 {
-    if (auto session = Application::existing_session(is_private))
-        m_session = session->make_weak_ptr();
 }
 
 WebWorkerClient::~WebWorkerClient()
@@ -205,7 +204,7 @@ void WebWorkerClient::did_request_file(ByteString path, i32 request_id)
 Messages::WebWorkerClient::DidIsKnownHstsHostResponse WebWorkerClient::did_is_known_hsts_host(String domain)
 {
     auto session = m_session.strong_ref();
-    return session ? session->hsts_store->is_known_hsts_host(domain) : false;
+    return session ? session->hsts_store->is_known_hsts_host(domain) : true;
 }
 
 Messages::WebWorkerClient::RequestMediaServerConnectionResponse WebWorkerClient::request_media_server_connection()

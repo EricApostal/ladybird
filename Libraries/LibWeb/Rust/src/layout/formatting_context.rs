@@ -85,6 +85,7 @@ pub(crate) struct ReplacedIntrinsicSize {
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ReplacedMaxContentSizeLimits {
     pub(super) definite_size_in_ratio_determining_axis: Option<CssPixels>,
+    pub(super) stretch_fit_inline_size: Option<CssPixels>,
     pub(super) minimum_inline_size: Option<CssPixels>,
     pub(super) minimum_block_size: Option<CssPixels>,
 }
@@ -99,6 +100,9 @@ pub(super) enum SizeDimension {
 pub(crate) enum TableWrapperInlineSizeMode {
     ClampToAvailableInlineSize,
     UseTableUsedInlineSizeIfNotAuto,
+    /// The wrapper is as wide as the table box, even when that's wider than the available inline size, as for an
+    /// absolutely positioned table.
+    UseTableUsedInlineSize,
 }
 
 /// What a layout run lays out for.
@@ -464,6 +468,15 @@ impl PlacedChild {
         self
     }
 
+    /// The child, a block-level box of a block container's flow, with the margin that flow leaves past its block end.
+    pub(crate) fn with_block_end_margin_collapsed_in_flow(mut self, margin: CssPixels) -> Self {
+        self.facts_decided_by_parent
+            .fragment_facts
+            .show
+            .block_end_margin_collapsed_in_flow = Some(margin);
+        self
+    }
+
     /// The child, a block-level box, with the offset the relative positioning of the inline boxes it interrupts gives
     /// it.
     pub(crate) fn with_offset_from_relatively_positioned_inline_ancestors(mut self, offset: FfiCssPixelPoint) -> Self {
@@ -500,12 +513,6 @@ pub(crate) fn place_child(
         );
         return None;
     };
-    fragments.note_placed_box(
-        &run.pass,
-        node,
-        placement,
-        cells_kept_for_contained_abspos(run, node, || placed_child.geometry.cells),
-    );
     let PlacedChild {
         mut geometry,
         facts_decided_by_parent,
@@ -543,6 +550,12 @@ pub(crate) fn place_child(
         Some(root) => fragments.take_in_child_root_at_placement(node, root, pass),
         None => fragments.open_fragment_of_placed_box(node),
     }
+    fragments.note_placed_box(
+        &run.pass,
+        node,
+        placement,
+        cells_kept_for_contained_abspos(run, node, || geometry.cells),
+    );
     let mut abspos_boxes_placed_with_it = Vec::new();
     loop {
         let batch = fragments.take_drainable_abspos(node, pass);
@@ -552,12 +565,21 @@ pub(crate) fn place_child(
         abspos_boxes_placed_with_it.extend(lay_out_pending_abspos_children(run, batch));
     }
     let node_facts = NodeFacts::new(pass, node);
-    let own_anchor_candidate_border_box_rect = (node_facts.is_box() && node_facts.has_anchor_names()).then(|| {
+    let committed_offset = point_add(
+        offset,
+        committed_offset_delta_at_placement(
+            pass,
+            node,
+            facts_decided_by_parent.used_insets,
+            offset_from_relatively_positioned_inline_ancestors,
+        ),
+    );
+    let own_anchor_candidate_border_box_rect = (node_facts.is_box() && node_facts.is_anchor_candidate()).then(|| {
         let metrics = &geometry.cells;
         let collapsed = metrics.uses_collapsing_borders_model();
         CssPixelRect {
-            x: offset.x - metrics.border_box_left(collapsed),
-            y: offset.y - metrics.border_box_top(collapsed),
+            x: committed_offset.x - metrics.border_box_left(collapsed),
+            y: committed_offset.y - metrics.border_box_top(collapsed),
             width: metrics.border_box_inline_size(collapsed),
             height: metrics.border_box_block_size(collapsed),
         }
@@ -570,15 +592,7 @@ pub(crate) fn place_child(
         facts_decided_by_parent,
         abspos_layout_inputs,
         resolve_containing_line_box_index(pass, node, containing_line_box_fragment),
-        point_add(
-            offset,
-            committed_offset_delta_at_placement(
-                pass,
-                node,
-                facts_decided_by_parent.used_insets,
-                offset_from_relatively_positioned_inline_ancestors,
-            ),
-        ),
+        committed_offset,
         own_anchor_candidate_border_box_rect,
         physical_contents_shift,
     );
@@ -598,7 +612,10 @@ fn cells_kept_for_contained_abspos(
     let data = run.pass.node_data(node);
     let may_contain_abspos = node_facts::has_flag(data, NodeFlag::EstablishesAbsolutePositionContainingBlock)
         || node_facts::has_flag(data, NodeFlag::EstablishesFixedPositionContainingBlock)
-        || data.parent.get().is_invalid();
+        || data.parent.get().is_invalid()
+        || run
+            .fragments
+            .is_some_and(|fragments| fragments.any_pending_abspos_contained_by(node));
     may_contain_abspos.then(|| fragment_tree::CellsInFrame {
         cells: cells_in_run_frame(),
         frame: run.pass.frame,
@@ -739,6 +756,14 @@ pub(crate) fn box_baseline_with_content_baselines(
 
     // INTEROP: A range input's baseline is its bottom border edge in Chrome, whatever its internal layout.
     if facts.is_range_input_box() {
+        return metrics.margin_box_top(collapsed) + metrics.content_block_size() + metrics.border_box_bottom(collapsed);
+    }
+
+    // AD-HOC: A checkbox or radio button with its native appearance takes its bottom border edge as its baseline,
+    //         rather than the bottom margin edge of a replaced box, so the control sits on the line next to its label
+    //         text instead of above it. With "appearance: none" it's an ordinary box, and its baseline is synthesized
+    //         as usual.
+    if facts.is_non_devolvable_widget() {
         return metrics.margin_box_top(collapsed) + metrics.content_block_size() + metrics.border_box_bottom(collapsed);
     }
 
@@ -1075,6 +1100,9 @@ pub(crate) struct ChildLayoutResult {
     /// children once they are placed, unless one of them is not an item.
     pub in_flow_children_margin_box_block_extent: Option<CssPixels>,
     pub depends_on_percentage_block_size: bool,
+    /// Whether a descendant of the root resolves percentages against the block size of the root, or of a box that
+    /// passes it through to its children.
+    pub contents_depend_on_percentage_block_size: bool,
     /// For an absolutely positioned box, the used insets its run gave it.
     pub out_of_flow_root_used_insets: Option<run_state::UsedInsets>,
     /// For a box that establishes an orthogonal flow, its baselines along the horizontal axis of its parent's frame,
@@ -2571,7 +2599,7 @@ fn lay_out_run_root_and_contents<'pass>(
             own_root_after_body.content_inline_size,
             own_frame.writing_mode(),
         );
-        result = result_in_parent_frame(result, own_root_after_body, parent_frame, own_frame);
+        result = result_in_parent_frame(&pass, run.box_, result, own_root_after_body, parent_frame, own_frame);
     }
     root.set(own_root_after_body.in_frame(own_frame, parent_frame));
 
@@ -2667,6 +2695,8 @@ fn lay_out_run_root_and_contents<'pass>(
             result.orthogonal_flow_baselines = orthogonal_flow_baselines(
                 shifted_baselines,
                 root_in_own_frame_left_by_run.content_block_size,
+                &pass,
+                run.box_,
                 parent_frame,
                 own_frame,
             );
@@ -2688,6 +2718,10 @@ fn lay_out_run_root_and_contents<'pass>(
             }
         });
     result.depends_on_percentage_block_size = run.sizing().resolve_percentage_block_size_dependency(run.box_);
+    result.contents_depend_on_percentage_block_size = run
+        .state
+        .percentage_block_size_dependency_of(run.box_)
+        .has_descendant_that_depends_on_percentage_block_size;
     // NB: A run that builds no fragments could never lay out the absolutely positioned boxes it registers. Those whose
     //     containing block is the root are laid out against its final sizes and box sides, in the frame its contents
     //     are laid out in, so that the root's fragment holds them. The columns of a fragmentainer run leave them to the
@@ -2855,10 +2889,13 @@ fn body_input_in_own_frame(
     }
     let mut constraints = input.containing_block_constraints;
     let mut available_space = input.available_space;
+    // NB: A flex container hands the wrapper of an orthogonal table its sizes in the table's own axes already.
     let sizing = RootSizingDirectives {
         treat_block_axis_percentage_insets_as_auto_beyond_root: input
             .sizing
             .treat_block_axis_percentage_insets_as_auto_beyond_root,
+        forced_min_border_box_block_size: input.sizing.forced_min_border_box_block_size,
+        forced_table_box_border_box_inline_size: input.sizing.forced_table_box_border_box_inline_size,
         ..RootSizingDirectives::default()
     };
     std::mem::swap(
@@ -2901,6 +2938,8 @@ fn body_input_in_own_frame(
 
 /// Maps what the layout of a run root's contents in its own frame found into its parent's frame.
 fn result_in_parent_frame(
+    pass: &LayoutPass<'_>,
+    root: Node,
     mut result: ChildLayoutResult,
     root_in_own_frame: used_values::RootInputCells,
     parent_frame: geometry::Frame,
@@ -2916,6 +2955,8 @@ fn result_in_parent_frame(
         result.orthogonal_flow_baselines = orthogonal_flow_baselines(
             result.baselines,
             root_in_own_frame.content_block_size,
+            pass,
+            root,
             parent_frame,
             own_frame,
         );
@@ -2940,6 +2981,8 @@ fn result_in_parent_frame(
 fn orthogonal_flow_baselines(
     baselines: DerivedBaselines,
     content_block_size: CssPixels,
+    pass: &LayoutPass<'_>,
+    root: Node,
     parent_frame: geometry::Frame,
     own_frame: geometry::Frame,
 ) -> Option<DerivedBaselines> {
@@ -2948,8 +2991,16 @@ fn orthogonal_flow_baselines(
         own_frame.side_in(geometry::Side::Top, parent_frame),
         geometry::Side::Left
     );
+    // NB: Only lines in a vertical typographic mode have a dominant baseline other than the alphabetic one, so only
+    //     then is the block whose lines give the baseline looked for.
+    let distance_to_dominant_baseline = if dominant_baseline_is_central(StyleValues::for_node(pass, root)) {
+        distance_from_alphabetic_to_dominant_baseline(style_of_first_baseline_line_root(pass, root))
+    } else {
+        CssPixels::default()
+    };
     let along_parent_horizontal_axis = |baseline: Option<CssPixels>| {
         baseline.map(|baseline| {
+            let baseline = baseline - distance_to_dominant_baseline;
             if block_start_is_left {
                 baseline
             } else {
@@ -2963,6 +3014,64 @@ fn orthogonal_flow_baselines(
         last: along_parent_horizontal_axis(baselines.last),
     };
     (orthogonal_flow_baselines != DerivedBaselines::default()).then_some(orthogonal_flow_baselines)
+}
+
+/// The style of the block container whose lines give `node` its first baseline: `node` itself, where its children are
+/// inline, or else the first in-flow descendant in document order that gives it baselines and has a line of content. So,
+/// the dominant baseline of text in a nested block is found from that block's font, and an empty block before it is
+/// passed over, as it gives no baseline.
+fn style_of_first_baseline_line_root<'pass>(pass: &LayoutPass<'pass>, node: Node) -> StyleValues<'pass> {
+    // NB: An explicit stack rather than recursion, as the boxes can nest arbitrarily deep.
+    let mut candidates = vec![node];
+    while let Some(current) = candidates.pop() {
+        let facts = NodeFacts::new(pass, current);
+        if !facts.is_block_container() {
+            // NB: A box that establishes another kind of formatting context gives the baselines of its own contents.
+            return StyleValues::for_node(pass, current);
+        }
+        if facts.children_are_inline() {
+            if pass
+                .children(current)
+                .any(|child| !pass.can_skip_is_anonymous_text_run(child))
+            {
+                return StyleValues::for_node(pass, current);
+            }
+            continue;
+        }
+        let first_candidate = candidates.len();
+        candidates.extend(pass.children(current).filter(|&child| {
+            NodeFacts::new(pass, child).is_box()
+                && !pass.can_skip_is_anonymous_text_run(child)
+                && child_gives_container_baselines(pass, current, child)
+        }));
+        candidates[first_candidate..].reverse();
+    }
+    StyleValues::for_node(pass, node)
+}
+
+/// How far a box's dominant baseline lies from the alphabetic baseline its lines record, toward the top of its frame.
+/// https://drafts.csswg.org/css-inline-3/#valdef-dominant-baseline-auto
+/// If in horizontal typographic mode, the dominant baseline is alphabetic. If in vertical typographic mode and
+/// text-orientation is mixed or upright, the dominant baseline is central.
+/// https://drafts.csswg.org/css-inline-3/#central
+/// central: Use the central baseline (halfway between the ascent and descent).
+fn distance_from_alphabetic_to_dominant_baseline(style: StyleValues<'_>) -> CssPixels {
+    if !dominant_baseline_is_central(style) {
+        return CssPixels::default();
+    }
+    // NB: A line puts the ascent of its text toward the top of its frame, and counts the font's metrics in whole
+    //     pixels.
+    let ascent = line_builder::font_metric_in_whole_pixels(style.font_ascent());
+    let descent = line_builder::font_metric_in_whole_pixels(style.font_descent());
+    (ascent - descent) / 2
+}
+
+/// Whether the lines of a box with `style` have the central baseline as their dominant one, rather than the alphabetic.
+fn dominant_baseline_is_central(style: StyleValues<'_>) -> bool {
+    matches!(
+        style.writing_mode(),
+        writing_mode::VERTICAL_RL | writing_mode::VERTICAL_LR
+    ) && style.text_orientation() != text_orientation::SIDEWAYS
 }
 
 fn finalize_atomic_root_block_size(
@@ -3091,6 +3200,15 @@ impl ChildLayout {
         match self {
             Self::SizedInParentRun { skipped, .. } => skipped.out_of_flow_root_used_insets,
             Self::Laid(layout) => layout.outcome.out_of_flow_root_used_insets,
+        }
+    }
+
+    /// Whether the contents of the child resolve percentages against its block size (see
+    /// ChildLayoutResult::contents_depend_on_percentage_block_size).
+    pub(crate) fn contents_depend_on_percentage_block_size(&self) -> bool {
+        match self {
+            Self::SizedInParentRun { .. } => false,
+            Self::Laid(layout) => layout.outcome.contents_depend_on_percentage_block_size,
         }
     }
 
@@ -4035,18 +4153,18 @@ fn layout_subtree_with_frozen_root_geometry(run: &FormattingContextRun<'_>) {
     let placement = facts_decided_by_parent
         .placement
         .expect("the root of a partial relayout keeps the placement it committed");
+    let Some(run_root_fragment) = fragment_arrival else {
+        panic!("the root of a partial relayout is laid out by a run of its own");
+    };
+    fragments.take_in_child_root_at_placement(root, run_root_fragment, pass);
+    // The retained offset already includes relative positioning. Publish it directly instead
+    // of applying placement adjustments a second time.
     fragments.note_placed_box(
         &run.pass,
         root,
         placement,
         cells_kept_for_contained_abspos(run, root, || root_geometry.cells),
     );
-    // The retained offset already includes relative positioning. Publish it directly instead
-    // of applying placement adjustments a second time.
-    let Some(run_root_fragment) = fragment_arrival else {
-        panic!("the root of a partial relayout is laid out by a run of its own");
-    };
-    fragments.take_in_child_root_at_placement(root, run_root_fragment, pass);
     fragments.build_fragment_for_placed_box(
         pass,
         root,

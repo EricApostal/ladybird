@@ -34,6 +34,15 @@ impl TryFrom<u8> for TextType {
     }
 }
 
+/// Whether the letters at the edges of a text join letters outside it, as the letters of cursive scripts such as
+/// Arabic do when a word is shaped in pieces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct JoiningContext {
+    pub joins_before: bool,
+    pub joins_after: bool,
+}
+
 /// A glyph as shaping makes it and as the glyph run readers in C++ read it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
@@ -151,8 +160,9 @@ unsafe extern "C" {
         text_type: TextType,
         letter_spacing: f32,
         word_spacing: f32,
+        joining_context: JoiningContext,
         sink: *mut c_void,
-        emit: unsafe extern "C" fn(*mut c_void, *const ShapedGlyph, usize, f32, usize, f32),
+        emit: unsafe extern "C" fn(*mut c_void, *const ShapedGlyph, usize, f32, usize, f32, f32, bool),
     );
 
     fn ladybird_gfx_glyph_run_bounding_box(
@@ -653,6 +663,7 @@ pub struct ShapedText {
     width: f32,
     trailing_whitespace_length_in_code_units: usize,
     trailing_whitespace_advance: f32,
+    trailing_ascii_whitespace_advance: f32,
 }
 
 impl ShapedText {
@@ -680,6 +691,12 @@ impl ShapedText {
     pub fn trailing_whitespace_advance(&self) -> f32 {
         self.trailing_whitespace_advance
     }
+
+    /// The advance of the ASCII white space at the very end alone, out of the trailing white space.
+    #[inline]
+    pub fn trailing_ascii_whitespace_advance(&self) -> f32 {
+        self.trailing_ascii_whitespace_advance
+    }
 }
 
 const SINGLE_ASCII_SHAPE_CACHE_SIZE: usize = 128;
@@ -695,6 +712,7 @@ struct ShapeParams {
     text_type: TextType,
     letter_spacing: f32,
     word_spacing: f32,
+    joining_context: JoiningContext,
 }
 
 impl ShapeParams {
@@ -704,6 +722,7 @@ impl ShapeParams {
         self.text_type == other.text_type
             && self.letter_spacing.to_bits() == other.letter_spacing.to_bits()
             && self.word_spacing.to_bits() == other.word_spacing.to_bits()
+            && self.joining_context == other.joining_context
     }
 }
 
@@ -713,6 +732,8 @@ struct CachedShape {
     width: f32,
     trailing_whitespace_length_in_code_units: usize,
     trailing_whitespace_advance: f32,
+    trailing_ascii_whitespace_advance: f32,
+    requires_context_for_breaks: bool,
 }
 
 impl CachedShape {
@@ -722,8 +743,10 @@ impl CachedShape {
 
     fn is_bitwise_equal_to(&self, other: &CachedShape) -> bool {
         self.width.to_bits() == other.width.to_bits()
+            && self.requires_context_for_breaks == other.requires_context_for_breaks
             && self.trailing_whitespace_length_in_code_units == other.trailing_whitespace_length_in_code_units
             && self.trailing_whitespace_advance.to_bits() == other.trailing_whitespace_advance.to_bits()
+            && self.trailing_ascii_whitespace_advance.to_bits() == other.trailing_ascii_whitespace_advance.to_bits()
             && self.glyphs.len() == other.glyphs.len()
             && std::iter::zip(self.glyphs.placed(), other.glyphs.placed())
                 .all(|(glyph, other_glyph)| glyph.is_bitwise_equal_to(&other_glyph))
@@ -739,12 +762,15 @@ impl SharedShape {
         width: f32,
         trailing_whitespace_length_in_code_units: usize,
         trailing_whitespace_advance: f32,
+        trailing_ascii_whitespace_advance: f32,
     ) -> Self {
         Self(Arc::new(CachedShape {
             glyphs: glyphs.into_shared(),
             width,
             trailing_whitespace_length_in_code_units,
             trailing_whitespace_advance,
+            trailing_ascii_whitespace_advance,
+            requires_context_for_breaks: true,
         }))
     }
 
@@ -766,6 +792,17 @@ impl SharedShape {
     #[inline]
     pub fn trailing_whitespace_advance(&self) -> f32 {
         self.0.trailing_whitespace_advance
+    }
+
+    /// The advance of the ASCII white space at the very end alone, out of the trailing white space.
+    #[inline]
+    pub fn trailing_ascii_whitespace_advance(&self) -> f32 {
+        self.0.trailing_ascii_whitespace_advance
+    }
+
+    /// Whether splitting the text can change its glyphs, so that separately shaped chunks might not reproduce it.
+    pub fn requires_context_for_breaks(&self) -> bool {
+        self.0.requires_context_for_breaks
     }
 
     pub fn with_baseline_start(&self, baseline_start_x: f32) -> ShapedText {
@@ -839,6 +876,7 @@ impl FontShapeCache {
             && params.text_type == TextType::Common
             && params.letter_spacing == 0.0
             && params.word_spacing == 0.0
+            && params.joining_context == JoiningContext::default()
         {
             return self.single_ascii_common_shapes[code_unit as usize]
                 .get_or_insert_with(|| Arc::new(shape_uncached()));
@@ -980,13 +1018,17 @@ thread_local! {
     static SHAPING_CACHE: std::cell::RefCell<ShapingCache> = std::cell::RefCell::new(ShapingCache::default());
 }
 
-fn shape_text_uncached(
-    font: &FontHandle,
-    text: &[u16],
-    text_type: TextType,
-    letter_spacing: f32,
-    word_spacing: f32,
-) -> CachedShape {
+/// Lets go of every shaped text the calling thread keeps, for a process that is short of memory.
+pub fn clear_shaping_cache() {
+    // NB: A thread that is in the middle of using a shape from the cache keeps it borrowed, and keeps its cache.
+    SHAPING_CACHE.with(|cache| {
+        if let Ok(mut cache) = cache.try_borrow_mut() {
+            *cache = ShapingCache::default();
+        }
+    });
+}
+
+fn shape_text_uncached(font: &FontHandle, text: &[u16], params: ShapeParams) -> CachedShape {
     unsafe extern "C" fn emit(
         sink: *mut c_void,
         glyphs: *const ShapedGlyph,
@@ -994,6 +1036,8 @@ fn shape_text_uncached(
         width: f32,
         trailing_whitespace_length_in_code_units: usize,
         trailing_whitespace_advance: f32,
+        trailing_ascii_whitespace_advance: f32,
+        requires_context_for_breaks: bool,
     ) {
         // SAFETY: `sink` is the Option<CachedShape> passed below, and the
         // glyph pointer stays valid for this synchronous callback.
@@ -1011,6 +1055,8 @@ fn shape_text_uncached(
             width,
             trailing_whitespace_length_in_code_units,
             trailing_whitespace_advance,
+            trailing_ascii_whitespace_advance,
+            requires_context_for_breaks,
         });
     }
     // The shape is built in the callback, so a cache miss allocates the glyph
@@ -1023,9 +1069,10 @@ fn shape_text_uncached(
             font.as_raw(),
             text.as_ptr(),
             text.len(),
-            text_type,
-            letter_spacing,
-            word_spacing,
+            params.text_type,
+            params.letter_spacing,
+            params.word_spacing,
+            params.joining_context,
             (&raw mut shape).cast(),
             emit,
         );
@@ -1043,26 +1090,18 @@ fn shaped_text_with_baseline_start(shape: &CachedShape, baseline_start_x: f32) -
         width: shape.width,
         trailing_whitespace_length_in_code_units: shape.trailing_whitespace_length_in_code_units,
         trailing_whitespace_advance: shape.trailing_whitespace_advance,
+        trailing_ascii_whitespace_advance: shape.trailing_ascii_whitespace_advance,
     }
 }
 
 fn with_cached_shape<R>(
     font: &FontHandle,
     text: &[u16],
-    text_type: TextType,
-    letter_spacing: f32,
-    word_spacing: f32,
+    params: ShapeParams,
     use_shape: impl FnOnce(&Arc<CachedShape>) -> R,
 ) -> R {
-    let params = ShapeParams {
-        text_type,
-        letter_spacing,
-        word_spacing,
-    };
     SHAPING_CACHE.with_borrow_mut(|cache| {
-        use_shape(&cache.shape_for(font.id().0, text, params, || {
-            shape_text_uncached(font, text, text_type, letter_spacing, word_spacing)
-        }))
+        use_shape(&cache.shape_for(font.id().0, text, params, || shape_text_uncached(font, text, params)))
     })
 }
 
@@ -1072,10 +1111,15 @@ pub fn shape_text_shared(
     text_type: TextType,
     letter_spacing: f32,
     word_spacing: f32,
+    joining_context: JoiningContext,
 ) -> SharedShape {
-    with_cached_shape(font, text, text_type, letter_spacing, word_spacing, |shape| {
-        SharedShape(shape.clone())
-    })
+    let params = ShapeParams {
+        text_type,
+        letter_spacing,
+        word_spacing,
+        joining_context,
+    };
+    with_cached_shape(font, text, params, |shape| SharedShape(shape.clone()))
 }
 
 pub fn shaped_text_width(
@@ -1084,8 +1128,15 @@ pub fn shaped_text_width(
     text_type: TextType,
     letter_spacing: f32,
     word_spacing: f32,
+    joining_context: JoiningContext,
 ) -> f32 {
-    with_cached_shape(font, text, text_type, letter_spacing, word_spacing, |shape| shape.width)
+    let params = ShapeParams {
+        text_type,
+        letter_spacing,
+        word_spacing,
+        joining_context,
+    };
+    with_cached_shape(font, text, params, |shape| shape.width)
 }
 
 pub fn shape_text(
@@ -1096,7 +1147,13 @@ pub fn shape_text(
     letter_spacing: f32,
     word_spacing: f32,
 ) -> ShapedText {
-    with_cached_shape(font, text, text_type, letter_spacing, word_spacing, |shape| {
+    let params = ShapeParams {
+        text_type,
+        letter_spacing,
+        word_spacing,
+        joining_context: JoiningContext::default(),
+    };
+    with_cached_shape(font, text, params, |shape| {
         shaped_text_with_baseline_start(shape, baseline_start_x)
     })
 }
@@ -1363,8 +1420,10 @@ mod shaping_cache_tests {
         CachedShape {
             glyphs: GlyphBuffer::from_shaped(&vec![ShapedGlyph::default(); glyph_count]),
             width: glyph_count as f32,
+            requires_context_for_breaks: false,
             trailing_whitespace_length_in_code_units: 0,
             trailing_whitespace_advance: 0.0,
+            trailing_ascii_whitespace_advance: 0.0,
         }
     }
 
@@ -1373,6 +1432,7 @@ mod shaping_cache_tests {
             text_type: TextType::Common,
             letter_spacing,
             word_spacing: 0.0,
+            joining_context: JoiningContext::default(),
         }
     }
 

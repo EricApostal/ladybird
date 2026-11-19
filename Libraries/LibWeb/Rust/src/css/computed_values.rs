@@ -247,6 +247,8 @@ impl_computed_payload_clone_and_eq!(InheritedTextValues {
     font_smoothing,
     webkit_text_fill_color => paint_only,
     webkit_text_fill_color_is_current_color => paint_only,
+    webkit_text_stroke_color => paint_only,
+    webkit_text_stroke_width => paint_only,
     text_shadow,
     text_transform,
     text_wrap_style,
@@ -1583,6 +1585,13 @@ impl Drop for ComputedGroups {
 }
 
 impl StyleGroups {
+    /// Asks the processor to fetch the sets of groups the groups are in, without waiting for them.
+    pub(crate) fn prefetch_sets(&self) {
+        crate::css::declaration_block::prefetch(self.inherited.0.as_ptr().cast_const());
+        crate::css::declaration_block::prefetch(self.rare.0.as_ptr().cast_const());
+        crate::css::declaration_block::prefetch(self.visual.0.as_ptr().cast_const());
+    }
+
     /// Takes over one reference to each of `pointers` but the `borrowed` ones, with `bits` beside
     /// them, sharing the sets of `shares` that hold the same.
     ///
@@ -2560,6 +2569,8 @@ pub(crate) enum GroupFieldKind {
     EnumKeyword(fn(u16) -> Option<u8>),
     /// A number stored as f64.
     F64,
+    /// A nonnegative pixel length stored without fixed-point rounding.
+    PixelLengthF64,
     /// A pixel length stored as raw CSSPixels (i32).
     CssPixels,
     /// A pixel length stored as raw CSSPixels, clamped at zero.
@@ -2698,6 +2709,8 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             COLOR @ color_style_value => RetainedData,
             _WEBKIT_TEXT_FILL_COLOR @ webkit_text_fill_color => Color,
             _WEBKIT_TEXT_FILL_COLOR @ webkit_text_fill_color_is_current_color => KeywordEqualsBool(k::CURRENTCOLOR),
+            _WEBKIT_TEXT_STROKE_COLOR @ webkit_text_stroke_color => HeldColor,
+            _WEBKIT_TEXT_STROKE_WIDTH @ webkit_text_stroke_width => PixelLengthF64,
             TEXT_SHADOW => RequireKeyword(k::NONE),
             TEXT_JUSTIFY @ text_justify => EnumKeyword(enums::keyword_to_text_justify),
             TEXT_TRANSFORM @ text_transform => EnumKeyword(enums::keyword_to_text_transform),
@@ -3035,7 +3048,7 @@ impl StyleGroupMasks {
 
     const fn compute() -> Self {
         use crate::css::property_metadata::property_id::{
-            CONTENT_VISIBILITY, DIRECTION, POSITION_ANCHOR, WRITING_MODE,
+            APPEARANCE, CONTENT_VISIBILITY, DIRECTION, POSITION_ANCHOR, WRITING_MODE,
         };
         use crate::css::property_metadata::{
             FIRST_INHERITED_PROPERTY_ID, FIRST_LONGHAND_PROPERTY_ID, LAST_INHERITED_PROPERTY_ID,
@@ -3092,6 +3105,8 @@ impl StyleGroupMasks {
         }
         masks[index(DIRECTION)] |= logical_mapping_mask;
         masks[index(WRITING_MODE)] |= logical_mapping_mask;
+        // Appearance controls the line-height adjustment of select elements.
+        masks[index(APPEARANCE)] |= 1 << crate::css::table_group_builder::group_index::FONT;
         // NB: The box group holds the used containment flags implied by hidden content visibility.
         masks[index(CONTENT_VISIBILITY)] |= 1 << crate::css::table_group_builder::group_index::BOX;
         // NB: The surround group holds whether the element names a default anchor, which layout reads beside the
@@ -3285,6 +3300,10 @@ style_bit_fields! {
         INHERITED_BITS_TEXT_WRAP_MODE_SHIFT, INHERITED_BITS_TEXT_WRAP_MODE_WIDTH;
     Inherited WordBreak: WORD_BREAK, word_break::NORMAL, keyword_to_word_break,
         INHERITED_BITS_WORD_BREAK_SHIFT, INHERITED_BITS_WORD_BREAK_WIDTH;
+    Inherited TextAlignLast: TEXT_ALIGN_LAST, text_align_last::AUTO, keyword_to_text_align_last,
+        INHERITED_BITS_TEXT_ALIGN_LAST_SHIFT, INHERITED_BITS_TEXT_ALIGN_LAST_WIDTH;
+    Inherited Hyphens: HYPHENS, hyphens::MANUAL, keyword_to_hyphens,
+        INHERITED_BITS_HYPHENS_SHIFT, INHERITED_BITS_HYPHENS_WIDTH;
     Reset Position: POSITION, positioning::STATIC, keyword_to_positioning,
         RESET_BITS_POSITION_SHIFT, RESET_BITS_POSITION_WIDTH;
     Reset Float: FLOAT, float::NONE, keyword_to_float,
@@ -4124,6 +4143,8 @@ impl crate::heap_size::HeapSize for InheritanceDependentValue {
 #[derive(Clone)]
 pub(crate) struct GroupValueFacts {
     inheritance_dependent_values: Option<std::sync::Arc<[InheritanceDependentValue]>>,
+    /// Computed background lists with entries beyond the image layers, for keyframe reflection.
+    uncoordinated_background_values: Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>>,
     effective_zoom: f32,
     display_before_box_type_transformation: u32,
     effective_color_scheme: i8,
@@ -4156,7 +4177,7 @@ fn read_in_place_bit(property: u16) -> u16 {
 
 impl crate::heap_size::HeapSize for GroupValueFacts {
     fn heap_size(&self, sizer: &mut crate::heap_size::HeapSizer) -> usize {
-        self.inheritance_dependent_values.heap_size(sizer)
+        self.inheritance_dependent_values.heap_size(sizer) + self.uncoordinated_background_values.heap_size(sizer)
     }
 }
 
@@ -4166,6 +4187,7 @@ impl GroupValueFacts {
     pub(crate) fn empty() -> Self {
         Self {
             inheritance_dependent_values: None,
+            uncoordinated_background_values: None,
             effective_zoom: 1.0,
             display_before_box_type_transformation: 0,
             effective_color_scheme: -1,
@@ -4173,6 +4195,18 @@ impl GroupValueFacts {
             read_in_place_bits: 0,
             current_color_groups: 0,
         }
+    }
+
+    pub(crate) fn uncoordinated_background_value(&self, property: u16) -> Option<&RetainedStyleValueData> {
+        self.uncoordinated_background_values
+            .as_ref()?
+            .iter()
+            .find(|(held, _)| *held == property)
+            .map(|(_, value)| value)
+    }
+
+    fn same_uncoordinated_background_values(&self, other: &Self) -> bool {
+        self.uncoordinated_background_values == other.uncoordinated_background_values
     }
 
     /// The groups holding colors resolved against `currentcolor`.
@@ -4244,7 +4278,8 @@ impl GroupValueFacts {
             other.inheritance_dependent_values.as_deref().unwrap_or_default(),
         );
         let same_recorded_values = std::ptr::eq(mine, theirs);
-        self.effective_zoom.to_bits() == other.effective_zoom.to_bits()
+        self.same_uncoordinated_background_values(other)
+            && self.effective_zoom.to_bits() == other.effective_zoom.to_bits()
             && self.display_before_box_type_transformation == other.display_before_box_type_transformation
             && self.effective_color_scheme == other.effective_color_scheme
             && self.native_appearance_disabled == other.native_appearance_disabled
@@ -4270,6 +4305,9 @@ impl GroupValueFacts {
             values.sort_unstable();
             values
         };
+        if !self.same_uncoordinated_background_values(other) {
+            return Some("the uncoordinated background values".into());
+        }
         if recorded(self) != recorded(other) {
             return Some("the recorded specified values".into());
         }
@@ -4777,6 +4815,7 @@ pub(crate) struct GroupValuesWriter<'a> {
     /// The recorded specified values of the longhands whose computed values depend on what the
     /// element inherits, once the computation records others than the seeded ones.
     inheritance_dependent_values: Option<Vec<(u16, RetainedStyleValueData)>>,
+    uncoordinated_background_values: Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>>,
     effective_zoom: f32,
     display_before_box_type_transformation: u32,
     effective_color_scheme: i16,
@@ -4848,6 +4887,7 @@ impl<'a> GroupValuesWriter<'a> {
             },
             seeded_inheritance_dependent_values: initial.facts.inheritance_dependent_values.clone(),
             inheritance_dependent_values: None,
+            uncoordinated_background_values: initial.facts.uncoordinated_background_values.clone(),
             effective_zoom: parent.facts.effective_zoom,
             display_before_box_type_transformation: initial.facts.display_before_box_type_transformation,
             effective_color_scheme: parent.facts.effective_color_scheme(),
@@ -5020,6 +5060,24 @@ impl<'a> GroupValuesWriter<'a> {
             place,
             value: value.into_owned(),
         });
+    }
+
+    pub(crate) fn set_uncoordinated_background_value(&mut self, property: u16, value: Option<RetainedStyleValueData>) {
+        if self.uncoordinated_background_values.is_none() && value.is_none() {
+            return;
+        }
+        let values = self
+            .uncoordinated_background_values
+            .get_or_insert_with(Default::default);
+        let values = std::sync::Arc::make_mut(values);
+        values.retain(|(held, _)| *held != property);
+        if let Some(value) = value {
+            values.push((property, value));
+            values.sort_by_key(|(property, _)| *property);
+        }
+        if values.is_empty() {
+            self.uncoordinated_background_values = None;
+        }
     }
 
     /// Records `value` as the specified value of `property` where its computed value depends on
@@ -5265,6 +5323,7 @@ impl<'a> GroupValuesWriter<'a> {
                 bits: self.bits,
                 facts: GroupValueFacts {
                     inheritance_dependent_values,
+                    uncoordinated_background_values: self.uncoordinated_background_values,
                     effective_zoom: self.effective_zoom,
                     display_before_box_type_transformation: self.display_before_box_type_transformation,
                     effective_color_scheme: i8::try_from(self.effective_color_scheme)
@@ -5347,6 +5406,16 @@ fn decode_group_field_pokes<'a>(
                     return None;
                 };
                 pokes.push(Poke::F64(offset, *value));
+            }
+            Kind::PixelLengthF64 => {
+                let length = match data {
+                    StyleValueData::Length { value, unit } if *unit == px_length_unit() => *value,
+                    StyleValueData::Calculated { .. } => {
+                        crate::css::calc::resolve_calculated_length_without_context(data, 0.0)?
+                    }
+                    _ => return None,
+                };
+                pokes.push(Poke::F64(offset, length.max(0.0)));
             }
             Kind::CssPixels => match data {
                 StyleValueData::Length { value, unit } if *unit == px_length_unit() => pokes.push(Poke::I32(
@@ -6174,6 +6243,8 @@ impl InheritedTextValues {
             font_smoothing: css_enums::font_smoothing::AUTO,
             webkit_text_fill_color: 0xff00_0000,
             webkit_text_fill_color_is_current_color: true,
+            webkit_text_stroke_color: crate::css::computed_value_types::StyleColor::CURRENT_COLOR,
+            webkit_text_stroke_width: 0.0,
             text_shadow: RetainedComputedShadowList::from_vec(Vec::new()),
             text_transform: enum_value(css_enums::keyword_to_text_transform(css_enums::keyword::NONE)),
             text_wrap_style: enum_value(css_enums::keyword_to_text_wrap_style(css_enums::keyword::AUTO)),
@@ -6344,7 +6415,6 @@ impl ContentValues {
     }
 
     fn generated_content_facts(&self) -> u8 {
-        use crate::css::css_enums::keyword;
         use crate::layout::counters::LIST_ITEM_COUNTER_NAME;
 
         let mut facts = 0;
@@ -6353,11 +6423,8 @@ impl ContentValues {
                 continue;
             };
             let CounterDefinitionsPayload { counter_definitions } = &**counter_definitions_payload;
-            let definitions = counter_definitions.as_slice();
-            if !definitions.is_empty() {
-                facts |= GENERATED_CONTENT_DEFINES_COUNTERS;
-            }
-            if definitions
+            if counter_definitions
+                .as_slice()
                 .iter()
                 .any(|definition| definition.name().units() == LIST_ITEM_COUNTER_NAME)
             {
@@ -6376,16 +6443,6 @@ impl ContentValues {
                 _ => &[],
             }
         }
-        for item in items(content) {
-            if let StyleValueData::Keyword { keyword } = item.data()
-                && matches!(
-                    *keyword,
-                    keyword::OPEN_QUOTE | keyword::CLOSE_QUOTE | keyword::NO_OPEN_QUOTE | keyword::NO_CLOSE_QUOTE
-                )
-            {
-                facts |= GENERATED_CONTENT_HAS_QUOTES;
-            }
-        }
         if items(content).iter().chain(items(alt_text)).any(|item| {
             matches!(item.data(), StyleValueData::Counter(counter) if counter.counter_name.units() == LIST_ITEM_COUNTER_NAME)
         }) {
@@ -6396,13 +6453,10 @@ impl ContentValues {
 }
 
 /// What a content group's generated content involves, which the DOM asks to know which changes
-/// can renumber or requote it: counter-increment, counter-reset or counter-set define a counter,
-/// one of them defines list-item, the content or its alternative text shows list-item, and the
-/// content has a quote.
-pub const GENERATED_CONTENT_DEFINES_COUNTERS: u8 = 1 << 0;
-pub const GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER: u8 = 1 << 1;
-pub const GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER: u8 = 1 << 2;
-pub const GENERATED_CONTENT_HAS_QUOTES: u8 = 1 << 3;
+/// can renumber it: counter-increment, counter-reset or counter-set defines list-item, and the
+/// content or its alternative text shows list-item.
+pub const GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER: u8 = 1 << 0;
+pub const GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER: u8 = 1 << 1;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_content_group_generated_content_facts(content: &ContentValues) -> u8 {

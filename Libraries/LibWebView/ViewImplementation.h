@@ -180,8 +180,6 @@ public:
     u64 system_microphone_requests_for_testing() const;
     u64 microphone_denied_notices_shown_for_testing() const { return m_microphone_denied_notices_shown; }
 
-    bool location_in_use() const { return m_tab_indicators.is_active(TabIndicator::UsingLocation); }
-
     // Ends every location request and watch whose document the user has since taken the permission away from.
     void revoke_geolocation_without_permission();
 
@@ -224,6 +222,8 @@ public:
     String const& handle() const { return m_window_handle; }
 
     void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect, double device_pixel_ratio);
+    // The Compositor showed the frame itself, in the remote layer of this view.
+    void server_did_present_frame_in_remote_layer(Badge<WebContentPage>, Gfx::IntSize size, Gfx::IntRect damage_rect, double device_pixel_ratio);
 
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
@@ -232,6 +232,22 @@ public:
     // in GPU memory that the view would have to read back for every frame.
     void set_presents_from_cpu_memory(bool);
     bool presents_from_cpu_memory() const { return m_presents_from_cpu_memory; }
+    // Whether the UI shows the view's frames in a remote layer, which the Compositor commits them into itself, rather
+    // than in backing stores the view receives.
+    void set_hosts_remote_layer(bool);
+    // What the view shows, from the Compositor, scaled down to fit within the size given.
+    void take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)>);
+    // The Compositor's remote layers went with its process, so the view asks the new one for another.
+    void recreate_remote_layer_after_compositor_reconnect(Badge<WebContentClient>);
+    static ViewImplementation* find_view_showing_remote_layer(u64 remote_layer_id);
+
+    // The UI shows a resize of the view along with the page's frame of the new size. A view without a remote layer
+    // has nothing to wait for, so it answers at once.
+    void begin_synchronized_resize(u64 token);
+    void await_synchronized_resize_frame(u64 token, Gfx::IntSize);
+    void commit_synchronized_resize(u64 token);
+    void synchronized_resize_frame_held(Badge<CompositorPresentationClient>, u64 token) { did_hold_synchronized_resize_frame(token); }
+    void synchronized_resize_committed(Badge<CompositorPresentationClient>, u64 token) { did_commit_synchronized_resize(token); }
     void set_has_system_focus(bool);
 
     void load(URL::URL const&, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
@@ -250,6 +266,7 @@ public:
 
     bool crash_overlay_active() const { return m_crash_state.has_value(); }
     String crash_overlay_failed_url() const;
+    bool crash_overlay_is_for_memory_limit() const { return m_crash_state.has_value() && m_crash_state->exceeded_memory_limit; }
     Optional<ByteString> crash_report_name() const;
     Optional<String> crash_report_website() const;
 
@@ -286,7 +303,7 @@ public:
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
     // Sends the display metadata to every page hosting documents of the tab.
-    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second);
+    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second, bool screen_shows_high_dynamic_range);
     void set_frame_rate_capped(bool);
 
     struct ScreenRects {
@@ -297,7 +314,8 @@ public:
     };
     // Sends the screens that screen_rects() reports to every page hosting documents of the tab.
     void update_screen_rects();
-    void set_scales_frames_to_fit(bool scales_frames_to_fit) { m_scales_frames_to_fit = scales_frames_to_fit; }
+    void set_scales_frames_to_fit(bool);
+    bool scales_frames_to_fit() const { return m_scales_frames_to_fit; }
     void enable_picture_in_picture_controls();
     void enqueue_input_event(Web::InputEvent);
     // The page reporting on an event must be the one handling it.
@@ -316,7 +334,7 @@ public:
     // Consumes the activation of the input the page is handling, if that input gives activation.
     void consume_user_activation_of_input_handled_by(Badge<WebContentPage>, WebContentPage const&);
     // Opening a link in a new tab takes one key or mouse press the view delivered.
-    bool take_input_to_open_link_in_new_tab(Badge<WebContentPage>);
+    bool take_input_to_open_link_in_new_tab(Badge<WebContentPage>, WebContentPage const&);
     void did_lose_input_event_endpoint(Badge<WebContentPage>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
@@ -523,7 +541,7 @@ public:
     bool is_capturing_audio() const { return m_tab_indicators.is_active(TabIndicator::UsingMicrophone); }
 
     bool tab_indicator_visible(TabIndicator indicator) const { return m_tab_indicators.is_visible(indicator); }
-    u64 playing_audio_indicator_change_count() const { return m_playing_audio_indicator_change_count; }
+    Vector<bool> const& playing_audio_indicator_transitions() const { return m_playing_audio_indicator_transitions; }
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
 
     void did_reset_state_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
@@ -553,6 +571,12 @@ public:
     void run_webdriver_user_prompt_handling(Function<void(Web::WebDriver::Response)> on_complete);
     void did_complete_webdriver_user_prompt_handling(Badge<WebContentPage>, u64 request_id, Web::WebDriver::Response);
     void did_open_user_prompt(Badge<WebContentPage>);
+
+    // NB: Under WebDriver, a renderer has some of the browser's powers only while it runs a command that needs them.
+    bool is_running_webdriver_command_to_select_file(WebContentPage const&, StringView path) const;
+    Optional<URL::URL> url_of_webdriver_cookie_command_running_in(WebContentClient const&) const;
+    bool is_running_webdriver_input_command_in(WebContentPage const&) const;
+    bool is_running_webdriver_window_command_in(WebContentPage const&) const;
     static Optional<ViewImplementation&> find_view_by_handle(StringView);
     void did_change_background_color(Badge<WebContentPage>, Gfx::Color);
     Gfx::Color page_background_color() const { return m_page_background_color; }
@@ -694,6 +718,7 @@ public:
     enum class WebContentCrashReason {
         ProcessCrash,
         RejectedIPC,
+        ExceededMemoryLimit,
     };
     Function<void(WebContentCrashReason)> on_web_content_crashed;
     Function<void(bool)> on_crash_overlay_state_change;
@@ -762,6 +787,12 @@ protected:
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
 
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
+    // The view's remote layer was made, or made again. The ID is 0 when there is none, and frames arrive in backing
+    // stores instead.
+    virtual void did_create_remote_layer(Compositing::RemoteLayerHostHandle) { }
+    virtual void did_present_frame_in_remote_layer(Gfx::IntSize, double device_pixel_ratio) { (void)device_pixel_ratio; }
+    virtual void did_hold_synchronized_resize_frame(u64 token) { (void)token; }
+    virtual void did_commit_synchronized_resize(u64 token) { (void)token; }
     // Lets the Compositor paint into a backing store again. A view whose frames something else still reads may wait
     // for that to finish first.
     virtual void release_backing_store(i32 bitmap_id);
@@ -819,6 +850,8 @@ protected:
     // The view to show a tab or window opened from this view in, or null for the application to open one of its own.
     virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) { return nullptr; }
     void apply_zoom_for_current_host();
+    void send_force_dark_to_embedded_page(WebContentPage&) const;
+    void send_force_dark_to_embedded_pages() const;
 
     void handle_resize();
     void fail_pending_debugger_requests();
@@ -864,7 +897,7 @@ protected:
     void retry_navigation(NavigationToRetry, Web::Bindings::NavigationHistoryBehavior);
 
     struct CrashState;
-    void handle_web_content_process_crash();
+    void handle_web_content_process_crash(WebContentCrashReason);
     void did_save_crash_report(ByteString report_name);
     void respawn_web_content_process_after_crash();
     void prepare_for_navigation_after_crash(Optional<NavigationToRetry> navigation_to_retry = {});
@@ -891,6 +924,9 @@ protected:
     NonnullOwnPtr<PageBackingStores> m_backing_stores { make<PageBackingStores>() };
     bool m_pinch_gesture_was_canceled { false };
     bool m_presents_from_cpu_memory { false };
+    bool m_hosts_remote_layer { false };
+    Optional<u64> m_remote_layer_id;
+    void update_remote_layer_fit();
 
     // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
     // asked for its tree too.
@@ -914,6 +950,7 @@ protected:
         Optional<NavigationToRetry> navigation_to_retry;
         bool recovery_started { false };
         ByteString report_name {};
+        bool exceeded_memory_limit { false };
     };
     Optional<CrashState> m_crash_state;
 
@@ -921,6 +958,7 @@ protected:
     double m_device_pixel_ratio { 1.0 };
     Optional<u64> m_display_id;
     double m_maximum_frames_per_second { 60.0 };
+    bool m_screen_shows_high_dynamic_range { false };
     bool m_frame_rate_capped { false };
     bool m_scales_frames_to_fit { false };
 
@@ -1077,6 +1115,12 @@ protected:
         Optional<Web::HTML::CrossProcessId> navigable_id;
         WebDriverProtocol protocol { WebDriverProtocol::Classic };
         bool stays_on_page { false };
+        // The paths an Element Send Keys command names, which the renderer may open to select them as files.
+        Vector<ByteString> files_to_select {};
+        // A command whose page went away while it waited for a navigation, which its new page only waits for.
+        bool only_waits_for_navigation { false };
+        // The URL of the document a cookie command is for, whose cookies alone the renderer may reach.
+        Optional<URL::URL> cookie_document_url {};
     };
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_commands;
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_crash_commands;
@@ -1112,7 +1156,7 @@ protected:
     Optional<Web::HTML::CrossProcessId> m_webdriver_current_parent_navigable_id;
 
     TabIndicators m_tab_indicators;
-    u64 m_playing_audio_indicator_change_count { 0 };
+    Vector<bool> m_playing_audio_indicator_transitions;
     Web::ScreenWakeLockState m_screen_wake_lock_state { Web::ScreenWakeLockState::Released };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };

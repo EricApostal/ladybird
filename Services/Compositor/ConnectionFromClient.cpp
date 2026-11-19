@@ -90,6 +90,35 @@ void ConnectionFromClient::bind_presentation(Web::CompositorContextId context_id
     m_compositor_state->bind_presentation(context_id, **connection);
 }
 
+Messages::CompositorControlServer::CreateRemoteLayerResponse ConnectionFromClient::create_remote_layer(u64 presentation_id, u64 remote_layer_id)
+{
+    auto connection = m_presentation_connections.get(presentation_id);
+    if (!connection.has_value()) {
+        dbgln("Compositor: Ignoring remote layer {} for presentation {}, which is already gone", remote_layer_id, presentation_id);
+        return Compositing::RemoteLayerHostHandle {};
+    }
+    return m_compositor_state->create_remote_layer(**connection, remote_layer_id);
+}
+
+void ConnectionFromClient::destroy_remote_layer(u64 remote_layer_id)
+{
+    m_compositor_state->destroy_remote_layer(remote_layer_id);
+}
+
+void ConnectionFromClient::show_context_in_remote_layer(u64 remote_layer_id, Optional<Web::CompositorContextId> context_id)
+{
+    m_compositor_state->show_context_in_remote_layer(remote_layer_id, context_id);
+}
+
+void ConnectionFromClient::set_remote_layer_fit(u64 remote_layer_id, Optional<Gfx::IntSize> fit_within)
+{
+    if (fit_within.has_value() && fit_within->is_empty()) {
+        did_misbehave("Empty size for a remote layer to fit frames within");
+        return;
+    }
+    m_compositor_state->set_remote_layer_fit(remote_layer_id, fit_within);
+}
+
 void ConnectionFromClient::create_context(Web::CompositorContextId context_id, Optional<u64> page_id, i32 web_content_connection_id)
 {
     auto* connection = web_content_connection(web_content_connection_id);
@@ -128,6 +157,11 @@ void ConnectionFromClient::set_context_visibility(Web::CompositorContextId conte
 void ConnectionFromClient::set_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)
 {
     m_compositor_state->set_context_presents_from_cpu_memory(context_id, presents_from_cpu_memory);
+}
+
+void ConnectionFromClient::set_context_scales_frames_to_fit(Web::CompositorContextId context_id, bool scales_frames_to_fit)
+{
+    m_compositor_state->set_context_scales_frames_to_fit(context_id, scales_frames_to_fit);
 }
 
 void ConnectionFromClient::crash()

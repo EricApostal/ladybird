@@ -59,6 +59,8 @@ public:
     struct RequestTransferLease {
         NonnullRefPtr<ConnectionFromClient> owner;
         u64 request_id { 0 };
+        // The bound client that may adopt the request, until it does or disconnects.
+        Optional<int> adopter_client_id {};
     };
 
     using RequestTransferLeaseMap = HashMap<Requests::RequestTransferLeaseKey, RequestTransferLease>;
@@ -87,7 +89,7 @@ private:
     virtual Messages::RequestServer::IsSupportedProtocolResponse is_supported_protocol(ByteString) override;
     virtual Messages::RequestServer::GetClientIdResponse get_client_id() override;
     virtual void start_request(u64 request_id, ByteString, URL::URL, Vector<HTTP::Header>, ByteBuffer, HTTP::CacheMode, Optional<HTTP::NetworkIsolationKey>, HTTP::Cookie::IncludeCredentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, i32 originating_process_id, u64 originating_page_id, HTTP::Cookie::SameSiteContext) override;
-    virtual void adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease) override;
+    virtual void adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease, Optional<int> owner_client_id) override;
     virtual void release_request_transfer_lease(int source_client_id, u64 source_request_id) override;
     virtual Messages::RequestServer::StopRequestResponse stop_request(u64 request_id) override;
     virtual Messages::RequestServer::ExportRequestResponse export_request(u64 request_id) override;
@@ -110,6 +112,7 @@ private:
     size_t websocket_count() const;
     size_t total_websocket_count() const;
     void connect_websocket(u64 websocket_id, URL::URL, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> request_headers);
+    void look_up_websocket_host(u64 websocket_id, URL::URL, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy>);
     void open_websocket(u64 websocket_id, URL::URL, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy>, RefPtr<DNS::LookupResult const>);
 
     IsPrivate m_is_private { IsPrivate::No };
@@ -146,6 +149,7 @@ private:
 
     HashMap<u64, NonnullOwnPtr<Request>> m_active_requests;
     HashMap<u64, NonnullOwnPtr<Request>> m_active_revalidation_requests;
+    void look_up_aia_host(ByteString const& url, ByteString const& fetch_url, ByteString const& host, u16 port, Optional<HTTP::Proxy>);
     void start_aia_fetch(ByteString const& url, ByteString const& fetch_url, Optional<HTTP::Proxy>, Optional<ByteString> resolve_entry);
     void abandon_aia_lookup(ByteString const& url);
 

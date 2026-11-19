@@ -19,13 +19,12 @@ enum class PictureInPictureControl : u8;
 struct PictureInPictureControlsState;
 struct UIOverlays;
 
-class AccumulatedVisualContextTree;
 class Canvas2DCommandStream;
 struct Canvas2DCommandStreamSegment;
-class DisplayList;
 struct DisplayListGlyph;
-class DisplayListResourceStorage;
-struct DisplayListResourceSet;
+class RegisteredImageFrame;
+class RegisteredImageFrames;
+class RegisteredTypefaces;
 enum class CompositorScrollNodeKind : u8;
 
 }

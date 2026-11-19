@@ -15,12 +15,12 @@ use libjs_jit::bytecode::{EnvironmentCoordinate, ExceptionHandler, FrameLayout, 
 use libjs_jit::code::ExitKind;
 use libjs_jit::snapshot::{
     AccessorFunctionSnapshot, CallFeedbackSnapshot, CellId, ClosureTemplateSnapshot, CompileOptions, ConstructTarget,
-    DirectCallTarget, DirectGetterFields, EnvironmentTemplateSnapshot, ExecutableSnapshot, FeedbackSnapshot,
-    ForwardedCallSnapshot, Forwarding, FunctionFrameFields, GlobalCacheSnapshot, GlobalValueSnapshot, GlobalsSnapshot,
-    InlinedFunctionSnapshot, InliningLimits, Intrinsic, KeyedFeedbackSnapshot, LexicalEnvironmentTemplateSnapshot,
-    NativeCallTarget, ObjectShapeCacheSnapshot, OrdinaryHasInstanceSnapshot, PropertyCacheEntrySnapshot,
-    PropertyCacheEntryType, PropertyCacheKind, PropertyCacheSnapshot, ShapeSnapshot, Snapshot, StressOptions,
-    TypedArraySnapshot,
+    DerivedInstanceFields, DirectCallTarget, DirectGetterFields, EnvironmentTemplateSnapshot, ExecutableSnapshot,
+    FeedbackSnapshot, ForwardedCallSnapshot, Forwarding, FunctionFrameFields, GlobalCacheSnapshot, GlobalValueSnapshot,
+    GlobalsSnapshot, InlinedFunctionSnapshot, InliningLimits, Intrinsic, KeyedFeedbackSnapshot,
+    LexicalEnvironmentTemplateSnapshot, NativeCallTarget, ObjectShapeCacheSnapshot, OrdinaryHasInstanceSnapshot,
+    PropertyCacheEntrySnapshot, PropertyCacheEntryType, PropertyCacheKind, PropertyCacheSnapshot, ShapeSnapshot,
+    Snapshot, StressOptions, SuperBaseSnapshot, SuperConstructTarget, TypedArraySnapshot,
 };
 
 use super::allocation::{
@@ -34,6 +34,7 @@ use crate::bytecode::feedback::{CallFeedback, CallFeedbackForwarding, call_feedb
 use crate::bytecode::instruction::instruction_length_from_bytes;
 use crate::gc::class::Extends;
 use crate::gc::defer_gc::{DeferGc, Deferred};
+use crate::gc::root::MarkedVec;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::DeclarativeEnvironment;
@@ -48,6 +49,7 @@ use crate::runtime::array_constructor::ArrayConstructor;
 use crate::runtime::array_prototype;
 use crate::runtime::boolean_constructor::BooleanConstructor;
 use crate::runtime::bound_function::BoundFunction;
+use crate::runtime::class_field_definition::{ClassElementName, ClassFieldInitializer};
 use crate::runtime::ecmascript_function_object::as_ecmascript_function_object;
 use crate::runtime::function_prototype::{self, FunctionPrototype};
 use crate::runtime::map_prototype;
@@ -55,6 +57,7 @@ use crate::runtime::math_object;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::object_constructor::ObjectConstructor;
 use crate::runtime::object_prototype;
+use crate::runtime::property_attributes::DEFAULT_ATTRIBUTES;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::realm_watchpoints;
@@ -95,7 +98,7 @@ struct Entry {
 
 struct SnapshotBuilder<'vm> {
     vm: &'vm Vm,
-    _defer_gc: &'vm DeferGc<'vm>,
+    defer_gc: &'vm DeferGc<'vm>,
     cells: Vec<Gc<CellHeader>>,
     entries: Vec<Entry>,
     indices: HashMap<InlinedFunction, u32>,
@@ -103,9 +106,11 @@ struct SnapshotBuilder<'vm> {
     compiled_function: Option<Gc<EcmascriptFunctionObject>>,
     /// The words the compiled executable's frames start with (see `FunctionFrameFields`).
     compiled_function_fields: FunctionFrameFields,
-    /// The closure templates of the compiled executable, until its snapshot takes them. Only the compiled function
-    /// allocates closures itself.
+    /// The closure templates of the compiled executable, until its snapshot takes them.
     closure_templates: Vec<Option<ClosureTemplateSnapshot>>,
+    /// The samples of the closure templates of inlined functions, by executable and template index, until the
+    /// inlining candidates they are get their indices.
+    closure_samples: Vec<(u32, usize, Gc<EcmascriptFunctionObject>)>,
     /// The lexical environment templates of the compiled executable, until its snapshot takes them.
     lexical_environment_templates: Vec<Option<LexicalEnvironmentTemplateSnapshot>>,
     /// The environment templates of the direct calls of the executable whose snapshot is being made.
@@ -115,7 +120,23 @@ struct SnapshotBuilder<'vm> {
     /// For the constructors among the inlining candidates, by index: the shape of the `this` value their inlined
     /// constructs create, whose entries their megamorphic caches describe.
     construct_this_shapes: HashMap<u32, Gc<Shape>>,
+    /// For the derived constructors among the inlining candidates, by index: what their super() constructs with in
+    /// inlined constructs of them (see `ExecutableSnapshot::super_constructor`).
+    super_constructors: HashMap<u32, SuperConstructTarget>,
+    /// For the base constructors with fields among the inlining candidates, by index: the values of their fields (see
+    /// `ExecutableSnapshot::literal_instance_fields`).
+    literal_instance_fields: HashMap<u32, Vec<(u32, u64)>>,
+    /// For the derived constructors with fields among the inlining candidates, by index: how they add their fields
+    /// (see `ExecutableSnapshot::derived_instance_fields`).
+    derived_instance_fields: HashMap<u32, DerivedInstanceFields>,
 }
+
+/// The property offset of a literal field, its value, and the shape its definition gives the object if it adds the
+/// property, if asked for (see `SnapshotBuilder::literal_field_definitions()`).
+type FieldDefinition = (u32, u64, Option<CellId>);
+
+/// The values of literal fields, by property offset (see `ExecutableSnapshot::literal_instance_fields`).
+type LiteralFieldValues = Vec<(u32, u64)>;
 
 /// The number of bytecode instructions of an executable, counted up to one past `limit`.
 fn instruction_count(executable: &Executable, limit: u32) -> u32 {
@@ -446,6 +467,15 @@ impl SnapshotBuilder<'_> {
                 PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
                     PropertyCacheEntryType::GetPropertyInPrototypeChain
                 }
+                // NB: Like the interpreter, compiled code relies on an entry for a missing property only where the
+                //     property is also missing from an unchanged prototype chain, which an entry without a prototype
+                //     chain validity can only tell for shapes without a prototype.
+                PropertyLookupCacheEntryType::GetMissingProperty
+                    if entry.prototype_chain_validity.is_none()
+                        && shape.is_some_and(|shape| shape.prototype().is_some()) =>
+                {
+                    continue;
+                }
                 PropertyLookupCacheEntryType::GetMissingProperty => PropertyCacheEntryType::GetMissingProperty,
             };
             let prototype_property = prototype_property_object(&entry);
@@ -516,16 +546,17 @@ impl SnapshotBuilder<'_> {
         PropertyCacheSnapshot { kind, entries }
     }
 
-    /// What the global variable caches of `executable`, whose frames run in `realm`, know about the global variables
-    /// of the realm, as far as it still holds.
-    fn globals(&mut self, executable: Gc<Executable>, realm: Gc<Realm>) -> GlobalsSnapshot {
+    /// What the global variable caches of `executable`, whose frames run in the realm of `caller`, know about the global
+    /// variables of the realm, as far as it still holds.
+    fn globals(&mut self, executable: Gc<Executable>, caller: &Entry) -> GlobalsSnapshot {
+        let realm = caller.realm;
         let object = realm.global_object();
         let environment = realm.global_declarative_environment();
         let environment_serial = environment.environment_serial_number();
         let shape = object.shape();
         let mut caches = Vec::with_capacity(executable.global_variable_caches().len());
         for cache in executable.global_variable_caches() {
-            caches.push(self.global_cache(cache, realm, object, environment, environment_serial, shape));
+            caches.push(self.global_cache(cache, object, environment, environment_serial, shape, caller));
         }
         GlobalsSnapshot {
             object: self.cell(object),
@@ -539,12 +570,13 @@ impl SnapshotBuilder<'_> {
     fn global_cache(
         &mut self,
         cache: &GlobalVariableCache,
-        realm: Gc<Realm>,
         object: Gc<Object>,
         environment: Gc<DeclarativeEnvironment>,
         environment_serial: u64,
         shape: Gc<Shape>,
+        caller: &Entry,
     ) -> Option<GlobalCacheSnapshot> {
+        let realm = caller.realm;
         if cache.environment_serial_number.get() != environment_serial {
             return None;
         }
@@ -566,7 +598,7 @@ impl SnapshotBuilder<'_> {
                     &object,
                     entry.property_offset,
                 ),
-                value: self.global_value(value, realm),
+                value: self.global_value(value, realm, Some(caller)),
             });
         }
         if !cache.has_environment_binding_index.get() {
@@ -578,14 +610,17 @@ impl SnapshotBuilder<'_> {
             index,
             mutable: environment.binding_is_mutable(index as usize),
             assigned: environment.binding_may_have_been_assigned(index as usize),
-            value: (!value.is_empty()).then(|| self.global_value(value, realm)),
+            value: (!value.is_empty()).then(|| self.global_value(value, realm, Some(caller))),
         })
     }
 
-    fn global_value(&mut self, value: Value, realm: Gc<Realm>) -> GlobalValueSnapshot {
+    /// The value of a global variable. Functions are inlining candidates of the call sites of `caller`, if given,
+    /// since the code may call them after passing them on, which no call feedback of `caller` records.
+    fn global_value(&mut self, value: Value, realm: Gc<Realm>, caller: Option<&Entry>) -> GlobalValueSnapshot {
         let cell = value.is_cell().then(|| value.as_cell());
         GlobalValueSnapshot {
             bits: value.0,
+            inline_executable: caller.and_then(|caller| self.inline_executable_index(cell, caller)),
             cell: cell.map(|cell| self.cell(cell)),
             intrinsic: intrinsic_of(self.vm, cell),
             has_instance: self.ordinary_has_instance(value, realm),
@@ -654,13 +689,30 @@ impl SnapshotBuilder<'_> {
         InlinedFunctionSnapshot {
             function: self.cell(function),
             formal_parameter_count: function.formal_parameter_count(),
-            strict: executable.is_strict_mode,
+            strict: executable.is_strict_mode(),
             // NB: Arrow functions resolve `this` through their environments.
             uses_this: function.uses_this() && function.this_mode() != ThisMode::Lexical,
             global_this: self.cell(realm.global_environment().global_this_value()),
             realm: self.cell(realm),
             shared_data: self.cell(function.shared_data()),
+            super_base: self.super_base(function),
+            // NB: Arrow functions resolve new.target through their environments.
+            has_own_new_target: function.this_mode() != ThisMode::Lexical,
         }
+    }
+
+    /// The base of `super` property access in `function`, if its home object gets its prototype from its shape.
+    fn super_base(&mut self, function: Gc<EcmascriptFunctionObject>) -> Option<SuperBaseSnapshot> {
+        let home = function.home_object()?;
+        let home_shape = home.shape();
+        if home_shape.is_dictionary() || !home.has_ordinary_get_prototype_of() {
+            return None;
+        }
+        Some(SuperBaseSnapshot {
+            home: self.cell(home),
+            home_shape: self.cell(home_shape),
+            prototype: home_shape.prototype().map(|prototype| self.cell(prototype)),
+        })
     }
 
     fn inlined_builtin(&mut self, function: Gc<NativeJavaScriptBackedFunction>) -> InlinedFunctionSnapshot {
@@ -674,6 +726,8 @@ impl SnapshotBuilder<'_> {
             global_this: self.cell(realm.global_environment().global_this_value()),
             realm: self.cell(realm),
             shared_data: self.cell(shared_data),
+            super_base: None,
+            has_own_new_target: true,
         }
     }
 
@@ -793,25 +847,61 @@ impl SnapshotBuilder<'_> {
     }
 
     /// Describes the single constructor of a construct site if JIT code can inline its construct: a base constructor
-    /// without fields (whose construct only creates `this` before running its body), with a function object of a shape
-    /// that has its "prototype" as a data property holding an object.
+    /// without fields (whose construct only creates `this` before running its body), or a derived constructor whose
+    /// chain of [[Prototype]]s up to such a base constructor are derived constructors, with a function object of a
+    /// shape that has its "prototype" as a data property holding an object.
     fn construct_target(&mut self, target: Option<Gc<CellHeader>>, caller: &Entry) -> Option<ConstructTarget> {
         let function = ecmascript_function(target)?;
-        if !function.has_constructor()
-            || function.constructor_kind() != ConstructorKind::Base
-            || function.has_class_data()
-            || function.allocates_function_environment()
-            || function.contains_direct_call_to_eval()
-            || function.realm() != Some(caller.realm)
-        {
-            return None;
+        // NB: The super() of an inlined derived constructor initializes its instance elements through the slow path of
+        //     BindThisFromSuperCall.
+        let inlinable = |constructor: Gc<EcmascriptFunctionObject>| {
+            constructor.has_constructor()
+                && (constructor.constructor_kind() == ConstructorKind::Derived
+                    || !constructor.has_class_data()
+                    || constructor.private_methods_count() == 0)
+                && !constructor.allocates_function_environment()
+                && !constructor.contains_direct_call_to_eval()
+                && constructor.realm() == Some(caller.realm)
+                // NB: The frame of a derived constructor holds its this value (see
+                //     `function_with_frame_as_this_environment()`).
+                && (constructor.constructor_kind() == ConstructorKind::Base
+                    || !constructor.shared_data().function_environment_has_this_binding())
+        };
+        // NB: The constructors super() constructs with, from the target's parent down to a base constructor. Each
+        //     level is one inlined call deeper.
+        // NB: Making the shape of `this` below may collect garbage.
+        let chain = MarkedVec::new(self.vm);
+        chain.push(function);
+        loop {
+            let constructor = chain.get(chain.len() - 1).expect("the chain starts with the target");
+            if !inlinable(constructor) {
+                return None;
+            }
+            if constructor.constructor_kind() == ConstructorKind::Base {
+                break;
+            }
+            if chain.len() > self.vm.jit.options.inline_depth as usize {
+                return None;
+            }
+            chain.push(ecmascript_function(
+                constructor.prototype().map(|parent| parent.upcast::<CellHeader>()),
+            )?);
         }
         // NB: Class constructors cannot be called, only constructed, so their executable is no inline call executable,
         //     but it runs in an inline frame for a construct all the same.
-        let executable = function.bytecode_executable()?;
         let limit = MAX_INLINED_CONSTRUCT_INSTRUCTION_COUNT;
-        if instruction_count(&executable, limit) > limit {
-            return None;
+        for level in 0..chain.len() {
+            let constructor = chain.get(level).expect("the level is in the chain");
+            if instruction_count(&*constructor.bytecode_executable()?, limit) > limit {
+                return None;
+            }
+        }
+        // NB: GetSuperConstructor in each derived constructor reads its [[Prototype]] from its shape.
+        for level in 0..chain.len() - 1 {
+            let constructor = chain.get(level).expect("the level is in the chain");
+            if constructor.shape().is_dictionary() || !constructor.has_ordinary_get_prototype_of() {
+                return None;
+            }
         }
         let function_shape = function.shape();
         if function_shape.is_dictionary() {
@@ -832,16 +922,139 @@ impl SnapshotBuilder<'_> {
         } else {
             empty_shape.create_prototype_transition(self.vm, Some(prototype))
         };
+        let base = chain
+            .get(chain.len() - 1)
+            .expect("the chain ends with a base constructor");
+        let (this_shape, literal_fields) = if base.has_class_data() {
+            let (shape, fields) = self.literal_instance_fields(base, this_shape)?;
+            (shape, Some(fields))
+        } else {
+            (this_shape, None)
+        };
         let index = self.inlined_function_index(function, caller)?;
-        self.construct_this_shapes.insert(index, this_shape);
+        let mut indices = vec![index];
+        for level in 1..chain.len() {
+            let entry = self.entries[*indices.last().expect("the chain starts with the target") as usize];
+            let parent = chain.get(level).expect("the level is in the chain");
+            indices.push(self.inlined_function_index(parent, &entry)?);
+        }
+        if let Some(fields) = literal_fields {
+            self.literal_instance_fields
+                .insert(*indices.last().expect("the chain ends with a base constructor"), fields);
+        }
+        for (level, index) in indices.iter().enumerate().take(chain.len() - 1) {
+            let constructor = chain.get(level).expect("the level is in the chain");
+            if let Some(fields) = self.derived_instance_fields(constructor) {
+                self.derived_instance_fields.insert(*index, fields);
+            }
+        }
+        if chain.len() == 1 {
+            self.construct_this_shapes.insert(index, this_shape);
+        }
+        let mut super_constructor = None;
+        for level in (0..chain.len() - 1).rev() {
+            let target = SuperConstructTarget {
+                executable: indices[level + 1],
+                function: self.cell(chain.get(level + 1).expect("the level is in the chain")),
+                function_shape: self.cell(chain.get(level).expect("the level is in the chain").shape()),
+                derived: level + 2 < chain.len(),
+            };
+            self.super_constructors.insert(indices[level], target);
+            super_constructor = Some(target);
+        }
         Some(ConstructTarget {
             executable: index,
             function_shape: self.cell(function_shape),
             prototype_offset: metadata.offset,
             prototype: self.cell(prototype),
             this_shape: self.cell(this_shape),
-            reserve: function.shared_data().current_construct_reserve(),
+            reserve: base.shared_data().current_construct_reserve(),
+            super_constructor,
         })
+    }
+
+    /// The values InitializeInstanceElements gives `this` of the base constructor `constructor`, whose construct
+    /// creates it with `shape`, by property offset, if its instance elements are only fields with string or symbol
+    /// names whose initial values are no cells (from literals) or absent, and the shape `this` has after that.
+    fn literal_instance_fields(
+        &mut self,
+        constructor: Gc<EcmascriptFunctionObject>,
+        shape: Gc<Shape>,
+    ) -> Option<(Gc<Shape>, LiteralFieldValues)> {
+        let (shape, fields) = self.literal_field_definitions(constructor, shape, false)?;
+        Some((
+            shape,
+            fields.into_iter().map(|(offset, value, _)| (offset, value)).collect(),
+        ))
+    }
+
+    /// How InitializeInstanceElements of the derived constructor `constructor` defines its fields on objects of the
+    /// shape it always initialized so far (see `ExecutableSnapshot::derived_instance_fields`), if they are literal
+    /// fields (see literal_instance_fields()) whose names objects of that shape do not have yet, and it allows
+    /// extensions.
+    fn derived_instance_fields(&mut self, constructor: Gc<EcmascriptFunctionObject>) -> Option<DerivedInstanceFields> {
+        if constructor.constructor_kind() != ConstructorKind::Derived || !constructor.has_class_data() {
+            return None;
+        }
+        let shape = constructor.instance_elements_shape()?;
+        if shape.is_dictionary() || shape.is_non_extensible() {
+            return None;
+        }
+        let own_property_count = shape.property_count();
+        let (_, fields) = self.literal_field_definitions(constructor, shape, true)?;
+        // NB: Defining a property the object has already may fail or change its attributes.
+        if fields.iter().any(|(offset, _, _)| *offset < own_property_count) {
+            return None;
+        }
+        Some(DerivedInstanceFields {
+            shape: self.cell(shape),
+            fields,
+        })
+    }
+
+    /// The fields InitializeInstanceElements of `constructor` defines on an ordinary object of `shape`, if its instance
+    /// elements are only fields with string or symbol names whose initial values are no cells (from literals) or
+    /// absent: the shape the object has after that, and in order, each field's property offset, its value, and with
+    /// `with_shapes` the shape the object gets if the field adds the property.
+    fn literal_field_definitions(
+        &mut self,
+        constructor: Gc<EcmascriptFunctionObject>,
+        shape: Gc<Shape>,
+        with_shapes: bool,
+    ) -> Option<(Gc<Shape>, Vec<FieldDefinition>)> {
+        if constructor.private_methods_count() != 0 {
+            return None;
+        }
+        let mut shape = shape;
+        let mut values = Vec::new();
+        for index in 0..constructor.fields_count() {
+            let field = constructor.field(index);
+            let ClassElementName::PropertyKey(key) = &field.name else {
+                return None;
+            };
+            // NB: Fields with index names go to the indexed elements.
+            if key.is_number() {
+                return None;
+            }
+            let value = match field.initializer {
+                ClassFieldInitializer::Value(value) if !value.is_cell() => value,
+                ClassFieldInitializer::Empty => Value::UNDEFINED,
+                _ => return None,
+            };
+            // 7.3.33 DefineField ( receiver, fieldRecord ), https://tc39.es/ecma262/#sec-definefield
+            // 6.b. Perform ? CreateDataPropertyOrThrow(receiver, fieldName, initValue).
+            // NB: For a property the object has from an earlier field of the same name, this sets the value like the
+            //     interpreter does, and otherwise it adds the property.
+            let (offset, added) = match shape.lookup(key) {
+                Some(metadata) => (metadata.offset, None),
+                None => {
+                    shape = shape.create_put_transition(self.vm, key, DEFAULT_ATTRIBUTES);
+                    (shape.property_count() - 1, with_shapes.then(|| self.cell(shape)))
+                }
+            };
+            values.push((offset, value.0, added));
+        }
+        Some((shape, values))
     }
 
     /// The environment of direct calls of `function`: Some(None) if they need none of their own, and Some(index of
@@ -900,6 +1113,7 @@ impl SnapshotBuilder<'_> {
         let mut snapshot = CallFeedbackSnapshot {
             target: self.optional_cell(target),
             flags,
+            value: call.value.get(),
             target_intrinsic: intrinsic_of(self.vm, target),
             target_builtin: target
                 .and_then(|target| target.downcast::<RawNativeFunction>()?.builtin())
@@ -968,6 +1182,27 @@ impl SnapshotBuilder<'_> {
         })
     }
 
+    /// The closure templates of an inlined function, whose frames JIT code creates closures in like the compiled
+    /// function's. Inlined frames have no private environment of their own, so a function with one has none.
+    fn inlined_closure_templates(
+        &mut self,
+        entry: &Entry,
+        function: Gc<EcmascriptFunctionObject>,
+    ) -> Vec<Option<ClosureTemplateSnapshot>> {
+        if function.private_environment().is_some() {
+            return Vec::new();
+        }
+        let index = self.indices[&InlinedFunction::Ecmascript(function)];
+        let defer_gc = self.defer_gc;
+        let templates = closure_templates(self.vm, entry.executable, function, defer_gc);
+        for (template_index, template) in templates.iter().enumerate() {
+            if let Some((sample, _)) = template {
+                self.closure_samples.push((index, template_index, *sample));
+            }
+        }
+        closure_template_snapshots(templates.into_inner(), |sample| self.cell(sample), defer_gc)
+    }
+
     /// The snapshot of an executable of the snapshot.
     fn executable_snapshot(&mut self, entry: &Entry) -> ExecutableSnapshot {
         let vm = self.vm;
@@ -997,17 +1232,20 @@ impl SnapshotBuilder<'_> {
             .collect();
         let feedback = FeedbackSnapshot {
             arith: feedback.arith().iter().map(core::cell::Cell::get).collect(),
-            value: feedback.value.iter().map(core::cell::Cell::get).collect(),
+            value: feedback.value().iter().map(core::cell::Cell::get).collect(),
+            cache_value: feedback.cache_value().iter().map(core::cell::Cell::get).collect(),
             call,
             keyed,
             bound_arguments: core::mem::take(&mut self.bound_arguments),
         };
 
-        let construct_this_shape = entry
-            .function
-            .and_then(|function| self.indices.get(&function))
-            .and_then(|index| self.construct_this_shapes.get(index))
-            .copied();
+        let index = entry.function.and_then(|function| self.indices.get(&function));
+        let construct_this_shape = index.and_then(|index| self.construct_this_shapes.get(index)).copied();
+        let super_constructor = index.and_then(|index| self.super_constructors.get(index)).copied();
+        let literal_instance_fields = index.and_then(|index| self.literal_instance_fields.get(index)).cloned();
+        let derived_instance_fields = index.and_then(|index| self.derived_instance_fields.get(index)).cloned();
+        let has_instance_elements =
+            matches!(entry.function, Some(InlinedFunction::Ecmascript(function)) if function.has_class_data());
         let property_caches = executable
             .property_lookup_caches()
             .iter()
@@ -1030,11 +1268,11 @@ impl SnapshotBuilder<'_> {
             bytecode: bytecode.to_vec(),
             bytecode_address: bytecode.as_ptr() as u64,
             layout: FrameLayout {
-                number_of_registers: executable.number_of_registers,
+                number_of_registers: executable.number_of_registers(),
                 registers_and_locals_count: executable.registers_and_locals_count(),
                 number_of_constants: u32::try_from(executable.constants().len())
                     .expect("the constant count fits in u32"),
-                number_of_arguments: executable.number_of_arguments,
+                number_of_arguments: executable.number_of_arguments(),
             },
             constants: executable.constants().iter().map(|constant| constant.0).collect(),
             exception_handlers: executable
@@ -1092,10 +1330,10 @@ impl SnapshotBuilder<'_> {
             number_prototype: Some(self.cell(realm.number_prototype(vm))),
             boolean_prototype: Some(self.cell(realm.boolean_prototype(vm))),
             object_shape_caches,
-            closure_templates: if entry.function.is_none() {
-                core::mem::take(&mut self.closure_templates)
-            } else {
-                Vec::new()
+            closure_templates: match entry.function {
+                None => core::mem::take(&mut self.closure_templates),
+                Some(InlinedFunction::Ecmascript(function)) => self.inlined_closure_templates(entry, function),
+                Some(InlinedFunction::Builtin(_)) => Vec::new(),
             },
             environment_templates: core::mem::take(&mut self.environment_templates),
             lexical_environment_templates: if entry.function.is_none() {
@@ -1105,7 +1343,11 @@ impl SnapshotBuilder<'_> {
             },
             // NB: Builtins written in JavaScript never access global variables by name.
             globals: (!matches!(entry.function, Some(InlinedFunction::Builtin(_))))
-                .then(|| self.globals(executable, realm)),
+                .then(|| self.globals(executable, entry)),
+            super_constructor,
+            has_instance_elements,
+            literal_instance_fields,
+            derived_instance_fields,
             // NB: Only the compiled function's own code creates bindings by name.
             identifiers: if entry.function.is_none() {
                 executable
@@ -1116,6 +1358,17 @@ impl SnapshotBuilder<'_> {
             } else {
                 Vec::new()
             },
+            property_key_names: executable
+                .property_keys()
+                .iter()
+                .map(|key| {
+                    if key.is_string() {
+                        key.as_string().raw_identity() as u64
+                    } else {
+                        0
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1166,7 +1419,7 @@ impl SnapshotBuilder<'_> {
             }
             let value = environment.get_initialized_binding_value_direct(coordinate.index as usize);
             if value.is_object() {
-                bindings.push((coordinate, self.global_value(value, realm)));
+                bindings.push((coordinate, self.global_value(value, realm, None)));
             }
         }
         bindings
@@ -1279,7 +1532,7 @@ pub fn capture_snapshot<'d>(
         .collect::<Vec<_>>();
     let mut builder = SnapshotBuilder {
         vm,
-        _defer_gc: defer_gc,
+        defer_gc,
         cells: (*allocation.cells).clone(),
         entries: vec![Entry {
             executable,
@@ -1291,10 +1544,14 @@ pub fn capture_snapshot<'d>(
         compiled_function: function,
         compiled_function_fields,
         closure_templates: Vec::new(),
+        closure_samples: Vec::new(),
         environment_templates: Vec::new(),
         bound_arguments: Vec::new(),
         lexical_environment_templates: Vec::new(),
         construct_this_shapes: HashMap::new(),
+        super_constructors: HashMap::new(),
+        literal_instance_fields: HashMap::new(),
+        derived_instance_fields: HashMap::new(),
     };
     builder.closure_templates =
         closure_template_snapshots(closure_templates.into_inner(), |sample| builder.cell(sample), defer_gc);
@@ -1308,23 +1565,32 @@ pub fn capture_snapshot<'d>(
         executables.push(builder.executable_snapshot(&entry));
         index += 1;
     }
-    // NB: Calls of closures the compiled function creates can be inlined without feedback, as calls of the function
-    //     its closure templates are samples of. These come last, so that they take what is left of the inlining budget.
-    let root = builder.entries[0];
-    for (template_index, sample) in closure_samples.into_iter().enumerate() {
-        let Some(sample) = sample else {
-            continue;
-        };
-        let sample_cell = sample.upcast::<CellHeader>();
-        let inline_executable = builder.inline_executable_index(Some(sample_cell), &root);
-        if let Some(Some(template)) = executables[0].closure_templates.get_mut(template_index) {
-            template.inline_executable = inline_executable;
+    // NB: Calls of closures the code creates can be inlined without feedback, as calls of the function its closure
+    //     templates are samples of. These come last, so that they take what is left of the inlining budget. Their
+    //     snapshots may have closure templates in turn.
+    let mut samples = closure_samples
+        .into_iter()
+        .enumerate()
+        .filter_map(|(template_index, sample)| Some((0, template_index, sample?)))
+        .collect::<Vec<_>>();
+    samples.append(&mut builder.closure_samples);
+    while !samples.is_empty() {
+        for (executable_index, template_index, sample) in samples {
+            let creator = builder.entries[executable_index as usize];
+            let inline_executable = builder.inline_executable_index(Some(sample.upcast::<CellHeader>()), &creator);
+            if let Some(Some(template)) = executables[executable_index as usize]
+                .closure_templates
+                .get_mut(template_index)
+            {
+                template.inline_executable = inline_executable;
+            }
         }
-    }
-    while index < builder.entries.len() {
-        let entry = builder.entries[index];
-        executables.push(builder.executable_snapshot(&entry));
-        index += 1;
+        while index < builder.entries.len() {
+            let entry = builder.entries[index];
+            executables.push(builder.executable_snapshot(&entry));
+            index += 1;
+        }
+        samples = core::mem::take(&mut builder.closure_samples);
     }
     let mut runtime = super::runtime_info::runtime_info(vm, realm, allocation, defer_gc);
     // NB: Code that embeds the prototypes of the runtime info lists them as embedded cells.

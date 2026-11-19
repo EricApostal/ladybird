@@ -225,13 +225,14 @@ void HTMLCanvasElement::did_change_canvas_content()
     }
 
     // NB: Don't request a display list recording here: the new content reaches the compositor through the canvas
-    // surface registry when the canvas is presented, and the cached DrawCanvas command is invalidated when the
-    // content generation moves in prepare_for_compositing.
+    // surface registry when the canvas is presented.
     set_needs_repaint(InvalidateDisplayList::No);
 }
 
 void HTMLCanvasElement::did_create_canvas_backing_storage()
 {
+    // The canvas has content to paint from now on, which a layout that reached it before has to hear of.
+    Painting::push_canvas_paint_facts(*this);
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
@@ -558,11 +559,6 @@ void HTMLCanvasElement::prepare_for_compositing()
 
     if (m_canvas_content_dirty) {
         m_canvas_content_dirty = false;
-
-        // NB: The content generation is recorded into DrawCanvas display list commands, letting display list damage
-        //     computation see that the canvas content changed. Canvases are prepared for compositing before painting
-        //     in the rendering update, so display lists recorded in the same update pick up the new generation.
-        ++m_content_generation;
 
         m_context.visit(
             [](GC::Ref<CanvasRenderingContext2D>& context) {

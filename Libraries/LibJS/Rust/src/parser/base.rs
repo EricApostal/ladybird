@@ -199,6 +199,9 @@ pub(crate) struct FunctionState {
     pub uses_this: bool,
     pub uses_this_from_environment: bool,
     pub might_need_arguments: bool,
+    pub arguments_other_uses: u32,
+    pub reads_arguments_index: bool,
+    pub may_write_parameters: bool,
     pub in_class_of_sloppy_function: bool,
     pub is_arrow: bool,
     pub summary_ordinal: u32,
@@ -231,8 +234,10 @@ pub struct Parser<'a, U: Unit> {
     /// The mark of the block being parsed, for the functions it declares, and the function that it declared last.
     pub(crate) block_mark: u32,
     pub(crate) last_function_of_block: u32,
-    /// Whether the list of arguments that was parsed last has a spread element.
-    pub(crate) arguments_have_spread: bool,
+    /// Whether the list of arguments that was parsed last is evaluated into an array for a sweep.
+    pub(crate) arguments_in_array: bool,
+    /// How many arguments a sweep can keep as separate operands before putting them into an array.
+    pub(crate) inline_argument_limit: usize,
     /// Whether anything uses what scopes declare and what code refers to, which a sweep with a summary does not.
     pub(crate) tracks_scopes: bool,
     /// Whether the first parse leaves a summary of the bindings of each function.
@@ -319,6 +324,13 @@ pub struct Parser<'a, U: Unit> {
     pub(crate) uses_this: bool,
     pub(crate) uses_this_from_environment: bool,
     pub(crate) might_need_arguments: bool,
+    /// How many mentions of `arguments` in the function so far are something other than reading `arguments.length` or
+    /// `arguments[key]`, which the function can answer from its frame.
+    pub(crate) arguments_other_uses: u32,
+    /// Whether the function reads `arguments[key]`.
+    pub(crate) reads_arguments_index: bool,
+    /// Whether something in the function may write a binding of the name of one of its parameters.
+    pub(crate) may_write_parameters: bool,
     /// Whether the code being parsed is in a class in a function that is not strict. The code of a class is strict, but
     /// `arguments` in its heritage and computed keys is the arguments object of that function.
     pub(crate) in_class_of_sloppy_function: bool,
@@ -345,6 +357,10 @@ pub const DEFAULT_STACK_BUDGET: usize = 4 << 20;
 
 /// How deeply statements and expressions may nest.
 const MAX_RECURSION_DEPTH: u32 = 2000;
+
+/// How many member accesses, calls and tagged templates one chain like `a.b[c](d)` may have. The parser goes through a
+/// chain in a loop, so the recursion limit does not apply to it.
+pub(crate) const MAX_SUBSCRIPT_CHAIN_LENGTH: u32 = 10000;
 
 pub(crate) const RECURSION_LIMIT_MESSAGE: &str = "Maximum parser recursion depth exceeded";
 
@@ -434,7 +450,8 @@ impl<'a, U: Unit> Parser<'a, U> {
             pseudo_function_flags: 0,
             block_mark: NONE,
             last_function_of_block: 0,
-            arguments_have_spread: false,
+            arguments_in_array: false,
+            inline_argument_limit: crate::bytecode::operand::MAX_OPERAND_LIST_LENGTH,
             tracks_scopes: true,
             records_summaries: true,
             summary_ordinal: 0,
@@ -531,6 +548,9 @@ impl<'a, U: Unit> Parser<'a, U> {
             uses_this: false,
             uses_this_from_environment: false,
             might_need_arguments: false,
+            arguments_other_uses: 0,
+            reads_arguments_index: false,
+            may_write_parameters: false,
             in_class_of_sloppy_function: false,
             in_arrow: false,
 
@@ -630,6 +650,9 @@ impl<'a, U: Unit> Parser<'a, U> {
         self.uses_this = false;
         self.uses_this_from_environment = false;
         self.might_need_arguments = false;
+        self.arguments_other_uses = 0;
+        self.reads_arguments_index = false;
+        self.may_write_parameters = false;
         self.in_arrow = false;
         self.cover_error = NONE;
         self.potential_arrow_at = NONE;
@@ -1075,11 +1098,11 @@ impl<'a, U: Unit> Parser<'a, U> {
         self.ast.push(tag::MARK_SUBTREE, self.tok_start, 0, 0)
     }
 
-    /// A list starts to have spread elements in it, after `count` others, in something that is at `position`.
+    /// A list starts to be built as an array, after `count` elements, in something that is at `position`.
     #[inline(always)]
-    pub(crate) fn mark_spread_start(&mut self, count: usize, position: u32) {
+    pub(crate) fn mark_array_start(&mut self, count: usize, position: u32) {
         if self.marks {
-            self.ast.push(tag::MARK_SPREAD_START, position, count as u32, 0);
+            self.ast.push(tag::MARK_ARRAY_START, position, count as u32, 0);
         }
     }
 
@@ -1243,10 +1266,12 @@ impl<'a, U: Unit> Parser<'a, U> {
                 }
             }
             if row == NONE {
-                self.add_declaration(hoist.name, top, decl::ANNEX_B);
-                if self.records_summaries {
-                    let d = self.decls.len() - 1;
-                    self.decls[d].summary_slot = SUMMARY_SLOT_EARLY;
+                if !is_parameter {
+                    self.add_declaration(hoist.name, top, decl::ANNEX_B);
+                    if self.records_summaries {
+                        let d = self.decls.len() - 1;
+                        self.decls[d].summary_slot = SUMMARY_SLOT_EARLY;
+                    }
                 }
             } else if flags & !decl::FUNCTION_NAME == 0 {
                 // NB: The name of a function expression is bound outside of the function, which gets a `var` of its own.
@@ -1432,6 +1457,65 @@ impl<'a, U: Unit> Parser<'a, U> {
         row
     }
 
+    /// Whether `node` is the identifier `arguments`.
+    #[inline(always)]
+    pub(crate) fn is_arguments_ident(&self, node: u32) -> bool {
+        self.ast.tag[node as usize] == tag::IDENT && self.ast.a[node as usize] == N_ARGUMENTS
+    }
+
+    /// The mention of `arguments` that `parse_atom()` counted turned out to be the base of a read of `arguments.length`
+    /// or `arguments[key]`.
+    pub(crate) fn note_arguments_read(&mut self) {
+        debug_assert!(self.arguments_other_uses != 0);
+        self.arguments_other_uses = self.arguments_other_uses.saturating_sub(1);
+    }
+
+    /// The property expression `node` turned out to be something other than read, such as written, deleted or called on
+    /// its base, which takes the arguments object if the base is `arguments`.
+    pub(crate) fn note_arguments_property_not_read(&mut self, node: u32) {
+        if matches!(self.ast.tag[node as usize], tag::MEMBER | tag::INDEX)
+            && self.is_arguments_ident(self.ast.a[node as usize])
+        {
+            self.arguments_other_uses += 1;
+        }
+    }
+
+    /// Like `note_arguments_property_not_read()`, for `node`, which gets called or deleted, through parentheses and from the
+    /// end of an optional chain.
+    pub(crate) fn note_arguments_property_called_or_deleted(&mut self, mut node: u32) {
+        while self.ast.tag[node as usize] == tag::PAREN {
+            node = self.ast.a[node as usize];
+        }
+        if self.ast.tag[node as usize] == tag::CHAIN {
+            node = self.ast.a[node as usize];
+        }
+        self.note_arguments_property_not_read(node);
+    }
+
+    /// Something assigns to the name, which may be a parameter of the function being parsed.
+    pub(crate) fn note_assignment_to_name(&mut self, name: u32) {
+        if self.tracks_scopes && self.is_parameter_of_current_function(name) {
+            self.may_write_parameters = true;
+        }
+    }
+
+    /// Whether the closest function, counting static blocks, declares a parameter of the name.
+    fn is_parameter_of_current_function(&self, name: u32) -> bool {
+        if name as usize >= self.names.len() {
+            return false;
+        }
+        let Some(scope) = self
+            .scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.flags & (scope_flag::FUNCTION | scope_flag::STATIC_BLOCK) != 0)
+        else {
+            return false;
+        };
+        let declaration = self.find_declaration(name, scope.id);
+        declaration != NONE && self.decls[declaration as usize].flags & decl::PARAMETER != 0
+    }
+
     /// Whether the name is declared so far in the current function, as far as code that reads `arguments` can tell.
     pub(crate) fn is_declared_in_current_function(&self, name: u32) -> bool {
         let mut d = self.names.get(name as usize).map_or(NONE, |state| state.decl_head);
@@ -1581,6 +1665,9 @@ impl<'a, U: Unit> Parser<'a, U> {
             return;
         }
         self.name_state(name).stamp |= DECLARED_BIT;
+        if !matches!(bind, Bind::None | Bind::Parameter) && self.is_parameter_of_current_function(name) {
+            self.may_write_parameters = true;
+        }
         let top = self.scopes.len() - 1;
         let flags = self.scopes[top].flags;
         let scope_id = self.scopes[top].id;
@@ -1804,6 +1891,9 @@ impl<'a, U: Unit> Parser<'a, U> {
             uses_this: self.uses_this,
             uses_this_from_environment: self.uses_this_from_environment,
             might_need_arguments: self.might_need_arguments,
+            arguments_other_uses: self.arguments_other_uses,
+            reads_arguments_index: self.reads_arguments_index,
+            may_write_parameters: self.may_write_parameters,
             in_class_of_sloppy_function: self.in_class_of_sloppy_function,
             is_arrow: self.in_arrow,
             summary_ordinal: self.summary_ordinal,
@@ -1812,6 +1902,9 @@ impl<'a, U: Unit> Parser<'a, U> {
         self.uses_this = false;
         self.uses_this_from_environment = false;
         self.might_need_arguments = false;
+        self.arguments_other_uses = 0;
+        self.reads_arguments_index = false;
+        self.may_write_parameters = false;
         self.in_arrow = flags & function_flag::ARROW != 0;
         self.in_class_of_sloppy_function &= self.in_arrow;
         self.ctx = new_ctx;
@@ -1964,6 +2057,15 @@ impl<'a, U: Unit> Parser<'a, U> {
         if self.might_need_arguments {
             flags |= function_flag::MENTIONS_ARGUMENTS;
         }
+        if self.arguments_other_uses == 0 {
+            flags |= function_flag::ARGUMENTS_FROM_FRAME;
+        }
+        if self.reads_arguments_index {
+            flags |= function_flag::READS_ARGUMENTS_INDEX;
+        }
+        if self.may_write_parameters {
+            flags |= function_flag::MAY_WRITE_PARAMETERS;
+        }
         (flags, scope_row, body_scope_row)
     }
 
@@ -2017,10 +2119,17 @@ impl<'a, U: Unit> Parser<'a, U> {
         self.cover_error = state.cover_error;
         self.retain = state.retain;
         self.duplicate_parameter = state.duplicate_parameter;
-        self.uses_this |= state.uses_this;
-        self.uses_this_from_environment |= state.uses_this_from_environment;
+        // Only an arrow function takes its `this` from the function around it.
+        self.uses_this = state.uses_this || (is_arrow && self.uses_this);
+        self.uses_this_from_environment =
+            state.uses_this_from_environment || (is_arrow && self.uses_this_from_environment);
         // An arrow function has no arguments object, so that what it mentions counts for the function around it.
-        self.might_need_arguments = state.might_need_arguments || (is_arrow && self.might_need_arguments);
+        let arrow_might_need_arguments = is_arrow && self.might_need_arguments;
+        self.might_need_arguments = state.might_need_arguments || arrow_might_need_arguments;
+        // NB: What an arrow function reads of `arguments` is not in the frame of the function around it.
+        self.arguments_other_uses = state.arguments_other_uses + u32::from(arrow_might_need_arguments);
+        self.reads_arguments_index = state.reads_arguments_index;
+        self.may_write_parameters = state.may_write_parameters;
         self.in_class_of_sloppy_function = state.in_class_of_sloppy_function;
         self.in_arrow = state.is_arrow;
 
@@ -2124,6 +2233,9 @@ impl<'a, U: Unit> Parser<'a, U> {
         self.uses_this = false;
         self.uses_this_from_environment = false;
         self.might_need_arguments = false;
+        self.arguments_other_uses = 0;
+        self.reads_arguments_index = false;
+        self.may_write_parameters = false;
         self.in_arrow = false;
         self.cover_error = NONE;
         self.potential_arrow_at = NONE;
@@ -2250,6 +2362,9 @@ impl<'a, U: Unit> Parser<'a, U> {
         self.uses_this = state.uses_this;
         self.uses_this_from_environment = state.uses_this_from_environment;
         self.might_need_arguments = state.might_need_arguments;
+        self.arguments_other_uses = state.arguments_other_uses;
+        self.reads_arguments_index = state.reads_arguments_index;
+        self.may_write_parameters = state.may_write_parameters;
         self.in_arrow = state.is_arrow;
         self.ast.push(tag::FUNCTION, state.start, 0, row)
     }

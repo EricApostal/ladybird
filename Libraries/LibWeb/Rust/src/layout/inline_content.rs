@@ -9,6 +9,7 @@ use super::geometry::{AvailableSize, Side};
 use super::layout_node_arena::LayoutNodeArena;
 use super::node_data::NodeSlotId;
 use super::{formatting_context, inline_formatting_context, used_values};
+use crate::css::css_pixels::CssPixelRect;
 use crate::css::style::fast_hash::FastSet as HashSet;
 
 // Finalized inline output shared by committed fragments, formatting-context caches and painting.
@@ -23,6 +24,8 @@ pub struct InlineContent {
     /// there are no boxes to interleave, so text can be painted together.
     pub items: Vec<InlineItem>,
     pub lines_after_clamp_point_rect: Option<Box<used_values::FfiCssPixelRect>>,
+    /// Inline border boxes on suppressed lines, retained for geometry queries without adding paintable content.
+    pub(crate) inline_box_rects_after_clamp: Option<Box<[ClampedInlineBoxRect]>>,
     /// Where the content that text-overflow elided from the end of a line would be, by line index.
     pub elided_content_rects: Vec<(u32, used_values::FfiCssPixelRect)>,
     /// The writing mode whose frame the lines were laid out in.
@@ -31,6 +34,22 @@ pub struct InlineContent {
     pub inline_boxes: InlineBoxIndex,
     /// The fragments of each node, by node.
     pub text_fragments: TextFragmentIndex,
+    pub(crate) glyph_ink_of_lines: GlyphInkOfLines,
+}
+
+#[derive(Default)]
+pub struct GlyphInkOfLines(std::sync::OnceLock<Box<[CssPixelRect]>>);
+
+impl Clone for GlyphInkOfLines {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for GlyphInkOfLines {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// The indices of each node's fragments in its line root's content, which queries that start from a node look up in a
@@ -172,6 +191,12 @@ pub struct LineRecord {
 }
 
 impl LineRecord {
+    pub(crate) fn mirrored_block_offset(&self, block_offset: CssPixels, block_length: CssPixels) -> CssPixels {
+        let line_block_start = self.block_end - self.block_length;
+        let line_content_block_end = self.block_end - self.clearance_block_length;
+        line_block_start + line_content_block_end - block_offset - block_length
+    }
+
     pub(crate) fn physical_horizontal_extent(&self) -> CssPixels {
         super::geometry::to_physical(self.writing_mode, self.inline_length, self.block_length).0
     }
@@ -423,6 +448,38 @@ pub struct InlineBoxPieceRecord {
     pub is_geometry_only_placeholder: bool,
 }
 
+fn pieces_only_moved<'a>(
+    previous_pieces: impl ExactSizeIterator<Item = &'a InlineBoxPieceRecord>,
+    pieces: impl ExactSizeIterator<Item = &'a InlineBoxPieceRecord>,
+) -> bool {
+    if previous_pieces.len() != pieces.len() {
+        return false;
+    }
+    let mut offset_of_every_piece = None;
+    for (previous_piece, piece) in previous_pieces.zip(pieces) {
+        let (previous_rect, rect) = (previous_piece.border_box_rect, piece.border_box_rect);
+        if previous_piece.is_geometry_only_placeholder
+            || piece.is_geometry_only_placeholder
+            || previous_piece.present_edges != piece.present_edges
+            || (previous_rect.width, previous_rect.height) != (rect.width, rect.height)
+        {
+            return false;
+        }
+        let offset = (rect.x - previous_rect.x, rect.y - previous_rect.y);
+        if *offset_of_every_piece.get_or_insert(offset) != offset {
+            return false;
+        }
+    }
+    offset_of_every_piece.is_some()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct ClampedInlineBoxRect {
+    pub node: NodeSlotId,
+    pub rect: used_values::FfiCssPixelRect,
+    pub box_fragment: u32,
+}
+
 impl InlineContent {
     pub(crate) fn finish(
         data: used_values::LineData,
@@ -497,9 +554,12 @@ impl InlineContent {
             inline_box_pieces: pieces,
             items: Vec::new(),
             lines_after_clamp_point_rect: data.lines_after_clamp_point_rect,
+            inline_box_rects_after_clamp: data.inline_box_rects_after_clamp,
             elided_content_rects,
             writing_mode,
+            glyph_ink_of_lines: GlyphInkOfLines::default(),
         };
+        content.glyph_ink_of_lines();
         // Plain text needs no interleaving and keeps its single foreground producer.
         if content.inline_box_pieces.is_empty() && !content.fragments.iter().any(|fragment| fragment.is_atomic_inline) {
             return content;
@@ -565,7 +625,62 @@ impl InlineContent {
         }
         combined.drop_repeated_placeholder_pieces();
         combined.index_inline_boxes();
+        let translated_glyph_ink_of_lines = contents
+            .iter()
+            .map(|(content, _, offset)| {
+                let ink = content.glyph_ink_of_lines.0.get()?;
+                (content.writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB).then(|| {
+                    ink.iter()
+                        .map(|rect| rect.translated(offset.x, offset.y))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(translated) = translated_glyph_ink_of_lines {
+            let _ = combined
+                .glyph_ink_of_lines
+                .0
+                .set(translated.into_iter().flatten().collect());
+        }
         std::sync::Arc::new(combined)
+    }
+
+    pub(crate) fn glyph_ink_of_lines(&self) -> &[CssPixelRect] {
+        self.glyph_ink_of_lines.0.get_or_init(|| {
+            let mut ink = vec![CssPixelRect::default(); self.lines.len()];
+            for fragment in &self.fragments {
+                if let Some(line_ink) = ink.get_mut(fragment.line_index as usize) {
+                    line_ink.unite(crate::painting::text_fragment::glyph_ink_rect_in_containing_block(
+                        fragment,
+                    ));
+                }
+            }
+            ink.into_boxed_slice()
+        })
+    }
+
+    /// The inline boxes whose pieces all lie as they did in `previous`, moved by one offset and drawn at the same size.
+    pub(crate) fn inline_boxes_whose_pieces_only_moved_since<'a>(
+        &'a self,
+        previous: &'a InlineContent,
+    ) -> impl Iterator<Item = NodeSlotId> + 'a {
+        let mut previous_boxes = previous.inline_boxes.boxes().peekable();
+        self.inline_boxes.boxes().filter_map(move |(node, piece_indices)| {
+            while previous_boxes
+                .next_if(|(previous_node, _)| inline_box_order(*previous_node) < inline_box_order(node))
+                .is_some()
+            {}
+            let (_, previous_piece_indices) = previous_boxes.next_if(|(previous_node, _)| *previous_node == node)?;
+            pieces_only_moved(
+                previous_piece_indices
+                    .iter()
+                    .map(|&index| &previous.inline_box_pieces[index as usize]),
+                piece_indices
+                    .iter()
+                    .map(|&index| &self.inline_box_pieces[index as usize]),
+            )
+            .then_some(node)
+        })
     }
 
     /// Indexes the pieces of each inline box again, after they were renumbered or given to other boxes.
@@ -645,6 +760,17 @@ impl InlineContent {
             }
             self.lines_after_clamp_point_rect = Some(Box::new(united.into()));
         }
+        if let Some(rects) = content.inline_box_rects_after_clamp.as_deref() {
+            let mut combined = self.inline_box_rects_after_clamp.take().unwrap_or_default().into_vec();
+            combined.extend(rects.iter().map(|rect| {
+                let mut rect = *rect;
+                rect.box_fragment = box_fragment;
+                rect.rect.x += offset.x;
+                rect.rect.y += offset.y;
+                rect
+            }));
+            self.inline_box_rects_after_clamp = Some(combined.into_boxed_slice());
+        }
         self.fragments
             .extend(content.fragments.iter().cloned().map(|mut fragment| {
                 fragment.line_index += line_offset;
@@ -708,6 +834,11 @@ impl InlineContent {
         }
         if let Some(rect) = content.lines_after_clamp_point_rect.as_deref_mut() {
             *rect = to_physical(*rect);
+        }
+        if let Some(rects) = content.inline_box_rects_after_clamp.as_deref_mut() {
+            for rect in rects {
+                rect.rect = to_physical(rect.rect);
+            }
         }
         for fragment in &mut content.fragments {
             let block_offset = mirror_in_line(fragment.line_index, fragment.block_offset, fragment.block_length);
@@ -851,7 +982,6 @@ impl<'content> PhysicalPlane<'content> {
     }
 
     pub(crate) fn delta(&self, delta: used_values::FfiCssPixelPoint) -> used_values::FfiCssPixelPoint {
-        use crate::css::css_pixels::CssPixelRect;
         let origin = self.frame.rect_to_physical(CssPixelRect::default(), self.content_size);
         let moved = self.frame.rect_to_physical(
             CssPixelRect::new(delta.x, delta.y, CssPixels::default(), CssPixels::default()),
@@ -883,9 +1013,7 @@ impl<'content> PhysicalPlane<'content> {
         };
         // The line's content is mirrored within its own extent: a clearing break after the line extends the line
         // toward the clearance, and the content stays where it is.
-        let line_block_start = line.block_end - line.block_length;
-        let line_content_block_end = line.block_end - line.clearance_block_length;
-        line_block_start + line_content_block_end - block_offset - block_length
+        line.mirrored_block_offset(block_offset, block_length)
     }
 
     fn unmoved_fragment_rect(

@@ -58,6 +58,7 @@ void CanonicalTraversable::set_system_visibility_state(Web::HTML::VisibilityStat
     m_system_visibility_state = visibility_state;
     for_each_hosting_page([&](WebContentPage& page) {
         page.async_set_system_visibility_state(visibility_state);
+        page.client().did_change_visibility_of_a_tab();
     });
 
     // When a user agent determines that the system visibility state for
@@ -1409,7 +1410,7 @@ void CanonicalTraversable::did_receive_changing_navigable_history_job_reached_po
         .user_involvement = operation->algorithm->user_involvement(),
         .navigation_id = finalized_navigation_id(*operation, navigable_id).value_or(Utf16String {}),
     };
-    auto loader = NavigationLoader::create(source_page.client().is_private(), move(request));
+    auto loader = NavigationLoader::create(move(request));
     changing_navigable->population = ChangingNavigable::CreatingNavigationParams { loader };
     source_page.owe_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id });
     source_page.async_create_history_navigation_params(operation_id, loader->request(), allow_POST);
@@ -1421,13 +1422,14 @@ void CanonicalTraversable::did_finish_history_navigation_params_creation(WebCont
     auto* changing_navigable = operation ? operation->pending_changing_job(navigable_id) : nullptr;
     auto* creating = changing_navigable ? changing_navigable->population.get_pointer<ChangingNavigable::CreatingNavigationParams>() : nullptr;
     if (!creating || !source_page.take_owed_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id })) {
-        NavigationLoader::discard(source_page.client().is_private(), result);
+        NavigationLoader::discard(source_page.client(), result);
         return;
     }
     auto loader = creating->loader;
     changing_navigable->population = ChangingNavigable::AcquiringResponseBody { loader };
+    loader->refuse_made_up_local_file_urls(source_page.client(), result);
     loader->did_finish_navigation_params_creation(move(result));
-    loader->acquire_response_body([this, operation_id, navigable_id](bool succeeded) {
+    loader->acquire_response_body(source_page.client(), [this, operation_id, navigable_id](bool succeeded) {
         auto* operation = find_history_operation(operation_id);
         auto* changing_navigable = operation ? operation->pending_changing_job(navigable_id) : nullptr;
         if (!changing_navigable)
@@ -1490,17 +1492,28 @@ void CanonicalTraversable::continue_history_navigation_population(HistoryOperati
             did_fail_history_navigation_population(*operation, *changing_navigable);
             return;
         }
-        auto& loader = *populating->loader;
-        Web::HTML::HistoryNavigationPopulation population { loader.request(), loader.take_result() };
-        endpoint->owe_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id });
-        if (endpoint == job_page) {
-            endpoint->async_continue_history_navigation_population(operation_id, move(population));
-            return;
-        }
-        // NB: The job's steps ran in the process displaying the navigable's document. Another process hosts the document
-        //     the population creates, and creates it there.
-        endpoint->async_populate_history_entry_document(operation_id, changing_navigable->target_entry_descriptor(), operation->algorithm->navigation_type(),
-            changing_navigable->navigable().ongoing_navigation().has<CanonicalNavigable::Traversal>(), move(population));
+        populating->loader->let_host_adopt_response_body(*endpoint, [this, operation_id, navigable_id, weak_loader, endpoint, job_page] {
+            auto* operation = find_history_operation(operation_id);
+            auto* changing_navigable = operation ? operation->pending_changing_job(navigable_id) : nullptr;
+            auto* populating = changing_navigable ? changing_navigable->population.get_pointer<ChangingNavigable::Populating>() : nullptr;
+            if (!populating || !weak_loader || populating->loader.ptr() != weak_loader.ptr())
+                return;
+            if (!endpoint->is_open()) {
+                did_fail_history_navigation_population(*operation, *changing_navigable);
+                return;
+            }
+            auto& loader = *populating->loader;
+            Web::HTML::HistoryNavigationPopulation population { loader.request(), loader.take_result() };
+            endpoint->owe_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id });
+            if (endpoint == job_page) {
+                endpoint->async_continue_history_navigation_population(operation_id, move(population));
+                return;
+            }
+            // NB: The job's steps ran in the process displaying the navigable's document. Another process hosts the document
+            //     the population creates, and creates it there.
+            endpoint->async_populate_history_entry_document(operation_id, changing_navigable->target_entry_descriptor(), operation->algorithm->navigation_type(),
+                changing_navigable->navigable().ongoing_navigation().has<CanonicalNavigable::Traversal>(), move(population));
+        });
     };
     loader->move_response_body_to(endpoint->client().request_server_site_bindings(), move(finish_handoff));
 }
@@ -1729,6 +1742,7 @@ void CanonicalTraversable::did_activate_history_entry(HistoryOperation& operatio
             // NB: The address bar can already show a pending navigation's URL while the old document
             //     is still visible. Only apply the destination's zoom after its document is activated.
             view->apply_zoom_for_current_host();
+            view->send_force_dark_to_embedded_pages();
             view->m_external_url_request_policy.clear_page_request_allowance();
             if (view->on_top_level_navigation_commit)
                 view->on_top_level_navigation_commit();
@@ -2114,7 +2128,7 @@ void CanonicalTraversable::did_attempt_to_populate_the_history_entry_document(We
             && navigation->history_entry->update_from_descriptor(history_entry_descriptor).is_error()) {
             return;
         }
-        navigation->history_entry->document_state->save_the_origin_of_the_populated_document();
+        navigation->history_entry->document_state->save_the_state_of_the_populated_document();
         return;
     }
 

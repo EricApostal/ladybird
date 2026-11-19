@@ -5,7 +5,7 @@
  */
 
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
-use crate::css::ffi_support::{FfiUtf16View, OwnedBox};
+use crate::css::ffi_support::FfiUtf16View;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{DomPaintFact, NodeSlotId};
 use crate::layout::query::inline_cursor::{CaretPosition, InlineCursor, InlineLine, LineEdge};
@@ -13,8 +13,6 @@ use crate::layout::script_entries::FfiCaretPosition;
 use crate::layout::svg_formatting_context;
 use crate::layout::used_values::FfiCssPixelPoint;
 use crate::layout::used_values::FfiCssPixelRect;
-use crate::layout::used_values::FfiCssPixelSize;
-use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::visual_context::FfiSvgFilterPrimitive;
 use crate::painting::paint_changes::{PaintChange, queue};
 use crate::painting::paint_read::{GeometryRead, PaintRead};
@@ -27,7 +25,7 @@ use std::ffi::c_void;
 
 mod main_thread_entries;
 
-pub(crate) use main_thread_entries::MainThreadFfiEntry;
+pub(crate) use main_thread_entries::{MainThreadFfiEntry, main_visual_context_tree};
 
 crate::render_state::held_node_entries!();
 
@@ -55,6 +53,16 @@ pub(crate) fn paintable_cleared_from_node(
     if arena.slot_is_live(layout_node) {
         arena.invalidate_committed_geometry_of_ancestors(layout_node);
     }
+    paintable_cleared_from_node_leaving_ancestors(host_calls, arena, layout_node);
+}
+
+/// As [`paintable_cleared_from_node`], for a box whose ancestors the build that takes it out of the tree invalidates as
+/// far as its leaving changes them.
+pub(crate) fn paintable_cleared_from_node_leaving_ancestors(
+    host_calls: crate::layout::tree_mutation::HostCalls<'_>,
+    arena: &mut LayoutNodeArena,
+    layout_node: NodeSlotId,
+) {
     arena.clear_committed_fragment_link(layout_node);
     if let Some(reset) = arena.prepare_paintable_row_cleared_reset(layout_node) {
         host_calls.paintable_row_reset(reset);
@@ -154,6 +162,51 @@ pub unsafe extern "C" fn document_host_set_geometry_host(
     host.host_tables().geometry_host.set(Some(callbacks));
 }
 
+/// Has the document of `host` tell paint preparation what it asks of the document through `callbacks`.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread. The callbacks must remain valid until the document
+/// clears them, and answer synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn document_host_set_paint_preparation_host(
+    host: &DocumentHost,
+    callbacks: crate::painting::host::FfiPaintPreparationHostCallbacks,
+) {
+    host.host_tables().paint_preparation_host.set(Some(callbacks));
+}
+
+/// Has the next preparation of the paint and hit testing properties of `host`'s document update its visual contexts.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_note_visual_contexts_need_update(host: &DocumentHost) {
+    host.paint_preparation().visual_contexts_need_update.set(true);
+}
+
+/// Whether the next preparation of the paint and hit testing properties of `host`'s document updates its visual
+/// contexts.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_visual_contexts_need_update(host: &DocumentHost) -> bool {
+    host.paint_preparation().visual_contexts_need_update.get()
+}
+
+/// Notes that the visual context tree of `host`'s document changed in a way the compositor has not been sent.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_note_visual_context_tree_needs_compositor_update(host: &DocumentHost) {
+    host.paint_preparation()
+        .visual_context_tree_needs_compositor_update
+        .set(true);
+}
+
+/// Has `host` forget its document's scroll state and the visual context tree changes left for the compositor, as the
+/// viewport's row or the document's paint state starts over.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_viewport_row_was_reset(host: &DocumentHost) {
+    host.forget_scroll_state();
+    host.paint_preparation()
+        .visual_context_tree_needs_compositor_update
+        .set(false);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_paintable_scrollable_overflow(
     host: &DocumentHost,
@@ -162,7 +215,7 @@ pub extern "C" fn render_state_paintable_scrollable_overflow(
 ) {
     // The host reads the overflow from the rows it holds, where they were measured and still read as the arena.
     let known = host.read_known_rows(|rows, source| {
-        rows.overflow_is_settled()
+        (rows.measured_overflow() >= crate::layout::row_reads::MeasuredOverflow::Scrollable)
             .then(|| FfiOptionalOverflowData::of(source, slot))
     });
     if let Some(Some(overflow)) = known {
@@ -329,44 +382,6 @@ pub extern "C" fn render_state_background_color_can_be_compositor_animated(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_paintable_visual_context_node_count(
-    host: &DocumentHost,
-    slot: NodeSlotId,
-    list: crate::painting::host::FfiVisualContextBoxNodeList,
-) -> usize {
-    read_arena(host, node_read(), (slot, list), |arena, (slot, list)| {
-        use crate::painting::host::FfiVisualContextBoxNodeList;
-        arena.with_paintable_visual_context_node_handles(slot, |handles| match list {
-            FfiVisualContextBoxNodeList::SpatialNodes => handles.spatial.len(),
-            FfiVisualContextBoxNodeList::ClipNodes => handles.clip_handles().count(),
-            FfiVisualContextBoxNodeList::EffectNodes => handles.effects.len(),
-        })
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_paintable_visual_context_copy_node_indices(
-    host: &DocumentHost,
-    slot: NodeSlotId,
-    list: crate::painting::host::FfiVisualContextBoxNodeList,
-    out: ak::SpanMut<'_, u32>,
-) {
-    let indices = {
-        read_arena(host, node_read(), (slot, list), |arena, (slot, list)| {
-            use crate::painting::host::FfiVisualContextBoxNodeList;
-            arena.with_paintable_visual_context_node_handles(slot, |handles| -> Vec<u32> {
-                match list {
-                    FfiVisualContextBoxNodeList::SpatialNodes => handles.spatial.iter().map(|index| index.0).collect(),
-                    FfiVisualContextBoxNodeList::ClipNodes => handles.clip_handles().map(|index| index.0).collect(),
-                    FfiVisualContextBoxNodeList::EffectNodes => handles.effects.iter().map(|index| index.0).collect(),
-                }
-            })
-        })
-    };
-    out.into_slice()[..indices.len()].copy_from_slice(&indices);
-}
-
 pub(super) fn apply_walk_assignments(
     arena: &mut crate::layout::LayoutNodeArena,
     outcome: &mut crate::painting::visual_context::incremental::IncrementalUpdateOutcome,
@@ -375,32 +390,6 @@ pub(super) fn apply_walk_assignments(
     for assignment in std::mem::take(&mut outcome.assignments) {
         assignment.apply(&mut paintable_rows);
     }
-}
-
-/// How far sticky positioning moved `paintable` from its normal position, in device pixels, as the scroll state of
-/// `host`'s document resolved it. Answers false when the accumulated visual context tree holds no sticky node for
-/// `paintable`.
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_sticky_device_offset(
-    host: &DocumentHost,
-    paintable: NodeSlotId,
-    out: &mut libgfx_rust::FloatPoint,
-) -> bool {
-    let sticky_node_index = read_arena(host, node_read(), paintable, |arena, paintable| {
-        let paint_state = arena.paint_state();
-        paint_state
-            .visual_context
-            .scroll_state
-            .states()
-            .iter()
-            .find(|state| state.is_sticky && state.paintable == paintable)
-            .map(|state| state.node_index)
-    });
-    let Some(sticky_node_index) = sticky_node_index else {
-        return false;
-    };
-    *out = host.scroll_state().device_offset_for_index(sticky_node_index);
-    true
 }
 
 /// Marks the entry the event loop calls between two tasks to take a finished recording in.
@@ -462,66 +451,6 @@ pub enum FfiRecordingLanding {
     /// The committed frame's recording renders SVG images, which the host renders for it with
     /// `render_state_render_vector_images`, and flies again.
     NeedsVectorImages,
-}
-
-/// A navigable's presenter and the seal of the frame it presents next (`Web::Compositor::NavigablePresenter` and
-/// `Web::Compositor::SealedPresentation`), which pass between the host and what presents a frame beside it. Both or
-/// neither are null.
-#[repr(C)]
-pub struct FfiPresentation {
-    pub presenter: *mut c_void,
-    pub sealed: *mut c_void,
-}
-
-impl Default for FfiPresentation {
-    /// Names no presentation.
-    fn default() -> Self {
-        Self {
-            presenter: std::ptr::null_mut(),
-            sealed: std::ptr::null_mut(),
-        }
-    }
-}
-
-/// What the host reads of a published recording, to build its display list from.
-#[repr(C)]
-pub struct FfiPresentedRecording {
-    pub is_identical_to_published_recording: bool,
-    pub has_blocking_wheel_event_listeners: bool,
-    /// The recorded display list, which the document's last recording holds until the next
-    /// recording replaces it. The host takes a reference of its own to keep it longer.
-    pub display_list: *const c_void,
-    /// The color the canvas holds below the recording's layers.
-    pub root_group_color: libgfx_rust::Color,
-}
-
-impl FfiPresentedRecording {
-    /// What the host reads of a recording published with `output`, whose display list `output` holds for as long as
-    /// the host reads it.
-    pub(crate) fn of_output(output: &crate::painting::record::RecordingOutput) -> Self {
-        Self {
-            is_identical_to_published_recording: output.is_identical_to_published_recording,
-            has_blocking_wheel_event_listeners: output.has_blocking_wheel_event_listeners,
-            display_list: std::sync::Arc::as_ptr(&output.display_list).cast(),
-            root_group_color: output.root_group_color,
-        }
-    }
-
-    /// What the host reads of the last recording the document took in.
-    pub(crate) fn of_last_recording(arena: &LayoutNodeArena) -> Self {
-        let paint_state = arena.paint_state();
-        let recording = paint_state.last_recording.as_deref();
-        Self {
-            is_identical_to_published_recording: recording
-                .is_some_and(|recording| recording.is_identical_to_published_recording),
-            has_blocking_wheel_event_listeners: recording
-                .is_some_and(|recording| recording.has_blocking_wheel_event_listeners),
-            display_list: recording.map_or(std::ptr::null(), |recording| {
-                std::sync::Arc::as_ptr(&recording.display_list).cast()
-            }),
-            root_group_color: recording.map_or(libgfx_rust::Color::TRANSPARENT, |recording| recording.root_group_color),
-        }
-    }
 }
 
 /// One `<area>` of an image map, as the document hands it over: the style-tree identity to name as
@@ -587,113 +516,6 @@ pub unsafe extern "C" fn layout_arena_svg_paint_resources_push_pattern(
             .to_vec(),
         },
     );
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
-pub enum FfiImagePaintRecordKind {
-    DecodedFrame,
-    NestedDisplayList,
-    Gradient,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiImagePaintRecordInputs {
-    pub kind: FfiImagePaintRecordKind,
-    pub device_pixels_per_css_pixel: f64,
-    pub dest_rect: libgfx_rust::FloatRect,
-    pub frame_id: u64,
-    pub scaling_mode: libgfx_rust::ScalingMode,
-    pub nested_display_list_id: u64,
-    pub nested_display_list_size: libgfx_rust::IntSize,
-    pub gradient_style_value: *const c_void,
-    pub gradient_tile_size: FfiCssPixelSize,
-    /// The `FfiColorResolutionStyle` the gradient's color stops resolve against.
-    pub gradient_stop_color_resolution_style: *const c_void,
-}
-
-/// # Safety
-///
-/// `inputs`, and the gradient style value and color resolution style it points at, must be
-/// live for the call. `consume` is called synchronously and takes ownership of the command
-/// storage and visual context tree handles.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
-    inputs: &FfiImagePaintRecordInputs,
-    context: *mut c_void,
-    consume: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void),
-) {
-    use crate::css::color_resolution::ColorResolutionInput;
-    use crate::painting::display_list::commands::{DisplayListResourceId, ImageFrameResourceId};
-    use crate::painting::display_list::device_pixels::DevicePixelConverter;
-    use crate::painting::display_list::recorder::DisplayListRecorder;
-    use crate::painting::record::paint::gradient_resolution::{
-        record_resolved_gradient_fill, resolve_gradient_paint_with_input,
-    };
-    use crate::painting::visual_context::{TransformData, TransformDataRole, VisualContextTree};
-    use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint};
-    let tree = VisualContextTree::create(TransformData {
-        matrix: FloatMatrix4x4::identity(),
-        origin: FloatPoint::default(),
-        sorting_context_root_index: None,
-        flattens_inherited_transform: false,
-        role: TransformDataRole::CssTransform,
-        synthetic_plane: false,
-        establishes_sorting_context: false,
-        bounds: libgfx_rust::FloatRect::default(),
-    });
-    // Force-dark never reaches here: an image is darkened by classifying the image itself — not by inverting the
-    // fills that raster it.
-    let mut recorder = DisplayListRecorder::new(None);
-    let dest_rect = inputs.dest_rect;
-    match inputs.kind {
-        FfiImagePaintRecordKind::DecodedFrame => recorder.draw_scaled_decoded_image_frame(
-            dest_rect,
-            None,
-            ImageFrameResourceId(inputs.frame_id),
-            inputs.scaling_mode,
-            CompositingAndBlendingOperator::Normal,
-            None,
-            ForceDarkRole::None,
-        ),
-        FfiImagePaintRecordKind::NestedDisplayList => recorder.paint_nested_display_list(
-            DisplayListResourceId(inputs.nested_display_list_id),
-            dest_rect,
-            inputs.nested_display_list_size,
-        ),
-        FfiImagePaintRecordKind::Gradient => {
-            // SAFETY: the host keeps the gradient style value and the style its color stops
-            // resolve against live for the duration of the call.
-            let (gradient_style_value, color_input) = unsafe {
-                (
-                    &*inputs
-                        .gradient_style_value
-                        .cast::<crate::css::style_value::StyleValueData>(),
-                    ColorResolutionInput::for_ffi_style(inputs.gradient_stop_color_resolution_style.cast()),
-                )
-            };
-            let resolved =
-                resolve_gradient_paint_with_input(gradient_style_value, inputs.gradient_tile_size.into(), &color_input);
-            record_resolved_gradient_fill(
-                &mut recorder,
-                DevicePixelConverter::new(inputs.device_pixels_per_css_pixel),
-                &resolved,
-                dest_rect,
-                CompositingAndBlendingOperator::Normal,
-                ForceDarkRole::None,
-            );
-        }
-    }
-    let recorded = recorder.into_builder().finish();
-    unsafe {
-        consume(
-            context,
-            std::sync::Arc::into_raw(std::sync::Arc::new(recorded)).cast(),
-            std::sync::Arc::into_raw(std::sync::Arc::new(tree)).cast(),
-        );
-    }
 }
 
 /// The glyph cells a text content element's box committed for its own characters, one per code
@@ -1449,24 +1271,6 @@ pub extern "C" fn render_state_paintable_used_grid_tracks(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_main_visual_context_tree_retain(
-    host: &DocumentHost,
-    read: &crate::render_state::BegunRead,
-) -> *const c_void {
-    fn retain(tree: Option<&std::sync::Arc<crate::painting::visual_context::VisualContextTree>>) -> *const c_void {
-        tree.map_or(std::ptr::null(), |tree| {
-            std::sync::Arc::into_raw(std::sync::Arc::clone(tree)).cast()
-        })
-    }
-    if let Some(tree) = host.read_known_rows(|rows, _| retain(rows.visual_context_tree.as_ref())) {
-        return tree;
-    }
-    read_arena(host, read, (), |arena, ()| {
-        retain(arena.paint_state().visual_context.tree.as_ref())
-    })
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn render_state_has_visual_context_tree(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
@@ -1474,24 +1278,6 @@ pub extern "C" fn render_state_has_visual_context_tree(
     read_arena(host, read, (), |arena, ()| {
         let paint_state = arena.paint_state();
         paint_state.visual_context.tree.is_some()
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_visual_context_tree_structural_epoch(
-    host: &DocumentHost,
-    read: &crate::render_state::BegunRead,
-) -> u64 {
-    let known = host.read_known_rows(|rows, _| {
-        rows.visual_context_tree
-            .as_ref()
-            .map_or(0, |tree| tree.structural_epoch)
-    });
-    known.unwrap_or_else(|| {
-        read_arena(host, read, (), |arena, ()| {
-            let paint_state = arena.paint_state();
-            paint_state.visual_context.structural_epoch()
-        })
     })
 }
 
@@ -1551,33 +1337,33 @@ pub unsafe extern "C" fn render_state_background_color_animation_keyframe_colors
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_state_create() -> *mut CompositorAnimationEffectState {
-    Box::into_raw(Box::new(CompositorAnimationEffectState::default()))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_state_destroy(state: OwnedBox<CompositorAnimationEffectState>) {
-    drop(state);
-}
-
 /// Builds the animation of the request's target kind for the effect and keeps it pending with the
-/// effect. The target's nodes come from the arena's main tree.
+/// effect, which runs with the timing of the effect record `effect` and of the record of its associated animation
+/// `animation`. The target's nodes come from the arena's main tree.
 ///
 /// # Safety
 ///
 /// `document_host` must be a live document host on its document's thread, and the request and host, with every range
-/// they address, live for the call. The host's callbacks run synchronously and may not touch the arena.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_build(
+/// they address, live for the call. The host's callbacks run synchronously and may not touch the arena or the records.
+pub(crate) unsafe fn build_compositor_animation_effect(
     state: &mut CompositorAnimationEffectState,
     document_host: &DocumentHost,
-    request: *const crate::painting::host::FfiCompositorAnimationRequest,
+    mut ffi_request: crate::painting::host::FfiCompositorAnimationRequest,
+    effect: &crate::animations::effect::AnimationEffectCell,
+    animation: &crate::animations::animation::AnimationCell,
     host: &crate::painting::host::FfiCompositorAnimationHost,
 ) -> crate::painting::host::FfiCompositorAnimationBuildOutcome {
     use crate::painting::visual_animation_builder::{Host, Request};
+    // NB: The easing descriptor borrows the control points of the effect's timing function, which the build leaves as
+    //     they are.
+    ffi_request.timing.playback_rate = animation.borrow().playback().playback_rate;
+    {
+        let effect = effect.borrow();
+        ffi_request.timing.effect = effect.timing();
+        ffi_request.timing.easing = effect.timing_function().descriptor();
+    }
     // SAFETY: Guaranteed by the caller.
-    let mut request = unsafe { Request::new(&*request) };
+    let mut request = unsafe { Request::new(&ffi_request) };
     let host = Host::new(host);
     let layout_node = request.layout_node();
     if request.target_kind() == crate::painting::host::FfiVisualAnimationTargetKind::Transform {
@@ -1599,65 +1385,6 @@ pub unsafe extern "C" fn compositor_animation_effect_build(
             },
         )
     })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_discard_pending(
-    state: &mut CompositorAnimationEffectState,
-    kind: crate::painting::host::FfiVisualAnimationTargetKind,
-) {
-    state.discard_pending(kind);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_has_pending(state: &CompositorAnimationEffectState) -> bool {
-    state.has_pending()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_clear_pending(state: &mut CompositorAnimationEffectState) {
-    state.clear_pending();
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_has_retained(state: &CompositorAnimationEffectState) -> bool {
-    state.has_retained()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_clear_retained(state: &mut CompositorAnimationEffectState) {
-    state.clear_retained();
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_reset(state: &mut CompositorAnimationEffectState) {
-    state.reset();
-}
-
-/// # Safety
-///
-/// The request and host, with every range they address, must be live for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_only_translates_horizontally(
-    request: *const crate::painting::host::FfiCompositorAnimationRequest,
-    host: &crate::painting::host::FfiCompositorAnimationHost,
-) -> bool {
-    use crate::painting::visual_animation_builder::{Host, Request, effect_only_translates_horizontally};
-    let request = unsafe { Request::new(&*request) };
-    effect_only_translates_horizontally(&request, &Host::new(host))
-}
-
-/// # Safety
-///
-/// The request and host, with every range they address, must be live for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_transform_preserves_axes(
-    request: *const crate::painting::host::FfiCompositorAnimationRequest,
-    host: &crate::painting::host::FfiCompositorAnimationHost,
-) -> bool {
-    use crate::painting::visual_animation_builder::{Host, Request, effect_transform_preserves_axes};
-    let request = unsafe { Request::new(&*request) };
-    effect_transform_preserves_axes(&request, &Host::new(host))
 }
 
 /// Starts an update pass: the effects publish into an empty document list.
@@ -1718,8 +1445,22 @@ pub unsafe extern "C" fn layout_arena_paint_push_svg_filter_primitive(
     sink: *mut c_void,
     primitive: *const FfiSvgFilterPrimitive,
 ) {
-    let primitives = unsafe { &mut *sink.cast::<Vec<SvgFilterPrimitive>>() };
-    primitives.push(unsafe { svg_filter_primitive_from_ffi(&*primitive) });
+    let filter = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgFilter>() };
+    filter
+        .primitives
+        .push(unsafe { svg_filter_primitive_from_ffi(&*primitive) });
+}
+
+/// # Safety
+///
+/// `sink` must be the pointer handed to the callback, used synchronously, and `region` must be readable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paint_set_svg_filter_region(
+    sink: *mut c_void,
+    region: *const crate::painting::host::visual_context::FfiSvgFilterRegion,
+) {
+    let filter = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgFilter>() };
+    filter.region = unsafe { *region };
 }
 
 /// Notes that the SVG paint resources the document's rows enrolled may have changed, and answers whether any row

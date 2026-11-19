@@ -8,7 +8,6 @@
 
 use super::Flow;
 use super::GraphBuilder;
-use super::SlotState;
 use crate::CompileFailure;
 use crate::bytecode::Operand;
 use crate::code::Repr;
@@ -35,15 +34,15 @@ impl GraphBuilder<'_> {
         let receiver = self.read(receiver)?;
         let keys = self.read(keys)?;
         let cursor_value = self.read(cursor)?;
-        // NB: Once there are no more keys, the value stays what it was. It is
-        //     dead before the instruction, which writes it, and inlined frames
-        //     drop dead slots at merges: there it becomes undefined, as the
-        //     slow path writes it once done.
-        let old_value = match self.peek(dst_value) {
-            SlotState::InMemory if self.function.is_virtual() => self.constant(value::UNDEFINED),
-            _ => self.read(dst_value)?,
-        };
+        // NB: Once there are no more keys, the value stays what it was. It is dead before the instruction, which
+        //     writes it, so where the walk does not know its value it is undefined (see `AbstractFrame::slots`), as
+        //     the slow path writes it once done.
+        let old_value = self.read(dst_value)?;
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
+        // NB: The cache stops holding the receiver's keys only where the loop changes the receiver's shape, which is
+        //     rare. Exiting there, until an exit was taken, makes the key the cache's key wherever the loop's body
+        //     reads it, which keyed accesses of the key rely on to read the property at its known place.
+        self.exit_instead_of_slow_path(&mut slow_paths);
         let receiver = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Object, vec![receiver], true);
         self.branch_to_slow_path(
             &mut slow_paths,

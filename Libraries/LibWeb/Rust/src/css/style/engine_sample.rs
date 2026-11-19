@@ -350,6 +350,7 @@ fn push_longhands(property: u16, keeps: &impl Fn(u16) -> bool, properties: &mut 
 fn post_compute_adjusts(property: u16, facts: u32) -> bool {
     use element_adjustment_fact::{CHECK_INPUT_LINE_HEIGHT, FORCE_LINE_HEIGHT_NORMAL};
     match property {
+        prop::APPEARANCE => facts & FORCE_LINE_HEIGHT_NORMAL != 0,
         prop::LINE_HEIGHT => facts & (FORCE_LINE_HEIGHT_NORMAL | CHECK_INPUT_LINE_HEIGHT) != 0,
         _ => POST_COMPUTE_ADJUSTED_LONGHANDS.contains(&property),
     }
@@ -387,13 +388,13 @@ impl super::StyleEngine {
                 .iter()
                 .flat_map(|keyframe| effect.declarations_of(keyframe))
                 .map(|declaration| declaration.property_id);
-            match timing.key_at(samples).ok_or(NeedsHost)? {
+            match timing
+                .key_at(effect.timing_function.as_easing(), samples)
+                .ok_or(NeedsHost)?
+            {
                 Some(current_key) => {
-                    composed.push(anim::FfiSampledAnimationEffect {
-                        effect: anim::FfiAnimationPreparationEffect {
-                            identity: effect.identity,
-                            generation: effect.generation,
-                        },
+                    composed.push(anim::SampledAnimationEffect {
+                        description: effect.description().clone(),
                         current_key,
                     });
                     composed_properties.extend(properties);
@@ -602,9 +603,10 @@ impl super::StyleEngine {
             root_effective_zoom: self.root_effective_zoom(),
         };
         let input = AnimationSampleInput {
+            record_dependencies: true,
             style_node: node.raw(),
             pseudo_kind: crate::css::cascaded_properties::NO_PSEUDO_ELEMENT,
-            effects: HostSampledEffects::none(),
+            effects: HostSampledEffects::new(),
             longhands,
             has_animated_overlay: true,
             current_color: working_set_current_color(longhands, Some(overlay)),
@@ -1085,6 +1087,11 @@ impl TickShownRecords {
             .find_map(|(shown_node, shown)| (*shown_node == node).then_some(shown))
     }
 
+    /// Whether a clock frame shows a record for `node`'s element or its pseudo-elements.
+    pub(super) fn shows_any(&self, node: StyleNodeID) -> bool {
+        !self.is_empty() && self.get(node).is_some()
+    }
+
     /// The record shown for `node`'s element, where a clock frame shows one.
     pub(super) fn element(&self, node: StyleNodeID) -> Option<super::computed::FinalStyleRecordID> {
         self.get(node).map(|shown| shown.element)
@@ -1438,7 +1445,11 @@ const _: () = {
 
 /// The line height `normal` uses for a resolved font.
 pub(super) fn normal_line_height(resolved: &bridge::FfiResolvedFont) -> f64 {
-    f64::from(resolved.ascent.round() as i32 + resolved.descent.round() as i32)
+    f64::from(
+        resolved.ascent.round_ties_even() as i32
+            + resolved.descent.round_ties_even() as i32
+            + resolved.line_gap.round_ties_even() as i32,
+    )
 }
 
 /// The used line height, as the C++ working set reads it from the computed value in `values`

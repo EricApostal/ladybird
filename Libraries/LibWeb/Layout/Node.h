@@ -58,7 +58,6 @@ public:
 
     static Compositing::RustFFI::NodeSlotId slot_id(Node const*);
     RustFFI::NodeKind kind() const { return m_kind; }
-    u32 arena_slot_index() const { return m_slot.index; }
     NodeArena& node_arena() const { return *m_arena; }
     RustFFI::DocumentHost* document_host() const;
     // The read this node was reached in, which it lends the calls the host makes about its document: a layout node is
@@ -148,6 +147,7 @@ public:
 
     bool is_anonymous() const { return has_identity_flag<RustFFI::NodeFlag::Anonymous>(); }
     bool is_document_element() const { return has_identity_flag<RustFFI::NodeFlag::IsDocumentElement>(); }
+    bool is_body() const { return has_identity_flag<RustFFI::NodeFlag::IsBody>(); }
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
     // The identity of the DOM node this row belongs to, which names nothing for an anonymous row
@@ -194,10 +194,6 @@ public:
 
     void prepare_subtree_for_detach_from_layout_tree();
     void pin_style_record_for_detachment();
-
-    // Returns the direct viewport child above this node (the node itself or its outermost
-    // anonymous table-fixup wrapper), or null when the node is not placed as a top layer box.
-    Node* topmost_layout_node_of_top_layer_placement();
 
     DOM::Document& document();
     DOM::Document const& document() const;

@@ -23,6 +23,7 @@
 #include <LibMediaCodecs/Codecs/AV1.h>
 #include <LibMediaCodecs/Codecs/H264.h>
 #include <LibMediaCodecs/Codecs/H265.h>
+#include <LibMediaCodecs/Codecs/HDR10Plus.h>
 #include <LibMediaCodecs/Limits.h>
 
 #include "Reader.h"
@@ -388,9 +389,93 @@ DecoderErrorOr<void> Reader::parse_segment_information(Streamer& streamer)
     return {};
 }
 
+static DecoderErrorOr<Optional<MasteringDisplayColorVolume>> parse_mastering_metadata(Streamer& streamer)
+{
+    MasteringDisplayColorVolume volume {};
+    // A field the element leaves out stays NaN, so the volume is only kept when every field is present.
+    auto chromaticity_values = to_array<float*>({ &volume.red.x, &volume.red.y, &volume.green.x, &volume.green.y, &volume.blue.x, &volume.blue.y, &volume.white_point.x, &volume.white_point.y });
+    auto luminance_values = to_array<float*>({ &volume.maximum_luminance, &volume.minimum_luminance });
+    for (auto* value : chromaticity_values)
+        *value = AK::NaN<float>;
+    for (auto* value : luminance_values)
+        *value = AK::NaN<float>;
+    auto is_usable = true;
+
+    TRY(Reader::parse_master_element(streamer, "MasteringMetadata"sv, [&](u64 element_id) -> DecoderErrorOr<ElementIterationDecision> {
+        auto read_value = [&](float& value) -> DecoderErrorOr<void> {
+            auto value_position = streamer.position();
+            auto value_or_error = streamer.read_float();
+            if (value_or_error.is_error()) {
+                if (value_or_error.error().category() != DecoderErrorCategory::Invalid)
+                    return value_or_error.release_error();
+                TRY(streamer.seek_to_position(value_position));
+                TRY(streamer.read_unknown_element());
+                is_usable = false;
+                return {};
+            }
+            value = static_cast<float>(value_or_error.release_value());
+            return {};
+        };
+        switch (element_id) {
+        case PRIMARY_R_CHROMATICITY_X_ID:
+            TRY(read_value(volume.red.x));
+            break;
+        case PRIMARY_R_CHROMATICITY_Y_ID:
+            TRY(read_value(volume.red.y));
+            break;
+        case PRIMARY_G_CHROMATICITY_X_ID:
+            TRY(read_value(volume.green.x));
+            break;
+        case PRIMARY_G_CHROMATICITY_Y_ID:
+            TRY(read_value(volume.green.y));
+            break;
+        case PRIMARY_B_CHROMATICITY_X_ID:
+            TRY(read_value(volume.blue.x));
+            break;
+        case PRIMARY_B_CHROMATICITY_Y_ID:
+            TRY(read_value(volume.blue.y));
+            break;
+        case WHITE_POINT_CHROMATICITY_X_ID:
+            TRY(read_value(volume.white_point.x));
+            break;
+        case WHITE_POINT_CHROMATICITY_Y_ID:
+            TRY(read_value(volume.white_point.y));
+            break;
+        case LUMINANCE_MAX_ID:
+            TRY(read_value(volume.maximum_luminance));
+            break;
+        case LUMINANCE_MIN_ID:
+            TRY(read_value(volume.minimum_luminance));
+            break;
+        default:
+            TRY(streamer.read_unknown_element());
+        }
+
+        return ElementIterationDecision::Continue;
+    }));
+
+    dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's MasteringMetadata with luminance {} to {}", volume.minimum_luminance, volume.maximum_luminance);
+    if (!is_usable)
+        return OptionalNone {};
+    // https://www.rfc-editor.org/rfc/rfc9559#section-5.1.4.1.28.31: chromaticities range from 0 to 1, and luminances are
+    // at least 0.
+    for (auto const* value : chromaticity_values) {
+        if (!isfinite(*value) || *value < 0 || *value > 1)
+            return OptionalNone {};
+    }
+    for (auto const* value : luminance_values) {
+        if (!isfinite(*value) || *value < 0)
+            return OptionalNone {};
+    }
+    return volume;
+}
+
 static DecoderErrorOr<TrackEntry::ColorFormat> parse_video_color_information(Streamer& streamer)
 {
     TrackEntry::ColorFormat color_format {};
+    auto content_light_level_information = [&] -> ContentLightLevelInformation& {
+        return color_format.content_light_level_information.ensure([] { return ContentLightLevelInformation {}; });
+    };
 
     TRY(Reader::parse_master_element(streamer, "Colour"sv, [&](u64 element_id) -> DecoderErrorOr<ElementIterationDecision> {
         switch (element_id) {
@@ -413,6 +498,17 @@ static DecoderErrorOr<TrackEntry::ColorFormat> parse_video_color_information(Str
         case BITS_PER_CHANNEL_ID:
             color_format.bits_per_channel = TRY(streamer.read_u64());
             dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's BitsPerChannel attribute: {}", color_format.bits_per_channel);
+            break;
+        case MAX_CLL_ID:
+            content_light_level_information().maximum_content_light_level = AK::clamp_to<u16>(TRY(streamer.read_u64()));
+            dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's MaxCLL attribute: {}", content_light_level_information().maximum_content_light_level);
+            break;
+        case MAX_FALL_ID:
+            content_light_level_information().maximum_frame_average_light_level = AK::clamp_to<u16>(TRY(streamer.read_u64()));
+            dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's MaxFALL attribute: {}", content_light_level_information().maximum_frame_average_light_level);
+            break;
+        case MASTERING_METADATA_ID:
+            color_format.mastering_display_color_volume = TRY(parse_mastering_metadata(streamer));
             break;
         default:
             TRY(streamer.read_unknown_element());
@@ -898,6 +994,71 @@ DecoderErrorOr<Block> Reader::parse_simple_block(Streamer& streamer, AK::Duratio
     return block;
 }
 
+// https://www.matroska.org/technical/codec_specs.html#block-addition-mappings
+// An ITU-T T.35 message, which is how WebM carries HDR10+ for VP9.
+static constexpr u64 ITU_T_T35_BLOCK_ADD_ID = 4;
+
+static DecoderErrorOr<void> parse_block_additions(Streamer& streamer, Block& block)
+{
+    TRY(Reader::parse_master_element(streamer, "BlockAdditions"sv, [&](u64 element_id) -> DecoderErrorOr<ElementIterationDecision> {
+        if (element_id != BLOCK_MORE_ID) {
+            TRY(streamer.read_unknown_element());
+            return ElementIterationDecision::Continue;
+        }
+
+        // https://www.matroska.org/technical/elements.html
+        // BlockAddID: default 1
+        u64 block_add_id = 1;
+        Optional<FixedArray<u8>> block_additional;
+        TRY(Reader::parse_master_element(streamer, "BlockMore"sv, [&](u64 block_more_element_id) -> DecoderErrorOr<ElementIterationDecision> {
+            switch (block_more_element_id) {
+            case BLOCK_ADD_ID_ID:
+                block_add_id = TRY(streamer.read_u64());
+                break;
+            case BLOCK_ADDITIONAL_ID: {
+                auto size = TRY(streamer.read_variable_size_integer());
+                // An addition too large to be HDR10+ is skipped rather than read, whatever its BlockAddID.
+                if (size > Codecs::HDR10_PLUS_MAXIMUM_T35_MESSAGE_SIZE) {
+                    block_additional.clear();
+                    Checked<size_t> end = streamer.position();
+                    end += size;
+                    if (end.has_overflow())
+                        return DecoderError::corrupted("BlockAdditional extends past the representable size"sv);
+                    TRY(streamer.seek_to_position(end.value()));
+                    break;
+                }
+                block_additional = TRY(streamer.read_raw_octets(size));
+                break;
+            }
+            default:
+                TRY(streamer.read_unknown_element());
+                break;
+            }
+            return ElementIterationDecision::Continue;
+        }));
+
+        if (block_add_id == ITU_T_T35_BLOCK_ADD_ID && block_additional.has_value()) {
+            if (auto luminance = Codecs::hdr10_plus_maximum_scene_luminance(block_additional->span()); luminance.has_value())
+                block.set_maximum_scene_luminance(luminance);
+        }
+        return ElementIterationDecision::Continue;
+    }));
+    return {};
+}
+
+static DecoderErrorOr<void> parse_or_skip_block_additions(Streamer& streamer, Block& block)
+{
+    auto additions_position = streamer.position();
+    auto result = parse_block_additions(streamer, block);
+    if (!result.is_error() || result.error().category() == DecoderErrorCategory::EndOfStream)
+        return result;
+
+    // Malformed additions are skipped as an unrecognized element would be, rather than failing the block they accompany.
+    block.set_maximum_scene_luminance({});
+    TRY(streamer.seek_to_position(additions_position));
+    return streamer.read_unknown_element();
+}
+
 DecoderErrorOr<Block> Reader::parse_block_group(Streamer& streamer, AK::Duration cluster_timestamp, u64 segment_timestamp_scale, TrackBlockContexts& contexts)
 {
     Block block;
@@ -943,6 +1104,10 @@ DecoderErrorOr<Block> Reader::parse_block_group(Streamer& streamer, AK::Duration
         case REFERENCE_BLOCK_ID: {
             has_reference_block = true;
             TRY(streamer.read_unknown_element());
+            break;
+        }
+        case BLOCK_ADDITIONS_ID: {
+            TRY(parse_or_skip_block_additions(streamer, block));
             break;
         }
         default:
@@ -1070,9 +1235,10 @@ static DecoderErrorOr<CueTrackPosition> parse_cue_track_position(Streamer& strea
     return track_position;
 }
 
-static DecoderErrorOr<CuePoint> parse_cue_point(Streamer& streamer, u64 timestamp_scale)
+static DecoderErrorOr<CuePoint> parse_cue_point(Streamer& streamer, u64 timestamp_scale, OrderedHashMap<u64, NonnullRefPtr<TrackEntry>> const& tracks)
 {
     CuePoint cue_point;
+    bool had_track_positions = false;
 
     TRY(Reader::parse_master_element(streamer, "CuePoint"sv, [&](u64 element_id) -> DecoderErrorOr<ElementIterationDecision> {
         switch (element_id) {
@@ -1093,6 +1259,9 @@ static DecoderErrorOr<CuePoint> parse_cue_point(Streamer& streamer, u64 timestam
         }
         case CUE_TRACK_POSITIONS_ID: {
             auto track_position = TRY(parse_cue_track_position(streamer));
+            had_track_positions = true;
+            if (!tracks.contains(track_position.track_number()))
+                break;
             DECODER_TRY_ALLOC(cue_point.track_positions().try_set(track_position.track_number(), track_position));
             break;
         }
@@ -1107,7 +1276,7 @@ static DecoderErrorOr<CuePoint> parse_cue_point(Streamer& streamer, u64 timestam
     if (cue_point.timestamp().is_negative())
         return DecoderError::corrupted("CuePoint was missing a timestamp"sv);
 
-    if (cue_point.track_positions().is_empty())
+    if (!had_track_positions)
         return DecoderError::corrupted("CuePoint was missing track positions"sv);
 
     return cue_point;
@@ -1129,7 +1298,7 @@ DecoderErrorOr<void> Reader::parse_cues(Streamer& streamer)
     TRY(Reader::parse_master_element(streamer, "Cues"sv, [&](u64 element_id) -> DecoderErrorOr<ElementIterationDecision> {
         switch (element_id) {
         case CUE_POINT_ID: {
-            auto cue_point = TRY(parse_cue_point(streamer, m_segment_information.timestamp_scale()));
+            auto cue_point = TRY(parse_cue_point(streamer, m_segment_information.timestamp_scale(), m_tracks));
 
             // FIXME: Verify that these are already in order of timestamp. If they are not, return a corrupted error for now,
             //        but if it turns out that Matroska files with out-of-order cue points are valid, sort them instead.

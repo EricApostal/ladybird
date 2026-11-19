@@ -22,6 +22,7 @@
 #include <LibWebView/ReportSubmission.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/TabPerformanceMonitor.h>
+#include <LibWebView/UpdateCheck.h>
 #include <LibWebView/WebCompatReport.h>
 #include <LibWebView/WebUI/ApplicationWebUI.h>
 
@@ -354,6 +355,11 @@ void ConnectionFromUI::system_time_zone_changed()
     });
 }
 
+void ConnectionFromUI::media_session_action(Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek)
+{
+    Application::the().media_session_coordinator().handle_action(action, seek_offset, seek_time, fast_seek);
+}
+
 void ConnectionFromUI::notification_shown(u64 id)
 {
     if (auto* backend = NotificationBackendInUI::the(); backend && backend->on_shown)
@@ -489,6 +495,11 @@ void ConnectionFromUI::view_request_page_dumps(u64 view_id, u64 request_id)
     });
 }
 
+void ConnectionFromUI::request_platform_features_description(u64 request_id)
+{
+    async_platform_features_description(request_id, Application::the().describe_platform_features_for_report({}));
+}
+
 void ConnectionFromUI::view_prepare_for_immediate_close(u64 view_id)
 {
     auto* view = find_view(view_id);
@@ -568,6 +579,7 @@ Messages::HubServer::CreateViewResponse ConnectionFromUI::create_view(Hub::NewVi
         .device_pixel_ratio = request.device_pixel_ratio,
         .maximum_frames_per_second = request.maximum_frames_per_second,
         .display_id = request.display_id,
+        .screen_shows_high_dynamic_range = request.screen_shows_high_dynamic_range,
         .system_theme = move(request.system_theme),
         .screen_rects = move(request.screen_rects),
         .owner_view_id = request.owner_view_id,
@@ -662,6 +674,18 @@ void ConnectionFromUI::stop_request(u64 request_id)
 {
     if (auto request = m_requests.take(request_id); request.has_value())
         (*request)->stop();
+}
+
+void ConnectionFromUI::check_for_updates(WebView::UpdateCheckTrigger trigger)
+{
+    if (auto* update_checker = Application::the().update_checker())
+        update_checker->check(trigger);
+}
+
+void ConnectionFromUI::skip_update_version(String version)
+{
+    if (auto* update_checker = Application::the().update_checker())
+        update_checker->skip_version(version);
 }
 
 void ConnectionFromUI::toggle_devtools_enabled()
@@ -910,6 +934,54 @@ void ConnectionFromUI::view_set_system_visibility_state(u64 view_id, Web::HTML::
     }
 }
 
+void ConnectionFromUI::view_set_hosts_remote_layer(u64 view_id, bool hosts_remote_layer)
+{
+    if (auto* view = find_view(view_id))
+        view->set_hosts_remote_layer(hosts_remote_layer);
+}
+
+void ConnectionFromUI::view_set_wants_frame_notifications(u64 view_id, bool wants_frame_notifications)
+{
+    if (auto* view = find_view(view_id))
+        view->set_wants_frame_notifications(wants_frame_notifications);
+}
+
+void ConnectionFromUI::view_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::IntSize> maximum_size)
+{
+    auto* view = find_view(view_id);
+    if (!view) {
+        async_view_did_take_frame_snapshot(view_id, request_id, {});
+        return;
+    }
+    view->take_frame_snapshot(maximum_size, [view_id, request_id](Optional<Gfx::ShareableBitmap> snapshot) {
+        if (auto* ui = ConnectionFromUI::the())
+            ui->async_view_did_take_frame_snapshot(view_id, request_id, move(snapshot));
+    });
+}
+
+void ConnectionFromUI::view_begin_synchronized_resize(u64 view_id, u64 token)
+{
+    if (auto* view = find_view(view_id))
+        view->begin_synchronized_resize(token);
+}
+
+// The UI waits for the answer on its main thread, so a view that is gone answers as well.
+void ConnectionFromUI::view_await_synchronized_resize_frame(u64 view_id, u64 token, Gfx::IntSize size)
+{
+    if (auto* view = find_view(view_id))
+        view->await_synchronized_resize_frame(token, size);
+    else
+        async_view_did_hold_synchronized_resize_frame(view_id, token);
+}
+
+void ConnectionFromUI::view_commit_synchronized_resize(u64 view_id, u64 token)
+{
+    if (auto* view = find_view(view_id))
+        view->commit_synchronized_resize(token);
+    else
+        async_view_did_commit_synchronized_resize(view_id, token);
+}
+
 void ConnectionFromUI::view_set_presents_from_cpu_memory(u64 view_id, bool presents_from_cpu_memory)
 {
     if (auto* view = find_view(view_id)) {
@@ -1118,10 +1190,10 @@ void ConnectionFromUI::view_reset_zoom(u64 view_id)
     }
 }
 
-void ConnectionFromUI::view_set_display_metadata(u64 view_id, Optional<u64> display_id, double maximum_frames_per_second)
+void ConnectionFromUI::view_set_display_metadata(u64 view_id, Optional<u64> display_id, double maximum_frames_per_second, bool screen_shows_high_dynamic_range)
 {
     if (auto* view = find_view(view_id)) {
-        view->set_display_metadata(display_id, maximum_frames_per_second);
+        view->set_display_metadata(display_id, maximum_frames_per_second, screen_shows_high_dynamic_range);
         view->push_state_to_ui();
     }
 }

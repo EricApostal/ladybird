@@ -388,7 +388,11 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
     case FilterOperationType::Image: {
         auto const& frame = m_image_frame(value<u64>());
         auto src_rect = rect();
-        auto dest_rect = rect();
+        auto dest_x = value<float>();
+        auto dest_y = value<float>();
+        auto dest_width = value<float>();
+        auto dest_height = value<float>();
+        auto dest_rect = SkRect::MakeXYWH(dest_x, dest_y, dest_width, dest_height);
         auto sampling_options = to_skia_sampling_options(value<ScalingMode>());
         auto image = sk_image_from_decoded_image_frame(frame);
         return SkImageFilters::Image(move(image), src_rect, dest_rect, sampling_options);
@@ -455,6 +459,14 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
         }
         return SkImageFilters::ColorFilter(move(color_space_filter), move(input));
     }
+    case FilterOperationType::Crop: {
+        auto x = value<float>();
+        auto y = value<float>();
+        auto width = value<float>();
+        auto height = value<float>();
+        auto input = optional_filter();
+        return SkImageFilters::Crop(SkRect::MakeXYWH(x, y, width, height), SkTileMode::kDecal, move(input));
+    }
     }
     VERIFY_NOT_REACHED();
 }
@@ -492,9 +504,18 @@ sk_sp<SkImage> sk_texture_image_sharing_pixels_of_decoded_image_frame([[maybe_un
     auto* gr_context = skia_backend_context.sk_context();
     if (!iosurface || !gr_context)
         return nullptr;
+    // NB: Metal aborts when asked for a texture larger than the GPU supports, so such a frame is drawn from its pixels
+    //     in memory instead.
+    if (frame.width() > gr_context->maxTextureSize() || frame.height() > gr_context->maxTextureSize())
+        return nullptr;
 
     auto texture_format = first_is_one_of(frame.format(), BitmapFormat::RGBA8888, BitmapFormat::RGBx8888) ? MetalTextureFormat::RGBA8 : MetalTextureFormat::BGRA8;
-    auto metal_texture = skia_backend_context.metal_context().create_texture_from_iosurface(*iosurface, texture_format, 0);
+    // The frame's surface may come from another process, which need not have aligned its rows as the GPU needs them,
+    // so such a frame is uploaded instead.
+    auto& metal_context = skia_backend_context.metal_context();
+    if (!metal_context.rows_have_linear_texture_alignment(*iosurface, texture_format, 0))
+        return nullptr;
+    auto metal_texture = metal_context.create_texture_from_iosurface(*iosurface, texture_format, 0);
     if (!metal_texture)
         return nullptr;
 

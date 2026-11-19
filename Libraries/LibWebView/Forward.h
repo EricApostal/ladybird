@@ -63,7 +63,9 @@ class SettingsUI;
 class SpellChecker;
 class Translator;
 class StorageJar;
+class SystemProbeClient;
 class TraversableSessionHistory;
+class UpdateChecker;
 class VideoDecoderServerControlClient;
 class ViewImplementation;
 class WebContentClient;
@@ -79,8 +81,11 @@ struct CookieStorageKey;
 struct HistoryEntry;
 struct HistoryOperation;
 struct SearchEngine;
+struct UpdateCheckResult;
 struct WebContentOptions;
 class WebContentPage;
+
+enum class UpdateCheckTrigger : u8;
 
 }
 

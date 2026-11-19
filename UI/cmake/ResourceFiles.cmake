@@ -21,25 +21,19 @@ list(TRANSFORM 48x48_ICONS PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/icons/48x48/
 set(INTERNAL_RESOURCES
     ladybird.css
     utils.js
+    WebCompat.json
 )
 list(TRANSFORM INTERNAL_RESOURCES PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/ladybird/")
 
-set(SITE_COMPATIBILITY_RESOURCES
-    cnn.com.json
-    nytimes.com.json
-    twitch.tv.json
-)
-list(TRANSFORM SITE_COMPATIBILITY_RESOURCES PREPEND "${LADYBIRD_SOURCE_DIR}/WebCompat/")
-
 set(ABOUT_PAGES
     about.html
-    blocking.html
     bookmarks.html
     crashes.html
     downloads.html
     history.html
     newtab.html
     settings.html
+    support.html
     version.html
     webui.css
     welcome.css
@@ -172,10 +166,6 @@ function(copy_resources_to_build base_directory bundle_target)
         DESTINATION ${base_directory} TARGET ${bundle_target}
     )
 
-    copy_resource_set(ladybird/site-compatibility RESOURCES ${SITE_COMPATIBILITY_RESOURCES}
-        DESTINATION ${base_directory} TARGET ${bundle_target}
-    )
-
     copy_resource_set(ladybird/about-pages RESOURCES ${ABOUT_PAGES}
         DESTINATION ${base_directory} TARGET ${bundle_target}
     )
@@ -222,7 +212,6 @@ function(install_ladybird_resources destination component)
         install(FILES ${LADYBIRD_ICU_DATA_FILE} DESTINATION "${destination}/icu" COMPONENT ${component})
     endif()
     install(FILES ${INTERNAL_RESOURCES} DESTINATION "${destination}/ladybird" COMPONENT ${component})
-    install(FILES ${SITE_COMPATIBILITY_RESOURCES} DESTINATION "${destination}/ladybird/site-compatibility" COMPONENT ${component})
     install(FILES ${ABOUT_PAGES} DESTINATION "${destination}/ladybird/about-pages" COMPONENT ${component})
     install(FILES ${ABOUT_SETTINGS_RESOURCES} DESTINATION "${destination}/ladybird/about-pages/settings" COMPONENT ${component})
     install(FILES ${WEB_TEMPLATES} DESTINATION "${destination}/ladybird/templates" COMPONENT ${component})

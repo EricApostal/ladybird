@@ -962,6 +962,19 @@ pub fn new_function_environment_for_native_javascript_backed_function(
     env
 }
 
+/// OPTIMIZATION: The function of the running execution context, if its frame answers for `this`, `super` and
+/// `new.target` in place of the function environment that GetThisEnvironment() would find. That is the case for an
+/// ECMAScript function that is no arrow function and whose calls get no environment with a this binding, because
+/// nothing reads those through the environment (no arrow function or direct eval in it uses them). The frame then has
+/// the this value (empty while a derived constructor has not called super()) and the new target, and the function has
+/// its home object.
+pub fn function_with_frame_as_this_environment(vm: &Vm) -> Option<Gc<EcmascriptFunctionObject>> {
+    let context = vm.running_execution_context_if_any()?;
+    let function = as_ecmascript_function_object(context.function.get()?)?;
+    let shared_data = function.shared_data();
+    (!shared_data.is_arrow_function() && !shared_data.function_environment_has_this_binding()).then_some(function)
+}
+
 // 9.4.3 GetThisEnvironment ( ), https://tc39.es/ecma262/#sec-getthisenvironment
 pub fn get_this_environment(vm: &Vm) -> Gc<Environment> {
     let context = vm
@@ -1006,8 +1019,21 @@ pub fn can_be_held_weakly(value: Value) -> bool {
     false
 }
 
+/// NB: Not an operation of the spec. Script is about to hold `value` weakly, which makes the identity of an object
+///     outlive the references to it, so the embedder must keep the object from then on (Object::preserve_identity()).
+pub fn preserve_identity_of_value_held_weakly(value: Value) {
+    if value.is_object() {
+        value.as_object().preserve_identity();
+    }
+}
+
 // 13.3.7.2 GetSuperConstructor ( ), https://tc39.es/ecma262/#sec-getsuperconstructor
 pub fn get_super_constructor(vm: &Vm) -> Option<Gc<Object>> {
+    // OPTIMIZATION: The running function is envRec.[[FunctionObject]] if its frame answers for the environment.
+    if let Some(active_function) = function_with_frame_as_this_environment(vm) {
+        return active_function.internal_get_prototype_of(vm).must();
+    }
+
     // 1. Let envRec be GetThisEnvironment().
     let env = get_this_environment(vm);
 
@@ -1346,7 +1372,7 @@ fn compile_eval(
         allow_super_constructor_call: in_derived_constructor,
         in_class_field_initializer,
     };
-    let parsed = parse_eval(source_code.code(), context).map_err(|errors| {
+    let parsed = parse_eval(&source_code.code(), context).map_err(|errors| {
         errors
             .first()
             .map(|error| format!("{} (line: {}, column: {})", error.message, error.line, error.column))

@@ -19,7 +19,6 @@
 //! same entries.
 
 use super::GraphBuilder;
-use super::SlotState;
 use crate::bytecode::Operand;
 use crate::ir::AccessorPart;
 use crate::ir::Block;
@@ -63,6 +62,9 @@ pub(super) enum Action {
         shape: CellId,
         prototype_chain: Option<(CellId, bool)>,
     },
+    /// Reads `undefined`: neither the object nor its prototype chain
+    /// (checked with the validity cell, if there is one) has the property.
+    GetMissing { prototype_chain: Option<(CellId, bool)> },
 }
 
 /// One cache entry: its guards and its action.
@@ -104,8 +106,7 @@ pub(super) struct CacheEntry {
 
 impl CacheEntry {
     /// The entry in its guard and action form, if compiled code can apply
-    /// it: entries of missing properties, and entries without a shape, are
-    /// left to the interpreter's code.
+    /// it: entries without a shape are left to the interpreter's code.
     pub fn of(entry: &PropertyCacheEntrySnapshot) -> Option<CacheEntry> {
         let prototype_holder = || match (entry.prototype, entry.prototype_chain_validity) {
             (Some(prototype), Some(validity)) => Some(Holder::Prototype {
@@ -142,6 +143,14 @@ impl CacheEntry {
                 Action::Set {
                     holder: prototype_holder()?,
                     offset: entry.property_offset,
+                },
+            ),
+            PropertyCacheEntryType::GetMissingProperty => (
+                entry.shape?,
+                Action::GetMissing {
+                    prototype_chain: entry
+                        .prototype_chain_validity
+                        .map(|validity| (validity, entry.prototype_chain_valid)),
                 },
             ),
             PropertyCacheEntryType::AddOwnProperty => (
@@ -182,6 +191,7 @@ impl CacheEntry {
     pub fn is_data_access(&self) -> bool {
         match self.action {
             Action::Get { .. } => !self.holds_accessor,
+            Action::GetMissing { .. } => true,
             Action::Set {
                 holder: Holder::Receiver,
                 ..
@@ -245,10 +255,7 @@ impl GraphBuilder<'_> {
         if cache.kind != PropertyCacheKind::Megamorphic {
             return None;
         }
-        let SlotState::Value { node, .. } = self.peek(object) else {
-            return None;
-        };
-        let shape = self.fresh_shape(node)?;
+        let shape = self.fresh_shape(self.peek(object)?.node)?;
         let entry = cache
             .entries
             .iter()

@@ -72,6 +72,7 @@ void RemotePlaybackManager::set_duration(AK::Duration duration)
     m_duration = duration;
     if (can_send())
         m_client->async_set_duration(m_session_id, duration);
+    dispatch_seekable_ranges_change();
 }
 
 AK::Duration RemotePlaybackManager::current_time() const
@@ -98,7 +99,7 @@ Media::VideoSinkHandle RemotePlaybackManager::reserve_video_sink_handle(Media::T
     auto handle = Media::allocate_video_sink_handle();
     m_video_sinks.set(handle, VideoSink { track });
     bool resume_ended_playback = m_state != Media::PlaybackState::Ended;
-    m_latest_seek_request_id++;
+    advance_seek_request_id();
     if (can_send())
         m_client->async_reserve_video_sink(m_session_id, m_latest_seek_request_id, track, handle, resume_ended_playback);
     dispatch_buffered_ranges_change();
@@ -108,7 +109,7 @@ Media::VideoSinkHandle RemotePlaybackManager::reserve_video_sink_handle(Media::T
 void RemotePlaybackManager::disable_video_sink_by_handle(Media::VideoSinkHandle handle)
 {
     m_video_sinks.remove(handle);
-    m_latest_seek_request_id++;
+    advance_seek_request_id();
     if (can_send())
         m_client->async_disable_video_sink(m_session_id, m_latest_seek_request_id, handle);
     dispatch_buffered_ranges_change();
@@ -131,7 +132,7 @@ void RemotePlaybackManager::enable_an_audio_track(Media::Track const& track)
     // Once the end has been observed here, the element is paused at the duration, so the server must not resume.
     bool resume_ended_playback = m_state != Media::PlaybackState::Ended;
     m_enabled_audio_tracks.set(track);
-    m_latest_seek_request_id++;
+    advance_seek_request_id();
     if (can_send())
         m_client->async_set_audio_track_enabled(m_session_id, m_latest_seek_request_id, track, true, resume_ended_playback);
     dispatch_buffered_ranges_change();
@@ -140,7 +141,7 @@ void RemotePlaybackManager::enable_an_audio_track(Media::Track const& track)
 void RemotePlaybackManager::disable_an_audio_track(Media::Track const& track)
 {
     m_enabled_audio_tracks.remove(track);
-    m_latest_seek_request_id++;
+    advance_seek_request_id();
     if (can_send())
         m_client->async_set_audio_track_enabled(m_session_id, m_latest_seek_request_id, track, false, false);
     dispatch_buffered_ranges_change();
@@ -179,7 +180,7 @@ void RemotePlaybackManager::pause()
 void RemotePlaybackManager::seek(AK::Duration timestamp, Media::SeekMode mode)
 {
     m_seek_timestamp = timestamp;
-    m_latest_seek_request_id++;
+    advance_seek_request_id();
     for (auto& [id, source_buffer] : m_source_buffers)
         source_buffer->invalidate_evictable_bytes({});
     dbgln_if(PLAYBACK_MANAGER_DEBUG, "RemotePlaybackManager({}): Requesting seek {} to {} ({}) in {}", m_session_id, m_latest_seek_request_id, timestamp, mode, m_state);
@@ -210,6 +211,29 @@ void RemotePlaybackManager::set_audio_group(Audio::PlaybackGroupId audio_group)
         m_client->async_set_audio_group(m_session_id, audio_group);
 }
 
+bool RemotePlaybackManager::playback_state_is_settled() const
+{
+    if (!can_send())
+        return true;
+    // The server reports its state once it has applied each request.
+    if (m_latest_reported_seek_request_id != m_latest_seek_request_id)
+        return false;
+    return m_server_playback_state_is_settled;
+}
+
+void RemotePlaybackManager::advance_seek_request_id()
+{
+    auto was_settled = playback_state_is_settled();
+    m_latest_seek_request_id++;
+    dispatch_playback_state_settled_change_if_changed(was_settled);
+}
+
+void RemotePlaybackManager::dispatch_playback_state_settled_change_if_changed(bool was_settled) const
+{
+    if (playback_state_is_settled() != was_settled && on_playback_state_settled_change)
+        on_playback_state_settled_change();
+}
+
 void RemotePlaybackManager::dispatch_state_change() const
 {
     if (on_playback_state_change)
@@ -220,6 +244,13 @@ void RemotePlaybackManager::dispatch_buffered_ranges_change() const
 {
     if (on_buffered_ranges_change)
         on_buffered_ranges_change();
+    dispatch_seekable_ranges_change();
+}
+
+void RemotePlaybackManager::dispatch_seekable_ranges_change() const
+{
+    if (on_seekable_ranges_change)
+        on_seekable_ranges_change();
 }
 
 bool RemotePlaybackManager::source_has_enabled_track(ReadonlySpan<Media::Track> audio_tracks, ReadonlySpan<Media::Track> video_tracks) const
@@ -249,6 +280,50 @@ Media::BufferedRanges RemotePlaybackManager::buffered_time_ranges() const
             active_sources.append(scan_state_for_enabled_tracks(source_buffer->scan_state(), source_buffer->audio_tracks(), source_buffer->video_tracks()));
     }
     return Media::DemuxerScanState::buffered_ranges_of_sources(active_sources);
+}
+
+// https://w3c.github.io/media-source/#htmlmediaelement-extensions-seekable
+// NB: The spec defines these ranges for a media element with a MediaSource attached; they apply to every source alike.
+Optional<Media::TimeRanges::Range> RemotePlaybackManager::seekable_time_ranges() const
+{
+    // -> If recent duration equals positive Infinity:
+    if (m_duration == AK::Duration::max()) {
+        auto buffered = buffered_time_ranges().time_ranges;
+
+        // 1. If recent live seekable range is not empty:
+        if (m_live_seekable_range.has_value()) {
+            // 1. Let union ranges be the union of recent live seekable range and the HTMLMediaElement's buffered
+            //    attribute.
+            // 2. Return a single range with a start time equal to the earliest start time in union ranges and an end
+            //    time equal to the highest end time in union ranges and abort these steps.
+            auto start = m_live_seekable_range->start;
+            auto end = m_live_seekable_range->end;
+            if (!buffered.is_empty()) {
+                start = min(start, buffered[0].start);
+                end = max(end, buffered.highest_end_time());
+            }
+            return Media::TimeRanges::Range { start, end };
+        }
+
+        // 2. If the HTMLMediaElement's buffered attribute returns an empty TimeRanges object, then return an empty
+        //    TimeRanges object and abort these steps.
+        if (buffered.is_empty())
+            return {};
+
+        // 3. Return a single range with a start time of 0 and an end time equal to the highest end time reported by the
+        //    HTMLMediaElement's buffered attribute.
+        return Media::TimeRanges::Range { AK::Duration::zero(), buffered.highest_end_time() };
+    }
+
+    // -> Otherwise:
+    //    Return a single range with a start time of 0 and an end time equal to recent duration.
+    return Media::TimeRanges::Range { AK::Duration::zero(), m_duration };
+}
+
+void RemotePlaybackManager::set_live_seekable_range(Optional<Media::TimeRanges::Range> range)
+{
+    m_live_seekable_range = range;
+    dispatch_seekable_ranges_change();
 }
 
 Media::CombinedScanState RemotePlaybackManager::scan_state_for_enabled_tracks(Media::DemuxerScanState const& state, ReadonlySpan<Media::Track> audio_tracks, ReadonlySpan<Media::Track> video_tracks) const
@@ -283,7 +358,9 @@ RemoteSourceBuffer* RemotePlaybackManager::find_source_buffer(u64 source_buffer_
 
 void RemotePlaybackManager::handle_connection_lost()
 {
+    auto was_settled = playback_state_is_settled();
     m_client = nullptr;
+    dispatch_playback_state_settled_change_if_changed(was_settled);
     for (auto& [id, source_buffer] : m_source_buffers)
         source_buffer->connection_lost({});
     auto pending_media_stream_sources = move(m_pending_media_stream_sources);
@@ -341,19 +418,24 @@ void RemotePlaybackManager::duration_changed(Badge<Client>, AK::Duration duratio
     m_duration = duration;
     if (on_duration_change)
         on_duration_change(duration);
+    dispatch_seekable_ranges_change();
 }
 
-void RemotePlaybackManager::state_changed(Badge<Client>, u64 applied_seek_request_id, Media::PlaybackState state, bool is_playing, Media::AvailableData available_data, AK::Duration current_time)
+void RemotePlaybackManager::state_changed(Badge<Client>, u64 applied_seek_request_id, Media::PlaybackState state, bool is_playing, Media::AvailableData available_data, bool server_playback_state_is_settled, AK::Duration current_time)
 {
     if (applied_seek_request_id != m_latest_seek_request_id) {
         dbgln_if(PLAYBACK_MANAGER_DEBUG, "RemotePlaybackManager({}): Dropping {} reported after seek {}, latest is {}", m_session_id, state, applied_seek_request_id, m_latest_seek_request_id);
         return;
     }
-    dbgln_if(PLAYBACK_MANAGER_DEBUG, "RemotePlaybackManager({}): Server reports {} playing={} available={} time={} (mirror was {})", m_session_id, state, is_playing, to_underlying(available_data), current_time, m_state);
+    dbgln_if(PLAYBACK_MANAGER_DEBUG, "RemotePlaybackManager({}): Server reports {} playing={} available={} settled={} time={} (mirror was {})", m_session_id, state, is_playing, to_underlying(available_data), server_playback_state_is_settled, current_time, m_state);
     if (state == Media::PlaybackState::Seeking)
         m_seek_timestamp = current_time;
+    auto was_settled = playback_state_is_settled();
+    m_latest_reported_seek_request_id = applied_seek_request_id;
+    m_server_playback_state_is_settled = server_playback_state_is_settled;
     m_is_playing = is_playing;
     m_available_data = available_data;
+    dispatch_playback_state_settled_change_if_changed(was_settled);
     if (m_state == state)
         return;
     m_state = state;

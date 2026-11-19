@@ -14,7 +14,6 @@
 #include <AK/Time.h>
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
-#include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibCore/Forward.h>
 #include <LibGC/Function.h>
@@ -63,6 +62,10 @@ class HTMLMediaElement : public HTMLElement {
     WEB_WRAPPABLE(HTMLMediaElement, HTMLElement);
 
 public:
+    // NB: A move runs no children changed steps, so the move algorithm reports these instead.
+    void child_moved_out(DOM::Node const& child, GC::Ptr<DOM::Node> old_previous_sibling);
+    void child_moved_in();
+
     static constexpr size_t audio_tracks_offset() { return offsetof(HTMLMediaElement, m_audio_tracks); }
     static constexpr size_t video_tracks_offset() { return offsetof(HTMLMediaElement, m_video_tracks); }
     static constexpr size_t text_tracks_offset() { return offsetof(HTMLMediaElement, m_text_tracks); }
@@ -175,7 +178,11 @@ public:
     void set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML::VideoTrack> video_track);
 
     void add_current_video_sink();
-    void sync_video_sink_ticking() const;
+    enum class DocumentWasLaidOut {
+        No,
+        Yes,
+    };
+    void sync_video_sink_ticking(DocumentWasLaidOut = DocumentWasLaidOut::Yes) const;
     void video_sink_ticking_inputs_changed() const;
     void detach_video_sink_edge();
 
@@ -183,7 +190,7 @@ public:
 
     void update_ready_state();
 
-    void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration) { set_duration(duration); }
+    void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration, double playback_position_before_the_change) { set_duration(duration, playback_position_before_the_change); }
     void media_source_metadata_available(Badge<MediaSourceExtensions::SourceBuffer>) { on_metadata_parsed(SourceType::Local); }
 
     MediaClient::RemotePlaybackManager& playback_manager()
@@ -224,8 +231,6 @@ public:
     Optional<PresentedVideoFrame> hold_presented_video_frame_for_callbacks();
     void release_presented_video_frame_held_for_callbacks();
     virtual void request_rendering_update_for_video_frame_callbacks() { }
-
-    Optional<Compositing::VideoSinkResourceId> video_sink_resource_id() const;
 
     virtual void update_representation() { }
 
@@ -320,7 +325,7 @@ private:
     void update_audio_play_state();
     void set_show_poster(bool);
     void set_paused(bool);
-    void set_duration(double);
+    void set_duration(double, Optional<double> playback_position_before_the_change = {});
     void set_ended(bool);
     void update_ended_attribute();
 
@@ -328,7 +333,7 @@ private:
     void update_volume();
     void attach_selected_video_track_sink(Media::Track const&);
 
-    bool video_sink_should_tick() const;
+    bool video_sink_should_tick(DocumentWasLaidOut) const;
     virtual bool is_shown_elsewhere() const { return false; }
     virtual HTMLMediaElement& media_element_for_controls() { return *this; }
 
@@ -377,6 +382,18 @@ private:
 
     // https://html.spec.whatwg.org/multipage/media.html#media-element-event-task-source
     UniqueTaskSource m_media_element_event_task_source;
+
+    // NB: The media element tasks that haven't run yet, in the order they were queued, so that they can follow the
+    //     element when it's adopted into another document.
+    struct PendingMediaElementTask {
+        u64 key { 0 };
+        TaskID task_id;
+        GC::Ref<GC::Function<void(HTMLMediaElement&)>> steps;
+    };
+    void queue_pending_media_element_task(PendingMediaElementTask&);
+    void requeue_pending_media_element_tasks();
+    Vector<PendingMediaElementTask> m_pending_media_element_tasks;
+    u64 m_next_media_element_task_key { 0 };
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-error
     GC::Ptr<MediaError> m_error;

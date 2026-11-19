@@ -8,32 +8,52 @@
 //! sender may ask for, and the answer a synchronous one gets.
 
 use super::{CompositorCore, ContextOwnerCheckResult};
+use crate::display_list_chunk_stores::chunks_of_list_sent_whole;
 use crate::host::{PresentationId, WebContentClientId};
+use libcompositing_rust::display_list::replay::{ReplayFrame, ReplaySelection, replay_display_list};
+use libcompositing_rust::display_list::storage::DisplayListStorage;
+use libcompositing_rust::display_list::window::RecordedWindow;
 use libcompositing_rust::ipc_types::compositor_presentation_client::messages::DidNotDispatchInputEvent;
 use libcompositing_rust::ipc_types::compositor_presentation_server::messages::{
     HandleAndDispatchKeyEvent, HandleAndDispatchMouseEvent, HandleAndDispatchPinchEvent,
 };
+use libcompositing_rust::ipc_types::compositor_web_content_client::messages::DidRasterizeDisplayList;
 use libcompositing_rust::ipc_types::compositor_web_content_server::messages::{
     ApplyScrollRequests, BeginInputTraceForTesting, BeginInputTraceForTestingResponse,
     ClearPerTestInputStateForTesting, ClearPerTestInputStateForTestingResponse, InvalidateKeyboardScrollState,
-    InvalidateKeyboardScrollStateResponse, InvalidateWheelEventListenerState, RouteFirstWheelStepForTesting,
-    RouteFirstWheelStepForTestingResponse, ScrollStateForTesting, ScrollStateForTestingResponse,
-    TakeInputTraceForTesting, TakeInputTraceForTestingResponse, TakePendingAsyncScrollUpdates,
-    TakePendingAsyncScrollUpdatesResponse, TakeWheelEventFromMainThread, TakeWheelEventFromMainThreadResponse,
-    UpdateScrollState, WheelEventCanceled, WheelEventLetThrough, WheelEventLetThroughResponse,
+    InvalidateKeyboardScrollStateResponse, InvalidateWheelEventListenerState, RasterizeDisplayList,
+    RouteFirstWheelStepForTesting, RouteFirstWheelStepForTestingResponse, ScrollStateForTesting,
+    ScrollStateForTestingResponse, TakeInputTraceForTesting, TakeInputTraceForTestingResponse,
+    TakePendingAsyncScrollUpdates, TakePendingAsyncScrollUpdatesResponse, TakeWheelEventFromMainThread,
+    TakeWheelEventFromMainThreadResponse, UpdateDisplayList, UpdateScrollState, UpdateVisualContextTree,
+    WheelEventCanceled, WheelEventLetThrough, WheelEventLetThroughResponse,
 };
 use libcompositing_rust::ipc_types::{
     Compositing_WheelEventAnswer as WheelEventAnswer, Compositing_WheelStepLetThrough as WheelStepLetThrough,
-    compositor_presentation_server, compositor_web_content_server,
+    SharedDisplayList, compositor_presentation_server, compositor_web_content_server,
 };
 use libcompositing_rust::scrolling::async_scrolling_state::AsyncScrollOperationID;
+use libcompositing_rust::scrolling::{AccumulatedVisualContextTree, DisplayList};
 use libcompositing_rust::scrolling::{
     CompositorContextId, KeyEvent, KeyModifier, MouseButton, MouseEvent, MouseEventType, PendingAsyncScrollUpdates,
-    PinchEvent, ScrollRequest, ScrollStateSnapshot,
+    PinchEvent, ScrollRequest,
 };
 use libcompositing_rust::time::MonotonicTime;
 use libgfx_rust::FloatPoint;
 use libipc_rust::Misbehavior;
+use std::io::Write;
+use std::rc::Rc;
+
+// The time a display list takes to be taken in, which WebContent's time to publish it is logged next to.
+fn display_list_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LADYBIRD_DISPLAY_LIST_TIMING").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+const DISPLAY_LIST_WITH_UNUSABLE_SCROLLING_STATE: &str =
+    "WebContent published a display list with scrolling state the compositor cannot use";
 
 // The main thread allocates the ids of the scrolls it requests from here up, so that they never meet the ids the
 // compositor allocates for scrolls of its own.
@@ -183,11 +203,259 @@ impl MessagesFromWebContent<'_> {
     }
 }
 
-impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
-    fn update_scroll_state(&mut self, message: UpdateScrollState) -> Result<(), Misbehavior> {
-        let Ok(scroll_state_snapshot) = ScrollStateSnapshot::from_encoded_bytes(&message.scroll_state) else {
-            return Err(Misbehavior("Invalid scroll state"));
+impl MessagesFromWebContent<'_> {
+    /// Rasterizes the display list `message` hands over into the bitmap staged for it, and answers whether it did.
+    fn rasterize_staged_display_list(&mut self, message: RasterizeDisplayList) -> Result<bool, Misbehavior> {
+        let raster = self.core.raster();
+        let (client, token) = (self.client_id.0, message.token);
+        let not_rasterized = |reason: &str| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: Not rasterizing display list from WebContent: {reason}"
+            );
+            raster.discard_staged_rasterization(client, token);
+            Ok(false)
         };
+        let SharedDisplayList {
+            chunks_in_paint_order,
+            packed_chunks,
+            packed_chunk_sizes,
+            properties,
+            ..
+        } = message.display_list;
+        let storage = match raster
+            .receive_display_list_chunks(packed_chunks, &packed_chunk_sizes)
+            .and_then(|sent| chunks_of_list_sent_whole(sent, &chunks_in_paint_order))
+            .and_then(|chunks| DisplayListStorage::of_received_chunks(&chunks))
+        {
+            Ok(storage) => storage,
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Compositor: Rejecting display list to rasterize from WebContent: {error}"
+                );
+                raster.discard_staged_rasterization(client, token);
+                return Err(Misbehavior(
+                    "WebContent asked to rasterize a display list its shared buffer does not hold",
+                ));
+            }
+        };
+        let tree = message.visual_context_tree;
+        if properties.compatible_visual_context_tree_structural_epoch != tree.structural_epoch
+            || !tree.display_list_references_only_live_nodes(storage.command_runs())
+        {
+            return not_rasterized("Display list does not match its visual context tree");
+        }
+        let summary = storage.summary();
+        let mut image_frame_ids = summary.image_frame_ids.clone();
+        tree.for_each_effects_filter_image_frame_id(&mut |id| image_frame_ids.push(id));
+        if !raster.staged_rasterization_has_resources(client, token, &summary.font_ids, &image_frame_ids) {
+            return not_rasterized("Display list draws resources that were not staged for it");
+        }
+        let time_ns = self.now.nanoseconds();
+        let success = raster.rasterize_staged(client, token, |painter| {
+            let frame = ReplayFrame::unscrolled(time_ns);
+            replay_display_list(
+                &tree,
+                storage.bytes(),
+                storage.command_runs(),
+                storage.effect_clip_plan(&tree),
+                properties.root_group_color,
+                &frame,
+                ReplaySelection::default(),
+                painter,
+            );
+        });
+        Ok(success)
+    }
+}
+
+impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
+    fn update_display_list(&mut self, message: UpdateDisplayList) -> Result<(), Misbehavior> {
+        let started_at = std::time::Instant::now();
+        let SharedDisplayList {
+            chunks_in_paint_order,
+            packed_chunks,
+            packed_chunk_sizes,
+            properties,
+            async_scrolling_metadata,
+        } = message.display_list;
+        let sent = match self
+            .core
+            .raster()
+            .receive_display_list_chunks(packed_chunks, &packed_chunk_sizes)
+        {
+            Ok(sent) => sent,
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Compositor: Rejecting display list from WebContent: {error}"
+                );
+                return Err(Misbehavior(
+                    "WebContent published a display list its shared buffer does not hold",
+                ));
+            }
+        };
+        let sent_chunk_count = sent.len();
+        // The chunks are taken in before anything else is checked: the list counts as one of the latest of the context
+        // on both ends whether it is installed or not.
+        let chunks = match self.core.take_in_display_list_chunks(
+            self.client_id,
+            message.context_id,
+            sent,
+            &chunks_in_paint_order,
+        ) {
+            Ok(Some(chunks)) => chunks,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(Misbehavior(error)),
+        };
+        let storage = match DisplayListStorage::of_received_chunks(&chunks) {
+            Ok(storage) => storage,
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Compositor: Dropping display list update from WebContent: {error}"
+                );
+                return Ok(());
+            }
+        };
+        let adopt_time = started_at.elapsed();
+        let tree = message.visual_context_tree;
+        if !self.context_is_owned_by_sender(message.context_id)? {
+            return Ok(());
+        }
+        if properties.compatible_visual_context_tree_structural_epoch != tree.structural_epoch {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: Dropping inconsistent display list update (display list epoch {}, tree epoch {})",
+                properties.compatible_visual_context_tree_structural_epoch,
+                tree.structural_epoch
+            );
+            return Ok(());
+        }
+        if !tree.display_list_references_only_live_nodes(storage.command_runs()) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: Dropping display list update that names nodes its visual context tree does not hold"
+            );
+            return Ok(());
+        }
+        if !self
+            .core
+            .raster()
+            .context_holds_fonts(message.context_id, &storage.summary().font_ids)
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: Dropping display list update that draws fonts its context does not hold"
+            );
+            return Ok(());
+        }
+        let mut image_frame_ids = storage.summary().image_frame_ids.clone();
+        tree.for_each_effects_filter_image_frame_id(&mut |id| image_frame_ids.push(id));
+        if !self
+            .core
+            .raster()
+            .take_registered_image_frames(message.context_id, &image_frame_ids)
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: Dropping display list update that draws image frames that are not registered"
+            );
+            return Ok(());
+        }
+        let window = match properties.window.as_ref().map(RecordedWindow::from_ipc) {
+            Some(None) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Compositor: Dropping display list update whose window no recording could have placed"
+                );
+                return Ok(());
+            }
+            window => window.flatten(),
+        };
+        let scroll_state_snapshot = message.scroll_state;
+        let storage_size = storage.bytes().len();
+        let display_list = DisplayList::new(
+            storage,
+            properties.id,
+            properties.compatible_visual_context_tree_structural_epoch,
+            async_scrolling_metadata,
+            properties.surface_clear_color,
+            properties.root_group_color,
+        )
+        .with_window(window);
+        if !self.core.install_display_list_update(
+            message.context_id,
+            Rc::new(display_list),
+            AccumulatedVisualContextTree::from_arc(tree),
+            scroll_state_snapshot,
+            self.now,
+        ) {
+            return Err(Misbehavior(DISPLAY_LIST_WITH_UNUSABLE_SCROLLING_STATE));
+        }
+        self.core.keep_only_drawn_resources(message.context_id);
+        if display_list_timing_enabled() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "DISPLAY_LIST_RECEIVE bytes={} chunks={} sent={sent_chunk_count} adopt={} µs install={} µs",
+                storage_size,
+                chunks.len(),
+                adopt_time.as_micros(),
+                (started_at.elapsed() - adopt_time).as_micros()
+            );
+        }
+        Ok(())
+    }
+
+    fn update_visual_context_tree(&mut self, message: UpdateVisualContextTree) -> Result<(), Misbehavior> {
+        let scroll_state_snapshot = message.scroll_state;
+        if !scroll_state_snapshot.has_only_finite_offsets() {
+            return Err(Misbehavior(
+                "WebContent published a visual context tree with a scroll state the compositor cannot use",
+            ));
+        }
+        let tree = message.visual_context_tree;
+        if !self.context_is_owned_by_sender(message.context_id)? {
+            return Ok(());
+        }
+        let mut image_frame_ids = Vec::new();
+        tree.for_each_effects_filter_image_frame_id(&mut |id| image_frame_ids.push(id));
+        if !self
+            .core
+            .raster()
+            .take_registered_image_frames(message.context_id, &image_frame_ids)
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: Dropping visual context tree update that draws image frames that are not registered"
+            );
+            return Ok(());
+        }
+        let tree_was_replaced = self.core.update_visual_context_tree(
+            message.context_id,
+            AccumulatedVisualContextTree::from_arc(tree),
+            scroll_state_snapshot,
+            message.keyboard_scroll_state,
+            self.now,
+        );
+        if tree_was_replaced {
+            self.core.keep_only_drawn_resources(message.context_id);
+        }
+        Ok(())
+    }
+
+    fn rasterize_display_list(&mut self, message: RasterizeDisplayList) -> Result<(), Misbehavior> {
+        let token = message.token;
+        let success = self.rasterize_staged_display_list(message)?;
+        self.core
+            .host
+            .post_to_web_content(self.client_id, DidRasterizeDisplayList { token, success });
+        Ok(())
+    }
+
+    fn update_scroll_state(&mut self, message: UpdateScrollState) -> Result<(), Misbehavior> {
+        let scroll_state_snapshot = message.scroll_state;
         if !scroll_state_snapshot.has_only_finite_offsets() {
             return Err(Misbehavior("Invalid scroll state"));
         }

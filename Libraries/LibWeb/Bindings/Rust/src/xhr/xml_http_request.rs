@@ -211,6 +211,24 @@ impl Response {
     fn extract_length(&self) -> Option<u64> {
         self.fetched().and_then(CppResponseView::extract_length)
     }
+
+    /// The length progress events report: the extracted length, or 0 (unknown) for a body with a content coding.
+    ///
+    /// AD-HOC: The spec reports the extracted length. But a content-coded body's bytes count as received once they're
+    ///         decoded, while its Content-Length counts the encoded bytes, so the received length could pass it — and
+    ///         neither says how much of the body is left. So the length of such a body is unknown, and its progress events
+    ///         aren't length-computable.
+    ///         https://github.com/whatwg/xhr/issues/403
+    fn progress_length(&self) -> u64 {
+        if self.has_content_coding() {
+            return 0;
+        }
+        self.extract_length().unwrap_or(0)
+    }
+
+    fn has_content_coding(&self) -> bool {
+        self.fetched().is_some_and(CppResponseView::has_content_coding)
+    }
 }
 
 /// https://xhr.spec.whatwg.org/#response-object
@@ -394,6 +412,8 @@ pub(crate) struct XMLHttpRequest {
     last_upload_progress_timestamp: Cell<Option<Instant>>,
     #[gc(untraced)]
     last_download_progress_timestamp: Cell<Option<Instant>>,
+    #[gc(untraced)]
+    last_download_progress_loaded: Cell<Option<u64>>,
 
     #[gc(untraced)]
     async_request: RefCell<Option<CppRequest>>,
@@ -578,6 +598,7 @@ impl XMLHttpRequest {
             request_body_transmitted: Cell::new(0),
             last_upload_progress_timestamp: Cell::new(None),
             last_download_progress_timestamp: Cell::new(None),
+            last_download_progress_loaded: Cell::new(None),
             async_request: RefCell::new(None),
             async_send_start_time: Cell::new(None),
             timeout_timer: GcRefCell::new(None),
@@ -1453,6 +1474,7 @@ impl XMLHttpRequest {
             this.request_body_transmitted.set(0);
             this.last_upload_progress_timestamp.set(None);
             this.last_download_progress_timestamp.set(None);
+            this.last_download_progress_loaded.set(None);
 
             // 3. Let requestBodyLength be req’s body’s length, if req’s body is non-null; otherwise 0.
             // NOTE: req's body is always this's request body, see step 6.
@@ -1668,7 +1690,7 @@ impl XMLHttpRequest {
 
         // 8. Let length be the result of extracting a length from this’s response’s header list.
         // 9. If length is not an integer, then set it to 0.
-        let length = this.response.borrow().extract_length().unwrap_or(0);
+        let length = this.response.borrow().progress_length();
 
         // Pre-allocate received bytes buffer if Content-Length is known.
         if let Ok(length) = usize::try_from(length) {
@@ -1724,6 +1746,7 @@ impl XMLHttpRequest {
 
         // 5. Fire a progress event named progress at this with this’s received bytes’s length and length.
         let received_length = self.received_bytes.borrow().len() as u64;
+        self.last_download_progress_loaded.set(Some(received_length));
         self.fire_progress_event(vm, "progress", received_length, length);
     }
 
@@ -1993,10 +2016,13 @@ impl XMLHttpRequest {
 
         // 4. Let length be the result of extracting a length from this’s response’s header list.
         // 5. If length is not an integer, then set it to 0.
-        let length = self.response.borrow().extract_length().unwrap_or(0);
+        let length = self.response.borrow().progress_length();
 
         // 6. If xhr’s synchronous flag is unset, then fire a progress event named progress at xhr with transmitted and length.
-        if !self.synchronous.get() {
+        // AD-HOC: Not when the last progress event already reported transmitted, i.e. no bytes arrived since. The spec
+        //         would fire that event again, though nothing progressed, and web-platform-tests require loaded to grow
+        //         from one progress event to the next.
+        if !self.synchronous.get() && self.last_download_progress_loaded.get() != Some(transmitted) {
             self.fire_progress_event(vm, "progress", transmitted, length);
         }
 

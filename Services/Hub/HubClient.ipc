@@ -15,6 +15,7 @@
 #include <LibURL/URL.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
+#include <LibWebCommon/MediaSession/MediaSessionState.h>
 #include <LibWebCommon/Gamepad/GamepadSnapshot.h>
 #include <LibWebCommon/Page/SpellingError.h>
 #include <LibWebCommon/Page/Translation.h>
@@ -29,6 +30,7 @@
 #include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/TabPerformanceStats.h>
+#include <LibWebView/UpdateCheck.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebView/Application.h>
@@ -204,6 +206,7 @@ struct Hub::ViewState {
     bool is_loading;
     bool crash_overlay_active;
     String crash_overlay_failed_url;
+    bool crash_overlay_is_for_memory_limit;
     Optional<ByteString> crash_report_name;
     Optional<String> crash_report_website;
     double zoom_level;
@@ -242,12 +245,14 @@ endpoint HubClient
     view_selected_text(u64 view_id, u64 request_id, Optional<ByteString> text) =|
     view_close_preflight_finished(u64 view_id, u64 request_id, bool may_close) =|
     view_page_dumps(u64 view_id, u64 request_id, Optional<String> dumps) =|
+    platform_features_description(u64 request_id, ByteString description) =|
     pip_open(u64 view_id, u64 owner_view_id, Gfx::IntSize video_size) =|
     pip_hide(u64 view_id) =|
     pip_set_video_size(u64 view_id, Gfx::IntSize video_size) =|
     pip_close(u64 view_id) =|
     notification_show(u64 id, u64 page_id, Optional<u64> replaces, Web::NotificationsAPI::NotificationData data, String attribution, Optional<Gfx::ShareableBitmap> icon) =|
     notification_close(u64 id) =|
+    media_session_update(Optional<Web::MediaSession::MediaSessionState> state) =|
     geolocation_start() =|
     geolocation_request_position(u64 id) =|
     geolocation_cancel_position_request(u64 id) =|
@@ -288,12 +293,13 @@ endpoint HubClient
     app_update_tabs_display() =|
     app_did_clear_history_since(UnixDateTime since) =|
     app_quit_for_signal() =|
-    app_did_enable_devtools() =|
+    app_did_enable_devtools(u16 port) =|
     app_did_disable_devtools() =|
     app_open_urls_in_new_tabs(Vector<URL::URL> urls) =|
     app_activate_or_open_tab_with_url(URL::URL url) =|
     app_open_view_in_new_tab(u64 view_id, Optional<u64> source_view_id, WebView::IsPrivate is_private, Web::HTML::ActivateTab activate_tab) =|
     app_display_error_dialog(String message) =|
+    app_display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger) =|
     app_display_download_confirmation_dialog(String download_name, ByteString path) =|
     app_read_clipboard_text(u64 request_id, WebView::Application::ClipboardType type) =|
     app_read_clipboard_item(u64 request_id) =|
@@ -325,6 +331,12 @@ endpoint HubClient
     view_keep_front_backing_store_as_backup(u64 view_id) =|
     view_clear_backup_backing_store(u64 view_id) =|
     view_clear_backing_stores(u64 view_id) =|
+    // The handle's kind is None when the view has no remote layer, and the UI goes on showing backing stores.
+    view_set_remote_layer(u64 view_id, Compositing::RemoteLayerHostHandle host_handle) =|
+    view_did_present_frame_in_remote_layer(u64 view_id, Gfx::IntSize size, double device_pixel_ratio) =|
+    view_did_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::ShareableBitmap> snapshot) =|
+    view_did_hold_synchronized_resize_frame(u64 view_id, u64 token) =|
+    view_did_commit_synchronized_resize(u64 view_id, u64 token) =|
     view_finish_handling_key_event(u64 view_id, u64 input_id, Web::KeyEvent event) =|
     view_finish_handling_mouse_event(u64 view_id, u64 input_id, Web::MouseEvent event, Web::EventResult result) =|
     view_finish_handling_drag_event(u64 view_id, u64 input_id, Web::DragEvent event) =|

@@ -306,6 +306,44 @@ void append_vp9_configuration_box(ByteBuffer& bytes)
     finish_box(bytes, configuration);
 }
 
+// BT.2020 primaries and a D65 white point mastered from 0.005 to 1000 cd/m², with primaries in mdcv's green, blue, red
+// order.
+void append_vp9_configuration_and_high_dynamic_range_boxes(ByteBuffer& bytes)
+{
+    append_vp9_configuration_box(bytes);
+
+    auto mastering_display_colour_volume = begin_box(bytes, "mdcv");
+    for (u16 value : { 8500, 39850, 6550, 2300, 35400, 14600, 15635, 16450 })
+        append_u16(bytes, value);
+    append_u32(bytes, 10'000'000);
+    append_u32(bytes, 50);
+    finish_box(bytes, mastering_display_colour_volume);
+
+    auto content_light_level = begin_box(bytes, "clli");
+    append_u16(bytes, 1005);
+    append_u16(bytes, 315);
+    finish_box(bytes, content_light_level);
+}
+
+// Each box is a byte short of the fields it holds.
+void append_vp9_configuration_and_truncated_high_dynamic_range_boxes(ByteBuffer& bytes)
+{
+    append_vp9_configuration_box(bytes);
+
+    auto mastering_display_colour_volume = begin_box(bytes, "mdcv");
+    for (u16 value : { 8500, 39850, 6550, 2300, 35400, 14600, 15635, 16450 })
+        append_u16(bytes, value);
+    append_u32(bytes, 10'000'000);
+    append_u16(bytes, 0);
+    bytes.append(50);
+    finish_box(bytes, mastering_display_colour_volume);
+
+    auto content_light_level = begin_box(bytes, "clli");
+    append_u16(bytes, 1005);
+    bytes.append(1);
+    finish_box(bytes, content_light_level);
+}
+
 void append_video_movie(ByteBuffer& bytes, char const (&format)[5], void (*append_configuration_box)(ByteBuffer&), ColourBoxOrder colour_box_order, Function<void(ByteBuffer&)> const& append_tables = {}, bool fragmented = false)
 {
     auto movie = begin_box(bytes, "moov");
@@ -438,6 +476,8 @@ void append_audio_movie(ByteBuffer& bytes, u32 timescale, u32 sample_rate, u16 c
 struct SampleEntrySummary {
     Optional<Media::CodingIndependentCodePoints> cicp;
     Optional<Media::ParsedCodec> parsed_codec;
+    Optional<Media::MasteringDisplayColorVolume> mastering_display_color_volume;
+    Optional<Media::ContentLightLevelInformation> content_light_level_information;
 };
 
 Media::DecoderErrorOr<Media::ISOBMFF::Movie> parse_movie(ByteBuffer& bytes)
@@ -454,7 +494,8 @@ SampleEntrySummary parse_only_sample_entry(ByteBuffer& bytes)
     auto movie = MUST(Media::ISOBMFF::Reader::parse_movie_box(streamer, header));
     auto const& sample_entries = movie.tracks.get(1).value()->sample_entries;
     VERIFY(sample_entries.size() == 1);
-    return { sample_entries[0].video->cicp, sample_entries[0].parsed_codec };
+    auto const& video = *sample_entries[0].video;
+    return { video.cicp, sample_entries[0].parsed_codec, video.mastering_display_color_volume, video.content_light_level_information };
 }
 
 }
@@ -1373,6 +1414,55 @@ TEST_CASE(parses_vp_codec_configuration_box)
     EXPECT_EQ(entry.cicp->transfer_characteristics(), Media::TransferCharacteristics::SMPTE2084);
 }
 
+static void append_vp9_configuration_box_and_quicktime_terminator(ByteBuffer& bytes)
+{
+    append_vp9_configuration_box(bytes);
+    append_u32(bytes, 0);
+}
+
+static void append_vp9_configuration_box_and_three_trailing_bytes(ByteBuffer& bytes)
+{
+    append_vp9_configuration_box(bytes);
+    bytes.append(1);
+    bytes.append(2);
+    bytes.append(3);
+}
+
+TEST_CASE(skips_trailing_bytes_too_short_for_a_box_at_the_end_of_a_sample_entry)
+{
+    for (auto append_configuration_box : { append_vp9_configuration_box_and_quicktime_terminator, append_vp9_configuration_box_and_three_trailing_bytes }) {
+        ByteBuffer bytes;
+        append_video_movie(bytes, "vp09", append_configuration_box, ColourBoxOrder::None);
+        auto entry = parse_only_sample_entry(bytes);
+
+        EXPECT(entry.parsed_codec.has_value());
+        EXPECT_EQ(entry.parsed_codec->vp9_parameters()->profile, 2);
+    }
+}
+
+TEST_CASE(leaves_the_streamer_at_the_parent_end_after_trailing_bytes_too_short_for_a_box)
+{
+    ByteBuffer bytes;
+    auto parent = begin_box(bytes, "moof");
+    auto child = begin_box(bytes, "free");
+    finish_box(bytes, child);
+    bytes.append(1);
+    bytes.append(2);
+    bytes.append(3);
+    finish_box(bytes, parent);
+    append_u32(bytes, 0); // Whatever follows the parent.
+
+    auto streamer = streamer_for(bytes);
+    auto header = MUST(Media::ISOBMFF::Reader::read_box_header(streamer));
+    size_t child_count = 0;
+    MUST(Media::ISOBMFF::Reader::parse_child_boxes(streamer, header, Media::ISOBMFF::IsTopLevel::No, [&](auto const&) -> Media::DecoderErrorOr<IterationDecision> {
+        ++child_count;
+        return IterationDecision::Continue;
+    }));
+    EXPECT_EQ(child_count, 1u);
+    EXPECT_EQ(streamer.position(), header.end_position().value());
+}
+
 TEST_CASE(colour_information_box_overrides_the_vp_configuration_box_in_either_order)
 {
     for (auto order : { ColourBoxOrder::BeforeConfiguration, ColourBoxOrder::AfterConfiguration }) {
@@ -1388,6 +1478,42 @@ TEST_CASE(colour_information_box_overrides_the_vp_configuration_box_in_either_or
         EXPECT(entry.parsed_codec.has_value());
         EXPECT_EQ(entry.parsed_codec->vp9_parameters()->profile, 2);
     }
+}
+
+TEST_CASE(parses_mastering_display_colour_volume_and_content_light_level_boxes)
+{
+    ByteBuffer bytes;
+    append_video_movie(bytes, "vp09", append_vp9_configuration_and_high_dynamic_range_boxes, ColourBoxOrder::None);
+    auto entry = parse_only_sample_entry(bytes);
+
+    EXPECT(entry.content_light_level_information.has_value());
+    EXPECT_EQ(entry.content_light_level_information->maximum_content_light_level, 1005);
+    EXPECT_EQ(entry.content_light_level_information->maximum_frame_average_light_level, 315);
+
+    EXPECT(entry.mastering_display_color_volume.has_value());
+    auto const& volume = *entry.mastering_display_color_volume;
+    EXPECT_APPROXIMATE(volume.red.x, 0.708f);
+    EXPECT_APPROXIMATE(volume.red.y, 0.292f);
+    EXPECT_APPROXIMATE(volume.green.x, 0.170f);
+    EXPECT_APPROXIMATE(volume.green.y, 0.797f);
+    EXPECT_APPROXIMATE(volume.blue.x, 0.131f);
+    EXPECT_APPROXIMATE(volume.blue.y, 0.046f);
+    EXPECT_APPROXIMATE(volume.white_point.x, 0.3127f);
+    EXPECT_APPROXIMATE(volume.white_point.y, 0.3290f);
+    EXPECT_APPROXIMATE(volume.maximum_luminance, 1000.0f);
+    EXPECT_APPROXIMATE(volume.minimum_luminance, 0.005f);
+}
+
+TEST_CASE(truncated_mastering_display_colour_volume_and_content_light_level_boxes_are_skipped)
+{
+    ByteBuffer bytes;
+    append_video_movie(bytes, "vp09", append_vp9_configuration_and_truncated_high_dynamic_range_boxes, ColourBoxOrder::AfterConfiguration);
+    auto entry = parse_only_sample_entry(bytes);
+
+    EXPECT(!entry.mastering_display_color_volume.has_value());
+    EXPECT(!entry.content_light_level_information.has_value());
+    EXPECT(entry.cicp.has_value());
+    EXPECT_EQ(entry.cicp->color_primaries(), Media::ColorPrimaries::BT709);
 }
 
 TEST_CASE(parses_av1_configuration_box_color_from_its_sequence_header)

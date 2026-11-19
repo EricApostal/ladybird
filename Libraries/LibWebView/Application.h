@@ -53,7 +53,9 @@
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/MediaSessionCoordinator.h>
 #include <LibWebView/Options.h>
+#include <LibWebView/PlatformFeatureDecisions.h>
 #include <LibWebView/Process.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/Profile.h>
@@ -96,6 +98,9 @@ public:
     static Profile const& profile() { return *the().m_profile; }
     BrowserProcess& browser_process() { return *m_browser_process; }
     bool should_exit_after_profile_coordination() const { return m_should_exit_after_profile_coordination; }
+    // Whether the process exits because a browser is running for the profile, but does not take what we were asked to
+    // open.
+    bool browser_is_unresponsive() const { return m_browser_is_unresponsive; }
 
     static BrowserOptions const& browser_options() { return the().m_browser_options; }
     static RequestServerOptions const& request_server_options() { return the().m_request_server_options; }
@@ -199,8 +204,6 @@ public:
 
     static NonnullRefPtr<BrowsingSession> session_for_new_view(IsPrivate);
 
-    static RefPtr<BrowsingSession> existing_session(IsPrivate);
-
     // Whether the windows and tabs of this run are kept for the next one. A headless run, a browser that WebDriver drives,
     // and one that logs process statistics never join a browser already running on their profile, so they keep none.
     bool persists_sessions() const { return m_persists_sessions; }
@@ -238,8 +241,13 @@ public:
         Web::PageId page_id { 0 };
     };
     // For what may share a process with no page. It ends once nothing keeps it.
-    ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process_without_page(IsPrivate);
+    ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process_without_page(BrowsingSession&);
     ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state);
+
+    MediaSessionCoordinator& media_session_coordinator() { return m_media_session_coordinator; }
+    virtual OwnPtr<MediaSessionPlatformBackend> create_media_session_platform_backend();
+    void set_media_session_platform_backend(OwnPtr<MediaSessionPlatformBackend>);
+
     Web::PageId allocate_page_id();
     Web::HTML::CrossProcessIdAllocator allocate_cross_process_id_allocator();
     Web::HTML::CrossProcessId allocate_ui_process_cross_process_id();
@@ -265,9 +273,25 @@ public:
     ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
     void update_compositor_viewport(Web::CompositorContextId, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
     void update_compositor_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays const&);
+    void update_compositor_high_dynamic_range_surfaces();
     void update_compositor_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void update_compositor_context_visibility(Web::CompositorContextId, Web::HTML::VisibilityState);
     void update_compositor_context_presents_from_cpu_memory(Web::CompositorContextId, bool);
+    void update_compositor_context_scales_frames_to_fit(Web::CompositorContextId, bool);
+
+    struct RemoteLayer {
+        u64 id { 0 };
+        Compositing::RemoteLayerHostHandle host_handle;
+    };
+    // None where the Compositor offers no remote layers, or is gone.
+    Optional<RemoteLayer> create_remote_layer();
+    void destroy_remote_layer(u64 remote_layer_id);
+    void show_context_in_remote_layer(u64 remote_layer_id, Optional<Web::CompositorContextId>);
+    void set_remote_layer_fit(u64 remote_layer_id, Optional<Gfx::IntSize> fit_within);
+    void begin_synchronized_resize(u64 remote_layer_id, u64 token);
+    void await_synchronized_resize_frame(u64 remote_layer_id, u64 token, Gfx::IntSize);
+    void commit_synchronized_resize(u64 remote_layer_id, u64 token);
+    void take_frame_snapshot(Web::CompositorContextId, Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)>);
     bool handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&, bool allow_keyboard_scroll);
     bool handle_and_dispatch_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
     bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
@@ -288,8 +312,6 @@ public:
 
     virtual void resolve_external_url_handler(URL::URL const&, ExternalURLHandlerCallback callback) const { callback(nullptr); }
 
-    Main::Arguments const& command_line_arguments() const { return m_arguments; }
-
     ChildIdentity add_child_process(Process&&);
 
     // FIXME: Should these methods be part of Application, instead of deferring to ProcessManager?
@@ -305,6 +327,9 @@ public:
 
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;
     virtual void display_error_dialog(StringView error_message) const;
+    virtual void display_update_check_result(UpdateCheckResult const&, UpdateCheckTrigger) { }
+
+    UpdateChecker* update_checker() { return m_update_checker.ptr(); }
 
     // FIXME: We should implement UI-agnostic platform APIs to interact with the system clipboard.
     enum class ClipboardType : u8 {
@@ -359,6 +384,7 @@ public:
     bool devtools_enabled() const { return m_devtools; }
     void dump_cookies() const;
     void crash_compositor_process();
+    bool has_compositor_process() const { return m_compositor_client; }
 
     FileDownloader& file_downloader() { return m_file_downloader; }
 
@@ -380,6 +406,15 @@ public:
     using CompositorGpuDeviceIdentityCallback = Function<void(Optional<Gfx::GpuDeviceIdentity> const&)>;
     void when_compositor_gpu_device_identity_is_known(CompositorGpuDeviceIdentityCallback);
 
+    // Calls back once the features are decided from this launch's probe rather than from cached facts.
+    void when_platform_features_are_current(Function<void()>);
+    PlatformFeatures::ProcessFeatures platform_features_for(FeatureProcess) const;
+    // Every feature's decision and the facts they were made from, for people to read.
+    JsonObject platform_features_report() const;
+    // The same as header lines of a report that leaves the machine: the features of one process or of all of them, the
+    // GPU, and every fact but the device's identity.
+    ByteString describe_platform_features_for_report(Optional<FeatureProcess>) const;
+
 protected:
     explicit Application(Optional<ByteString> ladybird_binary_path = {});
 
@@ -394,6 +429,8 @@ protected:
     virtual NonnullOwnPtr<MicrophoneAuthorizer> create_microphone_authorizer();
 
     virtual bool should_coordinate_browser_process() const { return true; }
+    // The process that shows this browser to the user, if that is not this process.
+    virtual Optional<pid_t> ui_process_id() const { return {}; }
     virtual bool captures_browser_crashes() const { return false; }
     virtual bool should_use_os_geolocation() const { return true; }
     virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::IFrame; }
@@ -416,17 +453,30 @@ protected:
     bool has_spare_web_content_process() const { return m_spare_web_content_process; }
 
 private:
-    ErrorOr<void> create_profile(Optional<StringView> profile_name, Optional<StringView> profile_path, bool force_new_process, bool temporary_profile);
+    ErrorOr<void> create_profile(Optional<StringView> profile_name, Optional<StringView> profile_path, bool temporary_profile);
     void create_mach_port_server(ByteString const& profile_identity);
     void update_website_color_scheme();
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(IsPrivate, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(BrowsingSession&, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
 
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
+    enum class CompositorLaunch {
+        Now,
+        WhenPlatformFeaturesAreCurrent,
+    };
+    CompositorLaunch prepare_platform_features();
+    JsonArray platform_features_json(Optional<FeatureProcess>) const;
+    void system_facts_arrived(SystemFacts const&);
+    void reevaluate_platform_features();
     ErrorOr<void> launch_compositor_process();
+    void bring_up_compositor_process();
+#if defined(AK_OS_WINDOWS)
+    bool is_window_of_compositor_process(u64 window_handle);
+#endif
     void compositor_reported_gpu_device_identity(Optional<Gfx::GpuDeviceIdentity>);
     void handle_compositor_process_death();
     void recover_compositor_process();
+    void relaunch_compositor_process(bool counts_as_crash);
     ErrorOr<void> launch_request_server();
     ErrorOr<void> launch_devtools_server();
     // Returns whether the combined rules changed.
@@ -549,9 +599,12 @@ private:
     OwnPtr<Settings> m_settings;
     OwnPtr<BrowserProcess> m_browser_process;
     bool m_should_exit_after_profile_coordination { false };
+    bool m_browser_is_unresponsive { false };
     OwnPtr<ApplicationSettingsObserver> m_settings_observer;
     OwnPtr<ApplicationPermissionManagerObserver> m_permission_manager_observer;
     RefPtr<Core::Timer> m_permission_expiry_timer;
+
+    MediaSessionCoordinator m_media_session_coordinator;
 
     Main::Arguments m_arguments;
     OwnPtr<Core::StatsLog> m_stats_log;
@@ -569,6 +622,8 @@ private:
     JsonValue m_site_compatibility_data;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
     RefPtr<Core::Timer> m_content_blocker_list_update_timer;
+    ByteString m_instance_data_directory;
+    OwnPtr<UpdateChecker> m_update_checker;
     struct PendingContentBlockerListUpdate {
         String identifier;
         String name;
@@ -596,11 +651,25 @@ private:
     RefPtr<CompositorClient> m_compositor_client;
     RefPtr<CompositorPresentationClient> m_compositor_presentation_client;
     u64 m_compositor_presentation_id { 0 };
+    // IDs are never reused, so one from before a Compositor restart names no layer of the new process.
+    u64 m_next_remote_layer_id { 1 };
     bool m_reported_compositor_gpu_presentation_unavailable { false };
     // The last identity a Compositor reported, which outlives that Compositor until its replacement reports.
     Optional<Optional<Gfx::GpuDeviceIdentity>> m_compositor_gpu_device_identity;
     Vector<CompositorGpuDeviceIdentityCallback> m_callbacks_awaiting_compositor_gpu_device_identity;
     size_t m_compositor_restart_count { 0 };
+    // Set when the Browser ends a Compositor to relaunch it with other features, which does not count as a crash.
+    bool m_compositor_relaunch_is_planned { false };
+    ByteString m_compositor_launched_features;
+
+    FeatureOverrides m_feature_overrides;
+    HashMap<PlatformFeatures::Feature, String> m_feature_runtime_failures;
+    // The facts the decisions were made from, which are the cached ones until the probe reports.
+    SystemFacts m_system_facts;
+    Optional<PlatformFeatureDecisions> m_platform_feature_decisions;
+    OwnPtr<SystemProbeClient> m_system_probe;
+    Vector<Function<void()>> m_callbacks_awaiting_current_platform_features;
+
     enum class CompositorRecoveryState {
         Idle,
         Queued,

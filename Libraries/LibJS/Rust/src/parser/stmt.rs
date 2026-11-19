@@ -268,6 +268,8 @@ impl<U: Unit> Parser<'_, U> {
                 let func = self.new_function_id(NONE);
                 self.summary_rows[func as usize] = summary_row;
                 self.open_scope_with(scope_flag::WITH, func);
+                // NB: `arguments` in the body may be a property of the object.
+                self.arguments_other_uses += 1;
                 self.with_depth += 1;
                 let body = self.parse_statement(Context::Single, false);
                 self.with_depth -= 1;
@@ -1023,6 +1025,9 @@ impl<U: Unit> Parser<'_, U> {
             uses_this: false,
             uses_this_from_environment: false,
             might_need_arguments: false,
+            arguments_other_uses: 0,
+            reads_arguments_index: false,
+            may_write_parameters: false,
             in_class_of_sloppy_function: self.in_class_of_sloppy_function,
             is_arrow: false,
             summary_ordinal: 0,
@@ -1442,16 +1447,17 @@ impl<U: Unit> Parser<'_, U> {
         is_name_like(self.tok) || matches!(self.tok, T::PrivateName | T::Num | T::BigInt | T::Str | T::LBracket)
     }
 
-    fn key_is(&self, key: u32, computed: bool, word: u32, text: &[u8]) -> bool {
+    fn key_is(&self, key: u32, computed: bool, word: u32, text: &str) -> bool {
         if computed {
             return false;
         }
         match self.ast.tag[key as usize] {
             tag::IDENT | tag::IDENT_KEY => self.ast.a[key as usize] == word,
             tag::STR | tag::STR_KEY => {
-                let start = self.ast.pos[key as usize] as usize;
-                self.ast.a[key as usize] as usize - start == text.len() + 2
-                    && (0..text.len()).all(|i| self.at(start + 1 + i) == text[i] as u32)
+                // NB: The name of the property is the value of the string, which escape sequences spell out as well.
+                let start = self.ast.pos[key as usize] as usize + 1;
+                let units = self.source_view(start, self.ast.a[key as usize] as usize - 1);
+                super::literals::string_literal_text(units).view() == text
             }
             _ => false,
         }
@@ -1521,7 +1527,7 @@ impl<U: Unit> Parser<'_, U> {
 
         if self.tok == T::LParen || accessor != 0 || is_generator || is_async {
             let is_constructor =
-                !is_static && private_name == NONE && self.key_is(key, computed, N_CONSTRUCTOR, b"constructor");
+                !is_static && private_name == NONE && self.key_is(key, computed, N_CONSTRUCTOR, "constructor");
             if is_constructor {
                 if accessor != 0 {
                     self.fail(key_start, "Constructor can't have a get or set modifier");
@@ -1533,7 +1539,7 @@ impl<U: Unit> Parser<'_, U> {
                     self.fail(key_start, "Duplicate constructor in the same class");
                 }
                 *had_constructor = true;
-            } else if is_static && private_name == NONE && self.key_is(key, computed, N_PROTOTYPE, b"prototype") {
+            } else if is_static && private_name == NONE && self.key_is(key, computed, N_PROTOTYPE, "prototype") {
                 self.fail(key_start, "Classes may not have a static property named 'prototype'");
             }
             if private_name != NONE {
@@ -1550,7 +1556,7 @@ impl<U: Unit> Parser<'_, U> {
                 let row = self.ast.b[function as usize] as usize;
                 self.index.flags[row] |= function_flag::INSIGHT_USES_THIS;
                 if has_super_class {
-                    self.index.flags[row] |= function_flag::INSIGHT_THIS_FROM_ENVIRONMENT;
+                    self.index.flags[row] |= function_flag::DERIVED_CONSTRUCTOR;
                 }
             }
             if accessor != 0 {
@@ -1572,9 +1578,9 @@ impl<U: Unit> Parser<'_, U> {
             };
         }
 
-        if self.key_is(key, computed, N_CONSTRUCTOR, b"constructor") {
+        if self.key_is(key, computed, N_CONSTRUCTOR, "constructor") {
             self.fail(key_start, "Classes can't have a field named 'constructor'");
-        } else if is_static && self.key_is(key, computed, N_PROTOTYPE, b"prototype") {
+        } else if is_static && self.key_is(key, computed, N_PROTOTYPE, "prototype") {
             self.fail(key_start, "Classes can't have a static field named 'prototype'");
         }
         if private_name != NONE {

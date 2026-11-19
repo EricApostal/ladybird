@@ -28,11 +28,11 @@
 //!   that have a representation (or virtual objects);
 //! - slow path calls have a frame state, and those that save registers
 //!   are in cold blocks;
-//! - `StoreSlot` writes only the reserved registers, written constants, the
-//!   arguments the compiled function's legacy `arguments` shows, and slots
-//!   that the next call reading the frame (a `Generic` node, or a call that
-//!   reads its operands from the frame) or `Suspend` reads (see
-//!   `verify_frame_writes()`).
+//! - `StoreSlot` writes only written constants, the arguments the compiled
+//!   function's legacy `arguments` shows, and slots that the next call
+//!   reading the frame (a `Generic` node, or a call that reads its operands
+//!   from the frame) or `Suspend` reads (see `verify_frame_writes()`), and
+//!   never one of `Graph::unwritten_slots`.
 
 use super::dominators::Dominators;
 use crate::bytecode::FrameLayout;
@@ -54,12 +54,9 @@ struct Place {
     index: usize,
 }
 
-/// Checks that `StoreSlot` writes frame memory only where nothing else can:
-/// the reserved registers (the this value and the saved lexical
-/// environment, which slow paths write there too), written constants, the
-/// arguments the compiled function's legacy `arguments` shows, and the slots
-/// a node that reads the frame reads, right before it. Merges and back edges
-/// never write frame memory: slots that differ get phis.
+/// Checks that `StoreSlot` writes frame memory only where something reads it: written constants, which live there,
+/// the arguments the compiled function's legacy `arguments` shows, and the slots a node that reads the frame reads,
+/// right before it. Merges and back edges never write frame memory: slots that differ get phis.
 pub fn verify_frame_writes(graph: &Graph, layout: &FrameLayout) -> Result<(), String> {
     let mut errors = Vec::new();
     for (index, block) in graph.blocks.iter().enumerate() {
@@ -74,23 +71,28 @@ pub fn verify_frame_writes(graph: &Graph, layout: &FrameLayout) -> Result<(), St
                 continue;
             };
             let operand = Operand::from_raw(slot).raw();
+            if graph.is_unwritten_slot(operand) {
+                errors.push(format!(
+                    "StoreSlot v{} in b{index} writes slot {operand}, which nothing writes (see `Graph::unwritten_slots`)",
+                    node.0
+                ));
+            }
             let is_constant = operand >= layout.registers_and_locals_count && operand < layout.arguments_base();
-            if operand < RESERVED_REGISTER_COUNT || is_constant || graph.legacy_arguments.contains(&operand) {
+            if is_constant || graph.legacy_arguments.contains(&operand) {
                 continue;
             }
             // NB: Conversions of the reader's inputs may come in between, and
-            //     so may the frame's initialization for stores of arguments,
-            //     which it leaves as they are (see `frame_initialization`).
-            let is_argument = operand >= layout.arguments_base();
+            //     so may the frame's initialization for stores of arguments
+            //     and reserved registers, which it leaves as they are (see
+            //     `frame_initialization`).
+            let survives_initialization = operand >= layout.arguments_base() || operand < RESERVED_REGISTER_COUNT;
             let reader = nodes[position + 1..].iter().find(|next| {
                 let op = &graph.node(**next).op;
                 let properties = op.properties();
-                let initializes_frame = matches!(
-                    op,
-                    Op::InitializeFrame { .. } | Op::EnsureFrameInitialized { .. } | Op::PublishFrame
-                );
+                let initializes_frame =
+                    matches!(op, Op::InitializeFrame | Op::EnsureFrameInitialized | Op::PublishFrame);
                 !matches!(op, Op::StoreSlot { .. })
-                    && !(is_argument && initializes_frame)
+                    && !(survives_initialization && initializes_frame)
                     && (properties.reads != Locations::NONE || properties.writes != Locations::NONE)
             });
             let reads_frame = reader.is_some_and(|reader| {
@@ -314,7 +316,8 @@ fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
                             node_id.0, value.0
                         ));
                     }
-                    if graph.node(value).repr == Some(Repr::Pointer) {
+                    // NB: Only the environments of virtual closures are cell addresses (see `VirtualObjectKind`).
+                    if graph.node(value).repr == Some(Repr::Pointer) && slot != crate::ir::VIRTUAL_OBJECT_PROPERTY {
                         errors.push(format!(
                             "the frame state of v{} has the cell address v{} for slot {slot}",
                             node_id.0, value.0
@@ -465,135 +468,19 @@ fn verify_frame_states(graph: &Graph) -> Result<(), String> {
     }
 }
 
-fn branch_input_reprs(condition: crate::ir::BranchCondition) -> Vec<Repr> {
-    let tagged = |count: usize| vec![Repr::Tagged; count];
-    match condition {
-        crate::ir::BranchCondition::Bool => vec![Repr::Bool],
-        crate::ir::BranchCondition::Int32(_) => vec![Repr::Int32, Repr::Int32],
-        crate::ir::BranchCondition::Float64(_) => vec![Repr::Float64, Repr::Float64],
-        crate::ir::BranchCondition::TaggedEquals { .. } => tagged(2),
-        crate::ir::BranchCondition::Nullish
-        | crate::ir::BranchCondition::Undefined
-        | crate::ir::BranchCondition::Object
-        | crate::ir::BranchCondition::NonNegativeInt32
-        | crate::ir::BranchCondition::Int32Value
-        | crate::ir::BranchCondition::Int32OrBoolean
-        | crate::ir::BranchCondition::Double
-        | crate::ir::BranchCondition::String
-        | crate::ir::BranchCondition::ElementsKind(_)
-        | crate::ir::BranchCondition::Builtin(_) => tagged(1),
-        crate::ir::BranchCondition::ResolvedString
-        | crate::ir::BranchCondition::MagicalLength
-        | crate::ir::BranchCondition::Extensible
-        | crate::ir::BranchCondition::HoleFillableArray
-        | crate::ir::BranchCondition::ArrayIterator
-        | crate::ir::BranchCondition::GeneratorObject
-        | crate::ir::BranchCondition::PlainArrayPrototypeChain
-        | crate::ir::BranchCondition::ArrayWithRealmArrayPrototypeAndNoNamedProperties
-        | crate::ir::BranchCondition::HoldsValidWatchpointSet => vec![Repr::Pointer],
-        crate::ir::BranchCondition::Shape(_) => vec![Repr::Tagged, Repr::Pointer],
-        crate::ir::BranchCondition::PropertyIteratorCacheValid => tagged(2),
-        crate::ir::BranchCondition::BindingMutable { .. } | crate::ir::BranchCondition::NextBindingOfShape { .. } => {
-            vec![Repr::Pointer]
-        }
-        crate::ir::BranchCondition::IndexInBounds => vec![Repr::Int32, Repr::Int32],
-    }
-}
-
-/// The representations a node requires of its inputs, if it requires any.
-fn expected_input_reprs(graph: &Graph, node: NodeId) -> Option<Vec<Repr>> {
-    let node = graph.node(node);
-    let tagged = |count: usize| vec![Repr::Tagged; count];
-    match node.op {
-        Op::Phi | Op::Constant(_) | Op::StoreSlot { .. } => None,
-        Op::Branch { condition, .. } | Op::Refine { condition, .. } => Some(branch_input_reprs(condition)),
-        Op::UnboxInt32 | Op::UnboxDouble | Op::CheckNumber | Op::StringAddress => Some(tagged(1)),
-        Op::StringLength => Some(vec![Repr::Pointer]),
-        Op::BoxFloat64
-        | Op::Float64Unary { .. }
-        | Op::Float64ToInt32
-        | Op::Float64ToUint8Clamped
-        | Op::CheckFloat64Int32 => Some(vec![Repr::Float64]),
-        Op::Float64Binary { .. } | Op::Float64Min | Op::Float64Max | Op::Float64Compare { .. } => {
-            Some(vec![Repr::Float64, Repr::Float64])
-        }
-        Op::CallFloat64Function { function } => Some(vec![Repr::Float64; function.argument_count()]),
-        Op::Int32Min | Op::Int32Max | Op::Uint32Min => Some(vec![Repr::Int32, Repr::Int32]),
-        Op::Uint32ShiftRight => Some(vec![Repr::Int32, Repr::Int32]),
-        Op::Uint32ToFloat64 | Op::IntegerToString => Some(vec![Repr::Int32]),
-        Op::StringsEqual | Op::ConcatenateStrings | Op::ToObject => Some(tagged(2)),
-        Op::PrimitiveToString => Some(tagged(1)),
-        Op::CallIntrinsic { intrinsic } => intrinsic.helper_call().map(|call| {
-            std::iter::once(call.receiver)
-                .chain(call.arguments.iter().copied())
-                .map(|operand| operand.repr())
-                .collect()
-        }),
-        Op::ArrayCreate => Some(vec![Repr::Int32, Repr::Tagged]),
-        Op::CallArraySplice => {
-            let mut inputs = tagged(node.inputs.len());
-            if inputs.len() < 3 {
-                return Some(vec![Repr::Tagged, Repr::Int32, Repr::Int32]);
-            }
-            inputs[1] = Repr::Int32;
-            inputs[2] = Repr::Int32;
-            Some(inputs)
-        }
-        Op::LoadStringCodeUnit => Some(vec![Repr::Pointer, Repr::Int32]),
-        Op::SingleCharacterString | Op::Int32Abs | Op::Int32ToFloat64 => Some(vec![Repr::Int32]),
-        Op::AppendElement | Op::CallStoreHoleyElement => Some(vec![Repr::Pointer, Repr::Int32, Repr::Tagged]),
-        Op::LoadElementsLength | Op::LoadElementsCapacity => Some(vec![Repr::Pointer]),
-        Op::LoadPropertyIteratorKey => Some(vec![Repr::Tagged, Repr::Int32]),
-        Op::OpenArrayIteration => Some(tagged(1)),
-        Op::LoadArrayIteratorArray
-        | Op::LoadArrayIteratorIndex
-        | Op::FinishArrayIterator
-        | Op::LoadGeneratorCompletionType
-        | Op::LoadGeneratorCompletionValue => Some(vec![Repr::Pointer]),
-        Op::StoreArrayIteratorIndex => Some(vec![Repr::Pointer, Repr::Int32]),
-        Op::BranchOnPc { .. } => Some(vec![Repr::Int32]),
-        Op::BoxInt32 | Op::CheckNonNegativeInt32 => Some(vec![Repr::Int32]),
-        Op::CheckShape { .. }
-        | Op::LoadNamed { .. }
-        | Op::ShapeSwitch { .. }
-        | Op::CheckAccessorFunction { .. }
-        | Op::LoadAccessorFunction { .. } => Some(vec![Repr::Tagged, Repr::Pointer]),
-        Op::StoreNamed { .. } | Op::AddNamed { .. } => Some(vec![Repr::Tagged, Repr::Tagged, Repr::Pointer]),
-        Op::LoadElementAt { .. } => Some(vec![Repr::Pointer, Repr::Int32]),
-        Op::StoreElementAt { kind } => Some(vec![Repr::Pointer, Repr::Int32, kind.stored_repr()]),
-        Op::CheckBounds => Some(vec![Repr::Int32, Repr::Int32]),
-        Op::LoadTypedArrayLength
-        | Op::LoadTypedArrayDataOffset
-        | Op::TypedArrayDataAddress
-        | Op::CheckTypedArrayStorage => Some(vec![Repr::Pointer]),
-        Op::BoxBool | Op::BoolToInt32 => Some(vec![Repr::Bool]),
-        Op::LoadFunctionEnvironment { .. }
-        | Op::BoxCell
-        | Op::LoadOuterEnvironment
-        | Op::LoadEnvironmentBinding { .. }
-        | Op::AppendEnvironmentBinding => Some(vec![Repr::Pointer]),
-        Op::StoreEnvironmentBinding { .. } => Some(vec![Repr::Pointer, Repr::Tagged]),
-        Op::AllocateFunction { .. } | Op::ProbeGlobalCache { .. } => Some(vec![Repr::Pointer, Repr::Pointer]),
-        Op::ProbeGlobalStore { .. } => Some(vec![Repr::Tagged, Repr::Pointer, Repr::Pointer]),
-        Op::Int32Binary { .. } | Op::Int32WrappingBinary { .. } | Op::Int32Compare { .. } => {
-            Some(vec![Repr::Int32, Repr::Int32])
-        }
-        _ => Some(tagged(node.inputs.len())),
-    }
-}
-
 fn check_input_reprs(graph: &Graph, node_id: NodeId) -> Option<String> {
-    let expected = expected_input_reprs(graph, node_id)?;
     let node = graph.node(node_id);
-    if node.inputs.len() != expected.len() {
-        return Some(format!(
-            "v{} ({}) has {} inputs, but takes {}",
-            node_id.0,
-            node.op.name(),
-            node.inputs.len(),
-            expected.len()
-        ));
-    }
+    let expected = match node.op.info().inputs.reprs(node.inputs.len()) {
+        Ok(expected) => expected?,
+        Err(count) => {
+            return Some(format!(
+                "v{} ({}) has {} inputs, but takes {count}",
+                node_id.0,
+                node.op.name(),
+                node.inputs.len(),
+            ));
+        }
+    };
     for (input, repr) in node.inputs.iter().zip(expected) {
         let actual = graph.node(*input).repr?;
         if actual != repr {

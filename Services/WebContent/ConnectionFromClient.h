@@ -94,11 +94,13 @@ private:
     Optional<PageClient const&> page(Web::PageId index, SourceLocation = SourceLocation::current()) const;
 
     virtual void set_font_service(IPC::TransportHandle, IPC::File catalog, u64 catalog_size, u64 generation) override;
+    virtual void release_memory() override;
     virtual void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::CrossProcessId initial_document_id, Web::HTML::VisibilityState system_visibility_state) override;
     virtual void create_representing_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables) override;
     virtual void create_embedded_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
     virtual void continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation) override;
     virtual void populate_history_entry_document(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType>, bool ongoing_navigation_is_traversal, Web::HTML::HistoryNavigationPopulation) override;
+    virtual void media_session_action(Web::PageId page_id, Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) override;
     virtual void insert_remote_navigable(Web::PageId page_id, Web::HTML::RemoteNavigableDescriptor) override;
     virtual void remove_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void update_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedNavigableState) override;
@@ -252,6 +254,7 @@ private:
     virtual void set_content_blockers(Core::AnonymousBuffer patterns) override;
 
     virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
+    virtual void set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) override;
     virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, OrderedHashMap<String, Web::HTML::AutoplayPolicy> site_policies) override;
     virtual void set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme) override;
     virtual void set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast) override;
@@ -275,6 +278,7 @@ private:
     virtual void set_is_scripting_enabled(Web::PageId page_id, bool) override;
     virtual void set_zoom_level(Web::PageId page_id, double zoom_level) override;
     virtual void set_maximum_frames_per_second(Web::PageId page_id, double) override;
+    virtual void set_screen_shows_high_dynamic_range(Web::PageId page_id, bool) override;
     virtual void set_frame_rate_capped(Web::PageId page_id, bool) override;
     virtual void set_window_position(Web::PageId page_id, Web::DevicePixelPoint) override;
     virtual void set_window_size(Web::PageId page_id, Web::DevicePixelSize) override;

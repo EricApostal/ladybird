@@ -4,10 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/GenericShorthands.h>
 #include <AK/Hex.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/BrowserVersion.h>
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/FileWatcher.h>
 #include <LibCore/GeolocationProvider.h>
 #include <LibCore/Process.h>
 #include <LibCore/Socket.h>
@@ -17,9 +20,12 @@
 #include <LibIPC/Encoder.h>
 #include <LibIPC/Transport.h>
 #include <LibURL/InternalURLs.h>
+#include <LibURL/Parser.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/MimeSniff/MimeType.h>
 #include <LibWebCommon/WebView/Utilities.h>
 #include <LibWebView/AutocompleteService.h>
+#include <LibWebView/BrowserProcess.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CrashReport.h>
 #include <LibWebView/CrashReportStore.h>
@@ -36,10 +42,9 @@
 #    include <LibIPC/MachBootstrapListener.h>
 #    include <LibIPC/TransportBootstrapMach.h>
 #    include <LibIPC/TransportMachPort.h>
-#    include <LibThreading/Thread.h>
+#    include <LibWebView/MediaSessionPlatformBackendMacOS.h>
 #    include <LibWebView/NotificationBackendMacOS.h>
 #    include <mach/mach.h>
-#    include <sys/wait.h>
 #elif defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
 #    include <LibWebView/NotificationBackendFreedesktop.h>
 #endif
@@ -57,6 +62,7 @@
 #include <UI/Qt/ExternalURLHandler.h>
 #include <UI/Qt/HistoryPage.h>
 #include <UI/Qt/Menu.h>
+#include <UI/Qt/PageCard.h>
 #include <UI/Qt/PictureInPictureWindow.h>
 #include <UI/Qt/PlainText.h>
 #include <UI/Qt/ProcessManagerWindow.h>
@@ -75,6 +81,7 @@
 #    include <UI/Qt/MacWindow.h>
 #    include <UI/Qt/MicrophoneAuthorizerMacOS.h>
 #    include <UI/Qt/ScrollbarPreferencesMac.h>
+#    include <UI/Qt/SoftwareUpdaterMac.h>
 #    include <UI/Qt/SpellCheckerMac.h>
 #endif
 
@@ -84,6 +91,11 @@
 
 #if defined(AK_OS_LINUX)
 #    include <UI/Qt/X11Window.h>
+#endif
+
+#if !defined(AK_OS_WINDOWS)
+#    include <sys/wait.h>
+#    include <unistd.h>
 #endif
 
 #include <QAction>
@@ -273,6 +285,10 @@ static bool has_visible_browser_window()
 }
 #endif
 
+// Whether this process is a browser by now, rather than a launch that may still hand over to another browser and end.
+static bool s_browser_has_started = false;
+static Vector<ByteString> s_urls_opened_before_browser_started;
+
 class LadybirdQApplication : public QApplication {
 public:
     AK_ALLOC_WITH_KMALLOC;
@@ -284,6 +300,7 @@ public:
 #if defined(AK_OS_MACOS)
         setQuitOnLastWindowClosed(false);
         install_appkit_event_capture();
+        install_appkit_popup_attachment();
 #endif
         installEventFilter(&m_plain_text_event_filter);
 
@@ -297,6 +314,18 @@ public:
 
     virtual bool event(QEvent* event) override
     {
+        // NB: Events also arrive while the launch asks the user what to do about a browser that is already running.
+        //     There is no browser to handle them then, so what the user opens meanwhile waits for the browser.
+        if (!s_browser_has_started) {
+            if (event->type() == QEvent::FileOpen) {
+                auto const& open_event = *static_cast<QFileOpenEvent const*>(event);
+                auto const qurl = open_event.url();
+                s_urls_opened_before_browser_started.append(qurl.isEmpty() ? ak_byte_string_from_qstring(open_event.file()) : ByteString { qurl.toEncoded().constData() });
+                return true;
+            }
+            return QApplication::event(event);
+        }
+
         auto& application = Application::the();
         auto const event_type = event->type();
 
@@ -499,15 +528,7 @@ public:
 
         m_quit_action = make_action("&Quit");
         m_quit_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Quit));
-#if defined(AK_OS_MACOS)
         QObject::connect(m_quit_action, &QAction::triggered, this, []() { Application::the().quit(); });
-#else
-        QObject::connect(m_quit_action, &QAction::triggered, this, []() {
-            // If there are no active windows, we are certainly already in the process of quitting.
-            if (auto* window = Application::the().active_window_if_any())
-                window->close();
-        });
-#endif
 
         m_bookmarks_menu = create_application_menu(*m_application_widget, Application::bookmarks().menu());
 
@@ -524,6 +545,28 @@ public:
         m_help_menu->addAction(create_application_action(*m_application_widget, application.report_website_issue_action(), IncludeActionIcon::No));
         m_help_menu->addSeparator();
         m_help_menu->addAction(create_application_action(*m_application_widget, application.open_about_page_action(), IncludeActionIcon::No));
+
+        auto* check_for_updates_action = make_action("Check for Updates…");
+        // NB: On macOS, this moves the item into the application menu, below About Ladybird.
+        check_for_updates_action->setMenuRole(QAction::ApplicationSpecificRole);
+        QObject::connect(check_for_updates_action, &QAction::triggered, this, [] {
+            HubConnection::the().async_check_for_updates(WebView::UpdateCheckTrigger::UserInitiated);
+        });
+        m_help_menu->addAction(check_for_updates_action);
+
+        auto* simulate_update_action = make_action("Simulate Available Update");
+        QObject::connect(simulate_update_action, &QAction::triggered, this, [] {
+            HubConnection::the().async_check_for_updates(WebView::UpdateCheckTrigger::Debug);
+        });
+        m_debug_menu->addSeparator();
+        m_debug_menu->addAction(simulate_update_action);
+#if defined(AK_OS_LINUX)
+        auto* simulate_replaced_installation_action = make_action("Simulate Replaced Installation");
+        QObject::connect(simulate_replaced_installation_action, &QAction::triggered, this, [] {
+            Application::the().offer_restart_after_update();
+        });
+        m_debug_menu->addAction(simulate_replaced_installation_action);
+#endif
     }
 
 #if defined(AK_OS_MACOS)
@@ -537,11 +580,19 @@ public:
         if (m_dock_menu)
             return;
 
+        // NB: AppKit lists the application's windows in the dock menu by itself.
         m_dock_menu = new QMenu(m_menu_bar);
-        QObject::connect(m_dock_menu, &QMenu::aboutToShow, this, [this] {
-            rebuild_dock_menu();
+
+        auto* new_window_action = m_dock_menu->addAction("New Window");
+        QObject::connect(new_window_action, &QAction::triggered, m_dock_menu, [] {
+            Application::the().open_new_window(WebView::IsPrivate::No);
         });
-        rebuild_dock_menu();
+
+        auto* new_private_window_action = m_dock_menu->addAction("New Private Window");
+        QObject::connect(new_private_window_action, &QAction::triggered, m_dock_menu, [] {
+            Application::the().open_new_window(WebView::IsPrivate::Yes);
+        });
+
         m_dock_menu->setAsDockMenu();
     }
 #endif
@@ -565,56 +616,6 @@ public:
 
 private:
     friend Application;
-
-#if defined(AK_OS_MACOS)
-    void rebuild_dock_menu()
-    {
-        m_dock_menu->clear();
-
-        auto* new_window_action = m_dock_menu->addAction("New Window");
-        QObject::connect(new_window_action, &QAction::triggered, m_dock_menu, [] {
-            Application::the().open_new_window(WebView::IsPrivate::No);
-        });
-
-        auto* new_private_window_action = m_dock_menu->addAction("New Private Window");
-        QObject::connect(new_private_window_action, &QAction::triggered, m_dock_menu, [] {
-            Application::the().open_new_window(WebView::IsPrivate::Yes);
-        });
-
-        bool added_window_separator = false;
-        for (auto* widget : QApplication::topLevelWidgets()) {
-            auto* window = as_if<BrowserWindow>(widget);
-            if (!window)
-                continue;
-
-            if (!added_window_separator) {
-                m_dock_menu->addSeparator();
-                added_window_separator = true;
-            }
-
-            auto title = window->windowTitle();
-            title.replace("&", "&&");
-            auto* action = m_dock_menu->addAction(title);
-            action->setCheckable(true);
-            action->setChecked(window == Application::the().active_window_if_any());
-
-            QPointer<BrowserWindow> window_pointer = window;
-            QObject::connect(action, &QAction::triggered, m_dock_menu, [window = window_pointer] {
-                if (!window)
-                    return;
-
-                if (window->isMinimized())
-                    window->showNormal();
-                else
-                    window->show();
-
-                window->raise();
-                window->activateWindow();
-                Application::the().set_active_window(*window);
-            });
-        }
-    }
-#endif
 
     // The application actions require a QWidget owner, which we don't have at the time of creation. We use this dummy
     // widget instead, which we also can't properly parent as it would need a QWidget owner as well.
@@ -694,6 +695,11 @@ ErrorOr<NonnullOwnPtr<Application>> Application::create(Main::Arguments const& a
 {
     auto application = adopt_own(*new Application);
     application->m_command_line = MUST(String::join(' ', arguments.strings));
+    if (auto executable = Core::System::current_executable_path(); !executable.is_error()) {
+        application->m_restart_command.executable = executable.release_value();
+        for (auto argument : arguments.strings.slice(1))
+            application->m_restart_command.arguments.append(argument);
+    }
 
 #ifdef LADYBIRD_HUB_IN_OWN_PROCESS
     WebView::platform_init();
@@ -704,6 +710,7 @@ ErrorOr<NonnullOwnPtr<Application>> Application::create(Main::Arguments const& a
     TRY(application->connect_to_hub(arguments));
 #else
     application->m_hub = TRY(Hub::Application::create(arguments, static_cast<Hub::ApplicationHost*>(application.ptr())));
+    s_browser_has_started = true;
 
     // Headless mode has no UI to connect to the Hub.
     if (browser_options().headless_mode.has_value())
@@ -718,7 +725,7 @@ ErrorOr<NonnullOwnPtr<Application>> Application::create(Main::Arguments const& a
 
 #ifdef LADYBIRD_HUB_IN_OWN_PROCESS
 #    if defined(AK_OS_MACOS)
-// What the Hub gets its end of the connection from. The thread that watches for the Hub to end can outlive connecting.
+// What the Hub gets its end of the connection from. The thread that answers the Hub can outlive connecting.
 struct HubBootstrap : public AtomicRefCounted<HubBootstrap> {
     IPC::TransportBootstrapMachServer server;
 };
@@ -766,6 +773,25 @@ Hub::UIInfo Application::current_ui_info() const
     return info;
 }
 
+[[maybe_unused]] static bool user_wants_to_replace_unresponsive_browser()
+{
+    QMessageBox dialog;
+    dialog.setIcon(QMessageBox::Warning);
+    dialog.setText(QObject::tr("Ladybird is already running, but it is not responding."));
+    dialog.setInformativeText(QObject::tr("To open Ladybird with this profile, the Ladybird that is running must be closed first. What its pages have not saved will be lost."));
+    auto* close_button = dialog.addButton(QObject::tr("Close Ladybird"), QMessageBox::DestructiveRole);
+    dialog.setDefaultButton(dialog.addButton(QMessageBox::Cancel));
+    // NB: Nothing else of this launch is on the screen yet, so the question has to be where the user sees it.
+    dialog.setWindowFlag(Qt::WindowStaysOnTopHint);
+    QTimer::singleShot(0, &dialog, [&dialog] {
+        dialog.raise();
+        dialog.activateWindow();
+        QApplication::alert(&dialog);
+    });
+    dialog.exec();
+    return dialog.clickedButton() == close_button;
+}
+
 ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
 {
     auto hub_path = TRY(hub_executable_path());
@@ -799,15 +825,11 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     hub_arguments.extend(take_urls_from_launch_apple_events());
 #    endif
     hub_arguments.append(ByteString::formatted("--ui-info={}", encode_hex(ui_info_buffer.data().span())));
-
-    Core::ProcessSpawnOptions spawn_options {
-        .name = "Hub"sv,
-        .executable = hub_path,
-        .arguments = hub_arguments,
-    };
+    hub_arguments.append(ByteString::formatted("--ui-pid={}", Core::System::getpid()));
 
 #    if defined(AK_OS_MACOS)
     // NB: This must answer while the main thread waits for the Hub to initialize, so it answers on its own thread.
+    //     Every round uses the same server, as its name cannot be registered again right after it was let go of.
     auto hub_bootstrap = adopt_ref(*new HubBootstrap);
     IPC::MachBootstrapListener bootstrap_listener { WebView::mach_server_name_for_process("Ladybird-UI"sv, Core::System::getpid()) };
     if (!bootstrap_listener.is_initialized())
@@ -817,71 +839,98 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
             dbgln("Unable to bootstrap the Hub: {}", result.error());
     };
     hub_arguments.append(ByteString::formatted("--ui-mach-server={}", bootstrap_listener.server_port_name()));
-    spawn_options.arguments = hub_arguments;
-
-    auto port_a_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
-    auto port_a_send = TRY(port_a_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
-    auto port_b_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
-    auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
-
-    // The Hub may receive startup messages before it has constructed its transport.
-    IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
-
-    Optional<Core::Process> spawned_process;
-    {
-        MutexLocker child_registration_locker(hub_bootstrap->server.child_registration_lock());
-        spawned_process = TRY(Core::Process::spawn(spawn_options));
-        hub_bootstrap->server.register_child_transport(spawned_process->pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
-    }
-    auto process = spawned_process.release_value();
-
-    // NB: Until the Hub takes its ports, we hold them ourselves, so nothing would tell us of a Hub that ended before
-    //     that. Letting go of them then closes the connection, as a socket does when its peer ends.
-    auto hub_exit_watcher = Threading::Thread::construct("HubExitWatcher"sv, [hub_bootstrap, pid = process.pid()]() -> intptr_t {
-        siginfo_t info {};
-        while (waitid(P_PID, pid, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
-            ;
-        hub_bootstrap->server.unregister_child_transport(pid);
-        return 0;
-    });
-    hub_exit_watcher->start();
-    hub_exit_watcher->detach();
-
-    auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
-#    else
-    int socket_fds[2] {};
-    TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_fds));
-
-    spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = socket_fds[1], .fd = socket_fds[1] });
-    TRY(Core::Environment::set("SOCKET_TAKEOVER"sv, ByteString::formatted("ipc:{}", socket_fds[1]), Core::Environment::Overwrite::Yes));
-    auto process = TRY(Core::Process::spawn(spawn_options));
-    TRY(Core::Environment::unset("SOCKET_TAKEOVER"sv));
-    TRY(Core::System::close(socket_fds[1]));
-
-    auto ipc_socket = TRY(Core::LocalSocket::adopt_fd(socket_fds[0]));
-    TRY(ipc_socket->set_blocking(true));
-    auto transport = make<IPC::Transport>(move(ipc_socket));
 #    endif
-    m_hub_connection = adopt_ref(*new HubConnection(move(transport)));
 
-    // The Hub can find that there is nothing for us to do, as when another process has this profile and takes our URLs,
-    // or when asked for its usage. It ends right away then, and how it ended is how we end.
-    auto initial_state = m_hub_connection->try_initialize();
-    if (initial_state.is_error()) {
-        m_exit_status_if_done = TRY(process.wait_for_termination());
+    // NB: A browser that is already running for the profile takes what we were asked to open. One that does not answer
+    //     can be ended to start in its place, which is for the user to decide.
+    Optional<Hub::InitialState> initial_state;
+    // NB: The user agrees to end the browser that they were asked about. One that started after that, as when another
+    //     launch replaced the first one meanwhile, is not ended without asking again.
+    Optional<UnixDateTime> replace_browser_from_before;
+    while (!initial_state.has_value()) {
+        auto round_arguments = hub_arguments;
+        if (replace_browser_from_before.has_value())
+            round_arguments.append(ByteString::formatted("--replace-unresponsive-browser-from-before={}", replace_browser_from_before->milliseconds_since_epoch()));
+        round_arguments.extend(s_urls_opened_before_browser_started);
+        // NB: A browser that this round finds unresponsive was there before the round began.
+        [[maybe_unused]] auto time_before_round = UnixDateTime::now();
+
+        Core::ProcessSpawnOptions spawn_options {
+            .name = "Hub"sv,
+            .executable = hub_path,
+            .arguments = round_arguments,
+        };
+
+#    if defined(AK_OS_MACOS)
+        auto port_a_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+        auto port_a_send = TRY(port_a_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
+        auto port_b_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+        auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
+
+        // The Hub may receive startup messages before it has constructed its transport.
+        IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
+
+        Optional<Core::Process> spawned_process;
+        {
+            MutexLocker child_registration_locker(hub_bootstrap->server.child_registration_lock());
+            spawned_process = TRY(Core::Process::spawn(spawn_options));
+            hub_bootstrap->server.register_child_transport(spawned_process->pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
+        }
+        auto process = spawned_process.release_value();
+
+        auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
+#    else
+        int socket_fds[2] {};
+        TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_fds));
+
+        spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = socket_fds[1], .fd = socket_fds[1] });
+        TRY(Core::Environment::set("SOCKET_TAKEOVER"sv, ByteString::formatted("ipc:{}", socket_fds[1]), Core::Environment::Overwrite::Yes));
+        auto process = TRY(Core::Process::spawn(spawn_options));
+        TRY(Core::Environment::unset("SOCKET_TAKEOVER"sv));
+        TRY(Core::System::close(socket_fds[1]));
+
+        auto ipc_socket = TRY(Core::LocalSocket::adopt_fd(socket_fds[0]));
+        TRY(ipc_socket->set_blocking(true));
+        auto transport = make<IPC::Transport>(move(ipc_socket));
+#    endif
+        m_hub_connection = adopt_ref(*new HubConnection(move(transport)));
+
+        // The Hub can find that there is nothing for us to do, as when another process has this profile and takes our
+        // URLs, or when asked for its usage. It ends right away then, and how it ended is how we end.
+        auto state_or_error = m_hub_connection->try_initialize();
+        if (!state_or_error.is_error()) {
+            initial_state = state_or_error.release_value();
+            m_restart_command.hub = move(process);
+            break;
+        }
+
+        m_hub_connection = nullptr;
+        auto exit_status = TRY(process.wait_for_termination());
+#    if !defined(AK_OS_WINDOWS)
+        // FIXME: Ask on Windows as well, once the Hub can end an unresponsive browser there.
+        if (exit_status == WebView::BrowserProcess::unresponsive_browser_exit_status) {
+            if (user_wants_to_replace_unresponsive_browser()) {
+                replace_browser_from_before = time_before_round;
+                continue;
+            }
+        }
+#    endif
+        m_exit_status_if_done = exit_status;
         return {};
     }
     auto state = initial_state.release_value();
     m_hub_connection->did_initialize();
 
     m_settings = make<WebView::Settings>(WebView::Settings::create_from_json(TRY(JsonValue::from_string(state.settings_json))));
-    m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(state.config_directory, "Bookmarks.json"sv).string()));
     create_session_store(state.data_directory, state.persists_sessions);
     create_history_store(state.data_directory, state.uses_sql_database);
-    // NB: Reports stay in files, which both of us read. This process keeps its own for when it crashes, and the next
-    //     launch recovers that the same as one of the Hub's.
+    m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(state.config_directory, "Bookmarks.json"sv).string(), *m_favicon_store));
+
     m_browser_options.disable_sandbox = state.sandbox_is_disabled ? WebView::DisableSandbox::Yes : WebView::DisableSandbox::No;
     WebView::CrashReport::set_sandbox_is_disabled(m_browser_options.disable_sandbox);
+
+    // NB: Reports stay in files, which both of us read. This process keeps its own for when it crashes, and the next
+    //     launch recovers that the same as one of the Hub's.
     auto& crash_report_store = WebView::CrashReportStore::the();
     crash_report_store.set_directory(move(state.crash_report_directory));
     if (auto result = crash_report_store.initialize_browser_crash_handler(); result.is_error())
@@ -890,6 +939,9 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     m_browser_options.urls = move(state.urls);
     m_browser_options.raw_urls = move(state.raw_urls);
     m_browser_options.devtools_port = state.devtools_port;
+    if (state.devtools_enabled)
+        m_devtools_port = state.devtools_port;
+    m_profile_is_temporary = state.profile_is_temporary;
 #    if defined(AK_OS_MACOS)
     set_profile_application_icon(state.profile_identifier, state.profile_identity, state.profile_is_temporary);
 #    endif
@@ -944,6 +996,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     };
     QObject::connect(&SystemAppearance::the(), &SystemAppearance::changed, send_ui_info);
     QObject::connect(&SystemAppearance::the(), &SystemAppearance::interface_appearance_changed, send_ui_info);
+    s_browser_has_started = true;
     return {};
 }
 
@@ -988,6 +1041,11 @@ Optional<int> Application::exit_status_if_done() const
 {
     if (!hub().should_exit_after_profile_coordination())
         return {};
+    if (hub().browser_is_unresponsive()) {
+        // FIXME: Offer to end the unresponsive browser, as is done when the Hub is in its own process.
+        warnln("Ladybird is already running with this profile, but it is not responding");
+        return WebView::BrowserProcess::unresponsive_browser_exit_status;
+    }
     outln("Opening in existing process");
     return 0;
 }
@@ -1014,7 +1072,12 @@ Application::~Application()
         // process at once, so it never records a clean exit.
         if (m_session_store) {
             m_session_store->flush_dirty_state();
-            m_session_store->mark_clean_exit();
+            auto after_exit = SessionStore::AfterExit::KeepPinnedTabs;
+            if (m_restart != Restart::None)
+                after_exit = SessionStore::AfterExit::Restart;
+            else if (Application::settings().restore_previous_session())
+                after_exit = SessionStore::AfterExit::KeepEverything;
+            m_session_store->mark_clean_exit(after_exit);
         }
 
         // NB: The views go along with the windows that showed them, and their timers need the QApplication.
@@ -1022,7 +1085,13 @@ Application::~Application()
         if (m_hub)
             m_hub->destroy_all_views();
 #endif
+        m_media_session_platform_backend = nullptr;
         m_application = nullptr;
+
+        // Messages that arrived while quitting hold on to the connection until an event loop handles them, which none
+        // does anymore. Closing it lets the Hub end now, which a restart waits for.
+        if (m_hub_connection)
+            m_hub_connection->transport().close();
         m_hub_connection = nullptr;
 #ifndef LADYBIRD_HUB_IN_OWN_PROCESS
         m_connection_from_ui = nullptr;
@@ -1091,11 +1160,14 @@ void Application::show_process_manager()
 void Application::create_platform_actions()
 {
 #ifndef LADYBIRD_HUB_IN_OWN_PROCESS
-    m_settings = make<WebView::Settings>(WebView::Settings::create_from_json(WebView::Application::settings().serialize_json()));
-    m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(WebView::Application::profile().paths().config, "Bookmarks.json"sv).string()));
     auto& hub = WebView::Application::the();
+
+    m_settings = make<WebView::Settings>(WebView::Settings::create_from_json(WebView::Application::settings().serialize_json()));
+    m_profile_is_temporary = WebView::Application::profile().is_temporary();
     create_session_store(WebView::Application::profile().paths().data, hub.persists_sessions());
     create_history_store(WebView::Application::profile().paths().data, WebView::Application::browser_options().disable_sql_database == WebView::DisableSQLDatabase::No);
+    m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(WebView::Application::profile().paths().config, "Bookmarks.json"sv).string(), *m_favicon_store));
+
     m_application_actions = make<ApplicationActions>(ApplicationActions::PageOptions {
         .user_agent = hub.user_agent_string(),
         .navigator_compatibility_mode = hub.navigator_compatibility_mode(),
@@ -1103,6 +1175,9 @@ void Application::create_platform_actions()
         .blocks_pop_ups = hub.blocks_pop_ups(),
         .devtools_enabled = hub.devtools_enabled(),
     });
+    if (hub.devtools_enabled())
+        m_devtools_port = WebView::Application::browser_options().devtools_port;
+
     RemoteDownloads::the().set_downloads(Hub::ConnectionFromUI::downloads());
 #endif
     if (auto* hub = HubConnection::the_if_connected())
@@ -1111,6 +1186,14 @@ void Application::create_platform_actions()
         if (auto* hub = HubConnection::the_if_connected())
             hub->send_settings_changes(settings);
     };
+#if defined(AK_OS_MACOS)
+    m_software_updater = SoftwareUpdater::create();
+    m_software_updater->on_will_relaunch = [this] {
+        m_restart = Restart::ByUpdater;
+    };
+#elif defined(AK_OS_LINUX)
+    watch_for_replaced_installation();
+#endif
     m_web_ui_pages = make<WebUIPages>();
     m_bookmarks = make<Bookmarks>(*m_bookmark_store);
     m_web_ui_pages->register_page("history"_string, "History"_string, [](u64 web_ui_id, WebView::IsPrivate is_private) -> NonnullOwnPtr<WebUIPage> {
@@ -1526,6 +1609,7 @@ BrowserWindow* Application::restore_previous_session(WindowConfiguration const& 
     return frontmost_window;
 }
 
+// After Ladybird quit unexpectedly, a card over the top of the page offers to restore the tabs that were open.
 void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& window)
 {
     auto& store = session_store(WebView::IsPrivate::No);
@@ -1543,7 +1627,7 @@ void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& windo
     if (unit_ids.is_empty() || !window.current_tab())
         return;
 
-    window.current_tab()->show_restore_session_card(tab_count, [window = QPointer<BrowserWindow>(&window), unit_ids = AK::move(unit_ids)] {
+    auto restore_tabs = [window = QPointer<BrowserWindow>(&window), unit_ids = AK::move(unit_ids)] {
         // A window that still shows only the new tab page it opened with is taken over by the tabs restored first.
         QPointer<Tab> new_tab_page;
         if (window && window->tab_count() == 1) {
@@ -1560,7 +1644,12 @@ void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& windo
 
         if (new_tab_page && window->tab_count() > 1)
             window->close_tab_without_keeping_it(window->tab_index(new_tab_page));
-    });
+    };
+    auto question = tab_count == 1 ? QStringLiteral("Restore the tab you had open?") : qformatted("Restore the {} tabs you had open?", tab_count);
+    Vector<PageCard::Button> buttons;
+    buttons.append({ "Not now", PageCard::ButtonRole::Secondary, {} });
+    buttons.append({ "Restore tabs", PageCard::ButtonRole::Primary, AK::move(restore_tabs) });
+    window.show_page_card(BrowserWindow::PageCardSlot::RestoreSession, "Ladybird quit unexpectedly", question, AK::move(buttons));
 }
 
 void Application::open_startup_tabs(BrowserWindow& window, Vector<URL::URL> const& urls)
@@ -1924,6 +2013,10 @@ void Application::finish_quit()
 void Application::cancel_quit()
 {
     m_quit_in_progress = false;
+    // Once Sparkle has installed an update, it relaunches Ladybird whenever Ladybird next quits. A canceled quit only
+    // calls off a restart of Ladybird's own.
+    if (m_restart == Restart::ByLadybird)
+        m_restart = Restart::None;
     m_windows_awaiting_quit_preflight.clear();
 
     // The windows whose pages already agreed go back to needing their own close check.
@@ -2014,6 +2107,29 @@ static BrowserWindow* window_for_view(RemoteView const& view)
             return window;
     }
     return nullptr;
+}
+
+OwnPtr<WebView::MediaSessionPlatformBackend> Application::create_media_session_platform_backend()
+{
+#if defined(AK_OS_MACOS)
+    auto backend = make<WebView::MediaSessionPlatformBackendMacOS>();
+    backend->on_action = [](Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_media_session_action(action, seek_offset, seek_time, fast_seek);
+    };
+    return backend;
+#else
+    return {};
+#endif
+}
+
+WebView::MediaSessionPlatformBackend* Application::media_session_platform_backend()
+{
+    if (browser_options().headless_mode.has_value())
+        return nullptr;
+    if (!m_media_session_platform_backend)
+        m_media_session_platform_backend = create_media_session_platform_backend();
+    return m_media_session_platform_backend.ptr();
 }
 
 OwnPtr<WebView::NotificationBackend> Application::create_notification_backend()
@@ -2277,6 +2393,177 @@ void Application::display_error_dialog(StringView error_message) const
     create_message_box(QMessageBox::Warning, error_message, active_window_if_any())->open();
 }
 
+void Application::display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> const& version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger)
+{
+    static constexpr auto current_version = BROWSER_VERSION ""sv;
+
+    switch (kind) {
+    case WebView::UpdateCheckResult::Kind::UpToDate:
+        create_message_box(QMessageBox::Information, MUST(String::formatted("Ladybird {} is the newest version.", current_version)), active_window_if_any())->open();
+        return;
+    case WebView::UpdateCheckResult::Kind::DevelopmentBuild:
+        create_message_box(QMessageBox::Information, "Development builds of Ladybird do not check for updates."sv, active_window_if_any())->open();
+        return;
+    case WebView::UpdateCheckResult::Kind::Failed:
+        display_error_dialog("Ladybird could not check for updates. Check your internet connection, and try again."sv);
+        return;
+    case WebView::UpdateCheckResult::Kind::UpdateAvailable:
+        break;
+    }
+
+    if (!version.has_value())
+        return;
+
+    // Once the system has installed a newer Ladybird in place of this one, restarting is what updates it.
+    if (m_installation_replaced) {
+        if (trigger != WebView::UpdateCheckTrigger::Automatic)
+            offer_restart_after_update();
+        return;
+    }
+
+    // A later automatic check finds the update again, but one that the user asked for answers now, in a new window if
+    // no window is open. On macOS, the menu bar outlives the last window.
+    auto* window = active_window_if_any();
+    if (!window && trigger == WebView::UpdateCheckTrigger::Automatic)
+        return;
+    if (!window)
+        window = &new_window({ Application::settings().new_tab_page_url() }, configuration_for_new_window());
+
+    Vector<PageCard::Button> buttons;
+    // A version skipped for the debug action would also be skipped when it is offered for real.
+    buttons.append({ "Skip", PageCard::ButtonRole::Secondary, [version = *version, trigger] {
+                        if (trigger != WebView::UpdateCheckTrigger::Debug)
+                            HubConnection::the().async_skip_update_version(version);
+                    } });
+
+    auto text = qformatted("You have Ladybird {}.", current_version);
+    if (first_is_one_of(install_method, WebView::InstallMethod::DEB, WebView::InstallMethod::RPM, WebView::InstallMethod::Flatpak)) {
+        text = qformatted("You have Ladybird {}. Update it with your system's software updater.", current_version);
+        buttons.append({ "Remind me later", PageCard::ButtonRole::Primary, {} });
+    } else if (install_method == WebView::InstallMethod::MacOSApp) {
+        buttons.append({ "Remind me later", PageCard::ButtonRole::Secondary, {} });
+#if defined(AK_OS_MACOS)
+        buttons.append({ "Install update", PageCard::ButtonRole::Primary, [trigger] {
+                            auto* software_updater = Application::the().software_updater();
+                            if (!software_updater)
+                                return;
+                            if (trigger == WebView::UpdateCheckTrigger::Debug)
+                                software_updater->install_latest_version();
+                            else
+                                software_updater->install_update();
+                        } });
+#endif
+    } else {
+        buttons.append({ "Remind me later", PageCard::ButtonRole::Secondary, {} });
+        buttons.append({ "View release", PageCard::ButtonRole::Primary, [url = WebView::release_page_url(*version)] {
+                            if (auto release_page = URL::Parser::basic_parse(url); release_page.has_value())
+                                Application::the().open_url_in_new_tab(*release_page, Web::HTML::ActivateTab::Yes, {}, WebView::IsPrivate::No);
+                        } });
+    }
+
+    window->show_page_card(BrowserWindow::PageCardSlot::Update, qformatted("Ladybird {} is available", *version), text, move(buttons));
+}
+
+#if defined(AK_OS_LINUX)
+// The system replaces the files of a package that it updates while Ladybird runs from the ones that it started with. The
+// processes that Ladybird starts from then on would be of the new version, so the user is asked to restart it.
+void Application::watch_for_replaced_installation()
+{
+    if (!first_is_one_of(WebView::describe_current_system().install_method, WebView::InstallMethod::DEB, WebView::InstallMethod::RPM))
+        return;
+    // /proc/self/exe stays the file that this process runs, even once another one took its place at its path.
+    auto running = Core::System::stat("/proc/self/exe"sv);
+    auto watcher = Core::FileWatcher::create();
+    if (running.is_error() || watcher.is_error())
+        return;
+
+    auto notice_replacement = [this, device = running.value().st_dev, inode = running.value().st_ino] {
+        auto executable = Core::System::stat(m_restart_command.executable);
+        if (m_installation_replaced || executable.is_error() || (executable.value().st_dev == device && executable.value().st_ino == inode))
+            return;
+        m_installation_replaced = true;
+        offer_restart_after_update();
+    };
+
+    // A package manager writes the new executable under another name, and renames it over the old one. That takes a
+    // link away from the file that this process started from, which changes its metadata.
+    m_installation_watcher = watcher.release_value();
+    m_installation_watcher->on_change = [notice_replacement](auto const&) { notice_replacement(); };
+    if (auto result = m_installation_watcher->add_watch(m_restart_command.executable, Core::FileWatcherEvent::Type::MetadataModified); result.is_error()) {
+        m_installation_watcher = nullptr;
+        return;
+    }
+
+    // An update that finished before the watch began is offered once Ladybird has opened its windows.
+    Core::deferred_invoke(move(notice_replacement));
+}
+
+#endif
+
+void Application::offer_restart_after_update()
+{
+    // Without the path of its executable, Ladybird could quit but not start again.
+    auto* window = active_window_if_any();
+    if (!window || m_restart_command.executable.is_empty())
+        return;
+
+    Vector<PageCard::Button> buttons;
+    buttons.append({ "Not now", PageCard::ButtonRole::Secondary, {} });
+    buttons.append({ "Restart", PageCard::ButtonRole::Primary, [] { Application::the().restart(); } });
+    // A temporary profile is gone once Ladybird quits, and its windows and tabs with it. A session that could not be
+    // saved, as when its database would not open, is gone as well.
+    auto reopens = !m_profile_is_temporary && m_session_store && m_session_store->is_persistent();
+    auto text = reopens ? "Restart Ladybird to use the new version. Your windows and tabs will reopen, except private ones."_string : "Restart Ladybird to use the new version."_string;
+    window->show_page_card(BrowserWindow::PageCardSlot::Update, "Ladybird was updated", qstring_from_ak_string(text), move(buttons));
+}
+
+void Application::restart()
+{
+    m_restart = Restart::ByLadybird;
+    quit();
+}
+
+Optional<Application::RestartCommand> Application::take_restart_command()
+{
+    if (m_restart == Restart::None || (m_restart == Restart::ByLadybird && m_restart_command.executable.is_empty()))
+        return {};
+    auto command = move(m_restart_command);
+    command.relaunched_by_updater = m_restart == Restart::ByUpdater;
+    return command;
+}
+
+// A restarted browser must start only once the Hub of this one is gone, as it would otherwise hand itself over to that
+// Hub. The Hub ends once the Application has closed the connection to it. An updater relaunches Ladybird by itself once
+// this process has ended, so this process ends only after the Hub has.
+ErrorOr<void> Application::RestartCommand::run()
+{
+    if (hub.has_value()) {
+#if !defined(AK_OS_WINDOWS)
+        // NB: The new browser needs the profile, which the Hub has until it ends. A Hub that does not end by itself
+        //     would keep us waiting with no window to show for it, so it is ended then.
+        static constexpr auto time_for_hub_to_end = AK::Duration::from_seconds(10);
+        auto deadline = MonotonicTime::now() + time_for_hub_to_end;
+        for (;;) {
+            int status = 0;
+            auto result = waitpid(hub->pid(), &status, WNOHANG);
+            if (result == hub->pid() || (result < 0 && errno != EINTR))
+                break;
+            if (MonotonicTime::now() >= deadline) {
+                (void)Core::Process::terminate_process(hub->pid(), Core::Process::TerminationMode::Forceful);
+                TRY(hub->wait_for_termination());
+                break;
+            }
+            usleep(10'000);
+        }
+#else
+        TRY(hub->wait_for_termination());
+#endif
+    }
+    if (!relaunched_by_updater)
+        TRY(Core::Process::spawn({ .executable = executable, .arguments = arguments }));
+    return {};
+}
+
 void Application::open_file(String const& path) const
 {
     QDesktopServices::openUrl(QUrl::fromLocalFile(qstring_from_ak_string(path)));
@@ -2363,6 +2650,11 @@ Web::Clipboard::SystemClipboardItem Application::clipboard_item() const
         for (auto const& format : mime_data->formats()) {
             auto mime_type = ak_string_from_qstring(format);
             if (mime_type == "text/uri-list"sv)
+                continue;
+
+            // Qt can expose X11 selection targets such as SAVE_TARGETS alongside MIME types. These are clipboard
+            // protocol requests, not pasteable data, and reading them can block until Qt's Wayland pipe times out.
+            if (!Web::MimeSniff::MimeType::parse(mime_type).has_value())
                 continue;
 
             auto data = ak_byte_string_from_qbytearray(mime_data->data(format));
@@ -2615,18 +2907,24 @@ void Application::report_active_view() const
     hub->async_active_view_changed(tab && tab->is_loaded() ? Optional<u64> { tab->view().view_id() } : Optional<u64> {});
 }
 
-void Application::did_enable_devtools() const
+void Application::did_enable_devtools(u16 port)
 {
+    m_devtools_port = port;
     m_application_actions->devtools_enabled_changed(true);
-    if (m_active_window)
-        m_active_window->on_devtools_enabled();
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget))
+            window->on_devtools_enabled();
+    }
 }
 
-void Application::did_disable_devtools() const
+void Application::did_disable_devtools()
 {
+    m_devtools_port = {};
     m_application_actions->devtools_enabled_changed(false);
-    if (m_active_window)
-        m_active_window->on_devtools_disabled();
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget))
+            window->on_devtools_disabled();
+    }
 }
 
 void Application::on_recently_closed_entries_changed() const

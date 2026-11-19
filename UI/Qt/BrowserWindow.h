@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/Optional.h>
 #include <AK/kmalloc.h>
 #include <LibURL/URL.h>
@@ -17,6 +18,7 @@
 #include <LibWebView/Settings.h>
 #include <UI/Qt/FullscreenDebounce.h>
 #include <UI/Qt/MacWindow.h>
+#include <UI/Qt/PageCard.h>
 #include <UI/Qt/SessionStore.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
@@ -183,6 +185,14 @@ public:
     // Opens a window's restored tabs, keeping the session rows the store re-adopted for them.
     void restore_tabs(Vector<RestoredSessionTab> const&, i64 active_tab_index);
     Tab* current_tab() const { return m_current_tab; }
+
+    enum class PageCardSlot : u8 {
+        RestoreSession,
+        Update,
+    };
+    void show_page_card(PageCardSlot, QString const& title, QString const& text, Vector<PageCard::Button>);
+    void reposition_page_cards();
+
     Tab* activate_tab_with_url(URL::URL const&, URL::ExcludeFragment);
     // Asks every tab's page if the window may close, without closing it, and reports the answer. Once the pages agree,
     // a close() goes straight through.
@@ -203,6 +213,7 @@ public:
 
     LadybirdButton& ladybird_button() const { return m_tabs_container->ladybird_button(); }
     static bool has_chrome_in_titlebar();
+    void window_control_buttons_changed();
 
     void show_window_context_menu(QPoint global_position);
 
@@ -235,6 +246,7 @@ public:
 
     double refresh_rate() const { return m_screen_observer->refresh_rate(); }
     Optional<u64> display_id() const { return m_screen_observer->display_id(); }
+    bool screen_shows_high_dynamic_range() const { return m_screen_observer->screen_shows_high_dynamic_range(); }
 
     void on_devtools_enabled();
     void on_devtools_disabled();
@@ -251,7 +263,6 @@ public slots:
     bool definitely_close_tab(int index);
     void move_tab(int old_index, int new_index);
     void request_to_close_tab(int index);
-    void request_to_close_current_tab();
     void open_next_tab();
     void open_previous_tab();
     void show_all_tabs();
@@ -329,6 +340,8 @@ private:
 
     TabWidget* m_tabs_container { nullptr };
     Tab* m_current_tab { nullptr };
+    Array<QPointer<PageCard>, 2> m_page_cards;
+    QPointer<WebContentView> m_page_cards_view;
     Vector<QPointer<Tab>> m_background_tabs_from_current_tab;
     DevToolsBanner* m_devtools_banner { nullptr };
 

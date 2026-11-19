@@ -10,7 +10,6 @@
 use super::builder::{HEADER_SIZE, for_each_command, read_command};
 use super::commands::*;
 use super::nested_records::{for_each_nested_record_span, span_bytes};
-use crate::visual_context::VisualContextTree;
 use libgfx_rust::CompositingAndBlendingOperator;
 use libgfx_rust::filter::Filter;
 use std::collections::HashSet;
@@ -26,8 +25,9 @@ pub struct IndexedRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveContent {
     Canvas(CanvasId),
-    VideoFrame(VideoSinkResourceId),
+    VideoFrame(VideoSinkHandle),
     ImageFrame(ImageFrameResourceId),
+    CompositedContext(CompositorContextId),
 }
 
 // A top-level record that draws live content, itself or in a record nested in it.
@@ -41,11 +41,14 @@ pub struct LiveContentRecord {
 pub struct DisplayListSummary {
     pub font_ids: Vec<u64>,
     pub image_frame_ids: Vec<u64>,
-    pub video_sink_ids: Vec<u64>,
-    pub display_list_ids: Vec<u64>,
+    pub video_sink_handles: Vec<u64>,
+    pub vector_image_ids: Vec<u64>,
     pub canvas_ids: Vec<u64>,
+    pub composited_context_ids: Vec<u64>,
     pub carets: Vec<IndexedRecord>,
     pub live_content_records: Vec<LiveContentRecord>,
+    pub destination_blending_records: Vec<IndexedRecord>,
+    pub mask_declarations: Vec<IndexedRecord>,
 }
 
 #[derive(Default)]
@@ -53,8 +56,9 @@ struct ReferencedIds {
     fonts: HashSet<u64>,
     image_frames: HashSet<u64>,
     video_sinks: HashSet<u64>,
-    display_lists: HashSet<u64>,
+    vector_images: HashSet<u64>,
     canvases: HashSet<u64>,
+    composited_contexts: HashSet<u64>,
 }
 
 fn live_content_of(command_type: DisplayListCommandType, payload: &[u8]) -> Option<LiveContent> {
@@ -62,7 +66,7 @@ fn live_content_of(command_type: DisplayListCommandType, payload: &[u8]) -> Opti
     match command_type {
         T::DrawCanvas => Some(LiveContent::Canvas(read_command::<DrawCanvas>(payload).canvas_id)),
         T::DrawVideoFrame => Some(LiveContent::VideoFrame(
-            read_command::<DrawVideoFrame>(payload).video_sink_id,
+            read_command::<DrawVideoFrame>(payload).video_sink_handle,
         )),
         T::DrawScaledDecodedImageFrame => Some(LiveContent::ImageFrame(
             read_command::<DrawScaledDecodedImageFrame>(payload).frame_id,
@@ -72,6 +76,9 @@ fn live_content_of(command_type: DisplayListCommandType, payload: &[u8]) -> Opti
         )),
         T::DrawTiledDecodedImageFrame => Some(LiveContent::ImageFrame(
             read_command::<DrawTiledDecodedImageFrame>(payload).frame_id,
+        )),
+        T::DrawCompositedContext => Some(LiveContent::CompositedContext(
+            read_command::<DrawCompositedContext>(payload).child_context_id,
         )),
         _ => None,
     }
@@ -100,14 +107,18 @@ fn note_referenced_ids(command_type: DisplayListCommandType, payload: &[u8], ids
         }
         T::DrawVideoFrame => {
             ids.video_sinks
-                .insert(read_command::<DrawVideoFrame>(payload).video_sink_id.0);
+                .insert(read_command::<DrawVideoFrame>(payload).video_sink_handle.0);
         }
         T::DrawCanvas => {
             ids.canvases.insert(read_command::<DrawCanvas>(payload).canvas_id.0);
         }
-        T::PaintNestedDisplayList => {
-            ids.display_lists
-                .insert(read_command::<PaintNestedDisplayList>(payload).display_list_id.0);
+        T::PaintVectorImage => {
+            ids.vector_images
+                .insert(read_command::<PaintVectorImage>(payload).vector_image_id.0);
+        }
+        T::DrawCompositedContext => {
+            ids.composited_contexts
+                .insert(read_command::<DrawCompositedContext>(payload).child_context_id.0);
         }
         T::DrawIsolatedGroup => {
             let filter = read_command::<DrawIsolatedGroup>(payload).filter;
@@ -122,7 +133,6 @@ fn note_referenced_ids(command_type: DisplayListCommandType, payload: &[u8], ids
         T::FillRect
         | T::PaintCaret
         | T::DrawRepeatedTile
-        | T::DrawCompositedContext
         | T::PaintLinearGradient
         | T::PaintRadialGradient
         | T::PaintConicGradient
@@ -190,8 +200,16 @@ pub fn summarize(tape: &[u8], command_runs: &[DisplayListCommandRun]) -> Display
                 run_index: run_index as u32,
                 record_offset: (run_start + offset) as u32,
             };
-            if header.command_type == DisplayListCommandType::PaintCaret {
-                summary.carets.push(indexed);
+            match header.command_type {
+                DisplayListCommandType::PaintCaret => summary.carets.push(indexed),
+                DisplayListCommandType::DeclareMaskContent => summary.mask_declarations.push(indexed),
+                _ => {}
+            }
+            if let Some((blend, blends_with_isolated_backdrop_color)) = command_blend(header.command_type, payload)
+                && blend != CompositingAndBlendingOperator::Normal
+                && !blends_with_isolated_backdrop_color
+            {
+                summary.destination_blending_records.push(indexed);
             }
             note_referenced_ids(header.command_type, payload, &mut ids);
             let mut note_live_content = |command_type, payload: &[u8]| {
@@ -213,9 +231,10 @@ pub fn summarize(tape: &[u8], command_runs: &[DisplayListCommandRun]) -> Display
     }
     summary.font_ids = sorted(ids.fonts);
     summary.image_frame_ids = sorted(ids.image_frames);
-    summary.video_sink_ids = sorted(ids.video_sinks);
-    summary.display_list_ids = sorted(ids.display_lists);
+    summary.video_sink_handles = sorted(ids.video_sinks);
+    summary.vector_image_ids = sorted(ids.vector_images);
     summary.canvas_ids = sorted(ids.canvases);
+    summary.composited_context_ids = sorted(ids.composited_contexts);
     summary
 }
 
@@ -286,7 +305,7 @@ fn command_blend(
         | T::DrawLine
         | T::BackdropFilterRegion
         | T::DrawRect
-        | T::PaintNestedDisplayList
+        | T::PaintVectorImage
         | T::DeclareMaskContent
         | T::CompositorWheelHitTestTarget
         | T::CompositorWheelHitTestTargetWithCornerRadii
@@ -322,49 +341,35 @@ fn draws_live_content(command_type: DisplayListCommandType) -> bool {
     )
 }
 
-/// Whether reusing a raster of the list can produce different pixels than replaying it in place, leaving out the
-/// display lists it nests. That is the case when a destination-reading operation can see content painted before the
-/// list began: a non-normal blend on a command or a visual context effect, or a backdrop filter of an effect. A blend
-/// inside a group recorded in the list reads only content of the list. It is also the case when the list draws live
-/// content that changes under its immutable commands: video frames, canvases and composited child contexts.
-pub fn requires_direct_replay_without_nested_lists(
-    tape: &[u8],
-    command_runs: &[DisplayListCommandRun],
-    tree: &VisualContextTree,
-) -> bool {
-    if tree.has_unisolated_destination_reading_effect() {
-        return true;
-    }
+/// Whether reusing a raster of an SVG image's records can produce different pixels than replaying them in place. That
+/// is the case when a destination-reading operation can see content painted before the records began: a non-normal
+/// blend on a command, or on a group of them. A blend inside a group reads only content of the group. It is also the
+/// case when the records draw live content that changes under them: video frames, canvases and composited child
+/// contexts.
+pub fn vector_image_records_require_direct_replay(records: &[u8]) -> bool {
     let mut requires_direct_replay = false;
-    for run in command_runs {
-        let records = &tape[run.offset as usize..(run.offset + run.size) as usize];
-        for_each_command(records, |header, _, payload| {
-            if requires_direct_replay {
-                return;
-            }
-            if draws_live_content(header.command_type) {
-                requires_direct_replay = true;
-                return;
-            }
-            if let Some((blend, blends_with_isolated_backdrop_color)) = command_blend(header.command_type, payload)
-                && blend != CompositingAndBlendingOperator::Normal
-                && !blends_with_isolated_backdrop_color
-                && !tree.effect_is_isolated_by_layer(run.context.effect)
-            {
-                requires_direct_replay = true;
-                return;
-            }
-            for_each_nested_record_span(header.command_type, payload, |_, span| {
-                for_each_record_including_nested(span_bytes(payload, span), &mut |command_type, _| {
-                    requires_direct_replay |= draws_live_content(command_type);
-                });
+    for_each_command(records, |header, _, payload| {
+        if requires_direct_replay {
+            return;
+        }
+        if draws_live_content(header.command_type) {
+            requires_direct_replay = true;
+            return;
+        }
+        if let Some((blend, blends_with_isolated_backdrop_color)) = command_blend(header.command_type, payload)
+            && blend != CompositingAndBlendingOperator::Normal
+            && !blends_with_isolated_backdrop_color
+        {
+            requires_direct_replay = true;
+            return;
+        }
+        for_each_nested_record_span(header.command_type, payload, |_, span| {
+            for_each_record_including_nested(span_bytes(payload, span), &mut |command_type, _| {
+                requires_direct_replay |= draws_live_content(command_type);
             });
         });
-        if requires_direct_replay {
-            return true;
-        }
-    }
-    false
+    });
+    requires_direct_replay
 }
 
 /// Visits the compositor metadata commands of the runs that hold any, in tape order.

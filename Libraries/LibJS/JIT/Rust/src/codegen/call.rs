@@ -73,6 +73,7 @@ enum CallOperand {
     /// A register: an input of the call's node, or a value loaded already.
     Register(Gpr),
     Undefined,
+    Empty,
 }
 
 /// What `emit_js_call()` worked out about a `Call` instruction before
@@ -259,6 +260,61 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Err(_) => None,
         };
         self.emit_js_call(executable, pc, None, call_function)
+    }
+
+    /// A generic `CallConstruct`, `SuperCall` or `SuperCallWithForwardedArguments`:
+    /// through the construct stub (see `RuntimeInfo::construct_stub`), with
+    /// the constructor as its own new target for `CallConstruct` and the
+    /// running frame's for super calls. `SuperCallWithForwardedArguments`
+    /// passes no callee, which has the runtime prepare the construct.
+    pub(super) fn emit_generic_construct(&mut self, executable: u32, pc: u32) -> Result<(), CompileFailure> {
+        let decoded = self.decoded(executable, pc)?;
+        let next_pc = decoded.next_pc();
+        let (dst, callee, new_target, arguments) = match decoded.instruction {
+            Instruction::CallConstruct {
+                dst,
+                callee,
+                ref arguments,
+                ..
+            } => (
+                dst,
+                CallOperand::Slot(callee),
+                CallOperand::Slot(callee),
+                arguments.clone(),
+            ),
+            Instruction::SuperCall {
+                dst,
+                super_constructor,
+                ref arguments,
+                ..
+            } => (
+                dst,
+                CallOperand::Slot(super_constructor),
+                CallOperand::Empty,
+                arguments.clone(),
+            ),
+            Instruction::SuperCallWithForwardedArguments { dst, .. } => {
+                (dst, CallOperand::Undefined, CallOperand::Empty, Vec::new())
+            }
+            _ => {
+                return Err(CompileFailure::InvalidBytecode {
+                    pc,
+                    reason: "generic construct of a non-construct instruction",
+                });
+            }
+        };
+        let arguments = arguments.into_iter().map(CallOperand::Slot).collect::<Vec<_>>();
+        self.emit_call_stub_call(
+            callee,
+            new_target,
+            &arguments,
+            pc,
+            next_pc,
+            dst.raw(),
+            self.runtime.construct_stub,
+        )?;
+        self.emit_continuation_check(next_pc, &[]);
+        Ok(())
     }
 
     /// Whether generic `Call` nodes try to call ECMAScript functions directly
@@ -815,7 +871,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_push_inlined_call_frames(site, &inputs);
             }
             store_operands(self)?;
-            self.emit_call_stub_call(callee_operand, this_operand, argument_operands, pc, next_pc, dst.raw())?;
+            self.emit_call_stub_call(
+                callee_operand,
+                this_operand,
+                argument_operands,
+                pc,
+                next_pc,
+                dst.raw(),
+                call_stub,
+            )?;
             self.masm.jump(check);
         }
 
@@ -992,6 +1056,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             CallOperand::Register(register) => self.masm.move64(dst, register),
             CallOperand::Undefined => self.masm.move_imm64(dst, value::UNDEFINED),
+            CallOperand::Empty => self.masm.move_imm64(dst, value::EMPTY),
         }
         Ok(())
     }
@@ -1015,6 +1080,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// `callee`, with `this` and `arguments`, which it stores on the machine
     /// stack for the stub. Leaves the stub's control word in the first
     /// return register.
+    #[allow(clippy::too_many_arguments)]
     fn emit_call_stub_call(
         &mut self,
         callee: CallOperand,
@@ -1023,6 +1089,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         pc: u32,
         next_pc: u32,
         dst: u32,
+        stub: u64,
     ) -> Result<(), CompileFailure> {
         let registers = M::ARGUMENT_GPRS;
         let scratch = self.pinned.scratch;
@@ -1047,7 +1114,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .move_imm64(registers[3], u64::from(pc) | (u64::from(next_pc) << 32));
         self.masm.move_imm32(registers[4], dst);
-        self.masm.call_absolute(self.runtime.dynamic_calls.call_stub);
+        self.masm.call_absolute(stub);
         if argument_bytes != 0 {
             self.masm.add64_imm(M::STACK_POINTER, M::STACK_POINTER, argument_bytes);
         }
@@ -1506,21 +1573,21 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// linked to the running frame like the interpreter's inline calls do,
     /// and returns the constant ones for `emit_constant_fields()`. Its `this`
     /// value and slots are left to the caller. Clobbers `function_register`
-    /// and `temp`.
+    /// and `temp`. The fields come from snapshot executable `executable`,
+    /// the entry of the frame's own function: closures that share one
+    /// executable each have an entry, with their own environments.
     fn emit_frame_header(
         &mut self,
+        executable: u32,
         new_frame: Gpr,
         function_register: Gpr,
         temp: Gpr,
         header: &FrameHeader,
     ) -> Vec<ConstantField> {
         let offsets = self.runtime.offsets;
-        let snapshot = self
-            .executables
-            .iter()
-            .find(|executable| executable.cell == header.executable);
-        let function_fields = snapshot.and_then(|executable| executable.function_fields);
-        let builtin = snapshot.is_some_and(|executable| executable.builtin);
+        let snapshot = &self.executables[executable as usize];
+        let function_fields = snapshot.function_fields;
+        let builtin = snapshot.builtin;
         let mut constants = Vec::new();
         if builtin {
             // NB: Frames of builtins written in JavaScript have the
@@ -1643,7 +1710,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             (offsets.execution_context_yield_is_await, 1, 0),
             (offsets.execution_context_yield_value_is_iterator_result, 1, 0),
             (offsets.execution_context_caller_is_construct, 1, 0),
+            (offsets.execution_context_caller_is_derived_construct, 1, 0),
             (offsets.execution_context_frame_initialized, 1, 0),
+            (offsets.execution_context_new_target, 8, value::UNDEFINED),
             (
                 offsets.execution_context_returns_to_native_caller,
                 1,
@@ -1694,7 +1763,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         return_pc: u32,
         dst: u32,
         passed_argument_count: u32,
-        construct: bool,
+        construct_new_target: Option<CellId>,
         this: Gpr,
         closure: Option<Gpr>,
         temps: [Gpr; 3],
@@ -1736,12 +1805,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_function_fields(new_frame, closure, temp);
                 self.frame_header_field_constants(&header)
             }
-            None => self.emit_frame_header(new_frame, function_register, temp, &header),
+            None => self.emit_frame_header(executable, new_frame, function_register, temp, &header),
         };
-        if construct {
+        if let Some(new_target) = construct_new_target {
+            let new_target = self.boxed_object(new_target);
             for field in &mut constants {
                 if field.0 == offsets.execution_context_caller_is_construct {
                     field.2 = 1;
+                } else if field.0 == offsets.execution_context_new_target {
+                    field.2 = new_target;
                 }
             }
         }

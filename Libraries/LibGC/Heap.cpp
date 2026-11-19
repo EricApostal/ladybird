@@ -17,6 +17,7 @@
 #include <AK/LexicalPath.h>
 #include <AK/NumberFormat.h>
 #include <AK/Platform.h>
+#include <AK/SaturatingMath.h>
 #include <AK/ScopeGuard.h>
 #include <AK/StackInfo.h>
 #include <AK/StackUnwinder.h>
@@ -26,6 +27,7 @@
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/StatsLog.h>
+#include <LibCore/ThreadEventQueue.h>
 #include <LibCore/Timer.h>
 #include <LibGC/BlockAllocator.h>
 #include <LibGC/CellAllocator.h>
@@ -60,6 +62,11 @@ static constexpr double GC_TARGET_TIME_FRACTION { 0.1 };
 static constexpr double GC_MIN_GROWTH_FACTOR { 2 };
 static constexpr double GC_MAX_GROWTH_FACTOR { 8 };
 
+// The maximum factor goes down to the minimum as the live heap, counting the memory its cells own outside it, grows
+// from the first size to the second. Letting a large heap grow by the maximum factor would add gigabytes of garbage.
+static constexpr size_t GC_LARGE_HEAP_START_BYTES { 128 * 1024 * 1024 };
+static constexpr size_t GC_LARGE_HEAP_END_BYTES { 512 * 1024 * 1024 };
+
 // OPTIMIZATION: A program that allocates fast and keeps little alive gains from a budget far above the maximum factor,
 //               so the maximum never limits a budget below this.
 static constexpr size_t GC_MAX_BUDGET_FLOOR_BYTES { 256 * 1024 * 1024 };
@@ -69,6 +76,11 @@ static constexpr size_t GC_MAX_BUDGET_FLOOR_BYTES { 256 * 1024 * 1024 };
 //     1 GiB of such memory allocate gigabytes of cells between collections, so it only grows the threshold by a tenth.
 static constexpr size_t GC_EXTERNAL_GROWTH_FACTOR_NUMERATOR { 1 };
 static constexpr size_t GC_EXTERNAL_GROWTH_FACTOR_DENOMINATOR { 10 };
+
+// The share of the threshold that may be allocated before the sweep that follows a collection has to be done. Until a
+// block is swept, its dead cells keep their slots and whatever memory they own outside the heap, and a program that
+// keeps the event loop busy gives the sweep timer no chance to run, so allocation pays for the sweep as it goes.
+static constexpr size_t GC_SWEEP_ALLOCATION_SHARE_DENOMINATOR { 4 };
 
 static constexpr int GC_INCREMENTAL_SWEEP_INTERVAL_MS = 16;
 static constexpr int GC_INCREMENTAL_SWEEP_SLICE_MS = 5;
@@ -81,6 +93,12 @@ static constexpr int GC_IDLE_GC_INTERVAL_MS = 4000;
 // next page, gets this long to settle, and a burst of abandoned graphs, like closing a window of tabs, shares one
 // collection.
 static constexpr int GC_ABANDONED_OBJECT_GRAPH_MIN_DELAY_MS = 1000;
+
+// How long after a collection the thread gives the memory that its allocator holds back to the system, unless another
+// collection comes first. The allocator only looks for memory to give back when the thread allocates, so what an idle
+// thread freed, or what other threads freed of its memory, would stay. The delay keeps this away from a thread that is
+// busy, and leaves time for the work that a collection starts on other threads, like compressing source text.
+static constexpr int GC_ALLOCATOR_MEMORY_RELEASE_DELAY_MS = 5000;
 
 // Every thread that runs a VM has a heap of its own, and all but the main thread may come and go.
 AK_TLS_INITIAL_EXEC static thread_local constinit Heap* s_the = nullptr;
@@ -439,6 +457,9 @@ void Heap::will_allocate(size_t size, TriggersCollection triggers_collection)
     m_allocated_bytes_since_last_gc += size;
     m_total_allocated_bytes += size;
 
+    if (m_block_sweeps_in_progress == 0 && triggers_collection == TriggersCollection::Yes)
+        sweep_in_step_with_allocation();
+
     // Keep the idle GC timer armed while allocation is happening, so a proactive collection runs once the mutator's
     // allocation rate drops.
     if (!m_idle_gc_timer || !m_idle_gc_timer->is_active())
@@ -474,15 +495,19 @@ double Heap::next_growth_factor(size_t live_cell_bytes)
         ? (wanted_budget / live + m_wanted_growth_factor.value()) / 2
         : wanted_budget / live;
 
-    auto max_growth_factor = max(GC_MAX_GROWTH_FACTOR, static_cast<double>(GC_MAX_BUDGET_FLOOR_BYTES) / live);
+    auto heap_size = static_cast<double>(live_cell_bytes) + static_cast<double>(m_marked_external_bytes);
+    auto large_heap_share = clamp((heap_size - GC_LARGE_HEAP_START_BYTES) / (GC_LARGE_HEAP_END_BYTES - GC_LARGE_HEAP_START_BYTES), 0.0, 1.0);
+    auto max_growth_factor = GC_MAX_GROWTH_FACTOR - (GC_MAX_GROWTH_FACTOR - GC_MIN_GROWTH_FACTOR) * large_heap_share;
+    max_growth_factor = max(max_growth_factor, static_cast<double>(GC_MAX_BUDGET_FLOOR_BYTES) / live);
     return clamp(m_wanted_growth_factor.value(), GC_MIN_GROWTH_FACTOR, max_growth_factor);
 }
 
-void Heap::update_gc_bytes_threshold(size_t live_external_bytes)
+void Heap::update_gc_bytes_threshold()
 {
     // NB: Only marking knows how much the last collection found alive. A sweep also sees the cells allocated into
     //     blocks it has yet to reach, which are marked to keep them alive.
     auto live_cell_bytes = m_marked_cell_bytes;
+    auto live_external_bytes = m_marked_external_bytes;
     if (m_stats) {
         m_stats->live_cell_bytes = live_cell_bytes;
         m_stats->live_external_bytes = live_external_bytes;
@@ -816,7 +841,7 @@ Vector<Heap::RetainingPath> Heap::build_retaining_paths(ReadonlySpan<FlatPtr> ca
         path.steps.ensure_capacity(path_cells.size());
         for (size_t i = path_cells.size(); i > 0; --i) {
             auto& step = *path_cells[i - 1];
-            path.steps.unchecked_append({ class_name_of(step) });
+            path.steps.unchecked_append({ &step, class_name_of(step) });
         }
         paths.append(move(path));
     }
@@ -884,11 +909,19 @@ NO_SANITIZE_ADDRESS void Heap::collect_garbage(CollectionType collection_type, b
     run_collection(captured_registers, collection_type, print_report);
 }
 
-void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType collection_type, bool print_report)
+void Heap::collect_garbage_without_scanning_the_stack()
+{
+    VERIFY(!heap_access_is_forbidden_on_this_thread());
+    VERIFY(is_on_owner_thread());
+    run_collection({}, CollectionType::CollectGarbage, false, false);
+}
+
+void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType collection_type, bool print_report, bool scan_stack)
 {
     ConservativeScanOrigin origin {
         .stack_floor = bit_cast<FlatPtr>(__builtin_frame_address(0)),
         .callee_saved_registers = callee_saved_registers,
+        .scan_stack = scan_stack,
     };
 
     VERIFY(!m_collecting_garbage);
@@ -938,6 +971,7 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
             }
         } else {
             m_marked_cell_bytes = 0;
+            m_marked_external_bytes = 0;
         }
         clear_weak_pointers_to_dead_cells(report);
         run_post_mark_phases(report);
@@ -997,6 +1031,8 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
     }
     if (m_abandoned_object_graph_state == AbandonedObjectGraphState::WaitingToReleaseMemory && !m_incremental_sweep_active)
         schedule_release_of_abandoned_object_graph_memory();
+    if (!m_incremental_sweep_active)
+        schedule_release_of_allocator_memory();
 }
 
 void Heap::update_allocation_rate()
@@ -1230,7 +1266,7 @@ void Heap::gather_roots(ConservativeScanOrigin const& origin, HashMap<Cell*, Hea
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.gather_embedder_roots_us };
         m_gather_embedder_roots(roots);
     }
-    {
+    if (origin.scan_stack) {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.gather_conservative_roots_us };
         gather_conservative_roots(origin, roots, out_stack_frames);
     }
@@ -1274,10 +1310,21 @@ NO_SANITIZE_ADDRESS static void gather_asan_fake_stack_roots(PossiblePointers& p
         return;
 
     for (auto* real_stack_addr = reinterpret_cast<void const* const*>(begin); real_stack_addr < end; ++real_stack_addr) {
-        void const* real_address = *real_stack_addr;
-        if (real_address == nullptr)
+        // ASan hands out fake frames from a pool without clearing them, so the parts of a frame that its function has not
+        // written yet still hold whatever an earlier function left there, often a pointer to a cell. ASan poisons the
+        // redzones and every local that is out of scope, so no live value can be in a poisoned byte. Skip those: a word
+        // is addressable up to its first poisoned byte, which leaves the low bytes of the value on a little-endian
+        // machine.
+        auto* first_poisoned_byte = static_cast<u8 const*>(__asan_region_is_poisoned(const_cast<void*>(static_cast<void const*>(real_stack_addr)), sizeof(FlatPtr)));
+        auto addressable_bytes = first_poisoned_byte ? static_cast<size_t>(first_poisoned_byte - reinterpret_cast<u8 const*>(real_stack_addr)) : sizeof(FlatPtr);
+        if (addressable_bytes == 0)
             continue;
-        add_possible_value(possible_pointers, reinterpret_cast<FlatPtr>(real_address), HeapRoot { .type = HeapRoot::Type::StackPointer }, bounds);
+        auto real_address = reinterpret_cast<FlatPtr>(*real_stack_addr);
+        if (addressable_bytes < sizeof(FlatPtr))
+            real_address &= (static_cast<FlatPtr>(1) << (addressable_bytes * 8)) - 1;
+        if (real_address == 0)
+            continue;
+        add_possible_value(possible_pointers, real_address, HeapRoot { .type = HeapRoot::Type::StackPointer }, bounds);
     }
 }
 #else
@@ -1505,8 +1552,12 @@ public:
                 if (cell->state() != Cell::State::Live)
                     continue;
                 auto* block = HeapBlock::from_cell(cell.ptr());
-                block->heap().m_marked_cell_bytes += block->cell_size();
-                cell->type_info().visit_edges(cell.ptr(), this);
+                auto& heap = block->heap();
+                auto const& type_info = block->type_info();
+                heap.m_marked_cell_bytes += block->cell_size();
+                if (type_info.external_memory_size)
+                    heap.m_marked_external_bytes = saturating_add(heap.m_marked_external_bytes, type_info.external_memory_size(cell.ptr()));
+                type_info.visit_edges(cell.ptr(), this);
             }
 
             bool marked_a_value = false;
@@ -1553,8 +1604,10 @@ void Heap::mark_live_cells_across(ReadonlySpan<Heap* const> heaps, HashMap<Cell*
         }
     }
 
-    for (auto* heap : heaps)
+    for (auto* heap : heaps) {
         heap->m_marked_cell_bytes = 0;
+        heap->m_marked_external_bytes = 0;
+    }
 
     Optional<MarkingVisitor> visitor;
     {
@@ -1609,14 +1662,12 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
     size_t live_cells = 0;
     size_t collected_cell_bytes = 0;
     size_t live_cell_bytes = 0;
-    size_t live_external_bytes = 0;
 
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.sweep_block_iteration_us };
         for_each_block([&](auto& block) {
             bool block_has_live_cells = false;
             bool block_was_full = block.is_full();
-            auto* external_memory_size = block.type_info().external_memory_size;
             block.template for_each_cell_in_state<Cell::State::Live>([&](Cell* cell) {
                 if (!cell->is_marked()) {
                     dbgln_if(HEAP_DEBUG, "  ~ {}", cell);
@@ -1628,12 +1679,6 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
                     block_has_live_cells = true;
                     ++live_cells;
                     live_cell_bytes += block.cell_size();
-                    if (!external_memory_size)
-                        return;
-                    auto cell_external_memory_size = external_memory_size(cell);
-                    live_external_bytes = cell_external_memory_size > NumericLimits<size_t>::max() - live_external_bytes
-                        ? NumericLimits<size_t>::max()
-                        : live_external_bytes + cell_external_memory_size;
                 }
             });
             if (!block_has_live_cells)
@@ -1667,7 +1712,7 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.sweep_update_threshold_us };
         m_sweep_duration_ns += MonotonicTime::now().nanoseconds() - sweep_start_ns;
-        update_gc_bytes_threshold(live_external_bytes);
+        update_gc_bytes_threshold();
     }
 
     if (print_report) {
@@ -1676,7 +1721,7 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
             .live_cells = live_cells,
             .collected_cell_bytes = collected_cell_bytes,
             .live_cell_bytes = live_cell_bytes,
-            .live_external_bytes = live_external_bytes,
+            .live_external_bytes = m_marked_external_bytes,
             .freed_block_count = empty_blocks.size(),
         };
     }
@@ -1705,13 +1750,13 @@ void Heap::sweep_block(HeapBlock& block)
 
     // Remove from the allocator's pending sweep list.
     block.m_sweep_list_node.remove();
+    ++m_blocks_swept;
 
     block.set_being_swept(true);
     bool block_has_live_cells = false;
     bool block_was_full = block.is_full();
     size_t collected_cells = 0;
     size_t live_cells = 0;
-    auto* external_memory_size = block.type_info().external_memory_size;
 
     block.for_each_cell_in_state<Cell::State::Live>([&](Cell* cell) {
         if (!cell->is_marked()) {
@@ -1722,12 +1767,6 @@ void Heap::sweep_block(HeapBlock& block)
             cell->set_marked(false);
             block_has_live_cells = true;
             ++live_cells;
-            if (!external_memory_size)
-                return;
-            auto cell_external_memory_size = external_memory_size(cell);
-            m_sweep_live_external_bytes = cell_external_memory_size > NumericLimits<size_t>::max() - m_sweep_live_external_bytes
-                ? NumericLimits<size_t>::max()
-                : m_sweep_live_external_bytes + cell_external_memory_size;
         }
     });
     block.set_being_swept(false);
@@ -1776,7 +1815,6 @@ void Heap::start_incremental_sweep()
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep] === Starting incremental sweep ===");
 
     m_incremental_sweep_active = true;
-    m_sweep_live_external_bytes = 0;
     incremental_sweep_stats().should_report = false;
     incremental_sweep_stats().total_blocks = 0;
     incremental_sweep_stats().batches.clear();
@@ -1800,6 +1838,8 @@ void Heap::start_incremental_sweep()
             m_allocators_to_sweep.append(allocator);
     }
     incremental_sweep_stats().total_blocks = total_blocks;
+    m_blocks_to_sweep = total_blocks;
+    m_blocks_swept = 0;
 
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep] {} blocks to sweep", total_blocks);
 
@@ -1808,7 +1848,7 @@ void Heap::start_incremental_sweep()
 
 void Heap::finish_incremental_sweep()
 {
-    update_gc_bytes_threshold(m_sweep_live_external_bytes);
+    update_gc_bytes_threshold();
 
     // NB: A graph abandoned during this sweep was alive when marking ran, so the threshold just set counts it.
     if (m_abandoned_object_graph_state == AbandonedObjectGraphState::WaitingToCollect)
@@ -1816,9 +1856,9 @@ void Heap::finish_incremental_sweep()
 
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep] === Sweep complete ===");
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep]     Live cell bytes: {} ({} KiB)", m_marked_cell_bytes, m_marked_cell_bytes / KiB);
-    dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep]     Live external bytes: {} ({} KiB)", m_sweep_live_external_bytes, m_sweep_live_external_bytes / KiB);
+    dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep]     Live external bytes: {} ({} KiB)", m_marked_external_bytes, m_marked_external_bytes / KiB);
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep]     Next GC threshold: {} ({} KiB)", m_gc_bytes_threshold, m_gc_bytes_threshold / KiB);
-    print_incremental_sweep_report(m_marked_cell_bytes, m_sweep_live_external_bytes, m_gc_bytes_threshold);
+    print_incremental_sweep_report(m_marked_cell_bytes, m_marked_external_bytes, m_gc_bytes_threshold);
 
     // Clear marks on cells allocated during sweep. Sweep already cleared
     // marks on cells it visited, so only these remain marked.
@@ -1837,6 +1877,7 @@ void Heap::finish_incremental_sweep()
 
     if (m_abandoned_object_graph_state == AbandonedObjectGraphState::WaitingToReleaseMemory)
         schedule_release_of_abandoned_object_graph_memory();
+    schedule_release_of_allocator_memory();
 }
 
 void Heap::finish_pending_incremental_sweep()
@@ -1856,6 +1897,37 @@ void Heap::finish_pending_incremental_sweep()
         }
         ++blocks_swept;
     }
+}
+
+void Heap::sweep_in_step_with_allocation()
+{
+    if (!m_incremental_sweep_active || is_gc_deferred())
+        return;
+
+    // Keep the share of blocks swept ahead of the share of the allocation allowance used since the collection. The
+    // allowance comes from the smallest threshold that the cells this collection found alive can give, since the
+    // threshold itself is only updated once the sweep is done. A collection that something asked for does not reset
+    // the bytes allocated towards the threshold, so this counts from the end of the collection instead.
+    auto smallest_threshold = max(static_cast<size_t>(static_cast<double>(m_marked_cell_bytes) * GC_MIN_GROWTH_FACTOR), GC_MIN_BYTES_THRESHOLD);
+    auto allowance = max(smallest_threshold / GC_SWEEP_ALLOCATION_SHARE_DENOMINATOR, static_cast<size_t>(1));
+    auto allocated = min(static_cast<size_t>(m_total_allocated_bytes - m_total_allocated_bytes_at_last_collection), allowance);
+    auto blocks_due = static_cast<size_t>(static_cast<double>(m_blocks_to_sweep) * static_cast<double>(allocated) / static_cast<double>(allowance));
+    // NB: Once every block is due, the sweep goes on until it finds nothing left to sweep, which finishes it.
+    auto is_ahead = [&] { return m_blocks_swept >= blocks_due && blocks_due < m_blocks_to_sweep; };
+    if (is_ahead())
+        return;
+
+    size_t blocks_swept = 0;
+    auto start_time = MonotonicTime::now();
+    while (!is_ahead()) {
+        if (sweep_next_block()) {
+            record_incremental_sweep_batch(blocks_swept, (MonotonicTime::now() - start_time).to_microseconds(), false);
+            finish_incremental_sweep();
+            return;
+        }
+        ++blocks_swept;
+    }
+    record_incremental_sweep_batch(blocks_swept, (MonotonicTime::now() - start_time).to_microseconds(), false);
 }
 
 void Heap::start_incremental_sweep_timer()
@@ -1932,7 +2004,7 @@ void Heap::idle_gc_on_timer()
         return;
     case IdleCollectionPolicy::Decision::Collect:
         m_allocated_bytes_since_last_gc = 0;
-        collect_garbage();
+        collect_garbage_from_timer();
         m_idle_gc_timer->stop();
         return;
     }
@@ -1982,7 +2054,39 @@ void Heap::on_abandoned_object_graph_timer()
     }
 
     m_allocated_bytes_since_last_gc = 0;
+    collect_garbage_from_timer();
+}
+
+void Heap::collect_garbage_from_timer()
+{
+    // A timer fires from the event loop. In its outermost turn the only frames on the stack are the event loop's and the
+    // embedder's, so if the embedder vouches for its own, there is no root to find there. Words that only look like a
+    // cell pointer are still there, and some never change, so scanning them could keep a cell alive for good. A nested
+    // event loop has its caller's frames further up the stack, and those need the scan.
+    if (m_outermost_event_loop_turn_holds_no_cells && !Core::ThreadEventQueue::current().is_processing_nested()) {
+        collect_garbage_without_scanning_the_stack();
+        return;
+    }
     collect_garbage();
+}
+
+void Heap::collect_garbage_and_return_memory_to_system()
+{
+    // NB: A collection that has to wait for a deferral to end still lets go of as much as this one would. What it
+    //     frees goes back to the system some seconds later, as after any other collection.
+    if (is_gc_deferred()) {
+        m_should_gc_when_deferral_ends = true;
+        m_should_return_memory_when_deferral_ends = true;
+        return;
+    }
+    {
+        TemporaryChange change { m_is_returning_memory_to_system, true };
+        collect_garbage();
+        finish_pending_incremental_sweep();
+    }
+    for (auto& allocator : m_all_cell_allocators)
+        allocator.block_allocator().return_freed_blocks_to_system();
+    ak_kmalloc_collect();
 }
 
 void Heap::schedule_release_of_abandoned_object_graph_memory()
@@ -1990,6 +2094,16 @@ void Heap::schedule_release_of_abandoned_object_graph_memory()
     // NB: A timer, since a sweep can finish in the middle of any allocation, and the allocator can't be collected from
     //     everywhere.
     m_abandoned_object_graph_timer->restart(AK::Duration::zero());
+}
+
+void Heap::schedule_release_of_allocator_memory()
+{
+    if (!m_allocator_memory_release_timer) {
+        m_allocator_memory_release_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(GC_ALLOCATOR_MEMORY_RELEASE_DELAY_MS), [] {
+            ak_kmalloc_collect();
+        });
+    }
+    m_allocator_memory_release_timer->restart();
 }
 
 void Heap::defer_gc()
@@ -2011,8 +2125,12 @@ void Heap::undefer_gc()
     if (m_block_sweeps_in_progress > 0)
         return;
 
-    collect_garbage();
+    {
+        TemporaryChange change { m_is_returning_memory_to_system, m_should_return_memory_when_deferral_ends };
+        collect_garbage();
+    }
     m_should_gc_when_deferral_ends = false;
+    m_should_return_memory_when_deferral_ends = false;
 }
 
 void Heap::uproot_cell(Cell* cell)

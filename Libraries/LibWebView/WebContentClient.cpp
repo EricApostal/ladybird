@@ -185,10 +185,10 @@ static constexpr auto detached_page_close_timeout_ms = 1000;
 static constexpr auto close_server_exit_timeout_ms = 5000;
 static constexpr auto detached_page_forced_exit_timeout_ms = detached_page_close_timeout_ms + close_server_exit_timeout_ms;
 
-WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
+WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, BrowsingSession& session, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
     : IPC::ConnectionToServer<WebContentClientEndpoint, WebContentServerEndpoint, WebContentClientPageRoutingStub>(*this, move(transport))
-    , m_is_private(is_private)
-    , m_session(Application::existing_session(is_private))
+    , m_is_private(session.is_private())
+    , m_session(session)
     , m_request_server_site_bindings([this](RequestServerClientConnection& connection, Optional<Utf16String> const& top_level_site) {
         async_connect_to_request_server(move(connection.handle), connection.client_id, top_level_site);
     })
@@ -197,7 +197,6 @@ WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPr
     , m_audio_tab_id(allocate_audio_tab_id())
 {
     VERIFY(initial_page_id > 0);
-    VERIFY(m_session);
     clients().set(this);
 }
 
@@ -239,6 +238,70 @@ void WebContentClient::gamepad_stop_effects(Web::Gamepad::GamepadHandle handle)
 void WebContentClient::die()
 {
     did_lose_process();
+}
+
+// A tab the user left is likely to stay in the background for long, and its process keeps much that only makes it
+// faster: compiled code, decoded images, caches. Once every tab of a process was hidden for this long, the process is
+// asked to let go of all that. The wait keeps a user who switches back and forth between tabs from paying for it.
+static constexpr auto time_hidden_before_releasing_memory = AK::Duration::from_seconds(10);
+
+bool WebContentClient::all_tabs_are_hidden() const
+{
+    // NB: A process without pages has no tabs to speak of, and little to release.
+    bool has_open_page = false;
+    for (auto const& [page_id, page] : m_pages) {
+        if (!page->is_open() || !page->has_traversable())
+            continue;
+        if (page->traversable().system_visibility_state() != Web::HTML::VisibilityState::Hidden)
+            return false;
+        has_open_page = true;
+    }
+    return has_open_page;
+}
+
+void WebContentClient::did_change_visibility_of_a_tab()
+{
+    if (!all_tabs_are_hidden()) {
+        if (m_release_memory_of_hidden_tabs_timer)
+            m_release_memory_of_hidden_tabs_timer->stop();
+        return;
+    }
+    if (!m_release_memory_of_hidden_tabs_timer) {
+        m_release_memory_of_hidden_tabs_timer = Core::Timer::create_single_shot(time_hidden_before_releasing_memory, [this] {
+            release_memory_of_hidden_tabs();
+        });
+    }
+    // NB: A timer that already runs keeps its time, so that more of these calls while the tabs stay hidden do not
+    //     put the release off.
+    if (!m_release_memory_of_hidden_tabs_timer->is_active())
+        m_release_memory_of_hidden_tabs_timer->start();
+}
+
+void WebContentClient::release_memory_of_hidden_tabs()
+{
+    if (!is_open() || !all_tabs_are_hidden())
+        return;
+    // NB: What the process lets go of, it has to make again when it needs it, which a tab that plays or records sound
+    //     in the background could not do without the user hearing it. A page that only hosts a frame of a tab counts
+    //     too, as the sound of the tab may come from that frame. The process is asked once the sound has stopped.
+    for (auto const& [page_id, page] : m_pages) {
+        if (!page->is_open() || !page->has_traversable())
+            continue;
+        auto view = page->traversable().view();
+        if (!view.has_value())
+            continue;
+        auto plays_or_records_sound = view->is_playing_audio() || view->is_capturing_audio();
+        // NB: A view that another view owns has no tab of its own, and its capture shows on its owner.
+        if (auto owner_view_id = view->owner_view_id(); owner_view_id.has_value()) {
+            if (auto owner = ViewImplementation::find_view_by_id(*owner_view_id); owner.has_value())
+                plays_or_records_sound |= owner->is_playing_audio() || owner->is_capturing_audio();
+        }
+        if (plays_or_records_sound) {
+            m_release_memory_of_hidden_tabs_timer->restart();
+            return;
+        }
+    }
+    async_release_memory();
 }
 
 void WebContentClient::did_misbehave(StringView message_name, StringView reason)
@@ -391,6 +454,7 @@ void WebContentClient::register_embedded_page(Web::PageId page_id, CanonicalTrav
     Application::process_manager().cancel_forced_exit(child_id());
 
     page.view().send_preferences_to_page(page);
+    page.view().send_force_dark_to_embedded_page(page);
     if (Application::browser_options().webdriver_browser_endpoint.has_value())
         Application::the().push_webdriver_session_config(page);
     page.async_set_has_focus(traversable.has_system_focus());
@@ -452,6 +516,8 @@ WebContentPage& WebContentClient::open_page(Web::PageId page_id, CanonicalTraver
 {
     auto page = adopt_ref(*new WebContentPage(*this, page_id, traversable));
     m_pages.set(page_id, page);
+    // NB: A tab that starts hidden, or that moves to this process while hidden, never tells of a change.
+    did_change_visibility_of_a_tab();
     return page;
 }
 
@@ -570,6 +636,8 @@ void WebContentClient::replay_compositor_view_state_after_reconnect(Badge<Applic
         if (!m_compositor_contexts.contains(context_id))
             continue;
         auto& view = page->view();
+        Application::the().update_compositor_context_scales_frames_to_fit(context_id, view.scales_frames_to_fit());
+        view.recreate_remote_layer_after_compositor_reconnect({});
         Application::the().update_compositor_viewport(context_id, view.viewport_size().to_type<int>(), view.device_pixel_ratio());
         Application::the().update_compositor_display_metadata(context_id, view.display_id(), view.maximum_frames_per_second());
         Application::the().update_compositor_context_visibility(context_id, view.traversable().system_visibility_state());
@@ -632,7 +700,11 @@ void WebContentClient::did_lose_process()
         return;
 
     // The views are told deferred, and looked up by ID, in case they are destroyed before then.
-    auto crash_reason = m_rejected_ipc ? ViewImplementation::WebContentCrashReason::RejectedIPC : ViewImplementation::WebContentCrashReason::ProcessCrash;
+    auto crash_reason = ViewImplementation::WebContentCrashReason::ProcessCrash;
+    if (m_rejected_ipc)
+        crash_reason = ViewImplementation::WebContentCrashReason::RejectedIPC;
+    else if (m_exceeded_memory_limit)
+        crash_reason = ViewImplementation::WebContentCrashReason::ExceededMemoryLimit;
     for (auto const& lost : lost_pages) {
         if (!lost.view_id.has_value())
             continue;
@@ -643,7 +715,7 @@ void WebContentClient::did_lose_process()
             if (!view.has_value())
                 return;
             if (shows_crash_screen)
-                view->handle_web_content_process_crash();
+                view->handle_web_content_process_crash(crash_reason);
             if (view->on_web_content_crashed)
                 view->on_web_content_crashed(crash_reason);
         });
@@ -682,33 +754,55 @@ void WebContentClient::cancel_navigation_transactions()
 // Seeing HttpOnly cookies, storing cookies the way an HTTP response does, and changing a cookie by its identity are for
 // WebDriver and the test harness. RequestServer handles the cookies of HTTP responses and requests itself, so a renderer
 // serving an ordinary browsing session never needs any of it.
-bool WebContentClient::renderers_may_access_cookies_like_http()
+// NB: Under WebDriver, the renderer may do so only while it runs a cookie command, and only for the document the
+//     command is for. Otherwise any renderer of an automated browser could take the cookies of every site.
+static Optional<URL::URL> url_of_webdriver_cookie_command_running_in(WebContentClient const& client)
 {
-    return Application::browser_options().webdriver_browser_endpoint.has_value()
-        || Application::web_content_options().is_test_mode == IsTestMode::Yes;
+    if (!Application::browser_options().webdriver_browser_endpoint.has_value())
+        return {};
+
+    Optional<URL::URL> url;
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        url = view.url_of_webdriver_cookie_command_running_in(client);
+        return url.has_value() ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return url;
 }
 
-bool WebContentClient::renderers_may_synthesize_input()
+WebContentClient::HTTPCookieAccess WebContentClient::http_cookie_access_for(URL::URL const& url) const
 {
-    // WebDriver's actions and the internals object dispatch input as though the user produced it.
-    return Application::browser_options().webdriver_browser_endpoint.has_value()
-        || Application::web_content_options().is_test_mode == IsTestMode::Yes
+    if (Application::web_content_options().is_test_mode == IsTestMode::Yes)
+        return HTTPCookieAccess::Allowed;
+
+    auto command_url = url_of_webdriver_cookie_command_running_in(*this);
+    if (!command_url.has_value())
+        return HTTPCookieAccess::Refused;
+    return command_url->equals(url, URL::ExcludeFragment::Yes) ? HTTPCookieAccess::Allowed : HTTPCookieAccess::RefusedForURL;
+}
+
+bool WebContentClient::renderers_may_synthesize_input_for_testing()
+{
+    // The internals object dispatches input as though the user produced it.
+    return Application::web_content_options().is_test_mode == IsTestMode::Yes
         || Application::web_content_options().expose_internals_object == ExposeInternalsObject::Yes;
 }
 
 bool WebContentClient::may_read_local_files() const
 {
-    // WebDriver's Element Send Keys selects the files it names by path through the process hosting the file input.
-    if (Application::browser_options().webdriver_browser_endpoint.has_value())
-        return true;
-
     return m_has_hosted_local_file_content;
 }
 
 Messages::WebContentClient::DidRequestAllCookiesWebdriverResponse WebContentClient::did_request_all_cookies_webdriver(URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context)
 {
-    if (!renderers_may_access_cookies_like_http()) {
-        did_misbehave("did_request_all_cookies_webdriver"sv, "not driven by WebDriver"sv);
+    if (auto access = http_cookie_access_for(url); access != HTTPCookieAccess::Allowed) {
+        if (access == HTTPCookieAccess::Refused)
+            did_misbehave("did_request_all_cookies_webdriver"sv, "not running a WebDriver cookie command"sv);
+        return Vector<HTTP::Cookie::Cookie> {};
+    }
+    // NB: Only the internals object of a test asks for the cookies of a partition. WebDriver asks for the unpartitioned
+    //     cookies of the document its command is for.
+    if (partition_context.has_value() && Application::web_content_options().is_test_mode != IsTestMode::Yes) {
+        did_misbehave("did_request_all_cookies_webdriver"sv, "partition context outside of a test"sv);
         return Vector<HTTP::Cookie::Cookie> {};
     }
     return m_session->cookie_jar->get_all_cookies_webdriver(url, partition_context);
@@ -731,8 +825,9 @@ Messages::WebContentClient::DidRequestNotificationsStateForTestingResponse WebCo
 
 Messages::WebContentClient::DidRequestNamedCookieResponse WebContentClient::did_request_named_cookie(URL::URL url, String name)
 {
-    if (!renderers_may_access_cookies_like_http()) {
-        did_misbehave("did_request_named_cookie"sv, "not driven by WebDriver"sv);
+    if (auto access = http_cookie_access_for(url); access != HTTPCookieAccess::Allowed) {
+        if (access == HTTPCookieAccess::Refused)
+            did_misbehave("did_request_named_cookie"sv, "not running a WebDriver cookie command"sv);
         return Optional<HTTP::Cookie::Cookie> {};
     }
 
@@ -741,8 +836,9 @@ Messages::WebContentClient::DidRequestNamedCookieResponse WebContentClient::did_
 
 Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_request_cookie(Web::PageId page_id, Optional<Web::HTML::EnvironmentId> environment_id, URL::URL url, HTTP::Cookie::Source source)
 {
-    if (source == HTTP::Cookie::Source::Http && !renderers_may_access_cookies_like_http()) {
-        did_misbehave("did_request_cookie"sv, "HTTP cookie source"sv);
+    if (auto access = source == HTTP::Cookie::Source::Http ? http_cookie_access_for(url) : HTTPCookieAccess::Allowed; access != HTTPCookieAccess::Allowed) {
+        if (access == HTTPCookieAccess::Refused)
+            did_misbehave("did_request_cookie"sv, "HTTP cookie source"sv);
         return HTTP::Cookie::VersionedCookie {};
     }
 
@@ -887,12 +983,28 @@ void WebContentClient::did_close_browsing_context(Web::PageId page_id)
 
 void WebContentClient::did_update_cookie(HTTP::Cookie::Cookie cookie)
 {
-    if (!renderers_may_access_cookies_like_http()) {
-        did_misbehave("did_update_cookie"sv, "not driven by WebDriver"sv);
+    if (Application::web_content_options().is_test_mode == IsTestMode::Yes) {
+        m_session->cookie_jar->update_cookie(move(cookie));
         return;
     }
 
-    m_session->cookie_jar->update_cookie(cookie);
+    // NB: WebDriver's Delete Cookie expires the cookies of the document its cookie command is for, which it got from
+    //     the cookie jar. So the browser expires its own copy of the cookie, and the renderer changes nothing else.
+    auto command_url = url_of_webdriver_cookie_command_running_in(*this);
+    if (!command_url.has_value()) {
+        did_misbehave("did_update_cookie"sv, "not running a WebDriver cookie command"sv);
+        return;
+    }
+
+    // NB: A cookie of the document can expire, and leave the cookie jar, before the renderer asks to expire it.
+    for (auto existing : m_session->cookie_jar->get_all_cookies_webdriver(*command_url)) {
+        if (existing.name != cookie.name || existing.domain != cookie.domain || existing.path != cookie.path
+            || existing.host_only != cookie.host_only || existing.partition_key != cookie.partition_key)
+            continue;
+        existing.expiry_time = UnixDateTime::earliest();
+        m_session->cookie_jar->update_cookie(move(existing));
+        return;
+    }
 }
 
 Messages::WebContentClient::DidIsKnownHstsHostResponse WebContentClient::did_is_known_hsts_host(String domain)
@@ -1198,7 +1310,7 @@ void WebContentClient::report_audio_capture_for_testing(Web::PageId labelled_pag
 
 ErrorOr<void> WebContentClient::tell_audio_server_of_capture_permission()
 {
-    auto response = m_audio_server_client->send_sync_but_allow_failure<Messages::AudioServerControl::SetCapturePermission>(m_audio_tab_id, m_audio_capture_permitted);
+    auto response = send_sync_to_helper<Messages::AudioServerControl::SetCapturePermission>(*m_audio_server_client, m_audio_tab_id, m_audio_capture_permitted);
     if (!response)
         return Error::from_string_literal("Failed to tell the AudioServer of the capture permission");
     return {};
@@ -1259,7 +1371,7 @@ void WebContentClient::forget_audio_playback(Web::PageId page_id)
 
 ErrorOr<void> WebContentClient::tell_audio_server_of_playback_authorization(Audio::PlaybackGroupId group)
 {
-    auto response = m_audio_server_client->send_sync_but_allow_failure<Messages::AudioServerControl::AuthorizePlaybackGroup>(m_audio_tab_id, group);
+    auto response = send_sync_to_helper<Messages::AudioServerControl::AuthorizePlaybackGroup>(*m_audio_server_client, m_audio_tab_id, group);
     if (!response)
         return Error::from_string_literal("Failed to tell the AudioServer of a playback authorization");
     return {};

@@ -23,10 +23,14 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/MediaCapture/MediaDevices.h>
+#include <LibWeb/MediaSession/MediaSession.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/PermissionsAPI/Permissions.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ServiceWorker/ServiceWorkerContainer.h>
+#include <LibWeb/WebIDL/AbstractOperations.h>
+#include <LibWeb/WebIDL/CallbackType.h>
+#include <LibWeb/WebIDL/Promise.h>
 
 namespace Web::HTML {
 
@@ -44,11 +48,6 @@ Navigator::Navigator(Window& window)
 }
 
 Navigator::~Navigator() = default;
-
-URL::URL Navigator::navigator_id_url() const
-{
-    return m_window->associated_document().url();
-}
 
 EnvironmentSettingsObject& Navigator::navigator_storage_settings_object() const
 {
@@ -85,6 +84,7 @@ void Navigator::visit_edges(GC::Cell::Visitor& visitor)
     visitor.visit(m_user_activation);
     visitor.visit(m_service_worker_container);
     visitor.visit(m_media_capabilities);
+    visitor.visit(m_media_session);
     visitor.visit(m_media_devices);
     visitor.visit(m_credentials);
     visitor.visit(m_permissions);
@@ -107,7 +107,7 @@ GC::Ref<PluginArray> Navigator::plugins()
 GC::Ref<Clipboard::Clipboard> Navigator::clipboard()
 {
     if (!m_clipboard)
-        m_clipboard = Clipboard::Clipboard::create();
+        m_clipboard = Clipboard::Clipboard::create(relevant_realm(*m_window));
     return *m_clipboard;
 }
 
@@ -153,11 +153,49 @@ GC::Ref<MediaCapabilitiesAPI::MediaCapabilities> Navigator::media_capabilities()
     return *m_media_capabilities;
 }
 
+// https://w3c.github.io/mediasession/#dom-navigator-mediasession
+GC::Ref<MediaSession::MediaSession> Navigator::media_session()
+{
+    // The mediaSession attribute MUST return the MediaSession instance associated with the Navigator object.
+    if (!m_media_session)
+        m_media_session = MediaSession::MediaSession::create(*m_window);
+    return *m_media_session;
+}
+
 GC::Ref<MediaCapture::MediaDevices> Navigator::media_devices()
 {
     if (!m_media_devices)
         m_media_devices = MediaCapture::MediaDevices::create(*m_window);
     return *m_media_devices;
+}
+
+// https://w3c.github.io/mediacapture-main/#dom-navigator-getusermedia
+void Navigator::webkit_get_user_media(MediaCapture::MediaStreamConstraints const& constraints, GC::Ref<WebIDL::CallbackType> success_callback, GC::Ref<WebIDL::CallbackType> error_callback)
+{
+    // 1. Let constraints be the method's first argument.
+    // 2. Let successCallback be the callback indicated by the method's second argument.
+    // 3. Let errorCallback be the callback indicated by the method's third argument.
+
+    // 4. Run the steps specified by the getUserMedia() algorithm with constraints as the argument, and let p be the
+    //    resulting promise.
+    auto promise = WebIDL::create_promise(relevant_realm(*m_window));
+    media_devices()->get_user_media(constraints, promise);
+
+    // 5. Upon fulfillment of p with value stream, run the following step:
+    auto on_fulfilled = GC::create_function<WebIDL::ExceptionOr<JS::Value>(JS::Value)>(GC::Heap::the(), GC::captures(success_callback), [](WebIDL::CallbackType& success_callback, JS::Value stream) -> WebIDL::ExceptionOr<JS::Value> {
+        // 1. Invoke successCallback with stream as the argument.
+        (void)WebIDL::invoke_callback(success_callback, {}, WebIDL::ExceptionBehavior::Report, { { stream } });
+        return JS::js_undefined();
+    });
+
+    // 6. Upon rejection of p with reason r, run the following step:
+    auto on_rejected = GC::create_function<WebIDL::ExceptionOr<JS::Value>(JS::Value)>(GC::Heap::the(), GC::captures(error_callback), [](WebIDL::CallbackType& error_callback, JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
+        // 1. Invoke errorCallback with r as the argument.
+        (void)WebIDL::invoke_callback(error_callback, {}, WebIDL::ExceptionBehavior::Report, { { reason } });
+        return JS::js_undefined();
+    });
+
+    WebIDL::react_to_promise(promise, on_fulfilled, on_rejected);
 }
 
 // https://w3c.github.io/battery/#the-getbattery-method

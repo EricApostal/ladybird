@@ -124,12 +124,100 @@ pub(crate) struct GridPayload {
     pub(crate) used_tracks: Option<std::sync::Arc<grid_formatting_context::OwnedUsedGridTracks>>,
 }
 
+/// A part of the glyph outlines of a text content element's own text, which paints after one of the element's children.
+#[derive(Clone, PartialEq)]
+pub(crate) struct SvgTextSegment {
+    /// The child element the part follows, or the invalid slot for the part that comes before every child element.
+    pub(crate) after_child: crate::layout::node_data::NodeSlotId,
+    pub(crate) path: libgfx_rust::path::Path,
+    /// The glyphs of the part that a color font draws. They have no outlines for the path to hold, so they paint as
+    /// glyphs.
+    pub(crate) color_glyph_runs: Vec<SvgColorGlyphRun>,
+}
+
+/// A run of glyphs of a color font in SVG text, in user units.
+#[derive(Clone, PartialEq)]
+pub(crate) struct SvgColorGlyphRun {
+    pub(crate) font: libgfx_rust::font::FontHandle,
+    /// The glyphs, each positioned by the top of the font's ascent.
+    pub(crate) glyphs: Vec<SvgColorGlyph>,
+    /// The cells the glyphs occupy.
+    pub(crate) bounds: libgfx_rust::FloatRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SvgColorGlyph {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) glyph_id: u32,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct SvgPayload {
     pub(crate) facts: CommittedSvgFacts,
     pub(crate) geometry: svg_formatting_context::SvgGeometry,
-    pub(crate) path: Option<std::sync::Arc<libgfx_rust::path::Path>>,
+    pub(crate) path: Option<std::sync::Arc<CommittedSvgPath>>,
+    /// The path of a text content element, in the parts that paint apart: Text that follows a child element paints
+    /// after that child. None where all of the element's text comes before its child elements.
+    pub(crate) text_segments: Option<std::sync::Arc<Vec<SvgTextSegment>>>,
     pub(crate) text_character_cells: Option<std::sync::Arc<Vec<svg_formatting_context::FfiSvgTextCharacterCell>>>,
+}
+
+pub(crate) struct CommittedSvgPath {
+    pub(crate) path: libgfx_rust::path::Path,
+    latest_stroke_outline: std::sync::Mutex<Option<StrokeOutline>>,
+}
+
+struct StrokeOutline {
+    style_it_was_built_for: libgfx_rust::path::StrokeStyle,
+    outline: libgfx_rust::path::Path,
+}
+
+impl CommittedSvgPath {
+    pub(crate) fn new(path: libgfx_rust::path::Path) -> Self {
+        Self {
+            path,
+            latest_stroke_outline: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn stroke_with_style_contains(&self, style: &libgfx_rust::path::StrokeStyle, x: f32, y: f32) -> bool {
+        let mut latest_stroke_outline = self
+            .latest_stroke_outline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stroke_outline = match latest_stroke_outline.take() {
+            Some(stroke_outline) if stroke_outline.style_it_was_built_for == *style => stroke_outline,
+            _ => StrokeOutline {
+                style_it_was_built_for: style.clone(),
+                outline: self.path.stroke_to_fill(style),
+            },
+        };
+        latest_stroke_outline
+            .insert(stroke_outline)
+            .outline
+            .contains(x, y, libgfx_rust::WindingRule::Nonzero)
+    }
+}
+
+impl std::ops::Deref for CommittedSvgPath {
+    type Target = libgfx_rust::path::Path;
+
+    fn deref(&self) -> &libgfx_rust::path::Path {
+        &self.path
+    }
+}
+
+impl PartialEq for CommittedSvgPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl std::fmt::Debug for CommittedSvgPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.path.fmt(formatter)
+    }
 }
 
 /// Compares payloads as painting needs: the layout data painting reads through its allocation as the same allocations,
@@ -150,6 +238,7 @@ impl PartialEq for FcPayload {
                 left.facts == right.facts
                     && left.geometry == right.geometry
                     && same_allocation(left.path.as_ref(), right.path.as_ref())
+                    && same_allocation(left.text_segments.as_ref(), right.text_segments.as_ref())
                     && same_allocation(left.text_character_cells.as_ref(), right.text_character_cells.as_ref())
             }
             _ => false,
@@ -172,6 +261,7 @@ impl FcPayload {
                 left.facts == right.facts
                     && left.geometry == right.geometry
                     && left.path == right.path
+                    && left.text_segments == right.text_segments
                     && left.text_character_cells == right.text_character_cells
             }
             _ => false,
@@ -185,6 +275,7 @@ impl FcPayload {
                 svg.facts == CommittedSvgFacts::default()
                     && svg.geometry == Default::default()
                     && svg.path.is_none()
+                    && svg.text_segments.is_none()
                     && svg.text_character_cells.is_none()
             }
             Self::Table(_) | Self::Flex(_) | Self::Multicol(_) | Self::Math(_) => false,
@@ -288,6 +379,11 @@ pub(crate) struct ParentShowFacts {
     /// for a box hidden after a clamp point, and the area before the block-end content edge of a line-clamp container
     /// for a float inside it.
     pub(crate) clip_decided_by_parent: Option<CssPixelRect>,
+    /// For a block-level box in the flow of a block container: the margin that flow leaves past the block end of the
+    /// box, which is its block-end margin, collapsed with the margins of its contents that collapse through its block
+    /// end. For a box that margins collapse through, which sits past the margins before it, that is how much its
+    /// block-end margin adds to them. The scrollable overflow of a scroll container ends its in-flow content there.
+    pub(crate) block_end_margin_collapsed_in_flow: Option<CssPixels>,
 }
 
 impl ParentShowFacts {
@@ -587,6 +683,45 @@ impl Fragment {
                 .zip(&previous.children)
                 .all(|(a, b)| a.fragment.node == b.fragment.node)
     }
+
+    pub(crate) fn has_same_inline_content(&self, previous: &Fragment) -> bool {
+        match (&self.line_data, &previous.line_data) {
+            (None, None) => true,
+            (Some(content), Some(previous_content)) => {
+                std::sync::Arc::ptr_eq(content, previous_content) || content == previous_content
+            }
+            _ => false,
+        }
+    }
+
+    fn has_same_inline_item_order(&self, previous: &Fragment) -> bool {
+        match (&self.line_data, &previous.line_data) {
+            (Some(content), Some(previous_content)) => content.has_same_item_order(previous_content),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LinkChange {
+    pub(crate) fragment_identity_changed: bool,
+    pub(crate) box_properties_changed: bool,
+    pub(crate) inline_content_changed: bool,
+    pub(crate) inline_item_order_changed: bool,
+    pub(crate) child_sequence_changed: bool,
+    pub(crate) child_placements_changed: bool,
+    pub(crate) offset_changed: bool,
+    pub(crate) placement_changed: bool,
+    pub(crate) shown_as_changed: bool,
+    pub(crate) content_size_change: Option<(FfiCssPixelSize, FfiCssPixelSize)>,
+    pub(crate) scrollable_overflow_changed: bool,
+    pub(crate) had_scrollable_overflow: bool,
+}
+
+impl LinkChange {
+    pub(crate) fn changes_what_the_box_itself_shows(&self) -> bool {
+        self.placement_changed || self.box_properties_changed || self.inline_content_changed
+    }
 }
 
 impl FragmentLink {
@@ -650,6 +785,39 @@ impl FragmentLink {
         self.fragment.node == previous.fragment.node
             && self.offset == previous.offset
             && self.placement == previous.placement
+    }
+
+    pub(crate) fn change_from(&self, previous: Option<&FragmentLink>) -> LinkChange {
+        let fragment = &*self.fragment;
+        let previous_fragment = previous.map(|previous| &*previous.fragment);
+        let fragment_identity_changed = previous_fragment.is_none_or(|previous| previous.identity != fragment.identity);
+        let new_fragment_differs_in = |is_same: fn(&Fragment, &Fragment) -> bool| {
+            fragment_identity_changed && previous_fragment.is_none_or(|previous| !is_same(fragment, previous))
+        };
+        let inline_content_changed = new_fragment_differs_in(Fragment::has_same_inline_content);
+        let content_size = fragment.sides.content_size;
+        let previous_content_size = previous_fragment
+            .map(|previous| previous.sides.content_size)
+            .unwrap_or_default();
+        let previous_scrollable_overflow = previous_fragment
+            .map(|previous| previous.scrollable_overflow)
+            .unwrap_or_default();
+        LinkChange {
+            fragment_identity_changed,
+            box_properties_changed: new_fragment_differs_in(Fragment::has_same_box_properties),
+            inline_content_changed,
+            inline_item_order_changed: inline_content_changed
+                && new_fragment_differs_in(Fragment::has_same_inline_item_order),
+            child_sequence_changed: new_fragment_differs_in(Fragment::has_same_child_sequence),
+            child_placements_changed: new_fragment_differs_in(Fragment::has_same_child_placements),
+            offset_changed: previous.is_none_or(|previous| previous.offset != self.offset),
+            placement_changed: previous.is_none_or(|previous| !self.has_same_placement(previous)),
+            shown_as_changed: previous.is_none_or(|previous| previous.placement.shown_as != self.placement.shown_as),
+            content_size_change: (previous_content_size != content_size)
+                .then_some((previous_content_size, content_size)),
+            scrollable_overflow_changed: previous_scrollable_overflow != fragment.scrollable_overflow,
+            had_scrollable_overflow: previous_scrollable_overflow.has_scrollable_overflow,
+        }
     }
 }
 
@@ -1848,6 +2016,21 @@ impl RunFragmentBuilder {
             .borrow()
             .iter_pending_abspos()
             .any(|entry| !entry.inline_containing_block().is_invalid())
+    }
+
+    pub(crate) fn any_pending_abspos_contained_by(&self, node: crate::layout::node_data::NodeSlotId) -> bool {
+        let inner = self.inner.borrow();
+        inner
+            .pending_abspos_at_root
+            .iter()
+            .chain(
+                inner
+                    .pending_fragments
+                    .get(&node.slot_index())
+                    .into_iter()
+                    .flat_map(|fragment| fragment.pending_abspos.iter()),
+            )
+            .any(|entry| entry.containing_block() == node)
     }
 
     pub(crate) fn any_pending_abspos_names_inline_containing_block(

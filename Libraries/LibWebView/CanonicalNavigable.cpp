@@ -1179,6 +1179,12 @@ void CanonicalNavigable::did_create_populated_document_with_an_origin_of_its_own
     auto origin = is_inline_content ? *populated_document->inline_content_origin : URL::Origin { "resource"_string, String {}, {} };
 
     auto url = is_inline_content ? URL::about_error() : populated_document->document->creation_url();
+
+    // The PDF viewer keeps only the sandboxing flags that don't come from the CSP of the PDF response.
+    auto sandboxing_flags = populated_document->document->active_sandboxing_flag_set();
+    if (!is_inline_content)
+        sandboxing_flags &= snapshot_target_snapshot_params().sandboxing_flags;
+
     NavigationLoader::ResponseDocument response_document {
         .is_inline_content = is_inline_content,
         .coop_enforcement_result = { .url = url, .origin = origin, .opener_policy = {} },
@@ -1187,7 +1193,7 @@ void CanonicalNavigable::did_create_populated_document_with_an_origin_of_its_own
         .origin = origin,
         .opener_policy = {},
         .embedder_policy = {},
-        .final_sandboxing_flag_set = populated_document->document->active_sandboxing_flag_set(),
+        .final_sandboxing_flag_set = sandboxing_flags,
         .environment_id = environment_id,
         .document_id = document_id,
     };
@@ -1579,7 +1585,7 @@ void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& ent
 
     // The document populated for the entry becomes its document state's document below.
     // NB: The process hosting the document ran the steps populating it for the entry it holds.
-    entry.document_state->save_the_origin_of_the_populated_document();
+    entry.document_state->save_the_state_of_the_populated_document();
     RefPtr<CanonicalDocument> document;
     if (auto populated_document = exchange(entry.document_state->populated_document, {}); populated_document.has_value())
         document = populated_document->document;

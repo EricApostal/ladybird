@@ -17,13 +17,14 @@ use crate::css::style_value::{
 };
 use crate::css::style_value_arc::StyleValueArc;
 use ak::math;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use crate::animations::keyframes::KeyframeValue;
 use crate::css::custom_properties::CustomPropertyValueToFinalize;
-use crate::css::easing::{Easing, FfiEasingDescriptor, FfiLinearEasingPoint, evaluate_easing_descriptor};
+use crate::css::easing::{Easing, FfiEasingDescriptor, FfiLinearEasingPoint};
 use crate::css::property_metadata::{property_animation_type, property_numeric_ranges};
-use crate::css::style::effect_descriptions::{PublishedEffect, PublishedValue};
+use crate::css::style::effect_descriptions::PublishedEffect;
 use crate::css::style_value::{
     BasicShapeData, ColorBase, CssString, CssStringList, FILTER_KIND_BLUR, FILTER_KIND_COLOR, FILTER_KIND_DROP_SHADOW,
     FILTER_KIND_HUE_ROTATE, GridTrackEntryKind, OwnedBasicShapeData, RetainedGridTrackEntry,
@@ -199,20 +200,6 @@ pub(crate) unsafe fn style_value_from_easing(descriptor: &FfiEasingDescriptor) -
     ))))
 }
 
-/// Evaluate a resolved easing descriptor without consulting C++.
-///
-/// # Safety
-/// `descriptor` must point to a live descriptor. Its linear point range must be live when the
-/// descriptor kind is linear.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_evaluate_easing(
-    descriptor: &FfiEasingDescriptor,
-    input_progress: f64,
-    before_flag: bool,
-) -> f64 {
-    evaluate_easing_descriptor(descriptor, input_progress, before_flag)
-}
-
 /// Describes the easing a computed timing function value names, appending a linear easing's
 /// control points through `append_point`. Returns false for a value that names none.
 ///
@@ -332,21 +319,12 @@ struct AnimationValueInput<'a> {
     keyframe_plans: &'a [AnimationKeyframePlan],
 }
 
-/// The version of an effect a preparation was made from.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiAnimationPreparationEffect {
-    pub identity: u64,
-    pub generation: u64,
-}
-
-/// One effect a sample composes, in composite order: the version a preparation is keyed by, and
-/// where the effect is.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiSampledAnimationEffect {
-    pub effect: FfiAnimationPreparationEffect,
-    pub current_key: f64,
+/// One effect a sample composes, in composite order: its description, which a preparation is keyed by, and where the
+/// effect is.
+#[derive(Clone)]
+pub(crate) struct SampledAnimationEffect {
+    pub(crate) description: std::sync::Arc<crate::css::style::effect_descriptions::EffectDescription>,
+    pub(crate) current_key: f64,
 }
 
 /// The declarations an element's effects resolved to, and the computed value of each, which a
@@ -361,7 +339,7 @@ pub(crate) struct ComputedAnimationBatch<'a> {
     pub(crate) context: FfiAnimationContext<'a>,
     /// The device pixel ratio that animated border widths are snapped to.
     pub(crate) device_pixels_per_css_pixel: f64,
-    pub(crate) sampled_effects: &'a [FfiSampledAnimationEffect],
+    pub(crate) sampled_effects: &'a [SampledAnimationEffect],
     /// The identities of the custom-property environments of the element and of the one it
     /// inherits from, which a preparation that substituted keyframe values against the element was
     /// made under.
@@ -831,11 +809,11 @@ fn clamp_to_range(value: f64, range: Option<(f64, f64)>) -> f64 {
     }
 }
 
-fn interpolate_f64(from: f64, to: f64, delta: f32, range: Option<(f64, f64)>) -> f64 {
-    clamp_to_range(from + (to - from) * f64::from(delta), range)
+fn interpolate_f64(from: f64, to: f64, delta: f64, range: Option<(f64, f64)>) -> f64 {
+    clamp_to_range(from + (to - from) * delta, range)
 }
 
-fn interpolate_i32(from: i32, to: i32, delta: f32, range: Option<(f64, f64)>) -> i32 {
+fn interpolate_i32(from: i32, to: i32, delta: f64, range: Option<(f64, f64)>) -> i32 {
     // https://drafts.csswg.org/css-values-4/#combine-integers
     // Interpolation of <integer> is defined as Vresult = round((1 - p) × VA + p × VB);
     // that is, interpolation happens in the real number space as for <number>s, and the result is converted to an <integer> by rounding to the nearest integer.
@@ -982,7 +960,7 @@ fn discrete_value(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     if !context.is_some_and(|context| context.allow_discrete) {
         return handled_without_value();
@@ -995,7 +973,7 @@ fn interpolate_visibility(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     let (StyleValueData::Keyword { keyword: from_keyword }, StyleValueData::Keyword { keyword: to_keyword }) =
         (from, to)
@@ -1031,7 +1009,7 @@ fn interpolate_content_visibility(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     let (StyleValueData::Keyword { keyword: from_keyword }, StyleValueData::Keyword { keyword: to_keyword }) =
         (from, to)
@@ -1069,7 +1047,7 @@ fn interpolate_display(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     let (StyleValueData::Display { raw: from_raw }, StyleValueData::Display { raw: to_raw }) = (from, to) else {
         return not_handled();
@@ -1133,7 +1111,7 @@ fn decode_scale_components(value: &StyleValueData) -> Option<Vec<f64>> {
         .collect::<Option<Vec<_>>>()
 }
 
-fn interpolate_scale(from: &StyleValueData, to: &StyleValueData, delta: f32) -> AnimationValueResult {
+fn interpolate_scale(from: &StyleValueData, to: &StyleValueData, delta: f64) -> AnimationValueResult {
     let none = crate::css::style_compute::none_keyword();
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == none)
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
@@ -1465,7 +1443,7 @@ fn interpolate_translate_component(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> Option<RetainedStyleValueData> {
     let direct = interpolate_scalar_value(property_id, from, to, delta, &[]);
     if let Some(value) = direct.into_value() {
@@ -1476,16 +1454,14 @@ fn interpolate_translate_component(
     // The computed value of a percentage-dimension mix is defined as
     // a computed percentage if the dimension component is zero
     let dimension_component_is_zero = match (from, to) {
-        (StyleValueData::Length { value, .. }, StyleValueData::Percentage { .. }) => {
-            *value * (1.0 - delta as f64) == 0.0
-        }
-        (StyleValueData::Percentage { .. }, StyleValueData::Length { value, .. }) => *value * delta as f64 == 0.0,
+        (StyleValueData::Length { value, .. }, StyleValueData::Percentage { .. }) => *value * (1.0 - delta) == 0.0,
+        (StyleValueData::Percentage { .. }, StyleValueData::Length { value, .. }) => *value * delta == 0.0,
         _ => false,
     };
     if dimension_component_is_zero {
         let percentage = match (from, to) {
-            (StyleValueData::Length { .. }, StyleValueData::Percentage { value }) => *value * delta as f64,
-            (StyleValueData::Percentage { value }, StyleValueData::Length { .. }) => *value * (1.0 - delta as f64),
+            (StyleValueData::Length { .. }, StyleValueData::Percentage { value }) => *value * delta,
+            (StyleValueData::Percentage { value }, StyleValueData::Length { .. }) => *value * (1.0 - delta),
             _ => unreachable!(),
         };
         let value =
@@ -1519,7 +1495,7 @@ fn decode_translate_components(value: &StyleValueData) -> Option<Vec<RetainedSty
     )
 }
 
-fn interpolate_translate(from: &StyleValueData, to: &StyleValueData, delta: f32) -> AnimationValueResult {
+fn interpolate_translate(from: &StyleValueData, to: &StyleValueData, delta: f64) -> AnimationValueResult {
     let none = crate::css::style_compute::none_keyword();
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == none)
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
@@ -1705,7 +1681,7 @@ fn interpolate_individual_rotate(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     let mut result = interpolate_individual_rotate_impl(context, from, to, delta);
     if has_transform_matrix_values(from) || has_transform_matrix_values(to) {
@@ -1731,7 +1707,7 @@ fn interpolate_individual_rotate_impl(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     let none = crate::css::style_compute::none_keyword();
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == none)
@@ -1847,7 +1823,7 @@ fn interpolate_font_variation_settings(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     // https://drafts.csswg.org/css-fonts/#font-variation-settings-def
     // Two declarations of font-feature-settings can be animated between if they are "like". "Like" declarations
@@ -1965,7 +1941,7 @@ fn interpolate_grid_component(
     property_id: u16,
     from: &RetainedStyleValueData,
     to: &RetainedStyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> RetainedStyleValueData {
     if let Some(value) = interpolate_translate_component(property_id, from.data(), to.data(), delta) {
         return value;
@@ -1983,7 +1959,7 @@ fn interpolate_grid_track_entries(
     from_entries: &[RetainedGridTrackEntry],
     to_is_subgrid: bool,
     to_entries: &[RetainedGridTrackEntry],
-    delta: f32,
+    delta: f64,
 ) -> Option<Vec<RetainedGridTrackEntry>> {
     // https://drafts.csswg.org/css-grid-2/#track-sizing
     // Animation type: if the list lengths match, by computed value type per item in the computed track list;
@@ -2651,7 +2627,7 @@ fn interpolate_basic_shape_component(
     property_id: u16,
     from: &RetainedStyleValueData,
     to: &RetainedStyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> RetainedStyleValueData {
     interpolate_translate_component(property_id, from.data(), to.data(), delta).unwrap_or_else(|| {
         if delta < 0.5 {
@@ -2674,7 +2650,7 @@ fn interpolate_radial_size(
     property_id: u16,
     from: RadialSizeComponents<'_>,
     to: RadialSizeComponents<'_>,
-    delta: f32,
+    delta: f64,
 ) -> Option<StyleValueData> {
     // https://drafts.csswg.org/css-images-4/#interpolating-gradients
     // https://drafts.csswg.org/css-shapes-1/#basic-shape-interpolation
@@ -2732,7 +2708,7 @@ fn interpolate_basic_shape(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> Option<StyleValueData> {
     let (
         Some(BasicShapeData {
@@ -2909,7 +2885,7 @@ fn interpolate_basic_shape(
             let path = from_absolute
                 .as_ref()
                 .unwrap_or(from_path)
-                .interpolate(to_absolute.as_ref().unwrap_or(to_path), delta)?;
+                .interpolate(to_absolute.as_ref().unwrap_or(to_path), delta as f32)?;
             Some(StyleValueData::BasicShape {
                 shape: OwnedBasicShapeData::new(BasicShapeData {
                     kind: *from_kind,
@@ -2941,7 +2917,7 @@ fn interpolate_shape_commands(
     property_id: u16,
     (from_fill_rule, from_commands, from_points): (u8, &[crate::css::style_value::ShapeCommand], &[RetainedShapePoint]),
     (to_fill_rule, to_commands, to_points): (u8, &[crate::css::style_value::ShapeCommand], &[RetainedShapePoint]),
-    delta: f32,
+    delta: f64,
 ) -> Option<StyleValueData> {
     let empty = empty_retained_style_value;
     // https://drafts.csswg.org/css-shapes-1/#interpolating-shape
@@ -3238,7 +3214,7 @@ fn interpolate_offset_path(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> Option<StyleValueData> {
     let (Some((Some(from_path), from_box)), Some((Some(to_path), to_box))) =
         (split_offset_path(from), split_offset_path(to))
@@ -3263,7 +3239,7 @@ fn interpolate_offset_path(
 
 /// https://drafts.csswg.org/motion-1/#ray-function
 /// NB: Rays interpolate their angles and positions when they have the same size and containment.
-fn interpolate_ray(property_id: u16, from: &StyleValueData, to: &StyleValueData, delta: f32) -> Option<StyleValueData> {
+fn interpolate_ray(property_id: u16, from: &StyleValueData, to: &StyleValueData, delta: f64) -> Option<StyleValueData> {
     let (StyleValueData::Ray(ray_payload_1), StyleValueData::Ray(ray_payload_2)) = (from, to) else {
         return None;
     };
@@ -3390,7 +3366,7 @@ fn join_offset_rotate(auto: bool, degrees: f64) -> StyleValueData {
 /// https://drafts.csswg.org/motion-1/#offset-rotate-property
 /// Animation type: by computed value
 /// NB: Values interpolate their angles when both or neither have auto.
-fn interpolate_offset_rotate(from: &StyleValueData, to: &StyleValueData, delta: f32) -> Option<StyleValueData> {
+fn interpolate_offset_rotate(from: &StyleValueData, to: &StyleValueData, delta: f64) -> Option<StyleValueData> {
     let ((from_auto, from_degrees), (to_auto, to_degrees)) = (split_offset_rotate(from)?, split_offset_rotate(to)?);
     if from_auto != to_auto {
         return None;
@@ -4385,7 +4361,7 @@ fn interpolate_scalar_value(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
     range_overrides: &[NumericRangeOverride],
 ) -> AnimationValueResult {
     if let Some(context) = animation_calculation_context(from).or_else(|| animation_calculation_context(to))
@@ -4408,16 +4384,14 @@ fn interpolate_scalar_value(
     // The computed value of a percentage-dimension mix is defined as
     // a computed percentage if the dimension component is zero
     let dimension_component_is_zero = match (from, to) {
-        (StyleValueData::Length { value, .. }, StyleValueData::Percentage { .. }) => {
-            *value * (1.0 - delta as f64) == 0.0
-        }
-        (StyleValueData::Percentage { .. }, StyleValueData::Length { value, .. }) => *value * delta as f64 == 0.0,
+        (StyleValueData::Length { value, .. }, StyleValueData::Percentage { .. }) => *value * (1.0 - delta) == 0.0,
+        (StyleValueData::Percentage { .. }, StyleValueData::Length { value, .. }) => *value * delta == 0.0,
         _ => false,
     };
     if dimension_component_is_zero {
         let percentage = match (from, to) {
-            (StyleValueData::Length { .. }, StyleValueData::Percentage { value }) => *value * delta as f64,
-            (StyleValueData::Percentage { value }, StyleValueData::Length { .. }) => *value * (1.0 - delta as f64),
+            (StyleValueData::Length { .. }, StyleValueData::Percentage { value }) => *value * delta,
+            (StyleValueData::Percentage { value }, StyleValueData::Length { .. }) => *value * (1.0 - delta),
             _ => unreachable!(),
         };
         let range = accepted_range(property_id, VALUE_TYPE_PERCENTAGE, range_overrides);
@@ -4445,8 +4419,8 @@ fn interpolate_scalar_value(
 
     match (from, to) {
         (StyleValueData::ColorFunction { .. }, StyleValueData::ColorFunction { .. }) => {
-            combine_legacy_rgb(from, to, ColorCombination::Interpolate(delta))
-                .or_else(|| combine_modern_color(from, to, ColorCombination::Interpolate(delta)))
+            combine_legacy_rgb(from, to, ColorCombination::Interpolate(delta as f32))
+                .or_else(|| combine_modern_color(from, to, ColorCombination::Interpolate(delta as f32)))
                 .map_or_else(not_handled, owned)
         }
         (StyleValueData::BasicShape { .. }, StyleValueData::BasicShape { .. }) => {
@@ -5152,7 +5126,7 @@ fn interpolate_rotate_3d(
     transform_function: u8,
     from_arguments: &RetainedStyleValueDataList,
     to_arguments: &RetainedStyleValueDataList,
-    delta: f32,
+    delta: f64,
 ) -> Option<StyleValueData> {
     interpolate_rotate_3d_with_phases(
         context,
@@ -5171,7 +5145,7 @@ fn interpolate_rotate_3d_with_phases(
     transform_function: u8,
     from_arguments: &RetainedStyleValueDataList,
     to_arguments: &RetainedStyleValueDataList,
-    delta: f32,
+    delta: f64,
     phases: Option<(f64, f64)>,
 ) -> Option<StyleValueData> {
     let ([from_x, from_y, from_z, from_angle], [to_x, to_y, to_z, to_angle]) =
@@ -5264,8 +5238,8 @@ fn interpolate_rotate_3d_with_phases(
             from_quaternion
         } else {
             let theta = math::acos(product);
-            let weight = math::sin(f64::from(delta) * theta) / (1.0 - product * product).sqrt();
-            let from_multiplier = math::cos(f64::from(delta) * theta) - product * weight;
+            let weight = math::sin(delta * theta) / (1.0 - product * product).sqrt();
+            let from_multiplier = math::cos(delta * theta) - product * weight;
             if weight.abs() < f64::from(f32::EPSILON) {
                 from_quaternion.map(|component| component * from_multiplier)
             } else if from_multiplier.abs() < f64::from(f32::EPSILON) {
@@ -5855,7 +5829,7 @@ fn recompose_matrix(values: DecomposedMatrix) -> Matrix4 {
 }
 
 // https://drafts.csswg.org/css-transforms-2/#interpolation-of-decomposed-3d-matrix-values
-fn slerp_quaternions(from: [f64; 4], to: [f64; 4], delta: f32) -> [f64; 4] {
+fn slerp_quaternions(from: [f64; 4], to: [f64; 4], delta: f64) -> [f64; 4] {
     let product = from
         .iter()
         .zip(to)
@@ -5866,8 +5840,8 @@ fn slerp_quaternions(from: [f64; 4], to: [f64; 4], delta: f32) -> [f64; 4] {
         return from;
     }
     let theta = math::acos(product);
-    let weight = math::sin(f64::from(delta) * theta) / (1.0 - product * product).sqrt();
-    let from_multiplier = math::cos(f64::from(delta) * theta) - product * weight;
+    let weight = math::sin(delta * theta) / (1.0 - product * product).sqrt();
+    let from_multiplier = math::cos(delta * theta) - product * weight;
     if weight.abs() < f64::from(f32::EPSILON) {
         return from.map(|component| component * from_multiplier);
     }
@@ -5877,7 +5851,7 @@ fn slerp_quaternions(from: [f64; 4], to: [f64; 4], delta: f32) -> [f64; 4] {
     std::array::from_fn(|index| from[index] * from_multiplier + to[index] * weight)
 }
 
-fn interpolate_matrices(from: Matrix4, to: Matrix4, delta: f32) -> Option<Matrix4> {
+fn interpolate_matrices(from: Matrix4, to: Matrix4, delta: f64) -> Option<Matrix4> {
     let from = decompose_matrix(from)?;
     let to = decompose_matrix(to)?;
     let interpolate_array = |from: [f64; 3], to: [f64; 3]| {
@@ -6074,7 +6048,7 @@ fn interpolate_transform_matrix_suffix(
     property: u16,
     from: &[RetainedStyleValueData],
     to: &[RetainedStyleValueData],
-    delta: f32,
+    delta: f64,
 ) -> Result<RetainedStyleValueData, TransformMatrixInterpolationError> {
     let from = post_multiply_transformations(context, from).ok_or(TransformMatrixInterpolationError::NotConvertible)?;
     let to = post_multiply_transformations(context, to).ok_or(TransformMatrixInterpolationError::NotConvertible)?;
@@ -6118,7 +6092,7 @@ fn interpolate_transform_list(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> Option<Option<StyleValueData>> {
     let endpoints = [from, to];
     let sources = if delta == 0.0 {
@@ -6137,7 +6111,7 @@ fn interpolate_transform_list_impl(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> Option<Option<StyleValueData>> {
     if matches!(from, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword())
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == crate::css::style_compute::none_keyword())
@@ -6823,7 +6797,7 @@ fn interpolate_animation_length(
     context: Option<&FfiAnimationContext>,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
     range: Option<(f64, f64)>,
 ) -> Option<RetainedStyleValueData> {
     Some(retained_length(
@@ -6949,7 +6923,7 @@ fn interpolate_shadow(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> Option<StyleValueData> {
     let (StyleValueData::Shadow(shadow_payload_1), StyleValueData::Shadow(shadow_payload_2)) = (from, to) else {
         return None;
@@ -7215,7 +7189,7 @@ fn interpolate_shadow_list(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     // https://drafts.csswg.org/css-backgrounds/#box-shadow
     // Animation type: by computed value, treating none as a zero-item list and appending blank shadows
@@ -7318,7 +7292,7 @@ fn interpolate_filter_function(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> Option<RetainedStyleValueData> {
     let (
         StyleValueData::Filter {
@@ -7663,7 +7637,7 @@ fn interpolate_filter_list(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     let list = |value: &StyleValueData| -> Option<(Vec<RetainedStyleValueData>, u8, bool)> {
         match value {
@@ -7877,7 +7851,7 @@ pub(crate) fn interpolate_value(
     property_id: u16,
     from: &StyleValueData,
     to: &StyleValueData,
-    delta: f32,
+    delta: f64,
 ) -> AnimationValueResult {
     if property_id == crate::css::property_metadata::property_id::CUSTOM {
         // https://drafts.css-houdini.org/css-properties-values-api/#animation-behavior-of-custom-properties
@@ -8358,7 +8332,7 @@ fn evaluate_animation_value(
         0.0
     } else {
         let interval_progress = (input.current_key - start_plan.key as f64) / (end_plan.key - start_plan.key) as f64;
-        start_plan.easing.evaluate_at(interval_progress, false) as f32
+        start_plan.easing.evaluate_at(interval_progress, false)
     };
     let Some(end) = end_keyframe.value.optional_data() else {
         if start_keyframe.value.optional_data().is_none() {
@@ -8615,6 +8589,26 @@ impl KeyframeConversionCache {
     }
 }
 
+/// The endpoints selected for a custom property's current animation sample.
+pub(crate) struct CustomPropertyInterval {
+    interval_span: [CustomPropertyKeyframeLookup; 2],
+    /// Index of the effect in the sample's composite order.
+    pub(crate) effect_index: usize,
+    pub(crate) custom_name_id: u32,
+    pub(crate) cyclic: [bool; 2],
+    pub(crate) name: crate::css::retained_fly_string::RetainedUtf16FlyString,
+    /// Written endpoint values; empty for neutral endpoints and for cached unregistered intervals.
+    pub(crate) declared_values: [RetainedStyleValueData; 2],
+    /// Fresh interval values awaiting cache insertion.
+    pub(crate) values_to_retain: Option<[RetainedStyleValueData; 2]>,
+}
+
+impl CustomPropertyInterval {
+    pub(crate) fn declaration_indices(&self) -> [usize; 2] {
+        self.interval_span.map(|lookup| lookup.declaration_index)
+    }
+}
+
 /// The custom properties the effects an element samples declare, each minted into the number the
 /// animation core keys it by, with what the element's environment and the document's registry say
 /// of it.
@@ -8622,6 +8616,8 @@ pub(crate) struct AnimatedCustomProperties {
     stores: KeyframeStores,
     names: Vec<crate::css::retained_fly_string::RetainedUtf16FlyString>,
     units: Vec<Vec<u16>>,
+    pub(crate) intervals: Vec<CustomPropertyInterval>,
+    pub(crate) registration_generation: u64,
     /// Whether any interval values are resolved afresh rather than retained across samples.
     pub(crate) has_uncached_interval_values: bool,
 }
@@ -8796,6 +8792,11 @@ pub unsafe extern "C" fn rust_substitute_compositor_keyframe_value(
     })
 }
 
+/// The key of `keyframe` on the scale keyframes are interpolated on.
+fn keyframe_key(keyframe: &crate::animations::keyframes::Keyframe) -> i64 {
+    i64::try_from(keyframe.key).expect("a keyframe's offset is at most 100%")
+}
+
 #[derive(Clone, Copy)]
 struct CustomPropertyKeyframeLookup {
     keyframe_index: usize,
@@ -8833,12 +8834,12 @@ fn select_custom_property_interval_span(
     current_key: f64,
 ) -> [CustomPropertyKeyframeLookup; 2] {
     let first_lookup = keyframe_lookups[0];
-    let first_composite = effect.keyframes()[first_lookup.keyframe_index].composite;
+    let first_composite = effect.composite_of(&effect.keyframes()[first_lookup.keyframe_index]);
     let first_value = &effect.custom_declaration_at(first_lookup.declaration_index).value;
 
-    let can_use_constant_interpolation = !matches!(first_value, PublishedValue::ElementValue)
+    let can_use_constant_interpolation = !matches!(first_value, KeyframeValue::ElementValue)
         && keyframe_lookups.iter().all(|lookup| {
-            let composite = effect.keyframes()[lookup.keyframe_index].composite;
+            let composite = effect.composite_of(&effect.keyframes()[lookup.keyframe_index]);
             let value = &effect.custom_declaration_at(lookup.declaration_index).value;
             composite == first_composite && value == first_value
         });
@@ -8849,11 +8850,68 @@ fn select_custom_property_interval_span(
         (0, keyframe_lookups.len() - 1)
     } else {
         keyframe_interval(keyframe_lookups.len(), current_key, |index| {
-            effect.keyframes()[keyframe_lookups[index].keyframe_index].key
+            keyframe_key(&effect.keyframes()[keyframe_lookups[index].keyframe_index])
         })
     };
 
     [keyframe_lookups[start], keyframe_lookups[end]]
+}
+
+/// Select contributing intervals in effect order, before substituting or retaining their values.
+fn select_contributing_custom_property_intervals(
+    selected: &[SelectedEffect<'_>],
+    custom_properties: &mut AnimatedCustomProperties,
+    registry: &Registry,
+) -> Vec<Vec<CustomPropertyInterval>> {
+    let mut intervals_by_effect = Vec::with_capacity(selected.len());
+    // NB: A replacing interval hides lower effects for its property. Neutral and additive
+    //     endpoints keep the intervals whose underlying values they need.
+    let mut replaced_names = HashSet::new();
+    for (effect_index, selection) in selected.iter().enumerate().rev() {
+        let effect = selection.effect;
+        let mut intervals = Vec::new();
+        for (name_id, keyframe_lookups) in build_custom_property_keyframe_lookups(effect, custom_properties) {
+            if keyframe_lookups.len() < 2 || custom_properties.is_important(name_id) && !effect.is_transition() {
+                continue;
+            }
+            if replaced_names.contains(&name_id) {
+                continue;
+            }
+            let interval_span = select_custom_property_interval_span(effect, &keyframe_lookups, selection.current_key);
+            let interpolable = registry.name_has_interpolable_syntax(custom_properties.units(name_id));
+            let replaces_underlying = interval_span.iter().all(|lookup| {
+                let composite_replaces = !interpolable
+                    || effect.composite_of(&effect.keyframes()[lookup.keyframe_index])
+                        == FfiCompositeOperation::Replace;
+                let has_declared_value = matches!(
+                    effect.custom_declaration_at(lookup.declaration_index).value,
+                    KeyframeValue::Declared(_)
+                );
+                composite_replaces && has_declared_value
+            });
+            // NB: A single selected endpoint has no value plan, so it cannot hide lower effects.
+            if replaces_underlying && interval_span[0].keyframe_index != interval_span[1].keyframe_index {
+                replaced_names.insert(name_id);
+            }
+            intervals.push(CustomPropertyInterval {
+                interval_span,
+                effect_index,
+                custom_name_id: name_id,
+                cyclic: [false; 2],
+                name: custom_properties.name(name_id).clone(),
+                declared_values: interval_span.map(|lookup| {
+                    match &effect.custom_declaration_at(lookup.declaration_index).value {
+                        KeyframeValue::Declared(value) => value.clone(),
+                        _ => RetainedStyleValueData::none(),
+                    }
+                }),
+                values_to_retain: None,
+            });
+        }
+        intervals_by_effect.push(intervals);
+    }
+    intervals_by_effect.reverse();
+    intervals_by_effect
 }
 
 /// Resolve the declarations of the effects an element samples from their descriptions: each
@@ -8873,12 +8931,15 @@ pub(crate) fn resolve_published_animation_declarations(
     important_property_bitmap: &[u8],
     conversions: &std::cell::RefCell<KeyframeConversionCache>,
 ) -> PublishedAnimationDeclarations {
-    use crate::css::style::effect_descriptions::{PublishedValue, easing_from_computed_timing_function};
+    use crate::animations::keyframes::KeyframeEasing;
+    use crate::css::style::effect_descriptions::easing_from_computed_timing_function;
     let registry = engine.custom_property_registry();
     let mut custom_properties = AnimatedCustomProperties {
         stores,
         names: Vec::new(),
         units: Vec::new(),
+        intervals: Vec::new(),
+        registration_generation: engine.custom_property_registration_generation(),
         has_uncached_interval_values: false,
     };
     let substitution_marks = std::cell::Cell::new(0_u8);
@@ -8903,9 +8964,10 @@ pub(crate) fn resolve_published_animation_declarations(
     let mut effects = Vec::new();
     let mut declarations = Vec::new();
     let mut base_urls = Vec::new();
-    for selection in selected {
+    let intervals_by_effect = select_contributing_custom_property_intervals(selected, &mut custom_properties, registry);
+    for (selection, intervals) in selected.iter().zip(intervals_by_effect) {
         let effect = selection.effect;
-        let is_transition = effect.is_transition;
+        let is_transition = effect.is_transition();
         let style_sheet_resource_context = match effect.resource_context() {
             None => FfiAnimationStyleSheetResourceContext {
                 base_url: std::ptr::null(),
@@ -8926,10 +8988,14 @@ pub(crate) fn resolve_published_animation_declarations(
         let first_keyframe_index = keyframes.len();
         for keyframe in effect.keyframes() {
             let keyframe_index = keyframes.len();
-            keyframes.push((keyframe.key, keyframe.composite));
+            keyframes.push((keyframe_key(keyframe), effect.composite_of(keyframe)));
             // A keyframe's own easing written as a value substitutes against the element; one that
-            // resolves to no easing runs its animation's.
-            let substituted_easing = keyframe.easing_value.as_ref().and_then(|written| {
+            // resolves to no easing runs its animation's, as does one that declares none.
+            let written_easing = match &keyframe.easing {
+                KeyframeEasing::Value(written) => Some(written),
+                KeyframeEasing::None | KeyframeEasing::Easing(_) => None,
+            };
+            let substituted_easing = written_easing.and_then(|written| {
                 let substituted;
                 let mut value = written.data();
                 if matches!(value, StyleValueData::Unresolved { .. }) {
@@ -8945,20 +9011,24 @@ pub(crate) fn resolve_published_animation_declarations(
                 }
                 easing_from_computed_timing_function(value)
             });
-            easings.push(substituted_easing.unwrap_or_else(|| keyframe.easing.clone()));
+            easings.push(match (&keyframe.easing, substituted_easing) {
+                (KeyframeEasing::Easing(easing), _) => easing.clone(),
+                (_, Some(substituted_easing)) => substituted_easing,
+                (_, None) => effect.default_easing(),
+            });
             let keyframe_declarations = effect.declarations_of(keyframe);
             // The values of the shorthands written with arbitrary substitution functions that this keyframe's
             // longhands pend the substitution of, each already standing for its longhands.
             let mut substituted_shorthand_values: Vec<*const StyleValueData> = Vec::new();
-            for declaration in keyframe_declarations {
+            for declaration in keyframe_declarations.clone() {
                 let (value, use_initial) = match &declaration.value {
-                    PublishedValue::ElementValue => {
+                    KeyframeValue::ElementValue => {
                         let Some(value) = longhands.handle(declaration.property_id) else {
                             continue;
                         };
                         (value.clone_retained(), true)
                     }
-                    PublishedValue::Declared(value) => match value.data() {
+                    KeyframeValue::Declared(value) => match value.data() {
                         // https://drafts.csswg.org/css-values-5/#pending-substitution-value
                         // The longhands of a shorthand written with an arbitrary substitution function take their
                         // parts of its value once it substitutes, so the shorthand stands for them.
@@ -8981,9 +9051,9 @@ pub(crate) fn resolve_published_animation_declarations(
                             }
                             substituted_shorthand_values.push(original);
                             let pending_longhands = keyframe_declarations
-                                .iter()
+                                .clone()
                                 .filter(|candidate| {
-                                    matches!(&candidate.value, PublishedValue::Declared(written)
+                                    matches!(&candidate.value, KeyframeValue::Declared(written)
                                         if matches!(written.data(), StyleValueData::PendingSubstitution { .. })
                                             && written_shorthand_value(written).pointer() == original)
                                 })
@@ -9050,35 +9120,42 @@ pub(crate) fn resolve_published_animation_declarations(
                 });
             }
         }
-        for (name_id, keyframe_lookups) in build_custom_property_keyframe_lookups(effect, &mut custom_properties) {
+        for mut interval in intervals {
+            let name_id = interval.custom_name_id;
             let important = custom_properties.is_important(name_id);
-            if keyframe_lookups.len() < 2 || important && !is_transition {
-                continue;
-            }
             let name = custom_properties.units(name_id);
-            let interval_span = select_custom_property_interval_span(effect, &keyframe_lookups, selection.current_key);
-            let (interval_values, values_are_retained) = effect.resolve_custom_property_interval_values(
-                interval_span.map(|lookup| lookup.declaration_index),
-                registry.name_has_interpolable_syntax(name),
-                || {
-                    interval_span.map(|lookup| {
+            let (retained_interval_values, can_retain_interval_values) = effect
+                .retained_custom_property_interval_values(
+                    interval.declaration_indices(),
+                    registry.name_has_interpolable_syntax(name),
+                );
+            let has_retained_values = retained_interval_values.is_some();
+            let interval_values = match retained_interval_values {
+                Some(values) => values,
+                None => {
+                    interval.interval_span.map(|lookup| {
                         let declaration = effect.custom_declaration_at(lookup.declaration_index);
                         match &declaration.value {
-                            PublishedValue::ElementValue => custom_properties.underlying_value(registry, name_id),
+                            KeyframeValue::ElementValue => custom_properties.underlying_value(registry, name_id),
                             // A custom property's value is a token stream; only the substitution functions
                             // in it resolve against the element.
-                            PublishedValue::Declared(value) if holds_arbitrary_substitution(value.data()) => {
+                            KeyframeValue::Declared(value) if holds_arbitrary_substitution(value.data()) => {
                                 substitute(crate::css::property_metadata::property_id::CUSTOM, name, value)
                             }
-                            PublishedValue::Declared(value) => value.clone_retained(),
+                            KeyframeValue::Declared(value) => value.clone_retained(),
                         }
                     })
-                },
-            );
+                }
+            };
             // SAFETY: The sample keeps the name alive while it is retained for the lookup.
             let interned_name = unsafe { ak::Utf16FlyString::from_raw_borrowed(custom_properties.name(name_id).raw()) };
             let custom_is_inherited = registry.name_inherits(&interned_name);
-            for (lookup, value) in interval_span.into_iter().zip(interval_values) {
+            interval.values_to_retain =
+                (can_retain_interval_values && !has_retained_values).then(|| interval_values.clone());
+            if has_retained_values && !registry.is_registered(&interned_name) {
+                interval.declared_values.fill(RetainedStyleValueData::none());
+            }
+            for (lookup, value) in interval.interval_span.into_iter().zip(interval_values) {
                 let declaration = effect.custom_declaration_at(lookup.declaration_index);
                 declarations.push(AnimationDeclaration {
                     keyframe_index: first_keyframe_index + lookup.keyframe_index,
@@ -9088,11 +9165,12 @@ pub(crate) fn resolve_published_animation_declarations(
                     custom_is_important: important,
                     value,
                     style_sheet_resource_context,
-                    use_initial: matches!(declaration.value, PublishedValue::ElementValue),
+                    use_initial: matches!(declaration.value, KeyframeValue::ElementValue),
                     is_transition,
                 });
             }
-            custom_properties.has_uncached_interval_values |= !values_are_retained;
+            custom_properties.has_uncached_interval_values |= !can_retain_interval_values;
+            custom_properties.intervals.push(interval);
         }
         effects.push(FfiAnimationEffect {
             first_keyframe_index,
@@ -9136,20 +9214,22 @@ fn holds_arbitrary_substitution(value: &StyleValueData) -> bool {
 }
 
 struct AnimationPreparationKey {
-    effects: Box<[FfiAnimationPreparationEffect]>,
+    /// The descriptions of the effects the preparation was made from, which it holds, so that no other description
+    /// can take the place of one.
+    effects: Box<[std::sync::Arc<crate::css::style::effect_descriptions::EffectDescription>]>,
     /// The custom-property environments a preparation that substituted keyframe values against the
     /// element was made under, which it holds for only as long as they stand.
     custom_property_environments: Option<[u64; 2]>,
 }
 
 impl AnimationPreparationKey {
-    fn matches(&self, sampled: &[FfiSampledAnimationEffect], custom_property_environments: [u64; 2]) -> bool {
+    fn matches(&self, sampled: &[SampledAnimationEffect], custom_property_environments: [u64; 2]) -> bool {
         self.effects.len() == sampled.len()
             && self
                 .effects
                 .iter()
                 .zip(sampled)
-                .all(|(effect, sampled)| *effect == sampled.effect)
+                .all(|(effect, sampled)| std::sync::Arc::ptr_eq(effect, &sampled.description))
             && self
                 .custom_property_environments
                 .is_none_or(|environments| environments == custom_property_environments)
@@ -9165,7 +9245,50 @@ pub(crate) struct PreparedAnimationBatch {
     context: FfiAnimationContext<'static>,
 }
 
-// SAFETY: A prepared batch is built once and never mutated: sampling reads its plans and copies
+impl PreparedAnimationBatch {
+    /// Replace cyclic intervals' keyframe values and report whether recomposition is needed.
+    pub(crate) fn replace_cyclic_custom_property_endpoints(
+        &mut self,
+        intervals: &[CustomPropertyInterval],
+        registry: &Registry,
+        inherited: Option<&crate::css::custom_properties::CustomPropertyStore>,
+    ) -> bool {
+        let mut has_cyclic_interval = false;
+        for interval in intervals {
+            if !interval.cyclic.contains(&true) {
+                continue;
+            }
+            // SAFETY: The interval retains the name while it is borrowed for the lookup.
+            let name = unsafe { ak::Utf16FlyString::from_raw_borrowed(interval.name.raw()) };
+            let registered = registry.is_registered(&name);
+            let fallback = registry.invalid_at_computed_value_time(&interval.name, inherited);
+            for (plan, keyframes) in self.resolved.value_plans.iter().zip(&mut self.keyframes_by_value) {
+                if plan.custom_name_id != interval.custom_name_id || plan.effect_index != interval.effect_index {
+                    continue;
+                }
+                // NB: Custom-property plans contain only the selected interval's two endpoints.
+                assert_eq!(keyframes.len(), interval.cyclic.len());
+                // AD-HOC: Compose a registered custom property's selected interval as unset if it has a cyclic endpoint
+                //         and two explicit keyframe values, matching Chromium. Keep unset as a marker until all effects
+                //         are composed so later additive effects do not add the inherited or initial value.
+                let fallback = if registered && keyframes.iter().all(|keyframe| !keyframe.is_implicit) {
+                    RetainedStyleValueData::shared_keyword(crate::css::css_enums::keyword::UNSET)
+                } else {
+                    &fallback
+                };
+                for (keyframe, cyclic) in keyframes.iter_mut().zip(interval.cyclic) {
+                    if cyclic || registered {
+                        keyframe.value = fallback.clone();
+                    }
+                }
+            }
+            has_cyclic_interval = true;
+        }
+        has_cyclic_interval
+    }
+}
+
+// SAFETY: A prepared batch is immutable while shared: sampling reads its plans and copies
 // its context. The raw pointers its resolved declarations hold name the base URLs and random
 // sharing values those declarations retain for the batch's lifetime. An animated overlay caches
 // one behind an `Arc`, and an installed overlay is reachable from the computed catalog that every
@@ -9178,7 +9301,7 @@ unsafe impl Sync for PreparedAnimationBatch {}
 /// under the custom-property environments a sample reads.
 pub(crate) fn animation_preparation_matches(
     overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
-    sampled: &[FfiSampledAnimationEffect],
+    sampled: &[SampledAnimationEffect],
     custom_property_environments: [u64; 2],
 ) -> bool {
     overlay
@@ -9226,31 +9349,35 @@ fn snap_animated_border_width(
 /// values the batch carries. Later samples can reuse that preparation from the animated overlay.
 /// Answers the final value of each custom property the effects animate, by the number it animates
 /// under, in that order.
-pub(crate) fn evaluate_animations(batch: ComputedAnimationBatch<'_>) -> Vec<(u32, RetainedStyleValueData)> {
-    crate::css::ffi_stats::note_animation_evaluation();
+pub(crate) fn evaluate_animations(mut batch: ComputedAnimationBatch<'_>) -> Vec<(u32, RetainedStyleValueData)> {
+    let preparation = prepare_animations(&mut batch);
+    evaluate_prepared_animations(&preparation, &mut batch)
+}
+
+/// Complete or reuse the animation plan and prepare its keyframe values for evaluation.
+pub(crate) fn prepare_animations(batch: &mut ComputedAnimationBatch<'_>) -> Arc<PreparedAnimationBatch> {
     let ComputedAnimationBatch {
         context: sample_context,
-        device_pixels_per_css_pixel,
         sampled_effects: sampled,
         custom_property_environments,
         cache_preparation,
         preparation_reads_custom_property_environments,
         preparation_inputs,
-        underlying_longhands,
         overlay,
-        custom_underlying_values,
-        custom_initial_values,
+        ..
     } = batch;
     let preparation = overlay
         .animation_preparation
         .as_ref()
-        .filter(|preparation| preparation.key.matches(sampled, custom_property_environments))
+        .filter(|preparation| preparation.key.matches(sampled, *custom_property_environments))
         .cloned()
         .unwrap_or_else(|| {
             let AnimationPreparationInputs {
                 resolved,
                 computed_keyframe_values,
-            } = preparation_inputs.expect("a sample without a matching preparation carries its inputs");
+            } = preparation_inputs
+                .take()
+                .expect("a sample without a matching preparation carries its inputs");
             assert_eq!(computed_keyframe_values.len(), resolved.properties.len());
             let keyframes_by_value = resolved
                 .value_plans
@@ -9268,9 +9395,9 @@ pub(crate) fn evaluate_animations(batch: ComputedAnimationBatch<'_>) -> Vec<(u32
                 .collect();
             std::sync::Arc::new(PreparedAnimationBatch {
                 key: AnimationPreparationKey {
-                    effects: sampled.iter().map(|sampled| sampled.effect).collect(),
+                    effects: sampled.iter().map(|sampled| sampled.description.clone()).collect(),
                     custom_property_environments: preparation_reads_custom_property_environments
-                        .then_some(custom_property_environments),
+                        .then_some(*custom_property_environments),
                 },
                 resolved: *resolved,
                 keyframes_by_value,
@@ -9286,11 +9413,28 @@ pub(crate) fn evaluate_animations(batch: ComputedAnimationBatch<'_>) -> Vec<(u32
                 },
             })
         });
-    if cache_preparation {
+    if *cache_preparation {
         overlay.animation_preparation = Some(preparation.clone());
     } else {
         overlay.animation_preparation = None;
     }
+    preparation
+}
+
+pub(crate) fn evaluate_prepared_animations(
+    preparation: &PreparedAnimationBatch,
+    batch: &mut ComputedAnimationBatch<'_>,
+) -> Vec<(u32, RetainedStyleValueData)> {
+    let ComputedAnimationBatch {
+        context: sample_context,
+        device_pixels_per_css_pixel,
+        sampled_effects: sampled,
+        underlying_longhands,
+        overlay,
+        custom_underlying_values,
+        custom_initial_values,
+        ..
+    } = batch;
     let resolved = &preparation.resolved;
     let context = FfiAnimationContext {
         current_color: sample_context.current_color,
@@ -9353,7 +9497,7 @@ pub(crate) fn evaluate_animations(batch: ComputedAnimationBatch<'_>) -> Vec<(u32
         }
         if let Some(value) = result.value {
             previous_values.push((input.property_id, input.custom_name_id, value.clone()));
-            let value = snap_animated_border_width(input.property_id, value, device_pixels_per_css_pixel);
+            let value = snap_animated_border_width(input.property_id, value, *device_pixels_per_css_pixel);
             overlay.set_owned(input.property_id, value, false, input.result_of_transition);
         } else {
             let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword {
@@ -9374,6 +9518,70 @@ pub(crate) fn evaluate_animations(batch: ComputedAnimationBatch<'_>) -> Vec<(u32
 mod tests {
     use super::*;
     use crate::css::easing::FfiEasingKind;
+
+    #[test]
+    fn preserves_lower_custom_property_effects_for_single_endpoint_intervals() {
+        use crate::animations::easing::CompactEasing;
+        use crate::animations::effect::AnimationEffectId;
+        use crate::animations::keyframes::{
+            CompositeOperationOrAuto, FINAL_KEY, KeyframeEasing, KeyframeProperty, KeyframeSet,
+        };
+        use crate::css::retained_fly_string::RetainedUtf16FlyString;
+        use crate::css::style::effect_descriptions::{EffectAnimation, EffectDescription};
+
+        let name = RetainedUtf16FlyString::from_utf16(&"--value".encode_utf16().collect::<Vec<_>>());
+        let values = [1.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+            .map(|value| RetainedStyleValueData::from_arc(StyleValueArc::new(StyleValueData::Number { value })));
+        let keys = [0, FINAL_KEY, 0, 0, FINAL_KEY, FINAL_KEY];
+        let effects = [(0, 2), (2, 4)].map(|(first_keyframe, keyframe_count)| {
+            let keyframes = (first_keyframe..first_keyframe + keyframe_count)
+                .map(|index| {
+                    (
+                        keys[index],
+                        CompositeOperationOrAuto::Replace,
+                        KeyframeEasing::None,
+                        vec![(
+                            KeyframeProperty::Custom(name.clone()),
+                            KeyframeValue::Declared(values[index].clone()),
+                        )],
+                    )
+                })
+                .collect();
+            PublishedEffect::new(Arc::new(EffectDescription {
+                keyframe_set: Some(Arc::new(KeyframeSet::from_keyframes_as_given(keyframes))),
+                animation: EffectAnimation::Animation(CompactEasing::Linear),
+                ..EffectDescription::new(AnimationEffectId(u64::try_from(first_keyframe).unwrap()))
+            }))
+        });
+        let registry = Registry::shared_empty();
+        let mut custom_properties = AnimatedCustomProperties {
+            stores: KeyframeStores {
+                substitution: std::ptr::null(),
+                base: std::ptr::null(),
+                inheritance: std::ptr::null(),
+                element_declares_custom_properties: false,
+            },
+            names: Vec::new(),
+            units: Vec::new(),
+            intervals: Vec::new(),
+            registration_generation: 0,
+            has_uncached_interval_values: false,
+        };
+
+        #[expect(clippy::cast_precision_loss)]
+        let final_key = FINAL_KEY as f64;
+        for (current_key, expected_span, lower_count) in
+            [(final_key / 2.0, [1, 2], 0), (final_key, [3, 3], 1), (-1.0, [0, 0], 1)]
+        {
+            let selected = effects
+                .iter()
+                .map(|effect| SelectedEffect { effect, current_key })
+                .collect::<Vec<_>>();
+            let intervals = select_contributing_custom_property_intervals(&selected, &mut custom_properties, registry);
+            assert_eq!(intervals[1][0].declaration_indices(), expected_span);
+            assert_eq!(intervals[0].len(), lower_count, "lower effect count at {current_key}");
+        }
+    }
 
     #[test]
     fn resolves_keyframe_property_conflicts_as_one_batch() {

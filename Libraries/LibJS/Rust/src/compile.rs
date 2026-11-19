@@ -41,7 +41,7 @@ use crate::utf16::Utf16View;
 use ak::Utf16String;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 // Compile-time assertion: what parse and compile produce travels from a worker thread to the main thread.
 const _: fn() = || {
@@ -115,13 +115,7 @@ impl ParsedProgram {
     /// first use.
     pub fn ast_dump(&mut self) -> &str {
         self.ast_dump.get_or_insert_with(|| {
-            let source = &self
-                .tree
-                .as_ref()
-                .expect("the program has a tree")
-                .script
-                .positions
-                .source;
+            let source = &self.tree.as_ref().expect("the program has a tree").source;
             let mut options = self.options;
             options.keep_whole_tree = true;
             let tree = parse_to_tree(source, &options)
@@ -1138,8 +1132,38 @@ pub struct FunctionPayload {
     /// The environment the function closes over, as laid out by the generators of its enclosing functions.
     pub enclosing_environment_scope: Option<Arc<bytecode::codegen::EnclosingEnvironmentScope>>,
     pub enclosing_code: Arc<EnclosingCode>,
-    /// The function's code, once it compiled, if its script retains compiled functions.
-    pub compiled: OnceLock<Arc<bytecode::executable_data::PrecompiledFunction>>,
+    /// The function's code, once it compiled, if its script retains compiled functions. Dropped when the code of a
+    /// function compiled from this payload is flushed (see `bytecode::flushing`).
+    pub compiled: Mutex<Option<Arc<bytecode::executable_data::PrecompiledFunction>>>,
+}
+
+impl FunctionPayload {
+    /// The code kept for the function, if its script retains compiled functions and it compiled before.
+    pub fn retained_code(&self) -> Option<Arc<bytecode::executable_data::PrecompiledFunction>> {
+        self.compiled
+            .lock()
+            .expect("nothing panics with the retained code")
+            .clone()
+    }
+
+    /// Drops the code kept for the function, whose executable that runs `flushed` is flushed, unless another
+    /// executable (of another realm that linked the script) still shares it: dropping it would free nothing then, and
+    /// the next link would compile the function again.
+    pub fn forget_retained_code(&self, flushed: &Arc<bytecode::executable_data::ExecutableData>) {
+        let mut compiled = self.compiled.lock().expect("nothing panics with the retained code");
+        let Some(retained) = compiled.as_ref() else {
+            return;
+        };
+        // NB: The kept code holds the code once, and the flushed executable, which is not swept yet, holds it too if it
+        //     runs it.
+        let holders = 1 + usize::from(Arc::ptr_eq(&retained.executable, flushed));
+        if Arc::strong_count(&retained.executable) > holders {
+            return;
+        }
+        let retained = compiled.take().expect("the kept code is there");
+        drop(compiled);
+        self.script.remove_retained_code_size(retained.memory_size());
+    }
 }
 
 /// What a runtime needs to create a SharedFunctionInstanceData for one function, none of which takes the function's own
@@ -1154,8 +1178,8 @@ pub struct SharedFunctionDescription {
     pub strict: bool,
     pub is_arrow: bool,
     pub has_simple_parameter_list: bool,
-    pub source_text_offset: usize,
-    pub source_text_length: usize,
+    pub source_text_offset: u32,
+    pub source_text_length: u32,
     pub uses_this: bool,
     pub uses_this_from_environment: bool,
     pub payload: Arc<FunctionPayload>,
@@ -1179,8 +1203,8 @@ pub fn describe_shared_function(
     enclosing_code: &Arc<EnclosingCode>,
 ) -> SharedFunctionDescription {
     let function_data = tree.function(function);
-    let source_start = function_data.source_text_start as usize;
-    let source_end = function_data.source_text_end as usize;
+    let source_start = function_data.source_text_start;
+    let source_end = function_data.source_text_end;
 
     let name = if let Some(name) = name_override {
         name
@@ -1207,7 +1231,7 @@ pub fn describe_shared_function(
             row: tree.function_row(function),
             enclosing_environment_scope,
             enclosing_code: enclosing_code.clone(),
-            compiled: OnceLock::new(),
+            compiled: Mutex::new(None),
         }),
     }
 }
@@ -1224,9 +1248,8 @@ pub(crate) fn pending_function_of_row(
     let index = &script.index;
     let at = row as usize;
     let flags = index.flags[at];
-    let (start, end) = (index.start[at] as usize, index.end[at] as usize);
+    let (start, end) = (index.start[at], index.end[at]);
     PendingSharedFunctionData {
-        function: FunctionId::function(0),
         description: SharedFunctionDescription {
             name: name.unwrap_or_default(),
             function_kind: ast::FunctionKind::from_async_generator(
@@ -1247,7 +1270,7 @@ pub(crate) fn pending_function_of_row(
                 row: crate::parser::FunctionRow(row),
                 enclosing_environment_scope,
                 enclosing_code: enclosing_code.clone(),
-                compiled: OnceLock::new(),
+                compiled: Mutex::new(None),
             }),
         },
         class_field_initializer_name: None,
@@ -1274,7 +1297,6 @@ impl PendingSharedFunctionData {
             enclosing_code,
         );
         Self {
-            function,
             description,
             class_field_initializer_name: None,
             should_eager_compile: false,
@@ -1289,7 +1311,7 @@ impl PendingSharedFunctionData {
             + self
                 .class_field_initializer_name
                 .as_ref()
-                .map_or(0, |(name, _)| utf16_string_memory_size(name))
+                .map_or(0, |field| size_of_val(&**field) + utf16_string_memory_size(&field.0))
             + self
                 .precompiled_function
                 .as_ref()
@@ -1319,7 +1341,7 @@ pub fn compile_function(
     builtin_abstract_operations_enabled: bool,
     stack_limit: usize,
 ) -> Result<bytecode::executable_data::PrecompiledFunction, OutOfStack> {
-    if let Some(compiled) = payload.compiled.get() {
+    if let Some(compiled) = payload.retained_code() {
         return Ok(compiled.shared_copy());
     }
 
@@ -1334,11 +1356,12 @@ pub fn compile_function(
     )?;
 
     // NB: Code with builtin abstract operations is only for the builtins of the engine, whatever asked for it.
-    if payload.script.retains_compiled_functions()
-        && !builtin_abstract_operations_enabled
-        && payload.compiled.set(Arc::new(compiled.shared_copy())).is_ok()
-    {
-        payload.script.add_retained_code_size(compiled.memory_size());
+    if payload.script.retains_compiled_functions() && !builtin_abstract_operations_enabled {
+        let mut retained = payload.compiled.lock().expect("nothing panics with the retained code");
+        if retained.is_none() {
+            *retained = Some(Arc::new(compiled.shared_copy()));
+            payload.script.add_retained_code_size(compiled.memory_size());
+        }
     }
     Ok(compiled)
 }
@@ -1710,7 +1733,7 @@ mod tests {
         let first = compile_with_enough_stack(&payload, false);
         let second = compile_with_enough_stack(&payload, false);
         assert!(!Arc::ptr_eq(&first.executable, &second.executable));
-        assert!(payload.compiled.get().is_none());
+        assert!(payload.retained_code().is_none());
         assert_eq!(program.memory_size(), size);
     }
 
@@ -1720,7 +1743,7 @@ mod tests {
         program.set_retains_compiled_functions(true);
         let payload = first_payload(&program);
         compile_with_enough_stack(&payload, true);
-        assert!(payload.compiled.get().is_none());
+        assert!(payload.retained_code().is_none());
     }
 
     #[test]
@@ -1729,9 +1752,9 @@ mod tests {
         program.set_retains_compiled_functions(true);
         let payload = first_payload(&program);
         assert!(compile_function(&payload, false, usize::MAX).is_err());
-        assert!(payload.compiled.get().is_none());
+        assert!(payload.retained_code().is_none());
         compile_with_enough_stack(&payload, false);
-        assert!(payload.compiled.get().is_some());
+        assert!(payload.retained_code().is_some());
     }
 
     #[test]
@@ -1742,6 +1765,20 @@ mod tests {
         let script = Arc::downgrade(&parsed.tree.script);
         let _compiled = compile_eval(parsed);
         assert!(script.upgrade().is_none());
+    }
+
+    #[test]
+    fn a_source_that_stops_compiling_lets_go_of_its_reparse_context() {
+        let program = compile(SOURCE);
+        let payload = first_payload(&program);
+        compile_with_enough_stack(&payload, false);
+        assert!(payload.script.has_reparse_context());
+        crate::parser::release_idle_reparse_contexts();
+        assert!(payload.script.has_reparse_context());
+        crate::parser::release_idle_reparse_contexts();
+        assert!(!payload.script.has_reparse_context());
+        compile_with_enough_stack(&payload, false);
+        assert!(payload.script.has_reparse_context());
     }
 
     #[test]

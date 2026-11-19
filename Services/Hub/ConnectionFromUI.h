@@ -68,6 +68,8 @@ private:
     void start_request(u64 request_id, ByteString const& method, URL::URL const&, HTTP::HeaderList const& headers, ByteString const& body, HTTP::CacheMode, HTTP::Cookie::IncludeCredentials, WebView::IsPrivate, ReadonlySpan<StringView> response_header_names);
     virtual void stop_request(u64 request_id) override;
     virtual void toggle_devtools_enabled() override;
+    virtual void check_for_updates(WebView::UpdateCheckTrigger) override;
+    virtual void skip_update_version(String) override;
     virtual void set_preferred_contrast(Web::CSS::PreferredContrast) override;
     virtual void set_preferred_motion(Web::CSS::PreferredMotion) override;
     virtual void set_user_agent_string(String user_agent) override;
@@ -103,6 +105,7 @@ private:
     virtual void view_request_selected_text(u64 view_id, u64 request_id) override;
     virtual void view_request_close_preflight(u64 view_id, u64 request_id) override;
     virtual void view_request_page_dumps(u64 view_id, u64 request_id) override;
+    virtual void request_platform_features_description(u64 request_id) override;
     virtual void view_prepare_for_immediate_close(u64 view_id) override;
     virtual void view_prepare_for_close_without_prompting(u64 view_id, u64 close_id) override;
     virtual void finish_prepared_close(u64 close_id) override;
@@ -112,6 +115,7 @@ private:
     virtual void notification_failed(u64 id) override;
     virtual void notification_clicked(u64 id) override;
     virtual void notification_closed(u64 id, bool by_user) override;
+    virtual void media_session_action(Web::Bindings::MediaSessionAction, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) override;
     virtual void geolocation_position(u64 id, Core::GeolocationCoordinates coordinates) override;
     virtual void geolocation_error(u64 id, Core::GeolocationError error) override;
     virtual void geolocation_authorization_changed(Core::GeolocationAuthorization authorization) override;
@@ -159,6 +163,12 @@ private:
     virtual void view_set_window_size(u64 view_id, Gfx::IntSize size) override;
     virtual void view_set_system_visibility_state(u64 view_id, Web::HTML::VisibilityState visibility_state) override;
     virtual void view_set_presents_from_cpu_memory(u64 view_id, bool presents_from_cpu_memory) override;
+    virtual void view_set_hosts_remote_layer(u64 view_id, bool hosts_remote_layer) override;
+    virtual void view_set_wants_frame_notifications(u64 view_id, bool wants_frame_notifications) override;
+    virtual void view_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::IntSize> maximum_size) override;
+    virtual void view_begin_synchronized_resize(u64 view_id, u64 token) override;
+    virtual void view_await_synchronized_resize_frame(u64 view_id, u64 token, Gfx::IntSize size) override;
+    virtual void view_commit_synchronized_resize(u64 view_id, u64 token) override;
     virtual void view_set_has_system_focus(u64 view_id, bool has_system_focus) override;
     virtual void view_open_url_in_new_tab(u64 view_id, URL::URL url, Web::HTML::ActivateTab activate_tab) override;
     virtual void view_open_url_in_new_window(u64 view_id, URL::URL url, WebView::IsPrivate is_private) override;
@@ -187,7 +197,7 @@ private:
     virtual void view_zoom_in(u64 view_id) override;
     virtual void view_zoom_out(u64 view_id) override;
     virtual void view_reset_zoom(u64 view_id) override;
-    virtual void view_set_display_metadata(u64 view_id, Optional<u64> display_id, double maximum_frames_per_second) override;
+    virtual void view_set_display_metadata(u64 view_id, Optional<u64> display_id, double maximum_frames_per_second, bool screen_shows_high_dynamic_range) override;
     virtual void view_set_scales_frames_to_fit(u64 view_id, bool scales_frames_to_fit) override;
     virtual void view_enable_picture_in_picture_controls(u64 view_id) override;
     virtual void view_update_interface_color_scheme(u64 view_id) override;

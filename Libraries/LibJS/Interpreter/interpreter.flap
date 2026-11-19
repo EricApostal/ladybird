@@ -11,14 +11,23 @@ inline fn max(lhs: u32, rhs: u32) -> u32 {
     }
 }
 
+inline fn call_length(
+    argument_count: u8
+) -> u32 {
+    let mut count: u32;
+    load8(count, [pb, pc, argument_count]);
+    # NB: 7 is what a Call takes up before its arguments, which are a byte each. Any call breaks if it goes out of date.
+    let length: u32 = 7 + count;
+    length
+}
+
 inline fn call_site_info(
-    length: u32,
+    argument_count: u8,
     dst: out Operand
 ) -> (u32, u32, u32) {
-    let [instruction_length, destination_index] = load_pair32(
-        [pb, pc, length],
-        [pb, pc, dst]
-    );
+    let instruction_length: u32 = call_length(argument_count);
+    let mut destination_index: u32;
+    load8(destination_index, [pb, pc, dst]);
     let current_pc: u32 = pc;
     let return_pc: u32 = current_pc + instruction_length;
     (current_pc, return_pc, destination_index)
@@ -111,7 +120,10 @@ inline fn load_direct_getter_value(
 }
 
 inline fn move_operand(dst: out Operand, src: in Operand) {
-    let [dst_index, src_index] = load_pair32([pb, pc, dst], [pb, pc, src]);
+    let mut dst_index: u32;
+    load8(dst_index, [pb, pc, dst]);
+    let mut src_index: u32;
+    load8(src_index, [pb, pc, src]);
     values[dst_index] = values[src_index];
 }
 
@@ -214,8 +226,8 @@ inline fn walk_environment_chain(
 ) -> (DeclarativeEnvironment, u32) {
     let mut environment = initial_environment;
     let coordinate = &coordinate;
-    let mut hops = coordinate.hops;
-    let binding_index = coordinate.binding_index;
+    let mut hops = u32(coordinate.hops);
+    let binding_index = u32(coordinate.binding_index);
     assert(environment != 0);
     if hops != 0 {
         do {
@@ -414,9 +426,16 @@ inline fn return_to_caller(
     let caller_frame = exec_ctx.caller_frame;
     guard caller_frame != 0 else top_level;
     let mut result = return_value;
+    # NB: The frame of a derived constructor returns its this value only for undefined.
     if exec_ctx.caller_is_construct {
         if result is not Value<Object> {
-            result = exec_ctx.this_value;
+            if exec_ctx.caller_is_derived_construct {
+                if result is Value<Undefined> {
+                    result = exec_ctx.this_value;
+                }
+            } else {
+                result = exec_ctx.this_value;
+            }
         }
     }
     let return_pc = exec_ctx.caller_return_pc;
@@ -1079,6 +1098,29 @@ inline fn record_value_feedback(slot: ValueFeedbackIndex, value: Value) @profili
     buckets[0] = value;
 }
 
+# The value buckets of the sites of property lookup caches lie before the
+# others, in reverse order: the bucket of cache 0 is the last of them.
+inline fn record_cache_value_feedback(cache: ProfiledPropertyLookupCacheIndex, value: Value) @profiling {
+    let feedback = feedback_base();
+    let index: u64 = alias(load(cache));
+    let unmasked: u64 = feedback.value_buckets - (index << 3) - 8;
+    let cage_base = primitive_storage_cage_base();
+    let buckets: Sequence<Value> = alias(
+        cage_base + ((unmasked << PRIMITIVE_STORAGE_CAGE_OFFSET_SHIFT) >> PRIMITIVE_STORAGE_CAGE_OFFSET_SHIFT)
+    );
+    buckets[0] = value;
+}
+
+# A call site keeps the tag of the value a call returned in its call feedback,
+# which holds its value bucket.
+inline fn record_call_value_feedback(slot: CallFeedbackIndex, value: Value) @profiling {
+    let feedback = feedback_base();
+    let call_feedback: CallFeedback = alias(
+        feedback_address(primitive_storage_cage_base(), feedback.call, load(slot), CALL_FEEDBACK_SIZE)
+    );
+    call_feedback.value_bucket = truncate_u16(i32(extract_tag(value)));
+}
+
 # Call feedback only does work when the callee differs from the first one
 # recorded at the site.
 inline fn record_call_target(slot: CallFeedbackIndex, function: Object) @profiling {
@@ -1237,6 +1279,10 @@ handler Enter() {
     consume_tier_up_budget(TIER_UP_FUNCTION_ENTRY_COST, pc, 0);
     let executable = exec_ctx.executable;
     assert(executable != 0);
+    # NB: Only a collection makes the count nonzero, so the store is rare.
+    if executable.idle_collection_count != 0 {
+        executable.idle_collection_count = 0;
+    }
     let registers_and_locals_count = executable.registers_and_locals_count;
     let empty_tag: Value = Value<Empty>;
     let mut slot_index: u64 = RESERVED_REGISTER_COUNT;
@@ -1272,6 +1318,24 @@ handler Mov(
 }
 
 specialize Mov(src: Undefined);
+
+# NB: The only way to reach the frame slots that no other instruction can name.
+handler MovWide(
+    dst_slot: u32,
+    src_slot: u32
+) {
+    values[load(dst_slot)] = values[load(src_slot)];
+    dispatch_next;
+}
+
+# The name table indices of the next instruction that are too large for its fields. Only what reads that instruction
+# looks at them.
+handler WideNameIndices(
+    first: u32,
+    second: u32
+) {
+    dispatch_next;
+}
 
 specialize Add(lhs: Int32);
 specialize Add(rhs: Int32);
@@ -1498,10 +1562,10 @@ handler ConcatString(
 ) @cold = call_slow_path(concat_string);
 
 handler CopyObjectExcludingProperties(
-    length: u32,
     dst: out Operand,
     from_object: Operand,
-    excluded_names_count: u32,
+    excluded_names_are_in_array: bool,
+    excluded_names_count: u8,
     excluded_names: Operand[]
 ) @cold = call_slow_path(copy_object_excluding_properties);
 
@@ -1521,7 +1585,6 @@ handler GetClassProtoParent(
 ) @cold = call_slow_path(get_class_proto_parent);
 
 handler NewClass(
-    length: u32,
     dst: out Operand,
     super_class: Optional<Operand>,
     proto_parent: Optional<Operand>,
@@ -1529,7 +1592,8 @@ handler NewClass(
     class_blueprint_index: u32,
     lhs_name: Optional<IdentifierTableIndex>,
     computed_name: Optional<Operand>,
-    element_keys_count: u32,
+    element_keys_are_in_array: bool,
+    element_keys_count: u8,
     element_keys: Optional<Operand>[]
 ) @cold = call_slow_path(new_class);
 
@@ -2562,7 +2626,34 @@ handler ThrowNotAFunction(
 
 handler GetArgumentCount(
     dst: out Operand
-) @cold = call_slow_path(get_argument_count);
+) {
+    let count = exec_ctx.passed_argument_count;
+    guard count <= INT32_MAX else {
+        call_slow_path(get_argument_count);
+    };
+    store(dst, box_i32(assume_i32(count)));
+    dispatch_next;
+}
+
+# `arguments[index]` of a function that has no arguments object, which reads the passed argument from the frame.
+handler GetArgument(
+    dst: out Operand,
+    index: in Operand,
+    kind: ArgumentsKind
+) {
+    let slow = || @cold {
+        call_slow_path(get_argument);
+    };
+    let key = load(index);
+    guard extract_tag(key) == INT32_TAG else slow;
+    let signed_index = unbox_i32(key);
+    guard signed_index >= 0 else slow;
+    let argument_index = assume_u32(signed_index);
+    guard argument_index < exec_ctx.passed_argument_count else slow;
+    let first_argument: u32 = exec_ctx.slot_count - exec_ctx.argument_count;
+    store(dst, values[first_argument + argument_index]);
+    dispatch_next;
+}
 
 handler Throw(
     src: Operand
@@ -2928,7 +3019,6 @@ handler PutByValue(
     property: in Operand,
     src: in Operand,
     kind: PutKind,
-    base_identifier: Optional<IdentifierTableIndex>,
     cache: PropertyLookupCacheIndex
 ) {
     let slow = || @cold {
@@ -3138,12 +3228,10 @@ handler PutByValue(
 }
 
 handler GetById(
-    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     base: in Operand,
     property: PropertyKeyTableIndex,
-    base_identifier: Optional<IdentifierTableIndex>,
-    cache: PropertyLookupCacheIndex
+    cache: ProfiledPropertyLookupCacheIndex
 ) {
     let try_cache = || @cold {
         let executable = exec_ctx.executable;
@@ -3153,7 +3241,7 @@ handler GetById(
         let result: Value = call_helper_with_two_arguments(asm_try_get_by_id_cache, load(base), cache_pointer);
         guard result is not Value<Empty> else slow;
         store(dst, result);
-        record_value_feedback(value_feedback, result);
+        record_cache_value_feedback(cache, result);
         dispatch_next;
     };
 
@@ -3182,7 +3270,7 @@ handler GetById(
         let getter = accessor.getter;
         guard getter != 0 else {
             let produced: Value = Value<Undefined>;
-            record_value_feedback(value_feedback, produced);
+            record_cache_value_feedback(cache, produced);
             store(dst, produced);
             dispatch_next;
         };
@@ -3193,7 +3281,7 @@ handler GetById(
         if flags has OBJECT_FLAG_IS_DIRECT_GETTER_FUNCTION {
             if property_cache.getter == getter {
                 guard let result = load_direct_getter_value(function, receiver_object) else invoke_accessor_slow;
-                record_value_feedback(value_feedback, result);
+                record_cache_value_feedback(cache, result);
                 store(dst, result);
                 dispatch_next;
             }
@@ -3248,11 +3336,12 @@ handler GetById(
         native_frame.frame_initialized = false;
         native_frame.returns_to_native_caller = false;
         native_frame.runs_jit_code = false;
+        native_frame.caller_is_derived_construct = false;
+        let undefined_new_target_1: Value = Value<Undefined>;
+        native_frame.new_target = undefined_new_target_1;
         let native_pc: u32 = pc;
-        let [destination_offset, _] = load_pair32(
-            [pb, pc, dst],
-            [pb, pc, base]
-        );
+        let mut destination_offset: u32;
+        load8(destination_offset, [pb, pc, dst]);
         exec_ctx.program_counter = native_pc;
         native_frame.caller_frame = exec_ctx;
         # The exception helper only needs a PC within the current instruction.
@@ -3295,7 +3384,7 @@ handler GetById(
         return_vm.interpreter_stack_top = alias(exec_ctx);
         exec_ctx = caller_frame;
         values = exec_ctx.slots;
-        record_value_feedback(value_feedback, native_payload);
+        record_cache_value_feedback(cache, native_payload);
         store(dst, native_payload);
         dispatch_next;
     };
@@ -3336,7 +3425,7 @@ handler GetById(
     let load_polymorphic_value = |holder: Object, entry: PropertyLookupCache| {
         let polymorphic_value = holder.named_properties[entry.property_offset];
         guard polymorphic_value is not Value<Accessor> else try_cache;
-        record_value_feedback(value_feedback, polymorphic_value);
+        record_cache_value_feedback(cache, polymorphic_value);
         store(dst, polymorphic_value);
         dispatch_next;
     };
@@ -3356,7 +3445,7 @@ handler GetById(
         guard property_cache.shape_dictionary_generation == shape.dictionary_generation else try_cache;
         let value = holder.named_properties[property_cache.property_offset];
         guard value is not Value<Accessor> else invoke_accessor(value, object, property_cache);
-        record_value_feedback(value_feedback, value);
+        record_cache_value_feedback(cache, value);
         store(dst, value);
         dispatch_next;
     };
@@ -3372,21 +3461,48 @@ handler GetById(
 }
 
 handler GetByIdWithThis(
-    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
-    base: Operand,
+    base: in Operand,
     property: PropertyKeyTableIndex,
     this_value: Operand,
-    cache: PropertyLookupCacheIndex
-) @cold = call_slow_path(get_by_id_with_this);
+    cache: ProfiledPropertyLookupCacheIndex
+) {
+    let slow = || @cold {
+        call_slow_path(get_by_id_with_this);
+    };
+
+    # Data properties found through the cache of the base, whose value does not depend on the receiver. Getters run in
+    # the slow path with the this value.
+    let load_cached_value = |holder: Object, property_cache: PropertyLookupCache| {
+        let value = holder.named_properties[property_cache.property_offset];
+        guard value is not Value<Accessor> else slow;
+        record_cache_value_feedback(cache, value);
+        store(dst, value);
+        dispatch_next;
+    };
+
+    guard let Value<Object>(object) = load(base) else slow;
+    let shape = object.shape;
+    guard let property_cache = load_property_lookup_cache(cache) else slow;
+    guard property_cache.shape == shape else slow;
+    guard property_cache.entry_type != PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_MISSING_PROPERTY else slow;
+    guard property_cache.shape_dictionary_generation == shape.dictionary_generation else slow;
+    let cached_prototype = property_cache.prototype;
+    guard cached_prototype == 0 else @cold {
+        let prototype_chain_validity = property_cache.prototype_chain_validity;
+        guard prototype_chain_validity != 0 else slow;
+        guard prototype_chain_validity.valid != 0 else slow;
+        goto load_cached_value(cached_prototype, property_cache);
+    };
+    goto load_cached_value(object, property_cache);
+}
 
 handler PutById(
     base: in Operand,
     property: PropertyKeyTableIndex,
     src: in Operand,
     kind: PutKind,
-    cache: PropertyLookupCacheIndex,
-    base_identifier: Optional<IdentifierTableIndex>
+    cache: PropertyLookupCacheIndex
 ) {
     let slow = || @cold {
         call_slow_path(put_by_id);
@@ -3420,13 +3536,11 @@ handler PutByIdWithThis(
 ) @cold = call_slow_path(put_by_id_with_this);
 
 handler GetByValue(
-    value_feedback: ValueFeedbackIndex,
     keyed_feedback: KeyedFeedbackIndex,
     dst: out Operand,
     base: in Operand,
     property: in Operand,
-    base_identifier: Optional<IdentifierTableIndex>,
-    cache: PropertyLookupCacheIndex
+    cache: ProfiledPropertyLookupCacheIndex
 ) {
     let slow = || @cold {
         call_slow_path(get_by_value);
@@ -3458,7 +3572,7 @@ handler GetByValue(
         guard keyed_value is not Value<Accessor> else slow_without_cache;
         # NB: The runtime recorded multiple keys before the access gave up on its own cache.
         record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_MULTIPLE_STRING_KEYS);
-        record_value_feedback(value_feedback, keyed_value);
+        record_cache_value_feedback(cache, keyed_value);
         store(dst, keyed_value);
         dispatch_next;
     };
@@ -3491,7 +3605,7 @@ handler GetByValue(
         guard property_cache.prototype == 0 else try_cache;
         let value = object.named_properties[property_cache.property_offset];
         guard value is not Value<Accessor> else slow;
-        record_value_feedback(value_feedback, value);
+        record_cache_value_feedback(cache, value);
         store(dst, value);
         dispatch_next;
     };
@@ -3510,7 +3624,7 @@ handler GetByValue(
         let result: Value = call_helper_with_two_arguments(asm_helper_single_ascii_character_string, current_vm(), signed_code_unit);
         assert(extract_tag(result) == STRING_TAG);
         record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_PRIMITIVE_BASE);
-        record_value_feedback(value_feedback, result);
+        record_cache_value_feedback(cache, result);
         store(dst, result);
         dispatch_next;
     };
@@ -3530,7 +3644,7 @@ handler GetByValue(
                 guard index < indexed_elements.capacity else slow;
                 let value = indexed_elements[index];
                 record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_INT32_INDEX_PACKED);
-                record_value_feedback(value_feedback, value);
+                record_cache_value_feedback(cache, value);
                 store(dst, value);
                 dispatch_next;
             },
@@ -3543,7 +3657,7 @@ handler GetByValue(
                 let value = indexed_elements[index];
                 guard value is not Value<Empty> else slow;
                 record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_INT32_INDEX_HOLEY);
-                record_value_feedback(value_feedback, value);
+                record_cache_value_feedback(cache, value);
                 store(dst, value);
                 dispatch_next;
             },
@@ -3567,14 +3681,14 @@ handler GetByValue(
 
     let typed_array_f64_as_int = |raw: i32| {
         let produced: Value = box_i32(raw);
-        record_value_feedback(value_feedback, produced);
+        record_cache_value_feedback(cache, produced);
         store(dst, produced);
         dispatch_next;
     };
 
     let typed_array_f64_as_double = |slot_f64: f64| {
         let result = canonicalize_nan(slot_f64);
-        record_value_feedback(value_feedback, result);
+        record_cache_value_feedback(cache, result);
         store(dst, result);
         dispatch_next;
     };
@@ -3584,7 +3698,7 @@ handler GetByValue(
     #        in this hot handler. Revisit with profile data or cost-aware layout.
     let typed_array_box_int32 = |raw: i32| {
         let produced: Value = box_i32(raw);
-        record_value_feedback(value_feedback, produced);
+        record_cache_value_feedback(cache, produced);
         store(dst, produced);
         dispatch_next;
     };
@@ -3594,7 +3708,7 @@ handler GetByValue(
             let value = load_caged_u8(elements, cached_offset, index);
             let widened: i32 = alias(value);
             let produced: Value = box_i32(widened);
-            record_value_feedback(value_feedback, produced);
+            record_cache_value_feedback(cache, produced);
             store(dst, produced);
             dispatch_next;
         },
@@ -3620,7 +3734,7 @@ handler GetByValue(
             let uint32_to_double = || @cold {
                 let slot_f64 = u32_to_f64(raw_u32);
                 let result = box_f64(slot_f64);
-                record_value_feedback(value_feedback, result);
+                record_cache_value_feedback(cache, result);
                 store(dst, result);
                 dispatch_next;
             };
@@ -3674,12 +3788,10 @@ handler PutBySpread(
 ) @cold = call_slow_path(put_by_spread);
 
 handler GetLength(
-    value_feedback: ValueFeedbackIndex,
     keyed_feedback: KeyedFeedbackIndex,
     dst: out Operand,
     base: in Operand,
-    base_identifier: Optional<IdentifierTableIndex>,
-    cache: PropertyLookupCacheIndex
+    cache: ProfiledPropertyLookupCacheIndex
 ) {
     let slow = || @cold {
         call_slow_path(get_length);
@@ -3691,7 +3803,7 @@ handler GetLength(
         let length = string.length_in_utf16_code_units;
         guard length <= INT32_MAX else slow;
         let produced: Value = box_i32(assume_i32(length));
-        record_value_feedback(value_feedback, produced);
+        record_cache_value_feedback(cache, produced);
         store(dst, produced);
         dispatch_next;
     };
@@ -3702,14 +3814,14 @@ handler GetLength(
         let length = object.indexed_array_like_size;
         let length_double = || @cold {
             let produced: Value = box_f64(u32_to_f64(length));
-            record_value_feedback(value_feedback, produced);
+            record_cache_value_feedback(cache, produced);
             store(dst, produced);
             dispatch_next;
         };
 
         guard length <= INT32_MAX else length_double;
         let produced: Value = box_i32(assume_i32(length));
-        record_value_feedback(value_feedback, produced);
+        record_cache_value_feedback(cache, produced);
         store(dst, produced);
         dispatch_next;
     }
@@ -3723,17 +3835,16 @@ handler GetLength(
     guard property_cache.shape_dictionary_generation == shape.dictionary_generation else slow;
     let value = object.named_properties[property_cache.property_offset];
     guard value is not Value<Accessor> else slow;
-    record_value_feedback(value_feedback, value);
+    record_cache_value_feedback(cache, value);
     store(dst, value);
     dispatch_next;
 }
 
 handler GetLengthWithThis(
-    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     base: Operand,
     this_value: Operand,
-    cache: PropertyLookupCacheIndex
+    cache: ProfiledPropertyLookupCacheIndex
 ) @cold = call_slow_path(get_length_with_this);
 
 handler GetMethod(
@@ -3854,14 +3965,11 @@ handler SetGlobal(
 }
 
 handler Call(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
-    length: u32,
     dst: out Operand,
     callee: in Operand,
     this_value: in Operand,
-    argument_count: u32,
-    expression_string: Optional<StringTableIndex>,
+    argument_count: u8,
     arguments: Operand[]
 ) {
     let slow = || @cold {
@@ -3890,7 +3998,7 @@ handler Call(
             }
         }
     }
-    let formal_count: u32 = max(u32(metadata), load(argument_count));
+    let formal_count: u32 = max(u32(metadata), u32(load(argument_count)));
     # Construct an interpreter frame for an inline ECMAScript call.
     assert(executable_pointer != 0);
     let registers_and_locals_count = executable_pointer.registers_and_locals_count;
@@ -3915,7 +4023,7 @@ handler Call(
     let frame_values = frame.slots;
     frame.slot_count = frame_slot_count;
     frame.argument_count = formal_count;
-    frame.passed_argument_count = load(argument_count);
+    frame.passed_argument_count = u32(load(argument_count));
     let realm = function.shape.realm;
     frame.function = function;
     frame.realm = realm;
@@ -3951,20 +4059,23 @@ handler Call(
     frame.frame_initialized = false;
     frame.returns_to_native_caller = false;
     frame.runs_jit_code = false;
+    frame.caller_is_derived_construct = false;
+    let undefined_new_target_3: Value = Value<Undefined>;
+    frame.new_target = undefined_new_target_3;
     frame.caller_frame = exec_ctx;
-    let [current_pc, return_pc, return_destination] = call_site_info(length, dst);
+    let [current_pc, return_pc, return_destination] = call_site_info(argument_count, dst);
     # NB: Stack traces show the caller at its program counter.
     exec_ctx.program_counter = current_pc;
     frame.caller_return_pc = return_pc;
     frame.caller_dst_raw = return_destination;
-    let actual_argument_count = load(argument_count);
+    let actual_argument_count = u32(load(argument_count));
     assert(formal_count >= actual_argument_count);
     let mut write_index: u64 = alias(callee_slot_count);
     let caller_values = exec_ctx.slots;
     let argument_operand_indices = &arguments;
     let mut argument_index: u32 = 0;
     while argument_index < actual_argument_count {
-        frame_values[write_index] = caller_values[argument_operand_indices[argument_index]];
+        frame_values[write_index] = caller_values[u32(argument_operand_indices[argument_index])];
         argument_index = argument_index + 1;
         write_index = write_index + 1;
     }
@@ -4005,7 +4116,7 @@ handler Call(
         # Construct the lightweight frame used by raw native functions.
         let flags = function.flags;
         guard flags has OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION else slow;
-        let actual_argument_count = load(argument_count);
+        let actual_argument_count = u32(load(argument_count));
         let native_frame_size: u64 = alias(actual_argument_count) * SIZEOF_VALUE + SIZEOF_EXECUTION_CONTEXT;
         let native_stack_vm = current_vm();
         let frame_base = native_stack_vm.interpreter_stack_top;
@@ -4052,7 +4163,10 @@ handler Call(
         native_frame.frame_initialized = false;
         native_frame.returns_to_native_caller = false;
         native_frame.runs_jit_code = false;
-        let [native_pc, after_pc, destination_offset] = call_site_info(length, dst);
+        native_frame.caller_is_derived_construct = false;
+        let undefined_new_target_2: Value = Value<Undefined>;
+        native_frame.new_target = undefined_new_target_2;
+        let [native_pc, after_pc, destination_offset] = call_site_info(argument_count, dst);
         exec_ctx.program_counter = native_pc;
         native_frame.caller_frame = exec_ctx;
         native_frame.caller_return_pc = after_pc;
@@ -4062,7 +4176,7 @@ handler Call(
         let native_frame_values = native_frame.slots;
         let mut argument_index: u32 = 0;
         while argument_index < actual_argument_count {
-            native_frame_values[argument_index] = native_caller_values[native_argument_operand_indices[argument_index]];
+            native_frame_values[argument_index] = native_caller_values[u32(native_argument_operand_indices[argument_index])];
             argument_index = argument_index + 1;
         }
         let native_running_vm = current_vm();
@@ -4111,8 +4225,9 @@ handler Call(
         exec_ctx = caller_frame;
         values = exec_ctx.slots;
         store(dst, native_payload);
-        record_value_feedback(value_feedback, native_payload);
-        dispatch_variable(load(length));
+        record_call_value_feedback(call_feedback, native_payload);
+        let length: u32 = call_length(argument_count);
+        dispatch_variable(length);
     };
 }
 
@@ -4299,66 +4414,70 @@ handler IteratorToArray(
 ) @cold = call_slow_path(iterator_to_array);
 
 handler CallConstruct(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
-    length: u32,
     dst: out Operand,
     callee: Operand,
-    argument_count: u32,
-    expression_string: Optional<StringTableIndex>,
+    argument_count: u8,
     arguments: Operand[]
 ) @cold = call_slow_path(call_construct);
 
 handler CallDirectEval(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
-    length: u32,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
-    argument_count: u32,
-    expression_string: Optional<StringTableIndex>,
+    argument_count: u8,
     arguments: Operand[]
 ) @cold = call_slow_path(call_direct_eval);
 
 handler CallWithArgumentArray(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
-    arguments: Operand,
-    expression_string: Optional<StringTableIndex>
+    arguments: Operand
 ) @cold = call_slow_path(call_with_argument_array);
 
 handler CallDirectEvalWithArgumentArray(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
-    arguments: Operand,
-    expression_string: Optional<StringTableIndex>
+    arguments: Operand
 ) @cold = call_slow_path(call_direct_eval_with_argument_array);
 
 handler CallConstructWithArgumentArray(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
-    arguments: Operand,
-    expression_string: Optional<StringTableIndex>
+    arguments: Operand
 ) @cold = call_slow_path(call_construct_with_argument_array);
 
 handler SuperCallWithArgumentArray(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
     dst: out Operand,
     super_constructor: Operand,
-    arguments: Operand,
-    is_synthetic: bool
+    arguments: Operand
 ) @cold = call_slow_path(super_call_with_argument_array);
+
+handler SuperCall(
+    call_feedback: CallFeedbackIndex,
+    dst: out Operand,
+    super_constructor: Operand,
+    argument_count: u8,
+    arguments: Operand[]
+) @cold = call_slow_path(super_call);
+
+handler SuperCallWithForwardedArguments(
+    call_feedback: CallFeedbackIndex,
+    dst: out Operand,
+    super_constructor: Operand
+) @cold = call_slow_path(super_call_with_forwarded_arguments);
+
+handler BindThisFromSuperCall(
+    result: Operand
+) @cold = call_slow_path(bind_this_from_super_call);
 
 handler NewObject(
     dst: out Operand,
@@ -4378,19 +4497,17 @@ handler InitObjectLiteralProperty(
     object: Operand,
     property: PropertyKeyTableIndex,
     src: Operand,
-    shape_cache_index: u32,
-    property_slot: u32
+    shape_cache_index: ObjectShapeCacheIndex,
+    property_slot: u16
 ) @cold = call_slow_path(init_object_literal_property);
 
 handler NewArray(
-    length: u32,
     dst: out Operand,
-    element_count: u32,
+    element_count: u8,
     elements: Operand[]
 ) @cold = call_slow_path(new_array);
 
 handler NewPrimitiveArray(
-    length: u32,
     dst: out Operand,
     element_count: u32,
     elements: Value[]
@@ -4554,19 +4671,27 @@ handler SetCompletionType(
 ) @cold = call_slow_path(set_completion_type);
 
 handler GetTemplateObject(
-    length: u32,
     dst: out Operand,
-    strings_count: u32,
+    strings_are_in_array: bool,
+    strings_count: u8,
     cache: TemplateObjectCacheIndex,
     strings: Operand[]
 ) @cold = call_slow_path(get_template_object);
 
 handler NewFunction(
     dst: out Operand,
-    shared_function_data_index: u32,
+    shared_function_data_index: u16,
     lhs_name: Optional<IdentifierTableIndex>,
     home_object: Optional<Operand>
 ) @cold = call_slow_path(new_function);
+
+# NB: A NewFunction for the functions of an executable past its first 65536, whose index takes four bytes.
+handler NewFunctionWide(
+    dst: out Operand,
+    shared_function_data_index: u32,
+    lhs_name: Optional<IdentifierTableIndex>,
+    home_object: Optional<Operand>
+) @cold = call_slow_path(new_function_wide);
 
 handler Typeof(
     dst: out Operand,

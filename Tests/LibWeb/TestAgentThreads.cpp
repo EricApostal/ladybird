@@ -24,6 +24,8 @@
 #include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
+#include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/FetchParams.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
@@ -411,7 +413,8 @@ public:
     TestAgent()
     {
         Web::Bindings::initialize_agent(Web::HTML::AgentType::DedicatedWorker);
-        Web::HTML::surrounding_agent().fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor();
+        auto& agent = Web::HTML::surrounding_agent();
+        agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
         Web::HTML::current_event_loop().set_on_destroyed([] {
             Core::EventLoop::current().quit(0);
         });
@@ -485,6 +488,27 @@ public:
         return request;
     }
 
+    // Fetches the URL, and runs the worker's tasks until the fetch's request is done. Returns the fetch's params.
+    NonnullRefPtr<Web::Fetch::Infrastructure::FetchParams> fetch_until_done(StringView url)
+    {
+        auto request = Web::Fetch::Infrastructure::Request::create();
+        request->set_url_list({ *URL::Parser::basic_parse(url) });
+        request->set_client(m_settings->address());
+        auto algorithms = Web::Fetch::Infrastructure::FetchAlgorithms::create(Web::Fetch::Infrastructure::FetchAlgorithms::Input { Web::Fetch::Engine::BodyIntent::DrainAndDiscard });
+
+        GC::Ptr<Web::Fetch::Infrastructure::FetchController> controller;
+        {
+            Web::HTML::TemporaryExecutionContext execution_context { m_settings->realm(), Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+            controller = Web::Fetch::Fetching::fetch(m_settings->realm(), request, algorithms);
+        }
+        auto fetch_params = controller->original_fetch_params();
+        VERIFY(fetch_params);
+        Web::HTML::current_event_loop().spin_until(GC::create_function(GC::Heap::the(), GC::captures(request), [](auto& request) {
+            return request->done();
+        }));
+        return fetch_params.release_nonnull();
+    }
+
     // What the host of a worker does once the worker's event loop is destroyed.
     void shut_down()
     {
@@ -556,10 +580,11 @@ static void set_up_process()
     Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(false));
 }
 
-// Each command an executor posts holds the executor until the command has run or been dropped.
-static bool has_queued_commands(Web::Fetch::Engine::FetchExecutor const& executor)
+// Each command an executor posts holds the executor until the command has run or been dropped. So do the agent and
+// each live controller of a fetch started through the executor.
+static bool has_queued_commands(Web::Fetch::Engine::FetchExecutor const& executor, size_t live_controller_count)
 {
-    return executor.ref_count() > 1;
+    return executor.ref_count() > 1 + live_controller_count;
 }
 
 TEST_CASE(an_agent_runs_on_a_thread_of_its_own)
@@ -642,12 +667,32 @@ TEST_CASE(a_fetch_started_just_before_close_never_runs_its_in_parallel_steps)
         auto request = agent.fetch_and_close("about:blank"sv, Web::Fetch::Infrastructure::FetchAlgorithms::Input { Web::Fetch::Engine::BodyIntent::DrainAndDiscard });
 
         // The worker's event loop has stopped with the command that runs the fetch's in-parallel steps still queued.
-        EXPECT(has_queued_commands(*Web::HTML::surrounding_agent().fetch_executor));
+        // Those steps keep the fetch's controller alive.
+        EXPECT(has_queued_commands(*Web::HTML::surrounding_agent().fetch_executor, 1));
 
         agent.shut_down();
 
         // Main fetch's in-parallel steps would make the response tainting of this no-cors request opaque.
         EXPECT_EQ(request->response_tainting(), Web::Fetch::Infrastructure::Request::ResponseTainting::Basic);
+    });
+}
+
+TEST_CASE(a_worker_agents_fetch_reads_the_network_activity_observers_of_that_agent)
+{
+    set_up_process();
+    run_on_agent_threads(1, [](size_t) {
+        Core::EventLoop event_loop;
+        TestAgent agent;
+
+        {
+            auto fetch_params = agent.fetch_until_done("about:blank"sv);
+            auto const& observers = *Web::HTML::surrounding_agent().network_activity_observers;
+            VERIFY(fetch_params->engine_record());
+            EXPECT_EQ(&fetch_params->engine_record()->network_activity_observers(), &observers);
+            EXPECT(!observers.has_devtools_client());
+        }
+
+        agent.close_and_shut_down();
     });
 }
 

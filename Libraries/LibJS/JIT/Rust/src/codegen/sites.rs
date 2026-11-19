@@ -13,9 +13,11 @@ use crate::code::Site;
 use crate::code::SiteKind;
 use crate::code::ValueLocation;
 use crate::code::VirtualObjectDescriptor;
+use crate::code::VirtualObjectDescriptorKind;
 use crate::ir::Graph;
 use crate::ir::NodeId;
 use crate::ir::Op;
+use crate::ir::VirtualObjectKind;
 use crate::regalloc::Allocation;
 use crate::regalloc::FPR_BASE;
 use crate::regalloc::Location;
@@ -49,16 +51,16 @@ pub(crate) fn site(
             // NB: Stack walks and the runtime read the values of inlined call
             //     sites from the JIT frame while the call runs, without the
             //     registers. Values live across calls have stack slots.
-            Location::Register(_) if kind == SiteKind::Call => {
-                let slot = allocation
-                    .node(value)
-                    .spill_slot
-                    .expect("values live across calls are spilled");
-                ValueLocation::Stack(stack_slot_offset(slot), repr)
-            }
+            Location::Register(_) if kind == SiteKind::Call => match allocation.node(value).spill_slot {
+                Some(slot) => ValueLocation::Stack(stack_slot_offset(slot), repr),
+                None => ValueLocation::Frame(
+                    crate::regalloc::frame_home(graph, value).expect("values live across calls are spilled"),
+                ),
+            },
             // NB: Exits read float64 values from the floating point registers.
             Location::Register(register) => ValueLocation::Register(register % FPR_BASE, repr),
             Location::Stack(slot) => ValueLocation::Stack(stack_slot_offset(slot), repr),
+            Location::Frame(slot) => ValueLocation::Frame(slot),
             Location::Constant(bits) => match crate::ir::value::virtual_arguments_kind(bits) {
                 Some(mapped) if repr == Repr::Tagged => ValueLocation::ArgumentsObject { mapped },
                 _ => ValueLocation::Constant(crate::ir::value::boxed_constant(bits, repr)),
@@ -93,8 +95,12 @@ pub(crate) fn site(
     let objects = objects
         .iter()
         .map(|object| {
-            let Op::VirtualObject { shape, allocation } = graph.node(*object).op else {
+            let Op::VirtualObject { kind, allocation } = graph.node(*object).op else {
                 unreachable!("virtual objects are VirtualObject nodes");
+            };
+            let kind = match kind {
+                VirtualObjectKind::Object { shape } => VirtualObjectDescriptorKind::Object { shape },
+                VirtualObjectKind::Closure { sample } => VirtualObjectDescriptorKind::Closure { sample },
             };
             let properties = graph
                 .node(*object)
@@ -103,7 +109,7 @@ pub(crate) fn site(
                 .map(|property| location_of(*property).1)
                 .collect();
             VirtualObjectDescriptor {
-                shape,
+                kind,
                 allocation: allocation.0,
                 properties,
             }

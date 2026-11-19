@@ -60,7 +60,7 @@ public:
     void set_on_present_needed(Function<void()> handler) { m_on_present_needed = move(handler); }
 
 private:
-    void dispatch_state_if_changed(PipelineStatus);
+    void dispatch_state_if_changed(PipelineStatus, PipelineCheckpoint);
     void seek_back_to_current_time();
 
     MediaTimeReader m_time_reader;
@@ -80,7 +80,10 @@ private:
     SeekStatus m_seek_status { SeekStatus::None };
 
     PipelineStateChangeHandler m_on_state_changed;
+    PipelineStatus m_latest_status { PipelineStatus::Pending };
     PipelineStatus m_last_dispatched_status { PipelineStatus::Pending };
+    PipelineCheckpoint m_input_checkpoint { 0 };
+    PipelineCheckpoint m_last_dispatched_checkpoint { 0 };
     u32 m_seek_id { 0 };
 
     PipelineResizeHandler m_on_resize;

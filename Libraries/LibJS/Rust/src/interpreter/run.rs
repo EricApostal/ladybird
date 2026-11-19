@@ -14,6 +14,7 @@ use ak::ScopeGuard;
 
 use super::vm::Vm;
 use crate::bytecode::executable::Executable;
+use crate::gc::root::Root;
 use crate::jit::code::EntryStatus;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
@@ -25,6 +26,7 @@ use crate::runtime::environment::Environment;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
+use crate::runtime::promise::Promise;
 use crate::runtime::source_text_module::SourceTextModule;
 use crate::script::Script;
 use libjs_abi::register;
@@ -205,7 +207,11 @@ impl Vm {
             return;
         }
 
-        if frame.caller_is_construct.get() && !return_value.is_object() {
+        // NB: The frame of a derived constructor returns its this value only for undefined.
+        if frame.caller_is_construct.get()
+            && !return_value.is_object()
+            && (!frame.caller_is_derived_construct.get() || return_value.is_undefined())
+        {
             return_value = frame.this_value.get();
         }
         // SAFETY: A frame's caller outlives it.
@@ -246,6 +252,8 @@ impl Vm {
         unsafe { context.as_ref() }
             .register(register::ACCUMULATOR)
             .set(initial_accumulator_value);
+        // NB: A resumed frame continues after its Enter, so the resume counts as entering the executable.
+        executable.head.idle_collection_count.set(0);
         self.run_executable(context, executable, entry_point)
     }
 
@@ -263,7 +271,9 @@ impl Vm {
         // NOTE: Spec steps are rearranged in order to compute number of registers+constants+locals before construction of the execution context.
 
         // 11. Let script be scriptRecord.[[ECMAScriptCode]].
-        let executable = script_record.cached_executable();
+        let executable = script_record.cached_executable().expect("a script is evaluated once");
+        // NB: The top-level code runs once, so the script lets it go when this returns, on every path.
+        let _forget_executable_guard = ScopeGuard::new(|| script_record.forget_executable());
         if should_dump_bytecode() {
             executable.dump();
         }
@@ -347,17 +357,17 @@ impl Vm {
         result
     }
 
-    pub fn run_module(&self, module: Gc<SourceTextModule>) -> ThrowCompletionOr<Value> {
+    pub fn run_module(&self, module: Gc<SourceTextModule>) -> ThrowCompletionOr<Gc<Promise>> {
         // FIXME: This is not a entry point as defined in the spec, but is convenient.
         //        To avoid work we use link_and_eval_module however that can already be
         //        dangerous if the vm loaded other modules.
-        self.link_and_eval_module(module.upcast())?;
+        let evaluation = Root::new(self, self.link_and_eval_module(module.upcast())?);
 
         self.run_queued_promise_jobs();
 
         self.run_queued_finalization_registry_cleanup_jobs();
 
-        Ok(Value::UNDEFINED)
+        Ok(evaluation.value())
     }
 
     /// Enters a frame for a call of `callee_function` that the interpreter runs inline, as Return leaves it: the
@@ -432,6 +442,7 @@ impl Vm {
             dst_raw,
         )?;
         callee_context.caller_is_construct.set(is_construct);
+        callee_context.caller_is_derived_construct.set(false);
 
         // Inlined PrepareForOrdinaryCall (avoids function call overhead on hot path).
         callee_context
@@ -439,6 +450,9 @@ impl Vm {
             .set(Some(callee_function.as_function_object_gc()));
         callee_context.realm.set(callee_function.realm());
         callee_context.script_or_module.set(callee_function.script_or_module());
+        callee_context
+            .new_target
+            .set(new_target.map_or(Value::UNDEFINED, Value::from_object));
         let environment = callee_function.inline_call_environment(self, new_target);
         callee_context.lexical_environment.set(environment);
         callee_context.variable_environment.set(environment);

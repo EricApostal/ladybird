@@ -192,4 +192,65 @@ test("a function in a block does not get hoisted to a parameter of the same name
         return [before, g];
     }
     expect(f()).toEqual([123, 123]);
+
+    function g(a = 1, read = () => a) {
+        {
+            function a() {}
+        }
+        a = 5;
+        return read();
+    }
+    expect(g()).toBe(5);
+
+    function h(a = 1, write = value => (a = value)) {
+        {
+            function a() {}
+        }
+        write(9);
+        return a;
+    }
+    expect(h()).toBe(9);
+});
+
+test("a function in the parameters checks the dead zone of a parameter that a var of the body has the name of", () => {
+    function f(a = (() => x * 2)(), x) {
+        var x;
+    }
+    expect(() => f()).toThrowWithMessage(ReferenceError, "Binding x is not initialized");
+
+    function g(a = () => x * 2, x = a()) {
+        var x;
+    }
+    expect(() => g()).toThrowWithMessage(ReferenceError, "Binding x is not initialized");
+});
+
+test("a function in the parameters checks the dead zone of what is around for a name that only a var of the body has", () => {
+    expect(() => {
+        (function (a = (() => late * 2)()) {
+            var late;
+        })();
+        let late;
+    }).toThrowWithMessage(ReferenceError, "Binding late is not initialized");
+});
+
+test("an eval in the parameters declares different variables on each call", () => {
+    let source = "var p = 1, q = 2";
+    function f(a = eval(source)) {
+        return [typeof p, typeof q, typeof r];
+    }
+    expect(f()).toEqual(["number", "number", "undefined"]);
+    source = "var r = 3";
+    expect(f()).toEqual(["undefined", "undefined", "number"]);
+});
+
+test("a function in the parameters sees the parameter, not a var in a catch clause of the same name", () => {
+    function f(a = () => x, x) {
+        try {
+            throw 2;
+        } catch (x) {
+            var x = 3;
+        }
+        return [a(), x];
+    }
+    expect(f(undefined, 1)).toEqual([1, 1]);
 });

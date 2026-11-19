@@ -4,12 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::cow_map::CowMap;
 use crate::css::css_enums::{overflow, positioning, writing_mode};
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
 use crate::css::display::FfiDisplay;
 use crate::layout::LayoutNodeArena;
 use crate::layout::fragment_tree::{Fragment, FragmentLink, OuterLinks, SvgPayload};
-use crate::layout::geometry::{Frame, Sides};
+use crate::layout::geometry::{Frame, Side, Sides};
 use crate::layout::inline_content::{InlineContent, PhysicalPlane};
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts::{self, NodeShape};
@@ -21,6 +22,7 @@ use crate::painting::scrollable_overflow::physical_overflow_directions_of_style;
 use crate::painting::visual_context::node_values;
 use crate::painting::{node_painting, scroll_snap, style_queries};
 use libgfx_rust::AffineTransform;
+use smallvec::SmallVec;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FragmentScrollableOverflow {
@@ -227,6 +229,10 @@ fn inline_box_unions(
     let mut border_union = None;
     for &piece_index in content.inline_boxes.piece_indices_of(link.fragment.node) {
         let piece = &content.inline_box_pieces[piece_index as usize];
+        // An interrupting block's placeholder records inline geometry; the block supplies its own overflow.
+        if piece.is_geometry_only_placeholder && piece.fragment_count != 0 {
+            continue;
+        }
         let border_rect = plane.piece_border_box_rect(piece);
         if piece.is_geometry_only_placeholder {
             let padding_rect = inflated_by(border_rect, padding_widths);
@@ -300,7 +306,13 @@ pub(crate) fn scrollable_overflow_of<'link>(
     let plane = line_content.map(|content| PhysicalPlane::of(content, own.content_size));
     if let (Some(content), Some(plane)) = (line_content, &plane) {
         let origin = own.content_box.location();
-        let line_rects = content.lines.iter().map(|line| plane.rect(line.rect));
+        // A block that interrupts inline layout contributes through its own transformed box. Its line record and
+        // inline fragments describe its untransformed position, not an additional CSS line box.
+        let line_rects = content
+            .lines
+            .iter()
+            .filter(|line| !line.has_block_level_box)
+            .map(|line| plane.rect(line.rect));
         let elided_content_rects = content.elided_content_rects.iter().map(|&(_, rect)| plane.rect(rect));
         let lines_after_clamp_point = content
             .lines_after_clamp_point_rect
@@ -313,6 +325,9 @@ pub(crate) fn scrollable_overflow_of<'link>(
             in_flow_and_floated_content_bounds.unite_vertically(line_rect);
         }
         for text_fragment in &content.fragments {
+            if content.lines[text_fragment.line_index as usize].has_block_level_box {
+                continue;
+            }
             let mut fragment_rect = plane.fragment_rect(text_fragment).translated_by(origin);
             if arena.node_is_in_focused_text_control(text_fragment.layout_node)
                 && let Some(style_source_style) = arena.node_style_if_live(text_fragment.style_source)
@@ -362,6 +377,7 @@ pub(crate) fn scrollable_overflow_of<'link>(
     //          its 3D rendering context. [CSS3-TRANSFORMS]
     let container_inline_axis_is_horizontal =
         style.is_none_or(|style| style.writing_mode() == writing_mode::HORIZONTAL_TB);
+    let container_frame = Frame::of(style.map_or(writing_mode::HORIZONTAL_TB, |style| style.writing_mode()));
     for link in contained_links {
         let child = &link.fragment;
         let child_node = child.node;
@@ -446,6 +462,19 @@ pub(crate) fn scrollable_overflow_of<'link>(
                     } else {
                         (zero, zero)
                     };
+                    // NB: Past the block end of a box in the flow of a block container, the margin that counts is
+                    //     what that flow collapsed there, not the box's own: The margins of the box's contents that
+                    //     collapse through its block end count too, and those that collapse through the box itself
+                    //     count once.
+                    let [top, right, bottom, left] =
+                        match link.placement.shown_as.facts.block_end_margin_collapsed_in_flow {
+                            Some(block_end_margin) => {
+                                let mut margins = [top, right, bottom, left];
+                                margins[container_frame.physical_side(Side::Bottom) as usize] = block_end_margin;
+                                margins
+                            }
+                            None => [top, right, bottom, left],
+                        };
                     let (left, right) = if overflow_directions.horizontal_axis_is_positive {
                         (left.max(zero), right.max(-border_box.width))
                     } else {
@@ -617,6 +646,60 @@ pub(crate) fn scrollable_overflow_of<'link>(
     }
 }
 
+/// The boxes whose committed links a box other than their containing block holds, by the containing block they were
+/// committed with, which a containing block reads its own from without walking every other one's.
+#[derive(Clone, Default)]
+pub(crate) struct LinksHeldApartFromTheirContainingBlocks {
+    containing_block_of: CowMap<NodeSlotId, NodeSlotId>,
+    by_containing_block: CowMap<NodeSlotId, SmallVec<[NodeSlotId; 4]>>,
+}
+
+impl LinksHeldApartFromTheirContainingBlocks {
+    fn insert(&mut self, node: NodeSlotId, containing_block: NodeSlotId) {
+        match self.containing_block_of.insert(node, containing_block) {
+            Some(previous) if previous == containing_block => return,
+            Some(previous) => self.remove_from(previous, node),
+            None => {}
+        }
+        self.by_containing_block
+            .get_or_insert_with(containing_block, SmallVec::new)
+            .push(node);
+    }
+
+    fn remove(&mut self, node: NodeSlotId) {
+        if let Some(containing_block) = self.containing_block_of.remove(&node) {
+            self.remove_from(containing_block, node);
+        }
+    }
+
+    fn remove_from(&mut self, containing_block: NodeSlotId, node: NodeSlotId) {
+        let Some(nodes) = self.by_containing_block.get_mut(&containing_block) else {
+            return;
+        };
+        if let Some(position) = nodes.iter().position(|held| *held == node) {
+            nodes.swap_remove(position);
+        }
+        if nodes.is_empty() {
+            self.by_containing_block.remove(&containing_block);
+        }
+    }
+
+    fn held_apart_from(&self, containing_block: NodeSlotId) -> &[NodeSlotId] {
+        self.by_containing_block
+            .get(&containing_block)
+            .map_or(&[], |nodes| nodes.as_slice())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.containing_block_of.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.containing_block_of.clear();
+        self.by_containing_block.clear();
+    }
+}
+
 impl LayoutNodeArena {
     pub(crate) fn request_fragment_overflow_recalculation(&mut self, node: NodeSlotId) {
         if !node.is_invalid() {
@@ -631,10 +714,11 @@ impl LayoutNodeArena {
         is_held_apart: bool,
     ) {
         if is_held_apart {
-            self.links_held_apart_from_their_containing_blocks.insert(node);
+            self.links_held_apart_from_their_containing_blocks
+                .insert(node, containing_block);
             self.request_fragment_overflow_recalculation(containing_block);
         } else if !self.links_held_apart_from_their_containing_blocks.is_empty() {
-            self.links_held_apart_from_their_containing_blocks.remove(&node);
+            self.links_held_apart_from_their_containing_blocks.remove(node);
         }
     }
 
@@ -668,12 +752,12 @@ impl LayoutNodeArena {
         );
     }
 
-    fn recalculated_fragment_overflow(
+    pub(crate) fn links_in_containing_block_fragment(
         &self,
         node: NodeSlotId,
         link: &FragmentLink,
         fragment_index: u32,
-    ) -> FragmentScrollableOverflow {
+    ) -> Vec<FragmentLink> {
         let mut met = crate::fast_hash::FastSet::default();
         let mut contained = Vec::new();
         let holder_fragment = self
@@ -694,7 +778,12 @@ impl LayoutNodeArena {
         let candidates = contained_links(&link.fragment)
             .map(|contained_link| contained_link.fragment.node)
             .chain(links_held_beside)
-            .chain(self.links_held_apart_from_their_containing_blocks.iter().copied());
+            .chain(
+                self.links_held_apart_from_their_containing_blocks
+                    .held_apart_from(node)
+                    .iter()
+                    .copied(),
+            );
         for candidate in candidates {
             if met.insert(candidate)
                 && self.slot_is_live(candidate)
@@ -704,6 +793,16 @@ impl LayoutNodeArena {
                 self.committed_links_in_containing_block_fragment(candidate, fragment_index, &mut contained);
             }
         }
+        contained
+    }
+
+    fn recalculated_fragment_overflow(
+        &self,
+        node: NodeSlotId,
+        link: &FragmentLink,
+        fragment_index: u32,
+    ) -> FragmentScrollableOverflow {
+        let contained = self.links_in_containing_block_fragment(node, link, fragment_index);
         scrollable_overflow_of(self, &link.fragment, contained.iter())
     }
 
@@ -773,7 +872,6 @@ impl LayoutNodeArena {
         if self.scrollable_overflow.recalculation_requests.is_empty() {
             return;
         }
-        self.scrollable_overflow.recalculations += 1;
         let requests = std::mem::take(&mut self.scrollable_overflow.recalculation_requests);
         let mut queued = crate::fast_hash::FastSet::default();
         let mut queue = std::collections::BinaryHeap::new();

@@ -285,9 +285,19 @@ void HTMLParser::run(HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point
 {
     m_stop_parsing = false;
 
+    // NB: document.close() leaves the explicit "EOF" character to us when a script that we are executing has paused
+    //     the parser. Once such a script is done, the outermost invocation tokenizes up to that character and finishes.
+    bool finish_script_created_parser = false;
+
     for (;;) {
         if (m_parser_pause_flag)
             break;
+
+        if (m_script_created && m_script_nesting_level == 0 && m_post_parse_action && m_tokenizer.is_input_stream_closed()
+            && stop_at_insertion_point == HTMLTokenizer::StopAtInsertionPoint::Yes) {
+            stop_at_insertion_point = HTMLTokenizer::StopAtInsertionPoint::No;
+            finish_script_created_parser = true;
+        }
 
         auto result = rust_html_parser_run_document(
             m_rust_parser,
@@ -318,6 +328,9 @@ void HTMLParser::run(HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point
     }
 
     m_tokenizer.parser_did_run({});
+
+    if (finish_script_created_parser && !m_parser_pause_flag)
+        invoke_post_parse_action();
 
     if (m_document->parser().ptr() == this)
         m_document->schedule_text_fragment_search_after_parser_progress({});
@@ -675,8 +688,11 @@ void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> pa
     }
 
     // 2. Set the insertion point to undefined.
+    // NB: A script that the parser is executing can get here through document.close(). Processing its end tag then
+    //     lets the insertion point have the value of the old insertion point, which would define it again for a
+    //     parser that has stopped, so the old insertion points are discarded as well.
     if (parser)
-        parser->m_tokenizer.undefine_insertion_point();
+        parser->m_tokenizer.discard_insertion_points();
 
     // NB: The normal parser fetches nothing more.
     discard_speculative_preloads(*document);
@@ -829,14 +845,14 @@ void HTMLParserEndState::check_progress()
             return;
 
         m_phase = Phase::WaitingForLoadEventDelay;
+
+        // AD-HOC: Update layout on entering this phase so the fetches that layout starts do not wait for other delays.
+        if (navigable_container_is_rendered(*m_document))
+            m_document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
         [[fallthrough]];
 
     case Phase::WaitingForLoadEventDelay:
         // 8. Spin the event loop until there is nothing that delays the load event in the Document.
-        // AD-HOC: Update layout first so font loads selected by text shaping can delay the load event.
-        // INTEROP: Gecko also flushes layout before firing the load event — so lazily-started font loads hold it back.
-        if (navigable_container_is_rendered(*m_document))
-            m_document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
         if (m_document->anything_is_delaying_the_load_event())
             return;
 
@@ -959,6 +975,8 @@ void HTMLParserEndState::complete()
         //          document loader likewise remains busy while a child loader is waiting to complete.
         // NB: A task that ran since step 8 can have given an element an image that starting layout fetches, and that
         //     fetch has to delay the load event too.
+        // AD-HOC: Update layout first so font loads selected by text shaping can delay the load event.
+        // INTEROP: Gecko also flushes layout before firing the load event — so lazily-started font loads hold it back.
         if (document->is_fully_active() && navigable_container_is_rendered(*document))
             document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
         if (document->is_fully_active() && document->anything_is_delaying_the_load_event()) {
@@ -2921,19 +2939,10 @@ static void insert_node_for_parser(DOM::Node& parent, DOM::Node& node, DOM::Node
     }
 }
 
-static u64 s_parser_non_append_insertions { 0 };
-
-u64 parser_non_append_insertions()
-{
-    return s_parser_non_append_insertions;
-}
-
 static NodeAndOffset node_and_offset_from_html_parser_ffi(size_t node, size_t offset)
 {
     auto& dom_node = node_from_html_parser_ffi(node);
     VERIFY(offset == NodeAndOffset::append_child_offset || offset <= dom_node.child_count());
-    if (offset != NodeAndOffset::append_child_offset)
-        ++s_parser_non_append_insertions;
     return { dom_node, offset };
 }
 

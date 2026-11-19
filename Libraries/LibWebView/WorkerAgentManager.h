@@ -40,7 +40,8 @@ public:
     static WorkerAgentManager& the();
 
     struct SharedWorkerKey {
-        IsPrivate is_private { IsPrivate::No };
+        // NB: No owner finds a worker of another browsing session, as step 11.3 allows.
+        u64 session_id { 0 };
         Web::StorageAPI::StorageKey storage_key;
         URL::URL url;
         Utf16String name;
@@ -117,7 +118,7 @@ private:
     static bool owner_process_may_host_shared_worker(Owner const&, CanonicalEnvironmentSettingsObject const& outside_settings);
     static bool page_environment_has_cross_site_ancestor(WebContentClient&, Web::PageId, CanonicalEnvironmentSettingsObject const&);
     bool has_reached_worker_limit(IsPrivate, CanonicalEnvironmentSettingsObject const& outside_settings) const;
-    ErrorOr<NonnullRefPtr<WebWorkerClient>> create_worker_client(NonnullOwnPtr<IPC::Transport>, IsPrivate, Web::HTML::WorkerAgentId, WebContentClient& host, RequestServerSiteBindings const& owner_request_server_site_bindings);
+    ErrorOr<NonnullRefPtr<WebWorkerClient>> create_worker_client(NonnullOwnPtr<IPC::Transport>, Web::HTML::WorkerAgentId, WebContentClient& host, RequestServerSiteBindings const& owner_request_server_site_bindings);
     static void start_worker(WebWorkerClient&, Web::HTML::WorkerAgentStartRequest, CanonicalEnvironmentSettingsObject const& outside_settings, bool has_cross_site_ancestor, bool owner_may_read_local_files, bool has_process_to_itself);
 
     void notify_worker_script_load_failure(Owner const&);
@@ -182,7 +183,7 @@ template<>
 struct Traits<WebView::WorkerAgentManager::SharedWorkerKey> : public DefaultTraits<WebView::WorkerAgentManager::SharedWorkerKey> {
     static unsigned hash(WebView::WorkerAgentManager::SharedWorkerKey const& key)
     {
-        auto hash = pair_int_hash(pair_int_hash(pair_int_hash(Traits<Web::StorageAPI::StorageKey>::hash(key.storage_key), Traits<URL::URL>::hash(key.url)), key.name.hash()), static_cast<unsigned>(key.is_private));
+        auto hash = pair_int_hash(pair_int_hash(pair_int_hash(Traits<Web::StorageAPI::StorageKey>::hash(key.storage_key), Traits<URL::URL>::hash(key.url)), key.name.hash()), u64_hash(key.session_id));
         if (key.top_level_site.has_value())
             hash = pair_int_hash(hash, key.top_level_site->hash());
         return pair_int_hash(hash, static_cast<unsigned>(key.has_cross_site_ancestor));

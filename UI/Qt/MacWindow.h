@@ -28,6 +28,8 @@ namespace Ladybird {
 #if defined(AK_OS_MACOS)
 // The CGDirectDisplayID of the screen the widget's window is on, or of the main screen while it has no window yet.
 Optional<u64> appkit_display_id_for_window(QWidget&);
+// Whether the screen the widget's window is on can show content brighter than SDR white, at its brightest setting.
+bool appkit_window_screen_shows_high_dynamic_range(QWidget&);
 void hide_appkit_window_title(QWidget&);
 void make_appkit_window_resizable(QWidget&);
 void keep_appkit_window_visible_while_inactive(QWidget&);
@@ -42,6 +44,8 @@ void offset_appkit_window_controls(QWidget&, int x_offset, int y_offset);
 // to their offset right away, before the next frame is drawn.
 void reapply_appkit_window_control_offsets(QWidget&);
 void install_appkit_event_capture();
+// Popups, such as popovers and menus, move along with the window they hang from, and cannot be moved on their own.
+void install_appkit_popup_attachment();
 // What AppKit says of a flick's momentum at the scroll event a wheel event came from, which Qt does not pass on.
 enum class AppKitScrollMomentumTransition {
     // The fingers lifted, and the momentum of the flick they made is about to begin.
@@ -56,8 +60,6 @@ void round_appkit_view_corners(QWidget&, qreal radius, QColor const& border_colo
 void set_appkit_view_opacity(QWidget&, qreal opacity);
 // Clips a native view to rounded bottom corners, for a sheet that hangs from what is above it.
 void round_appkit_view_bottom_corners(QWidget&, qreal radius);
-// Casts a shadow around a native view. Being outside of the view, the shadow takes no mouse input.
-void cast_appkit_view_shadow(QWidget&, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const&);
 // The focus ring around a focused surface: a line right outside its edge, inside a wider, softer ring.
 struct AppKitViewFocusRing {
     QColor edge_color;

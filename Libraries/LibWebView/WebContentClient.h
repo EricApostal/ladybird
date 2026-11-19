@@ -94,13 +94,14 @@ public:
     virtual void did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) override;
     virtual Messages::WebContentClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
 
-    WebContentClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
+    WebContentClient(NonnullOwnPtr<IPC::Transport>, BrowsingSession&, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
     ~WebContentClient();
 
     IsPrivate is_private() const { return m_is_private; }
     BrowsingSession& session() const { return *m_session; }
 
     RequestServerSiteBindings& request_server_site_bindings() { return m_request_server_site_bindings; }
+    RequestServerSiteBindings const& request_server_site_bindings() const { return m_request_server_site_bindings; }
     void remove_blob_url_entries();
 
     void connect_test_endpoint(NonnullOwnPtr<IPC::Transport>);
@@ -121,8 +122,18 @@ public:
     Optional<i32> compositor_connection_id(Badge<Application>) const { return m_compositor_connection_id; }
 
     virtual void did_misbehave(StringView message_name, StringView reason) override;
-    static bool renderers_may_access_cookies_like_http();
-    static bool renderers_may_synthesize_input();
+    // The process is about to be ended for using more memory than the limit.
+    void did_exceed_memory_limit() { m_exceeded_memory_limit = true; }
+    // A tab that a page of this process belongs to was shown or hidden.
+    void did_change_visibility_of_a_tab();
+    enum class HTTPCookieAccess : u8 {
+        Allowed,
+        // A WebDriver cookie command runs, but for another document, which the renderer may not have heard of yet.
+        RefusedForURL,
+        Refused,
+    };
+    HTTPCookieAccess http_cookie_access_for(URL::URL const&) const;
+    static bool renderers_may_synthesize_input_for_testing();
     bool may_read_local_files() const;
     // Documents with no site, such as those of an opaque origin, come with whatever made them, so they do not count.
     void did_host_document_of_site(Utf16String site);
@@ -265,6 +276,7 @@ private:
     RequestServerSiteBindings m_request_server_site_bindings;
     bool m_requested_close { false };
     bool m_rejected_ipc { false };
+    bool m_exceeded_memory_limit { false };
     // The site of the documents this process hosts, if it has only hosted those of one.
     Optional<Utf16String> m_site_of_hosted_documents;
     Optional<u64> m_image_decoder_client_generation;
@@ -327,6 +339,10 @@ private:
         [this] { update_audio_capture_indicators(); },
     };
     RefPtr<Core::Timer> m_detached_page_close_timer;
+
+    bool all_tabs_are_hidden() const;
+    void release_memory_of_hidden_tabs();
+    RefPtr<Core::Timer> m_release_memory_of_hidden_tabs_timer;
 
     // When this process last got a WebRTCClient, so that it can't make us spawn them in a loop.
     Vector<MonotonicTime> m_webrtc_client_launch_times;

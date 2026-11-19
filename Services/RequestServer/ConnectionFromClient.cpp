@@ -208,9 +208,13 @@ void ConnectionFromClient::cancel_owned_work()
 void ConnectionFromClient::die()
 {
     Vector<Requests::RequestTransferLeaseKey> transfer_leases_to_cancel;
-    for (auto const& entry : m_request_transfer_leases) {
+    for (auto& entry : m_request_transfer_leases) {
         if (entry.value.owner.ptr() == this)
             transfer_leases_to_cancel.append(entry.key);
+
+        // A designation ends with the client it names.
+        if (entry.value.adopter_client_id == client_id())
+            entry.value.adopter_client_id = {};
     }
     for (auto const& transfer_lease : transfer_leases_to_cancel) {
         auto lease = m_request_transfer_leases.take(transfer_lease);
@@ -363,7 +367,7 @@ void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL:
         m_request_transfer_leases.set(*transfer_lease, RequestTransferLease { *this, request_id });
 }
 
-void ConnectionFromClient::adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease)
+void ConnectionFromClient::adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease, Optional<int> owner_client_id)
 {
     if (is_live_request_id(target_request_id)) {
         did_misbehave("reused live request ID");
@@ -372,7 +376,21 @@ void ConnectionFromClient::adopt_request(int source_client_id, u64 source_reques
 
     auto lease_key = Requests::RequestTransferLeaseKey { source_client_id, source_request_id };
     auto transfer_lease = m_request_transfer_leases.get(lease_key);
-    if (!transfer_lease.has_value()) {
+    auto may_adopt = [&] {
+        if (!transfer_lease.has_value())
+            return false;
+        // The UI process adopts from the owner it names, or from itself when it names the client it designated. A bound
+        // client adopts only what it was designated for.
+        if (m_site_binding == SiteBinding::Unrestricted) {
+            if (!owner_client_id.has_value())
+                return false;
+            if (*owner_client_id == transfer_lease->owner->client_id())
+                return true;
+            return transfer_lease->owner.ptr() == this && transfer_lease->adopter_client_id == *owner_client_id;
+        }
+        return transfer_lease->adopter_client_id == client_id();
+    }();
+    if (!may_adopt) {
         async_request_finished(target_request_id, 0, {}, Requests::NetworkError::Unknown);
         return;
     }
@@ -408,6 +426,7 @@ void ConnectionFromClient::adopt_request(int source_client_id, u64 source_reques
     if (preserve_transfer_lease) {
         transfer_lease->owner = *this;
         transfer_lease->request_id = target_request_id;
+        transfer_lease->adopter_client_id = {};
     } else {
         m_request_transfer_leases.remove(lease_key);
     }
@@ -608,8 +627,25 @@ void ConnectionFromClient::fetch_aia_intermediate(Badge<Request>, ByteString con
     auto fetch_url = parsed->serialize().to_byte_string();
     auto weak_self = make_weak_ptr<ConnectionFromClient>();
 
-    // Avoid leaking hostnames resolved by the proxy.
     auto proxy = proxy_configuration().proxy_for(*parsed).copy();
+    resolve_proxy_host(proxy, [weak_self, url, fetch_url, host, port, proxy](ErrorOr<void> result) mutable {
+        auto self = weak_self.strong_ref();
+        if (!self)
+            return;
+        if (result.is_error()) {
+            dbgln_if(REQUESTSERVER_DEBUG, "AIA: Proxy lookup failed for {}: {}", url, result.error());
+            self->abandon_aia_lookup(url);
+            return;
+        }
+        self->look_up_aia_host(url, fetch_url, host, port, move(proxy));
+    });
+}
+
+void ConnectionFromClient::look_up_aia_host(ByteString const& url, ByteString const& fetch_url, ByteString const& host, u16 port, Optional<HTTP::Proxy> proxy)
+{
+    auto weak_self = make_weak_ptr<ConnectionFromClient>();
+
+    // Avoid leaking hostnames resolved by the proxy.
     if (proxy.has_value() && proxy->resolves_hostnames()) {
         start_aia_fetch(url, fetch_url, move(proxy), {});
         return;
@@ -684,11 +720,14 @@ void ConnectionFromClient::start_aia_fetch(ByteString const& url, ByteString con
     set_option(CURLOPT_WRITEDATA, fetch.ptr());
     set_option(CURLOPT_PROXY, proxy.has_value() ? proxy->to_curl_url().characters() : "");
 
-    if (resolve_entry.has_value()) {
-        if (curl_slist* resolve_list = curl_slist_append(nullptr, resolve_entry->characters())) {
-            set_option(CURLOPT_RESOLVE, resolve_list);
-            fetch->resolve_list = resolve_list;
-        }
+    curl_slist* resolve_list = nullptr;
+    for (auto const& entry : { move(resolve_entry), curl_resolve_entry_for_proxy(proxy) }) {
+        if (entry.has_value())
+            resolve_list = curl_slist_append(resolve_list, entry->characters());
+    }
+    if (resolve_list) {
+        set_option(CURLOPT_RESOLVE, resolve_list);
+        fetch->resolve_list = resolve_list;
     }
 
     auto result = curl_multi_add_handle(m_fetch_curl.handle, easy_handle);
@@ -959,8 +998,27 @@ void ConnectionFromClient::connect_websocket(u64 websocket_id, URL::URL url, Byt
         return;
     }
 
-    // Avoid leaking hostnames resolved by the proxy.
     auto proxy = proxy_configuration().proxy_for(url).copy();
+    resolve_proxy_host(proxy, [weak_self, websocket_id, url = move(url), origin = move(origin), protocols = move(protocols), extensions = move(extensions), additional_request_headers = move(additional_request_headers), proxy](ErrorOr<void> result) mutable {
+        auto self = weak_self.strong_ref();
+        if (!self)
+            return;
+        if (result.is_error()) {
+            dbgln("WebSocketConnect: Proxy lookup failed: {}", result.error());
+            if (self->m_pending_websockets.remove(websocket_id))
+                self->fail_websocket(websocket_id, Requests::WebSocket::Error::CouldNotEstablishConnection);
+            return;
+        }
+        self->look_up_websocket_host(websocket_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy));
+    });
+}
+
+void ConnectionFromClient::look_up_websocket_host(u64 websocket_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy> proxy)
+{
+    auto host = url.serialized_host().to_byte_string();
+    auto weak_self = make_weak_ptr<ConnectionFromClient>();
+
+    // Avoid leaking hostnames resolved by the proxy.
     if (proxy.has_value() && proxy->resolves_hostnames()) {
         if (m_pending_websockets.remove(websocket_id))
             open_websocket(websocket_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy), nullptr);

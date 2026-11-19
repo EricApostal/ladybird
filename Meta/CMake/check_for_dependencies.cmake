@@ -80,7 +80,6 @@ endif()
 
 find_package(CURL REQUIRED)
 find_package(ICU 78.3 EXACT REQUIRED COMPONENTS data i18n uc)
-find_package(LibXml2 REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(SDL3 CONFIG REQUIRED)
 find_package(simdjson CONFIG REQUIRED)
@@ -89,7 +88,6 @@ find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
 pkg_check_modules(LIBPSL REQUIRED IMPORTED_TARGET libpsl)
-pkg_check_modules(libtommath REQUIRED IMPORTED_TARGET libtommath)
 
 find_package(unofficial-angle CONFIG)
 if(unofficial-angle_FOUND)

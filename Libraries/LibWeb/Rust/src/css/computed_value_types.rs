@@ -274,6 +274,10 @@ pub const INHERITED_BITS_TEXT_WRAP_MODE_SHIFT: u32 = 23;
 pub const INHERITED_BITS_TEXT_WRAP_MODE_WIDTH: u32 = 1;
 pub const INHERITED_BITS_WORD_BREAK_SHIFT: u32 = 24;
 pub const INHERITED_BITS_WORD_BREAK_WIDTH: u32 = 2;
+pub const INHERITED_BITS_TEXT_ALIGN_LAST_SHIFT: u32 = 26;
+pub const INHERITED_BITS_TEXT_ALIGN_LAST_WIDTH: u32 = 3;
+pub const INHERITED_BITS_HYPHENS_SHIFT: u32 = 29;
+pub const INHERITED_BITS_HYPHENS_WIDTH: u32 = 2;
 
 /// The keywords of few values of properties that do not inherit a style holds as bits in its
 /// root beside its own groups, in place of fields of its box group: each the code of its keyword
@@ -574,6 +578,8 @@ pub struct InheritedTextValues {
     pub color_style_value: ComputedStyleValueHandle,
     pub webkit_text_fill_color: u32,
     pub webkit_text_fill_color_is_current_color: bool,
+    pub webkit_text_stroke_color: StyleColor,
+    pub webkit_text_stroke_width: f64,
     pub font_smoothing: u8,
     pub text_shadow: RetainedComputedShadowList,
     pub text_transform: u8,
@@ -738,7 +744,9 @@ impl FontValues {
         if is_normal && let Some(font) = self.first_available_font() {
             let facts = font.facts();
             return crate::css::css_pixels::CssPixels::from_integer(
-                i64::from(facts.ascent.round() as i32) + i64::from(facts.descent.round() as i32),
+                i64::from(facts.ascent.round_ties_even() as i32)
+                    + i64::from(facts.descent.round_ties_even() as i32)
+                    + i64::from(facts.line_gap.round_ties_even() as i32),
             );
         }
         self.resolved_line_height_used

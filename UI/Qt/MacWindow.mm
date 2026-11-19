@@ -12,11 +12,13 @@
 #include <LibGfx/Point.h>
 #include <LibGfx/Size.h>
 #include <QAbstractNativeEventFilter>
+#include <QApplication>
 #include <QColor>
 #include <QCoreApplication>
 #include <QDrag>
 #include <QGuiApplication>
 #include <QMargins>
+#include <QMetaObject>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QWheelEvent>
@@ -461,7 +463,84 @@ void install_appkit_event_capture()
     }
 }
 
-Optional<u64> appkit_display_id_for_window(QWidget& widget)
+static NSWindow* appkit_window_for(QWidget& widget)
+{
+    if (QGuiApplication::platformName() != "cocoa")
+        return nil;
+    auto* view = reinterpret_cast<NSView*>(widget.internalWinId());
+    return view.window;
+}
+
+// A popup is a window of its own, placed by what it hangs from when it opens. Dragging that window by its title bar
+// never reaches the popup as a press outside it, so the popup would stay open where it was while the window moved away.
+// The popup's window is a child window of the window it hangs from while it is shown, so AppKit moves it along. On
+// other platforms, starting to move a window is a press outside the popup, which closes it.
+class LadybirdAppKitPopupAttachmentFilter final : public QObject {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    virtual bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() != QEvent::Show && event->type() != QEvent::Hide)
+            return false;
+        if (!watched->isWidgetType())
+            return false;
+        auto& popup = static_cast<QWidget&>(*watched);
+        if (popup.windowType() != Qt::Popup || !popup.parentWidget())
+            return false;
+
+        if (event->type() == QEvent::Hide) {
+            auto* popup_window = appkit_window_for(popup);
+            if (auto* parent_window = popup_window.parentWindow)
+                [parent_window removeChildWindow:popup_window];
+            return false;
+        }
+
+        // Qt sends the Show event before applying the popup's geometry to its native window. Attaching it during
+        // that event can expose the window with its initial geometry.
+        // The menus that every window shares have a parent that is never shown. Its window would appear along with a
+        // child window that is pressed, so such a menu hangs from the popup that opened it.
+        // NB: Qt sends the Show event before the popup becomes the active one.
+        QPointer<QWidget> anchor = popup.parentWidget()->window();
+        if (!anchor->isVisible())
+            anchor = QApplication::activePopupWidget();
+
+        auto attach_popup = [&popup, anchor] {
+            if (!popup.isVisible() || !anchor || !anchor->isVisible())
+                return;
+            auto* popup_window = appkit_window_for(popup);
+            if (!popup_window)
+                return;
+
+            // A window can be dragged by its content with a gesture, which would take the popup away from its anchor.
+            popup_window.movable = NO;
+
+            auto* parent_window = appkit_window_for(*anchor);
+            if (!parent_window || parent_window == popup_window || popup_window.parentWindow == parent_window)
+                return;
+
+            if (auto* previous_parent_window = popup_window.parentWindow)
+                [previous_parent_window removeChildWindow:popup_window];
+            [parent_window addChildWindow:popup_window ordered:NSWindowAbove];
+        };
+
+        QMetaObject::invokeMethod(&popup, attach_popup, Qt::QueuedConnection);
+        return false;
+    }
+};
+
+void install_appkit_popup_attachment()
+{
+    static bool installed = false;
+    if (installed)
+        return;
+    if (auto* application = QCoreApplication::instance()) {
+        application->installEventFilter(new LadybirdAppKitPopupAttachmentFilter);
+        installed = true;
+    }
+}
+
+static NSScreen* appkit_screen_of_window(QWidget& widget)
 {
     NSScreen* screen = nil;
     // winId() would create the native window, so only a window that already has one is asked for its screen.
@@ -471,6 +550,18 @@ Optional<u64> appkit_display_id_for_window(QWidget& widget)
     }
     if (screen == nil)
         screen = NSScreen.mainScreen;
+    return screen;
+}
+
+bool appkit_window_screen_shows_high_dynamic_range(QWidget& widget)
+{
+    auto* screen = appkit_screen_of_window(widget);
+    return screen != nil && screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0;
+}
+
+Optional<u64> appkit_display_id_for_window(QWidget& widget)
+{
+    auto* screen = appkit_screen_of_window(widget);
     if (screen == nil)
         return {};
 
@@ -522,12 +613,15 @@ void disable_appkit_window_animations(QWidget& widget)
 void ensure_appkit_window_is_exposed(QWidget& widget)
 {
     auto* window = widget.windowHandle();
-    if (!widget.isVisible() || !window || window->isExposed())
+    if (!widget.isVisible() || !window || !window->isVisible() || window->isExposed())
         return;
 
-    // Qt restores a native view's exposed state from its display callback. A view whose backing layer is already
-    // clean can remain unexposed after being shown or raised, causing Qt to route hover events to the view below it.
-    [reinterpret_cast<NSView*>(widget.winId()) setNeedsDisplay:YES];
+    // Qt restores a native view's exposed state from its content layer's display callback. A view whose backing layer
+    // is already clean can remain unexposed after being shown or raised, causing Qt to route hover events below it.
+    // Display the content layer directly: marking the NSView as needing display can leave that callback uncalled.
+    auto* layer = static_cast<CALayer*>(appkit_content_layer(widget));
+    [layer setNeedsDisplay];
+    [layer displayIfNeeded];
 }
 
 void set_appkit_window_content_aspect_ratio(QWidget& widget, Gfx::IntSize aspect_ratio)
@@ -794,28 +888,6 @@ void round_appkit_view_bottom_corners(QWidget& widget, qreal radius)
     // NB: Qt's views are flipped, so the bottom of the view is at its layer's largest y.
     layer.maskedCorners = view.isFlipped ? (kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner) : (kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner);
     layer.masksToBounds = YES;
-}
-
-void cast_appkit_view_shadow(QWidget& widget, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const& color)
-{
-    if (QGuiApplication::platformName() != "cocoa")
-        return;
-    auto* view = reinterpret_cast<NSView*>(widget.winId());
-    if (!view)
-        return;
-    view.wantsLayer = YES;
-    auto* layer = view.layer;
-    layer.masksToBounds = NO;
-    layer.shadowOpacity = 1;
-    layer.shadowRadius = blur_radius;
-    // NB: The layer of a view is flipped with it, and Qt's views are, so a positive offset points down.
-    layer.shadowOffset = CGSizeMake(0, y_offset);
-    auto* shadow_color = CGColorCreateSRGB(color.redF(), color.greenF(), color.blueF(), color.alphaF());
-    layer.shadowColor = shadow_color;
-    CGColorRelease(shadow_color);
-    auto* shadow_path = CGPathCreateWithRoundedRect(view.bounds, corner_radius, corner_radius, nullptr);
-    layer.shadowPath = shadow_path;
-    CGPathRelease(shadow_path);
 }
 
 AppKitViewShadow::AppKitViewShadow()

@@ -105,8 +105,11 @@ case "${ID}" in
             gcc-c++ \
             git \
             glslang \
+            libavcodec-free \
             libdrm-devel \
+            liberation-mono-fonts \
             liberation-sans-fonts \
+            liberation-serif-fonts \
             libglvnd-devel \
             libstdc++-devel \
             libtool \
@@ -120,6 +123,7 @@ case "${ID}" in
             perl-IPC-Cmd \
             perl-lib \
             perl-Time-Piece \
+            procps-ng \
             pulseaudio \
             pulseaudio-libs-devel \
             python3 \

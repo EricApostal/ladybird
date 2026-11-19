@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCompositing/DisplayList/DisplayListResources.h>
 
 #include <AK/ByteBuffer.h>
 #include <AK/Error.h>
@@ -19,8 +19,10 @@
 #include <AK/String.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
+#include <Compositor/DrawnResources.h>
 #include <Compositor/Forward.h>
 #include <Compositor/HostWebGLContext.h>
+#include <Compositor/PresentableSurface.h>
 #include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCompositing/Forward.h>
 #include <LibCompositing/Types.h>
@@ -64,7 +66,7 @@ public:
     CreateWebGLContextResult create_webgl_context(Compositing::WebGL::WebGLVersion, Gfx::IntSize, bool depth, bool stencil, bool antialias);
     void destroy_context(Compositing::CanvasId);
 
-    void execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> const&, Vector<Compositing::FontResourceId> const& kept_font_ids, Vector<Compositing::DisplayListFontResource> const& added_fonts, Vector<Compositing::DisplayListImageFrameResource> const& image_frames);
+    [[nodiscard]] bool execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> const&, Vector<Compositing::DisplayListFontDescription> const& fonts, Compositing::RegisteredTypefaces const&, Compositing::RegisteredImageFrames const&);
     void execute_webgl_commands(Compositing::CanvasId, ReadonlyBytes, Vector<Compositing::WebGL::ImageSourceFrame> const&);
     void set_webgl_shared_command_buffer(Compositing::CanvasId, Compositing::WebGL::WebGLSharedCommandBuffer);
     [[nodiscard]] bool execute_webgl_commands_from_shared_buffer(Compositing::CanvasId, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Compositing::WebGL::ImageSourceFrame> const&);
@@ -87,6 +89,7 @@ public:
 private:
     struct Canvas2DContext {
         NonnullOwnPtr<Canvas2DCommandPlayer> command_player;
+        PresentableSurfacePool presented_surfaces;
         NonnullRefPtr<Gfx::PaintingSurface> presented_surface;
         bool has_uncommitted_commands { false };
     };
@@ -104,9 +107,8 @@ private:
     CanvasSurfaceRegistry& m_canvas_surface_registry;
     Compositing::CanvasSurfaceOwnerId m_canvas_surface_owner_id;
     HashMap<Compositing::CanvasId, Context> m_contexts;
-    Compositing::DisplayListResourceStorage m_text_resources;
-    // The image frames of the stream batch that plays.
-    HashMap<u64, Gfx::DecodedImageFrame> m_image_frames_of_batch;
+    DrawnFonts m_fonts_of_latest_stream_batch;
+    Compositing::RegisteredImageFrames const* m_image_frames_registered_while_stream_batch_plays { nullptr };
 
     VideoFrameHolds const& m_video_frame_holds;
     struct VideoFrameImage;

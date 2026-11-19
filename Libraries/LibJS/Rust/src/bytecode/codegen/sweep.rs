@@ -27,6 +27,7 @@ use crate::parser::OutOfStack;
 use crate::parser::columns::NONE;
 use crate::parser::columns::function_flag;
 use crate::parser::columns::tag;
+use crate::parser::token::N_ARGUMENTS;
 use crate::parser::token::N_PROTO;
 
 use super::context::Generator;
@@ -125,8 +126,12 @@ impl Generator<'_> {
             self.current_source_offset = SourceOffset(position);
             match row_tag {
                 tag::IDENT => {
-                    let ident = self.identifier_of(Name(a));
-                    self.value_of_identifier(ident);
+                    if let Some(kind) = (a == N_ARGUMENTS).then(|| self.arguments_from_frame()).flatten() {
+                        self.value_of_arguments_from_frame(kind);
+                    } else {
+                        let ident = self.identifier_of(Name(a));
+                        self.value_of_identifier(ident);
+                    }
                 }
                 tag::IDENT_CALLEE => {
                     let ident = self.identifier_of(Name(a));
@@ -156,7 +161,10 @@ impl Generator<'_> {
                         self.begin_disposal(is_async);
                     }
                     let ident = self.declare_binding(Name(a), declaration_kind);
-                    self.target_of_declaration(ident);
+                    // NB: A `var` without an initializer does nothing, not even resolve its name.
+                    if declaration_kind != DeclarationKind::Var || tags[row + 1] != tag::DECLARATOR {
+                        self.target_of_declaration(ident);
+                    }
                     declared_ident = Some(ident);
                 }
                 tag::IDENT_TYPEOF => {
@@ -217,12 +225,12 @@ impl Generator<'_> {
                 tag::PAREN => {}
                 tag::CALL | tag::OPT_CALL => self.call(tree.node_list(b).len()),
                 tag::NEW => self.construct(tree.node_list(b).len()),
-                tag::CALL_SPREAD => self.call_with_array(),
+                tag::CALL_ARRAY => self.call_with_array(),
                 tag::CALL_DIRECT_EVAL => self.direct_eval(tree.node_list(b).len()),
-                tag::CALL_DIRECT_EVAL_SPREAD => self.direct_eval_with_array(),
-                tag::NEW_SPREAD => self.construct_with_array(),
+                tag::CALL_DIRECT_EVAL_ARRAY => self.direct_eval_with_array(),
+                tag::NEW_ARRAY => self.construct_with_array(),
                 tag::ARRAY_SPREAD => {}
-                tag::MARK_SPREAD_START => self.spread_begin(a as usize),
+                tag::MARK_ARRAY_START => self.array_begin(a as usize),
                 tag::SPREAD => self.append_element(true),
                 tag::MARK_APPEND => self.append_element(false),
                 tag::OBJECT_SPREAD => self.object_spread(),
@@ -242,14 +250,14 @@ impl Generator<'_> {
                 tag::SUPER => self.value_of_super_this(),
                 tag::SUPER_CALLEE => self.value_of_super_constructor(),
                 tag::SUPER_CALL => {
-                    if !tree
-                        .node_list(b)
-                        .iter()
-                        .any(|argument| tree.node_tag(argument) == tag::SPREAD)
+                    let arguments = tree.node_list(b);
+                    if arguments.len() <= super::inline_argument_limit(self.builtin_abstract_operations_enabled)
+                        && !arguments.iter().any(|argument| tree.node_tag(argument) == tag::SPREAD)
                     {
-                        self.array(tree.node_list(b).len());
+                        self.super_call_with_operands(arguments.len());
+                    } else {
+                        self.super_call();
                     }
-                    self.super_call();
                 }
                 tag::SUPER_MEMBER => self.value_of_super_property(Some(Name(b)), false),
                 tag::SUPER_MEMBER_CALLEE => self.value_of_super_property(Some(Name(b)), true),

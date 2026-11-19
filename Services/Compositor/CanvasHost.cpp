@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/ScopeGuard.h>
+#include <AK/TemporaryChange.h>
 #include <Compositor/Canvas2DCommandPlayer.h>
 #include <Compositor/CanvasHost.h>
 #include <Compositor/CanvasSurfaceRegistry.h>
@@ -15,7 +15,7 @@
 #include <Compositor/VideoFrameSkia.h>
 #include <LibCompositing/CanvasSize.h>
 #include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
-#include <LibCompositing/DisplayList/DisplayList.h>
+#include <LibCompositing/DisplayList/RegisteredImageFrames.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ColorSpace.h>
 #include <LibMediaCodecs/VideoFrame.h>
@@ -74,15 +74,17 @@ OwnPtr<Canvas2DCommandPlayer> CanvasHost::create_2d_command_player(Gfx::IntSize 
         return m_canvas_surface_registry.canvas_surface(m_canvas_surface_owner_id, Compositing::CanvasId { canvas_id });
     };
     auto font_resolver = [this](u64 font_id) -> Gfx::Font const* {
-        if (!m_text_resources.has_font(Compositing::FontResourceId { font_id }))
+        if (!m_fonts_of_latest_stream_batch.contains(Compositing::FontResourceId { font_id }))
             return nullptr;
-        return &m_text_resources.font(Compositing::FontResourceId { font_id });
+        return &m_fonts_of_latest_stream_batch.font(Compositing::FontResourceId { font_id });
     };
     auto image_frame_resolver = [this](u64 frame_id) -> Gfx::DecodedImageFrame const* {
-        auto it = m_image_frames_of_batch.find(frame_id);
-        if (it == m_image_frames_of_batch.end())
+        if (!m_image_frames_registered_while_stream_batch_plays)
             return nullptr;
-        return &it->value;
+        auto image_frame = m_image_frames_registered_while_stream_batch_plays->image_frame(Compositing::ImageFrameResourceId { frame_id });
+        if (!image_frame)
+            return nullptr;
+        return &image_frame->frame();
     };
     auto video_frame_image_resolver = [this, skia_backend_context_of_canvas](u64 video_sink_handle, u64 generation) {
         return held_video_frame_image(Media::VideoSinkHandle { video_sink_handle }, generation, skia_backend_context_of_canvas);
@@ -115,14 +117,11 @@ static void copy_surface_contents(Gfx::PaintingSurface& source, Gfx::PaintingSur
     destination.copy_from_surface(source);
 }
 
-static ErrorOr<NonnullRefPtr<Gfx::PaintingSurface>> create_presented_canvas_surface(Gfx::PaintingSurface& source, RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
+// The pool keeps a surface that the window server shows, or that a frame takes to it, as it is.
+static ErrorOr<NonnullRefPtr<PresentableSurface>> present_into_surface_of_pool(PresentableSurfacePool& pool, Gfx::PaintingSurface& source, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
 {
-    auto surface = TRY(Gfx::PaintingSurface::try_create_with_size(
-        source.size(),
-        Gfx::BitmapFormat::BGRA8888,
-        Gfx::AlphaType::Premultiplied,
-        move(skia_backend_context)));
-    copy_surface_contents(source, *surface);
+    auto surface = TRY(pool.surface_for_next_content(source.size(), skia_backend_context));
+    copy_surface_contents(source, surface->painting_surface());
     return surface;
 }
 
@@ -141,16 +140,18 @@ bool CanvasHost::create_2d_context(Compositing::CanvasId canvas_id, Gfx::IntSize
 
     // NB: A canvas that draws in memory still presents onto the GPU, if there is one. A present then uploads it once,
     //     instead of every composited frame uploading a fresh snapshot of it.
-    auto presented_surface_or_error = create_presented_canvas_surface(command_player->surface(), m_skia_backend_context);
+    PresentableSurfacePool presented_surfaces;
+    auto presented_surface_or_error = present_into_surface_of_pool(presented_surfaces, command_player->surface(), m_skia_backend_context);
     if (presented_surface_or_error.is_error()) {
         dbgln("Unable to create the presented surface of a {}x{} 2D canvas context: {}", size.width(), size.height(), presented_surface_or_error.error());
         return false;
     }
     auto presented_surface = presented_surface_or_error.release_value();
-    m_canvas_surface_registry.set_canvas_surface(m_canvas_surface_owner_id, canvas_id, presented_surface);
+    m_canvas_surface_registry.set_canvas_surface(m_canvas_surface_owner_id, canvas_id, *presented_surface);
     Canvas2DContext context {
         .command_player = command_player.release_nonnull(),
-        .presented_surface = move(presented_surface),
+        .presented_surfaces = move(presented_surfaces),
+        .presented_surface = presented_surface->painting_surface(),
     };
     m_contexts.set(canvas_id, move(context));
     return true;
@@ -184,26 +185,28 @@ CanvasHost::Context* CanvasHost::context(Compositing::CanvasId canvas_id)
 
 void CanvasHost::present_canvas_2d_context(Compositing::CanvasId canvas_id, Canvas2DContext& context)
 {
-    copy_surface_contents(context.command_player->surface(), context.presented_surface);
-    m_canvas_surface_registry.set_canvas_surface(m_canvas_surface_owner_id, canvas_id, context.presented_surface);
+    auto presented_surface_or_error = present_into_surface_of_pool(context.presented_surfaces, context.command_player->surface(), m_skia_backend_context);
+    // The canvas goes on showing what it presented before, and presents again with its next commands.
+    if (presented_surface_or_error.is_error()) {
+        dbgln("Unable to present a 2D canvas context: {}", presented_surface_or_error.error());
+        return;
+    }
+    auto presented_surface = presented_surface_or_error.release_value();
+    m_canvas_surface_registry.set_canvas_surface(m_canvas_surface_owner_id, canvas_id, *presented_surface);
+    context.presented_surface = presented_surface->painting_surface();
     context.has_uncommitted_commands = false;
 }
 
-void CanvasHost::execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> const& segments, Vector<Compositing::FontResourceId> const& kept_font_ids, Vector<Compositing::DisplayListFontResource> const& added_fonts, Vector<Compositing::DisplayListImageFrameResource> const& image_frames)
+bool CanvasHost::execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStreamSegment> const& segments, Vector<Compositing::DisplayListFontDescription> const& fonts, Compositing::RegisteredTypefaces const& registered_typefaces, Compositing::RegisteredImageFrames const& registered_image_frames)
 {
-    Compositing::DisplayListResourceSet resources;
-    for (auto font_id : kept_font_ids)
-        resources.fonts.set(font_id);
-    for (auto const& font : added_fonts) {
-        // NB: Font IDs are immutable. Keep the typeface that Skia's glyph caches were built for.
-        if (!m_text_resources.has_font(font.id))
-            m_text_resources.set_font(font.id, font.font);
-        resources.fonts.set(font.id);
-    }
-    m_text_resources.retain_only(resources);
-    for (auto const& image_frame : image_frames)
-        m_image_frames_of_batch.set(image_frame.id.value(), image_frame.frame);
-    ScopeGuard forget_image_frames_of_batch = [&] { m_image_frames_of_batch.clear(); };
+    if (!m_fonts_of_latest_stream_batch.add_described_fonts_made_of_registered_typefaces(fonts, registered_typefaces))
+        return false;
+    Vector<u64> font_ids_of_batch;
+    font_ids_of_batch.ensure_capacity(fonts.size());
+    for (auto const& font : fonts)
+        font_ids_of_batch.unchecked_append(font.id.value());
+    (void)m_fonts_of_latest_stream_batch.retain_only(font_ids_of_batch);
+    TemporaryChange image_frames_registered_while_stream_batch_plays { m_image_frames_registered_while_stream_batch_plays, &registered_image_frames };
     Vector<NonnullRefPtr<Gfx::PaintingSurface>> surfaces_that_sample_video_frames;
     for (auto const& segment : segments) {
         // The canvas may have been destroyed while this segment was pending in
@@ -231,6 +234,7 @@ void CanvasHost::execute_canvas_2d_stream(Vector<Compositing::Canvas2DCommandStr
         for (auto& surface : surfaces_that_sample_video_frames)
             m_skia_backend_context->flush_and_submit(surface);
     }
+    return true;
 }
 
 sk_sp<SkImage> CanvasHost::held_video_frame_image(Media::VideoSinkHandle handle, u64 generation, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context_of_canvas)
@@ -342,8 +346,12 @@ void CanvasHost::present_webgl_canvas(Compositing::CanvasId canvas_id, bool pres
     auto* context = this->context(canvas_id);
     VERIFY(context);
 
-    auto surface = MUST(as_webgl(*context).prepare_for_compositing(preserve_drawing_buffer));
-    m_canvas_surface_registry.set_canvas_surface(m_canvas_surface_owner_id, canvas_id, move(surface));
+    auto& webgl_context = as_webgl(*context);
+    auto surface = MUST(webgl_context.prepare_for_compositing(preserve_drawing_buffer));
+    if (auto presentable_surface = webgl_context.presented_presentable_surface(); presentable_surface && &presentable_surface->painting_surface() == surface.ptr())
+        m_canvas_surface_registry.set_canvas_surface(m_canvas_surface_owner_id, canvas_id, *presentable_surface);
+    else
+        m_canvas_surface_registry.set_canvas_surface(m_canvas_surface_owner_id, canvas_id, move(surface));
 }
 
 void CanvasHost::clear_webgl_drawing_buffer(Compositing::CanvasId canvas_id)

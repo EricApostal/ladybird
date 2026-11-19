@@ -470,6 +470,43 @@ impl VisualContextTree {
         false
     }
 
+    pub fn nearest_layer_at_or_above(&self, mut effect: EffectNodeIndex) -> Option<EffectNodeIndex> {
+        while !effect.is_none() {
+            if self.effect_pushes_layer_at_replay(effect) {
+                return Some(effect);
+            }
+            effect = self.effect_nodes[effect.0 as usize].parent;
+        }
+        None
+    }
+
+    pub fn content_under_effect_composites_into_root_group(&self, effect: EffectNodeIndex) -> bool {
+        self.nearest_layer_at_or_above(effect)
+            .is_none_or(|layer| self.root_isolation_effect == Some(layer))
+    }
+
+    // The backdrop of an effect whose box's masks draw it is read where the outermost of those masks composites.
+    pub fn effect_backdrop_is_root_group(&self, effect: EffectNodeIndex) -> bool {
+        let mut reader = effect;
+        loop {
+            let parent = self.effect_nodes[reader.0 as usize].parent;
+            if parent.is_none()
+                || !matches!(&self.effect_nodes[parent.0 as usize].data, EffectNodeData::Mask(mask) if mask.masks_backdrop)
+            {
+                break;
+            }
+            reader = parent;
+        }
+        self.content_under_effect_composites_into_root_group(self.effect_nodes[reader.0 as usize].parent)
+    }
+
+    pub fn has_blend_mode_reading_root_group(&self) -> bool {
+        self.effect_nodes.iter().enumerate().any(|(index, node)| {
+            matches!(&node.data, EffectNodeData::Effects(effects) if effects.blend_mode != CompositingAndBlendingOperator::Normal)
+                && self.effect_backdrop_is_root_group(EffectNodeIndex(index as u32))
+        })
+    }
+
     // A blend mode or a backdrop filter reads what the canvas holds outside the effect's own layer.
     pub fn has_unisolated_destination_reading_effect(&self) -> bool {
         self.effect_nodes.iter().any(|node| {
@@ -535,6 +572,22 @@ impl VisualContextTree {
             && self.effect_is_none_or_live(context.effect)
             && (context.effect.is_none()
                 || self.clip_is_none_or_live(self.effect_nodes[context.effect.0 as usize].local_clip))
+    }
+
+    /// Visits the id of every image frame that a filter or backdrop filter of an effect node draws.
+    pub fn for_each_effects_filter_image_frame_id(&self, visit: &mut dyn FnMut(u64)) {
+        for node in &self.effect_nodes {
+            let EffectNodeData::Effects(effects) = &node.data else {
+                continue;
+            };
+            let backdrop_filter_bytes = effects.backdrop_filter.as_ref().map(|backdrop| &backdrop.filter);
+            for filter_bytes in effects.filter.iter().chain(backdrop_filter_bytes) {
+                let Some(filter) = libgfx_rust::filter::Filter::deserialize(filter_bytes) else {
+                    continue;
+                };
+                filter.for_each_image_frame_id(&mut |id| visit(id));
+            }
+        }
     }
 
     pub fn display_list_references_only_live_nodes(
@@ -1212,6 +1265,7 @@ mod tests {
                 scroller: viewport_scroll_node,
                 parent_sticky: None,
                 position_relative_to_scroller: point(0.0, 100.0),
+                border_box_origin: FloatPoint::default(),
                 border_box_size: FloatSize {
                     width: 800.0,
                     height: 50.0,
@@ -1238,6 +1292,7 @@ mod tests {
                 scroller: viewport_scroll_node,
                 parent_sticky: Some(header_node),
                 position_relative_to_scroller: point(0.0, 110.0),
+                border_box_origin: FloatPoint::default(),
                 border_box_size: FloatSize {
                     width: 800.0,
                     height: 10.0,
@@ -1287,6 +1342,7 @@ mod tests {
             scroller,
             parent_sticky,
             position_relative_to_scroller: point(0.0, top),
+            border_box_origin: FloatPoint::default(),
             border_box_size: FloatSize {
                 width: 10.0,
                 height: 10.0,

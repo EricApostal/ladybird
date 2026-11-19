@@ -26,6 +26,7 @@ use crate::bytecode::executable::{
     Executable, KeyedPropertyLookupCache, PropertyLookupCache, StaticPropertyLookupCacheSite,
     StaticPropertyLookupCaches,
 };
+use crate::bytecode::flushing::{CodeFlushing, CodeFlushingOptions};
 use crate::bytecode::property_access::Strict;
 use crate::debugger::Debugger;
 use crate::embedding::hooks::Embedder;
@@ -36,7 +37,7 @@ use crate::gc::foreign::ForeignCellSlot;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::heap::Heap;
 use crate::gc::heap_function::HeapFunction;
-use crate::gc::root::{MarkedVec, RootSet};
+use crate::gc::root::{MarkedVec, Root, RootSet};
 use crate::gc::sweep::Sweep;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::gc::weak_container::WeakContainer;
@@ -56,6 +57,7 @@ use crate::layout::value::Value;
 use crate::layout::vm::{DISPATCH_TABLE_COUNT, ExecutionContextStackEntry, InterpreterStack, VmHead};
 use crate::layout_forward::RawNativeFunctionPointer;
 use crate::lexical_path;
+use crate::runtime::abstract_operations::function_with_frame_as_this_environment;
 use crate::runtime::abstract_operations::get_this_environment;
 use crate::runtime::agent::AgentRecord;
 use crate::runtime::array_buffer::{ArrayBuffer, ZeroFillNewBytes};
@@ -84,7 +86,7 @@ use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::reference::{BaseType, Reference};
-use crate::runtime::shape::PrototypeTransitionCache;
+use crate::runtime::shape::{ConstructShapeCache, PrototypeTransitionCache};
 use crate::runtime::shared_function_instance_data::SharedFunctionInstanceData;
 use crate::runtime::source_text_module::SourceTextModule;
 use crate::runtime::symbol::{self, GlobalSymbolRegistry, Symbol, enumerate_well_known_symbols};
@@ -270,13 +272,16 @@ pub(crate) fn default_host_system_utc_epoch_nanoseconds(_: &Vm, _: &Object) -> S
     nanoseconds.clamp(NANOSECONDS_MIN_INSTANT.clone(), NANOSECONDS_MAX_INSTANT.clone())
 }
 
-/// The VM's queues of promise jobs and finalization registry cleanup jobs, in a cell the VM roots.
+/// The VM's promise jobs, cleanup jobs, standalone timer tasks, and pending async waits, in a cell the VM roots.
 #[repr(C)]
 #[derive(Trace)]
 pub struct JobQueues {
     header: CellHeader,
     promise_jobs: GcRefCell<VecDeque<Gc<HeapFunction>>>,
     finalization_registry_cleanup_jobs: GcRefCell<Vec<Gc<FinalizationRegistry>>>,
+    // Ephemerons must be visited during marking, not by the VM's root-gathering visitor.
+    async_waits: GcRefCell<Vec<crate::runtime::async_wait::PendingWait>>,
+    timeout_jobs: GcRefCell<Vec<crate::runtime::async_wait::TimeoutJob>>,
 }
 
 define_cell!(JobQueues, Other);
@@ -452,6 +457,8 @@ pub(crate) fn default_host_enqueue_finalization_registry_cleanup_job(
 }
 
 pub const STRING_TO_ATOM_CACHE_SIZE: usize = 256;
+pub const CHARACTERS_TO_ATOM_CACHE_SIZE: usize = 256;
+pub const KEY_CONCATENATION_CACHE_SIZE: usize = 256;
 pub const FLY_STRING_CACHE_SIZE: usize = 1024;
 pub const NUMERIC_STRING_CACHE_SIZE: usize = 1000;
 pub const LARGE_NUMERIC_STRING_CACHE_SIZE: usize = 1024;
@@ -462,6 +469,37 @@ const SINGLE_ASCII_CHARACTER_STRING_COUNT: usize = 128;
 pub struct StringToAtomCacheEntry {
     pub string: Option<Gc<PrimitiveString>>,
     pub atom: Option<Utf16FlyString>,
+}
+
+/// Remembers the fly string of a short ASCII string that became a property key before it had storage, for the next
+/// string with the same characters (see PrimitiveString::property_key()).
+#[derive(Default)]
+pub struct CharactersToAtomCacheEntry {
+    /// The hash of the characters that were looked up here without being found, if no lookup since then found
+    /// `fly_string`. Characters only replace `fly_string` with theirs the second time in a row, so that keys that are
+    /// only used once leave it alone.
+    pub missed_hash: u64,
+    pub fly_string: Option<Utf16FlyString>,
+}
+
+/// Remembers the string that the concatenation of the strings `lhs` and `rhs` made when it became a property key, so
+/// that JIT code takes that string for a later concatenation of the same two strings (see
+/// RopeString::remember_key_concatenations()). The three are string values, or 0 in an entry that remembers nothing.
+/// JIT code reads the entries, which it finds by a shift, so their size is a power of two (see
+/// RuntimeLayout::key_concatenation_cache).
+#[repr(align(32))]
+pub struct KeyConcatenationCacheEntry {
+    pub lhs: Cell<u64>,
+    pub rhs: Cell<u64>,
+    pub string: Cell<u64>,
+}
+
+const _: () = assert!(size_of::<KeyConcatenationCacheEntry>().is_power_of_two());
+
+/// Where the VM's cache of the concatenations that became property keys has the concatenation of the string values
+/// `lhs` and `rhs`, if it has it. JIT code computes the same index.
+fn key_concatenation_cache_index(lhs: u64, rhs: u64) -> usize {
+    (((lhs >> 4) ^ (rhs >> 4).wrapping_mul(33)) as usize) & (KEY_CONCATENATION_CACHE_SIZE - 1)
 }
 
 #[derive(Trace)]
@@ -521,6 +559,8 @@ pub struct Vm {
     interrupt_requested: AtomicBool,
     /// This agent's node in the WaiterLists, which Atomics.wait() and memory.atomic.wait sleep on.
     agent_waiter: Arc<AgentWaiter>,
+    pub(crate) async_wait_agent: std::sync::OnceLock<Arc<crate::runtime::async_wait::AsyncWaitAgent>>,
+    pub(crate) next_async_wait_id: Cell<u64>,
     /// The tables `VmHead::dispatch_tables` points to.
     pub(crate) own_dispatch_tables: VmDispatchTables,
     /// The word that stops the WebAssembly code of this VM's agent (see set_wasm_stack_limit_word()), if it has any.
@@ -547,6 +587,11 @@ pub struct Vm {
     pub names: CommonPropertyNames,
     /// What functions without parameter names share, since an empty Rc slice is an allocation of its own.
     pub(crate) no_parameter_names: Rc<[Utf16FlyString]>,
+    /// The fly strings of short ASCII strings that became property keys before they had storage, found by a hash of
+    /// their characters. Every collection empties this cache, so that it keeps no fly string alive for long.
+    characters_to_atom_cache: RefCell<Box<[CharactersToAtomCacheEntry; CHARACTERS_TO_ATOM_CACHE_SIZE]>>,
+    /// The strings in this cache are weak: every collection empties it.
+    key_concatenation_cache: Box<[KeyConcatenationCacheEntry; KEY_CONCATENATION_CACHE_SIZE]>,
     /// The strings in these two caches are weak: the sweep callback drops the ones that die.
     string_to_atom_cache: RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>>,
     fly_string_cache: Box<[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE]>,
@@ -558,6 +603,7 @@ pub struct Vm {
     json_parse_cache: JsonParseCache,
     json_stringify_cache: JsonStringifyCache,
     empty_string: OnceCell<Gc<PrimitiveString>>,
+    empty_realm: OnceCell<Gc<Realm>>,
     cached_strings: OnceCell<CachedStrings>,
     single_ascii_character_strings: OnceCell<[Gc<PrimitiveString>; SINGLE_ASCII_CHARACTER_STRING_COUNT]>,
     well_known_symbols: OnceCell<WellKnownSymbols>,
@@ -572,6 +618,7 @@ pub struct Vm {
     static_property_lookup_caches: StaticPropertyLookupCaches,
     keyed_property_lookup_cache: KeyedPropertyLookupCache,
     prototype_transition_cache: Box<PrototypeTransitionCache>,
+    construct_shape_cache: Box<ConstructShapeCache>,
     /// Like the keyed property lookup cache, how string-keyed PutByValue instructions whose own caches gave up put
     /// properties: the writable own data properties they change and the properties they add, by shape and name (see
     /// put_by_value_with_keyed_store_cache()).
@@ -609,6 +656,9 @@ pub struct Vm {
     host_finalize_import_meta: Cell<HostFinalizeImportMeta>,
     host_get_supported_import_attributes: Cell<HostGetSupportedImportAttributes>,
     dynamic_imports_allowed: Cell<bool>,
+    /// Whether errors keep at least LONG_STACK_TRACE_FRAME_COUNT frames, for a debugger that lists them, even when
+    /// Error.stackTraceLimit is not a number. Their stack strings and script-visible frames stay as without it.
+    keeps_long_stack_traces: Cell<bool>,
     loaded_modules: OnceCell<Gc<LoadedModules>>,
     module_execution_depth: Cell<u32>,
     module_async_evaluation_count: Cell<u64>, // [[ModuleAsyncEvaluationCount]]
@@ -635,6 +685,7 @@ pub struct Vm {
     saved_execution_context_stacks: RefCell<Vec<SavedExecutionContextStack>>,
     host_classes: RefCell<HostClassRegistry>,
     pub jit: JitState,
+    pub code_flushing: CodeFlushing,
 }
 
 const _: () = assert!(core::mem::offset_of!(Vm, head) == 0);
@@ -698,6 +749,8 @@ impl Vm {
             jit_native_stack_limit: AtomicUsize::new(0),
             interrupt_requested: AtomicBool::new(false),
             agent_waiter: AgentWaiter::new(),
+            async_wait_agent: std::sync::OnceLock::new(),
+            next_async_wait_id: Cell::new(1),
             own_dispatch_tables: VmDispatchTables::new(),
             wasm_stack_limit_word: Mutex::new(core::ptr::null()),
             heap: OnceCell::new(),
@@ -711,6 +764,18 @@ impl Vm {
             names: CommonPropertyNames::new(),
             no_parameter_names: Rc::from([]),
             string_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| StringToAtomCacheEntry::default()))),
+            characters_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| {
+                CharactersToAtomCacheEntry::default()
+            }))),
+            key_concatenation_cache: Box::new(
+                [const {
+                    KeyConcatenationCacheEntry {
+                        lhs: Cell::new(0),
+                        rhs: Cell::new(0),
+                        string: Cell::new(0),
+                    }
+                }; KEY_CONCATENATION_CACHE_SIZE],
+            ),
             fly_string_cache: Box::new([const { Cell::new(None) }; FLY_STRING_CACHE_SIZE]),
             numeric_string_cache: Box::new([const { Cell::new(None) }; NUMERIC_STRING_CACHE_SIZE]),
             large_numeric_string_cache: Box::new(
@@ -725,6 +790,7 @@ impl Vm {
             json_parse_cache: JsonParseCache::default(),
             json_stringify_cache: JsonStringifyCache::new(),
             empty_string: OnceCell::new(),
+            empty_realm: OnceCell::new(),
             cached_strings: OnceCell::new(),
             single_ascii_character_strings: OnceCell::new(),
             well_known_symbols: OnceCell::new(),
@@ -734,6 +800,7 @@ impl Vm {
             static_property_lookup_caches: StaticPropertyLookupCaches::new(),
             keyed_property_lookup_cache: KeyedPropertyLookupCache::new(),
             prototype_transition_cache: Box::new(PrototypeTransitionCache::new()),
+            construct_shape_cache: Box::new(ConstructShapeCache::new()),
             keyed_property_store_cache: KeyedPropertyLookupCache::new(),
             keyed_property_store_scratch_cache: PropertyLookupCache::new(),
             host_ensure_can_add_private_element: Cell::new(default_host_ensure_can_add_private_element),
@@ -763,6 +830,7 @@ impl Vm {
             host_finalize_import_meta: Cell::new(default_host_finalize_import_meta),
             host_get_supported_import_attributes: Cell::new(default_host_get_supported_import_attributes),
             dynamic_imports_allowed: Cell::new(false),
+            keeps_long_stack_traces: Cell::new(false),
             loaded_modules: OnceCell::new(),
             module_execution_depth: Cell::new(0),
             module_async_evaluation_count: Cell::new(0),
@@ -777,6 +845,7 @@ impl Vm {
             saved_execution_context_stacks: RefCell::new(Vec::new()),
             host_classes: RefCell::new(HashMap::default()),
             jit: JitState::new(JitOptions::from_environment()),
+            code_flushing: CodeFlushing::new(CodeFlushingOptions::from_environment()),
         };
         // SAFETY: The caller provides storage for a Vm.
         unsafe { storage.write(vm) };
@@ -852,6 +921,8 @@ impl Vm {
             header: CellHeader::for_class(JobQueues::CLASS),
             promise_jobs: GcRefCell::new(VecDeque::new()),
             finalization_registry_cleanup_jobs: GcRefCell::new(Vec::new()),
+            async_waits: GcRefCell::new(Vec::new()),
+            timeout_jobs: GcRefCell::new(Vec::new()),
         }));
         let _ = self.loaded_modules.set(self.heap().allocate(|_| LoadedModules {
             header: CellHeader::for_class(LoadedModules::CLASS),
@@ -914,6 +985,9 @@ impl Vm {
             word.store(u64::MAX, Ordering::Relaxed);
         }
         self.agent_waiter.interrupt();
+        if let Some(agent) = self.async_wait_agent.get() {
+            agent.wake();
+        }
     }
 
     /// This agent's node in the WaiterLists.
@@ -968,6 +1042,7 @@ impl Vm {
         context_ref.caller_return_pc.set(0);
         context_ref.caller_dst_raw.set(0);
         context_ref.caller_is_construct.set(false);
+        context_ref.caller_is_derived_construct.set(false);
         let length = self.head.execution_context_stack_length.get();
         if length == self.head.execution_context_stack_capacity.get() {
             self.grow_execution_context_stack();
@@ -1175,6 +1250,7 @@ impl Vm {
     }
 
     fn gather_roots(&self, visitor: &mut Visitor) {
+        self.code_flushing.begin_pass(self);
         self.jit.trace(visitor);
         self.for_each_execution_context_top_to_bottom(|context| {
             context.trace(visitor);
@@ -1200,6 +1276,7 @@ impl Vm {
         }
         self.roots.trace(visitor);
         self.empty_string.trace(visitor);
+        self.empty_realm.trace(visitor);
         self.single_ascii_character_strings.trace(visitor);
         self.numeric_string_cache.trace(visitor);
         self.large_numeric_string_cache.trace(visitor);
@@ -1461,22 +1538,28 @@ impl Vm {
     pub fn stack_trace(&self) -> MarkedVec<'_, StackTraceElement> {
         let stack_trace = MarkedVec::new(self);
         self.for_each_stack_frame_top_to_bottom(|frame| {
-            // NB: Builtins written in JavaScript show up like other builtins, without a position in their source.
-            let runs_builtin = frame
-                .function
-                .is_some_and(|function| function.is::<NativeJavaScriptBackedFunction>());
-            let source_range = frame
-                .executable
-                .filter(|_| !runs_builtin)
-                .map(|executable| executable.get_source_range(frame.program_counter));
             stack_trace.push(StackTraceElement {
                 execution_context: NonNull::from(frame.execution_context),
                 function: frame.function,
-                source_range,
+                source_range: frame.source_range(),
             });
             ControlFlow::Continue(())
         });
         stack_trace
+    }
+
+    /// The source range of the innermost frame that has one, as the first such element of stack_trace() has, without
+    /// walking the rest of the stack.
+    pub fn innermost_source_range(&self) -> Option<SourceRange> {
+        let mut source_range = None;
+        self.for_each_stack_frame_top_to_bottom(|frame| {
+            source_range = frame.source_range();
+            if source_range.is_some() {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        source_range
     }
 
     /// Calls `callback` with each frame from the running one down, until it breaks, like
@@ -1522,7 +1605,19 @@ impl Vm {
         });
     }
 
-    /// Drops the weak cache entries of strings that died in this collection.
+    /// Clears the idle count of the executables that frames still run: they are not idle, even when no frame entered
+    /// them for many collections (as in a long loop).
+    fn clear_idle_collection_counts_of_running_executables(&self) {
+        self.for_each_live_execution_context(|frame| {
+            if let Some(head) = frame.executable.get() {
+                Executable::from_head(head).head.idle_collection_count.set(0);
+            }
+            ControlFlow::Continue(())
+        });
+    }
+
+    /// Drops the weak cache entries of strings that died in this collection, and every entry of the caches that each
+    /// collection empties.
     fn remove_dead_strings_from_weak_caches(&self, sweep: &Sweep<'_>) {
         let is_dead = |string: Gc<PrimitiveString>| sweep.is_dead(string);
         for cache_slot in self.fly_string_cache.iter() {
@@ -1536,6 +1631,14 @@ impl Vm {
             }
         }
         self.interned_strings.borrow_mut().retain(|_, string| !is_dead(*string));
+        self.characters_to_atom_cache
+            .borrow_mut()
+            .fill_with(CharactersToAtomCacheEntry::default);
+        for entry in self.key_concatenation_cache.iter() {
+            entry.lhs.set(0);
+            entry.rhs.set(0);
+            entry.string.set(0);
+        }
     }
 
     /// Forgets the cells that died in this collection from the inline caches of executables and static call sites.
@@ -1546,13 +1649,25 @@ impl Vm {
                 return false;
             }
             executable.remove_dead_cells(sweep);
+            let idle_collection_count = &executable.head.idle_collection_count;
+            idle_collection_count.set(idle_collection_count.get().saturating_add(1));
             true
         });
         self.static_property_lookup_caches.remove_dead_entries(sweep);
         self.keyed_property_lookup_cache.remove_dead_entries(sweep);
         self.prototype_transition_cache.remove_dead_entries(sweep);
+        self.construct_shape_cache.remove_dead_entries(sweep);
         self.keyed_property_store_cache.remove_dead_entries(sweep);
         self.jit.dependents.remove_dead_entries(sweep);
+    }
+
+    /// Has the JIT code that idled long enough in this collection flushed once the collection is over.
+    pub(crate) fn enqueue_code_flushing_task(&self) {
+        // SAFETY: The VM outlives its heap, whose collections run the task.
+        unsafe {
+            self.heap()
+                .enqueue_post_gc_task(flush_idle_jit_code, core::ptr::from_ref(self).cast_mut().cast());
+        }
     }
 
     pub fn register_executable(&self, executable: Gc<Executable>) {
@@ -1577,6 +1692,10 @@ impl Vm {
 
     pub fn prototype_transition_cache(&self) -> &PrototypeTransitionCache {
         &self.prototype_transition_cache
+    }
+
+    pub fn construct_shape_cache(&self) -> &ConstructShapeCache {
+        &self.construct_shape_cache
     }
 
     pub fn keyed_property_store_cache(&self) -> &KeyedPropertyLookupCache {
@@ -1704,6 +1823,26 @@ impl Vm {
 
     fn job_queues(&self) -> Gc<JobQueues> {
         *self.job_queues.get().expect("the VM allocates its job queues")
+    }
+
+    pub(crate) fn async_waits(&self) -> &GcRefCell<Vec<crate::runtime::async_wait::PendingWait>> {
+        &self
+            .job_queues
+            .get()
+            .expect("the VM allocates its job queues")
+            .async_waits
+    }
+
+    pub(crate) fn timeout_jobs(&self) -> &GcRefCell<Vec<crate::runtime::async_wait::TimeoutJob>> {
+        &self
+            .job_queues
+            .get()
+            .expect("the VM allocates its job queues")
+            .timeout_jobs
+    }
+
+    pub(crate) fn is_running_promise_jobs(&self) -> bool {
+        self.running_promise_jobs.get()
     }
 
     pub fn run_executable_depth(&self) -> &Cell<u32> {
@@ -1847,6 +1986,14 @@ impl Vm {
         self.dynamic_imports_allowed.set(value);
     }
 
+    pub fn keeps_long_stack_traces(&self) -> bool {
+        self.keeps_long_stack_traces.get()
+    }
+
+    pub fn set_keeps_long_stack_traces(&self, value: bool) {
+        self.keeps_long_stack_traces.set(value);
+    }
+
     pub fn enter_module_execution(&self) {
         self.module_execution_depth.set(self.module_execution_depth.get() + 1);
     }
@@ -1877,6 +2024,30 @@ impl Vm {
         &self.string_to_atom_cache
     }
 
+    pub fn characters_to_atom_cache(
+        &self,
+    ) -> &RefCell<Box<[CharactersToAtomCacheEntry; CHARACTERS_TO_ATOM_CACHE_SIZE]>> {
+        &self.characters_to_atom_cache
+    }
+
+    pub fn key_concatenation_cache(&self) -> &[KeyConcatenationCacheEntry; KEY_CONCATENATION_CACHE_SIZE] {
+        &self.key_concatenation_cache
+    }
+
+    /// Remembers that `string` is the concatenation of `lhs` and `rhs`, see KeyConcatenationCacheEntry.
+    pub fn remember_key_concatenation(
+        &self,
+        lhs: Gc<PrimitiveString>,
+        rhs: Gc<PrimitiveString>,
+        string: Gc<PrimitiveString>,
+    ) {
+        let (lhs, rhs) = (Value::from_string(lhs).0, Value::from_string(rhs).0);
+        let entry = &self.key_concatenation_cache[key_concatenation_cache_index(lhs, rhs)];
+        entry.lhs.set(lhs);
+        entry.rhs.set(rhs);
+        entry.string.set(Value::from_string(string).0);
+    }
+
     pub fn fly_string_cache(&self) -> &[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE] {
         &self.fly_string_cache
     }
@@ -1895,6 +2066,12 @@ impl Vm {
 
     pub fn empty_string(&self) -> Gc<PrimitiveString> {
         *self.empty_string.get().expect("the VM allocates the empty string")
+    }
+
+    /// A realm with no intrinsics, global object, global environment or host-defined data, which nothing can give it.
+    /// An object that belongs to no realm lives in it, and whatever asks that realm for one of those panics.
+    pub fn empty_realm(&self) -> Gc<Realm> {
+        *self.empty_realm.get_or_init(|| Realm::create_empty(self))
     }
 
     pub fn single_ascii_character_string(&self, character: u8) -> Gc<PrimitiveString> {
@@ -2154,6 +2331,16 @@ impl Vm {
 
     // 9.4.4 ResolveThisBinding ( ), https://tc39.es/ecma262/#sec-resolvethisbinding
     pub fn resolve_this_binding(&self) -> ThrowCompletionOr<Value> {
+        // OPTIMIZATION: A frame that answers for the environment has the this value, which is empty while it is not
+        //               initialized.
+        if function_with_frame_as_this_environment(self).is_some() {
+            let this_value = self.running_execution_context_ref().this_value.get();
+            if this_value.is_empty() {
+                return self.throw_completion(ErrorKind::ReferenceError, ErrorType::ThisHasNotBeenInitialized, &[]);
+            }
+            return Ok(this_value);
+        }
+
         // 1. Let envRec be GetThisEnvironment().
         let environment = get_this_environment(self);
 
@@ -2163,6 +2350,11 @@ impl Vm {
 
     // 9.4.5 GetNewTarget ( ), https://tc39.es/ecma262/#sec-getnewtarget
     pub fn get_new_target(&self) -> Value {
+        // OPTIMIZATION: A frame that answers for the environment has the new target.
+        if function_with_frame_as_this_environment(self).is_some() {
+            return self.running_execution_context_ref().new_target.get();
+        }
+
         // 1. Let envRec be GetThisEnvironment().
         let environment = get_this_environment(self);
 
@@ -2186,6 +2378,13 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        if let Some(agent) = self.async_wait_agent.get() {
+            agent.close();
+        }
+        for wait in self.async_waits().borrow().iter() {
+            ak::waiter_list::cancel_async_waiter(&wait.waiter);
+        }
+        self.async_waits().borrow_mut(self).clear();
         if self.options.become_thread_default_heap {
             libregex_rust::vm::set_interrupt_flag_of_this_thread(core::ptr::null());
         }
@@ -2220,13 +2419,30 @@ unsafe extern "C" fn sweep(context: *mut c_void) {
     let vm = unsafe { &*context.cast::<Vm>() };
     // SAFETY: LibGC runs sweep callbacks once the marks are final, before it sweeps the cells that died.
     let sweep = unsafe { Sweep::new(vm) };
+    vm.code_flushing.finish_pass(vm, &sweep);
+    crate::parser::release_idle_reparse_contexts();
+    // NB: The VM has no heap anymore when this runs for the last collection of a heap that goes away.
+    if vm.heap.get().is_some_and(Heap::is_returning_memory_to_system) {
+        crate::source_text::park_all_source_texts();
+        crate::runtime::regexp_prototype::clear_regex_cache();
+    } else {
+        crate::source_text::park_idle_source_texts();
+    }
+    vm.remove_dead_async_waits(&sweep);
     vm.remove_dead_cells_from_weak_containers(&sweep);
     vm.remove_dead_strings_from_weak_caches(&sweep);
     vm.remove_dead_cells_from_property_lookup_caches(&sweep);
+    vm.clear_idle_collection_counts_of_running_executables();
     vm.remove_dead_objects_from_intrinsic_accessors_and_unimplemented_properties(&sweep);
     if let Some(debugger) = vm.debugger() {
         debugger.remove_dead_executables(&sweep);
     }
+}
+
+unsafe extern "C" fn flush_idle_jit_code(context: *mut c_void) {
+    // SAFETY: The task was enqueued with the VM as its context.
+    let vm = unsafe { &*context.cast::<Vm>() };
+    vm.code_flushing.flush_idle_jit_code(vm);
 }
 
 unsafe extern "C" fn enqueue_cleanup_jobs_of_finalization_registries_with_dead_cells(context: *mut c_void) {
@@ -2275,6 +2491,19 @@ pub struct StackFrame<'a> {
     pub program_counter: u32,
     /// For a frame of a call that JIT code inlined: where its values are.
     pub inlined_call: Option<InlinedCallStackFrame>,
+}
+
+impl StackFrame<'_> {
+    /// Where the frame is in the source of its executable, which is nowhere for a frame that runs no bytecode.
+    pub fn source_range(&self) -> Option<SourceRange> {
+        // NB: Builtins written in JavaScript show up like other builtins, without a position in their source.
+        let runs_builtin = self
+            .function
+            .is_some_and(|function| function.is::<NativeJavaScriptBackedFunction>());
+        self.executable
+            .filter(|_| !runs_builtin)
+            .map(|executable| executable.get_source_range(self.program_counter))
+    }
 }
 
 /// Where the values of a frame of a call that JIT code inlined are: the inlined call site of the code running the
@@ -2431,7 +2660,7 @@ impl Vm {
             });
     }
 
-    pub fn link_and_eval_module(&self, module: Gc<CyclicModule>) -> ThrowCompletionOr<()> {
+    pub fn link_and_eval_module(&self, module: Gc<CyclicModule>) -> ThrowCompletionOr<Gc<Promise>> {
         let filename = module.filename().to_string();
         if !filename.is_empty() {
             let absolute_filename = resolve_module_filename(&lexical_path::absolute_path(".", &filename), "");
@@ -2456,20 +2685,17 @@ impl Vm {
 
         module.link(self)?;
 
-        let evaluated_value = promise_of(module.evaluate(self)?);
+        let evaluated_value = Root::new(self, promise_of(module.evaluate(self)?));
 
         self.run_queued_promise_jobs();
-        assert!(self.job_queues().promise_jobs.borrow().is_empty());
 
-        // FIXME: This will break if we start doing promises actually asynchronously.
-        assert!(evaluated_value.state() != PromiseState::Pending);
-
-        if evaluated_value.state() == PromiseState::Rejected {
-            crate::embedding::completion::log_exception_if_enabled(self, evaluated_value.result());
-            return Err(Throw::new(evaluated_value.result()));
+        if evaluated_value.get().state() == PromiseState::Rejected {
+            crate::embedding::completion::log_exception_if_enabled(self, evaluated_value.get().result());
+            return Err(Throw::new(evaluated_value.get().result()));
         }
 
-        Ok(())
+        // The host owns the tasks that can resume a suspended module, so it also observes the evaluation promise.
+        Ok(evaluated_value.value())
     }
 
     // 16.2.1.8 HostLoadImportedModule ( referrer, specifier, hostDefined, payload ), https://tc39.es/ecma262/#sec-HostLoadImportedModule

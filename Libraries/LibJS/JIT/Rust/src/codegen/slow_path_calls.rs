@@ -9,6 +9,7 @@
 //! code of nodes.
 
 use super::Codegen;
+use super::lowering_info::lowering_info;
 use crate::CompileFailure;
 use crate::asm::Address;
 use crate::asm::Gpr;
@@ -62,6 +63,7 @@ pub(super) fn slow_path_saved_registers_of<M: PortableMacroAssembler>(allocation
 impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// The out of line code of nodes, after the last block.
     pub(super) fn emit_deferred_code(&mut self) -> Result<(), CompileFailure> {
+        self.emit_deferred_vm_cache_probes()?;
         self.emit_deferred_cache_probes()?;
         self.emit_deferred_allocations();
         self.emit_deferred_storage_growths();
@@ -130,23 +132,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let in_inlined_callee = node
             .frame_state
             .is_some_and(|frame_state| self.graph.frame_state(frame_state).parent.is_some());
-        in_inlined_callee
-            && matches!(
-                node.op,
-                Op::CallSlowPath { .. }
-                    | Op::CallDirect {
-                        inlined_frame_bytes: 0,
-                        ..
-                    }
-                    | Op::CallNative {
-                        inlined_frame_bytes: 0,
-                        ..
-                    }
-            )
+        in_inlined_callee && lowering_info(node).publishes_frames
     }
 
     /// The address of word `index` of the saves area.
     pub(super) fn save_address(&self, index: usize) -> Address {
+        self.note_saves_area_use();
         self.local_address(self.locals.saves + 8 * index as u32)
     }
 
@@ -169,26 +160,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         }
     }
 
-    /// Whether the code of `node` uses the saves area: slow paths and the
-    /// runtime calls that save registers like them, calls that publish
-    /// frames, and stores that may grow named property storage.
+    /// Whether the code of `node` uses the saves area (see `LoweringInfo::uses_saves_area`), or publishes frames,
+    /// which uses it too.
     pub(super) fn uses_saves_area(&self, node: NodeId) -> bool {
-        match self.graph.node(node).op {
-            Op::CallSlowPath { .. }
-            | Op::ProbePropertyCache { .. }
-            | Op::ProbeHasProperty { .. }
-            | Op::ProbePropertyStore { .. }
-            | Op::ProbeKeyedStore { .. }
-            | Op::CallArrayPush
-            | Op::CallStoreHoleyElement
-            | Op::OpenArrayIteration
-            | Op::AllocateObject { .. }
-            | Op::AllocateArray { .. }
-            | Op::AllocateFunction { .. }
-            | Op::AllocateEnvironment { .. } => true,
-            Op::CallDirect { .. } | Op::CallNative { .. } => self.publishes_frames(node),
-            _ => false,
-        }
+        lowering_info(self.graph.node(node)).uses_saves_area || self.publishes_frames(node)
     }
 
     /// A `SlowPathOutput` node: output `index` of the `CallSlowPath` node
@@ -212,7 +187,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             if field.role == crate::bytecode::OperandRole::In {
                 continue;
             }
-            if self.read_u32(executable, pc, field.instruction_offset)? != crate::bytecode::Operand::INVALID {
+            if self.read_operand(executable, pc, field.instruction_offset)? != crate::bytecode::Operand::INVALID {
                 outputs.push(field_index as u32);
             }
         }
@@ -310,18 +285,44 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             frames.push((frame, values));
         }
         let mut clobbered = false;
+        // NB: The new target of the frame of the level above.
+        let mut new_target = None;
         for level in (0..frames.len()).rev() {
             if level + 1 < frames.len() {
                 let (caller, _) = &frames[level + 1];
                 let (callee, values) = &frames[level];
                 let call = self.decoded(caller.executable, caller.pc)?;
+                let callee_function = self.executables[callee.executable as usize]
+                    .function
+                    .map(|function| function.function);
                 let (argument_count, construct) = match call.instruction {
-                    crate::bytecode::Instruction::Call { argument_count, .. } => (argument_count, false),
-                    crate::bytecode::Instruction::CallConstruct { argument_count, .. } => (argument_count, true),
+                    crate::bytecode::Instruction::Call { argument_count, .. } => {
+                        new_target = None;
+                        (argument_count, false)
+                    }
+                    crate::bytecode::Instruction::CallConstruct { argument_count, .. } => {
+                        new_target = callee_function;
+                        (argument_count, true)
+                    }
+                    // NB: The super() of a derived constructor constructs
+                    //     with the derived constructor's new target.
+                    crate::bytecode::Instruction::SuperCall { argument_count, .. } if new_target.is_some() => {
+                        (argument_count, true)
+                    }
+                    // NB: Frame states at it list how many arguments it passes
+                    //     on.
+                    crate::bytecode::Instruction::SuperCallWithForwardedArguments { .. } if new_target.is_some() => {
+                        (0, true)
+                    }
                     // NB: Property gets and sets call inlined getters and
                     //     setters.
-                    crate::bytecode::Instruction::GetById { .. } => (0, false),
-                    crate::bytecode::Instruction::PutById { .. } => (1, false),
+                    crate::bytecode::Instruction::GetById { .. } | crate::bytecode::Instruction::PutById { .. } => {
+                        new_target = None;
+                        (
+                            u32::from(matches!(call.instruction, crate::bytecode::Instruction::PutById { .. })),
+                            false,
+                        )
+                    }
                     _ => {
                         return Err(CompileFailure::InvalidBytecode {
                             pc: caller.pc,
@@ -360,7 +361,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                     call.next_pc(),
                     dst,
                     caller.passed_argument_count.unwrap_or(argument_count),
-                    construct,
+                    construct.then_some(new_target).flatten(),
                     this,
                     closure,
                     [saved[0], saved[1], saved[2]],
@@ -420,6 +421,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_box(dst, dst, repr);
             }
             Location::Constant(bits) => self.masm.move_imm64(dst, value::boxed_constant(bits, repr)),
+            Location::Frame(slot) => self.emit_load_frame_home(dst, slot),
         }
     }
 }

@@ -95,8 +95,15 @@ fn iterator_record_from_registers(
 }
 
 /// The primitive values a NewPrimitiveArray instruction carries after its fixed fields.
-fn primitive_array_elements(instruction: &op::NewPrimitiveArray) -> &[Value] {
-    instruction.elements()
+#[cfg_attr(
+    ladybird_gc_lints,
+    expect(
+        gc_container_on_stack,
+        reason = "the elements are numbers, booleans, null and holes, which are not cells"
+    )
+)]
+fn primitive_array_elements(instruction: &op::NewPrimitiveArray) -> Vec<Value> {
+    instruction.elements().collect()
 }
 
 pub fn debugger_check_breakpoint(vm: &Vm, pc: u32) {
@@ -165,7 +172,7 @@ pub fn new_primitive_array(
     instruction: &op::NewPrimitiveArray,
     values: &mut op::NewPrimitiveArrayValues,
 ) -> SlowPathControl {
-    values.dst = Value::from_object(create_array_literal(vm, primitive_array_elements(instruction)));
+    values.dst = Value::from_object(create_array_literal(vm, &primitive_array_elements(instruction)));
     SlowPathControl::continue_at(pc + instruction.length())
 }
 
@@ -313,8 +320,11 @@ pub fn get_template_object(
         return SlowPathControl::continue_at(pc + instruction.length());
     }
 
+    let strings = super::operand_list(vm, instruction.strings_are_in_array, strings);
+    let strings = strings.values();
+    let strings = &*strings;
     let realm = current_realm(vm);
-    let count = instruction.strings_count / 2;
+    let count = crate::u32_from_usize(strings.len()) / 2;
     let template_object = Array::create(vm, realm, u64::from(count), None).must();
     let raw_object = Array::create(vm, realm, u64::from(count), None).must();
 
@@ -344,8 +354,8 @@ pub fn new_regexp(vm: &Vm, pc: u32, instruction: &op::NewRegExp, values: &mut op
     let regexp_object = RegExpObject::create_with_pattern_and_flags(
         vm,
         realm,
-        Utf16String::from(executable.get_string(instruction.source_index)),
-        Utf16String::from(executable.get_string(instruction.flags_index)),
+        Utf16String::from(executable.get_string(&instruction.source_index)),
+        Utf16String::from(executable.get_string(&instruction.flags_index)),
     );
     regexp_object.set_realm(realm);
     regexp_object.set_legacy_features_enabled(true);
@@ -364,7 +374,7 @@ pub fn new_reference_error(
     values.dst = Value::from_object(create_reference_error(
         vm,
         realm,
-        executable.get_string(instruction.error_string),
+        executable.get_string(&instruction.error_string),
     ));
     SlowPathControl::continue_at(pc + op::NewReferenceError::LENGTH)
 }
@@ -380,7 +390,7 @@ pub fn new_type_error(
     values.dst = Value::from_object(create_type_error(
         vm,
         realm,
-        executable.get_string(instruction.error_string),
+        executable.get_string(&instruction.error_string),
     ));
     SlowPathControl::continue_at(pc + op::NewTypeError::LENGTH)
 }
@@ -415,6 +425,7 @@ fn fast_array_mode_array(vm: &Vm, iterable: Value, method: Gc<FunctionObject>) -
 
 /// The next step of an iteration in fast array mode at `index`, like %ArrayIteratorPrototype%.next ( ): the element
 /// and the index after it, or `None` once the iteration is done.
+#[inline(always)]
 fn fast_array_mode_step(vm: &Vm, array: &Object, index: f64) -> ThrowCompletionOr<Option<(Value, Value)>> {
     let index = index as u64;
     if index >= iterated_array_like_length(vm, array)? {

@@ -54,7 +54,6 @@ public:
     };
     HasOrCreatedContext create_2d_context(CanvasRenderingContext2DSettings);
     HasOrCreatedContext create_webgl_context(WebGL::WebGLContextAttributes);
-    HasOrCreatedContext create_webgl2_context(WebGL::WebGLContextAttributes);
     RenderingContext const& context() const { return m_context; }
 
     WebIDL::UnsignedLong width() const;
@@ -85,8 +84,6 @@ public:
 
     Optional<Compositing::CanvasId> canvas_id() const;
 
-    u64 content_generation() const { return m_content_generation; }
-
     Optional<Gfx::IntSize> canvas_surface_content_size() const;
 
     void ensure_backing_storage();
@@ -116,7 +113,6 @@ private:
 
     Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, GC::Ref<ImageBitmapRenderingContext>, Empty> m_context;
     bool m_canvas_content_dirty { false };
-    u64 m_content_generation { 0 };
 
     bool m_is_placeholder { false };
     Optional<Compositing::CanvasId> m_placeholder_canvas_id;

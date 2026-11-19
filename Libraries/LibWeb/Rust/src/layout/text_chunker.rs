@@ -162,7 +162,8 @@ unsafe extern "C" {
         end: *mut usize,
     );
     safe fn unicode_layout_bidirectional_class(code_point: u32) -> u8;
-    safe fn unicode_layout_line_break_class(code_point: u32, allow_conditional_japanese_starters: bool) -> u8;
+    safe fn unicode_layout_line_break_class(code_point: u32) -> u8;
+    safe fn unicode_layout_joining_type(code_point: u32) -> u8;
     safe fn unicode_layout_code_point_has_emoji_property(code_point: u32) -> bool;
 }
 
@@ -174,10 +175,97 @@ mod line_break_class {
     pub(super) const AMBIGUOUS: u8 = 3;
     pub(super) const COMPLEX_CONTEXT: u8 = 4;
     pub(super) const COMBINING_MARK: u8 = 5;
+    pub(super) const CONDITIONAL_JAPANESE_STARTER: u8 = 6;
+    pub(super) const HANGUL_JAMO: u8 = 7;
+    pub(super) const OPEN_PUNCTUATION: u8 = 8;
+    pub(super) const CLOSE_PUNCTUATION: u8 = 9;
+    pub(super) const BREAK_SYMBOLS: u8 = 10;
+    pub(super) const INFIX_NUMERIC_SEPARATOR: u8 = 11;
+    pub(super) const PREFIX_NUMERIC: u8 = 12;
+    pub(super) const POSTFIX_NUMERIC: u8 = 13;
+    pub(super) const HYPHEN: u8 = 14;
+    pub(super) const GLUE: u8 = 15;
+    pub(super) const WORD_JOINER: u8 = 16;
+    pub(super) const ZERO_WIDTH_JOINER: u8 = 17;
+    pub(super) const OTHER: u8 = 18;
 }
 
-fn line_break_class(code_point: u32, allow_conditional_japanese_starters: bool) -> u8 {
-    unicode_layout_line_break_class(code_point, allow_conditional_japanese_starters)
+fn line_break_class(code_point: u32) -> u8 {
+    unicode_layout_line_break_class(code_point)
+}
+
+pub(crate) const SOFT_HYPHEN: u16 = 0xad;
+
+/// Whether a line that breaks right after `text[..end]` breaks at a soft hyphen there, and so ends in a hyphen: The
+/// text has to end in a soft hyphen that no whitespace follows, since the line breaks at that whitespace instead.
+pub(crate) fn breaks_at_soft_hyphen(text: &[u16], end: usize) -> bool {
+    end > 0
+        && text[end - 1] == SOFT_HYPHEN
+        && text
+            .get(end)
+            .is_none_or(|&code_unit| !(code_unit < 0x80 && code_point_is_ascii_space(u32::from(code_unit))))
+}
+
+// LibUnicode's JoiningType, in declaration order.
+mod joining_type {
+    pub(super) const NON_JOINING: u8 = 0;
+    pub(super) const TRANSPARENT: u8 = 1;
+    pub(super) const DUAL_JOINING: u8 = 2;
+    pub(super) const JOIN_CAUSING: u8 = 3;
+    pub(super) const LEFT_JOINING: u8 = 4;
+    pub(super) const RIGHT_JOINING: u8 = 5;
+}
+
+fn joining_type(code_point: u32) -> u8 {
+    // OPTIMIZATION: Below U+0300, only U+00AD SOFT HYPHEN takes part in joining, as a transparent character.
+    if code_point < 0x300 && code_point != 0xad {
+        return joining_type::NON_JOINING;
+    }
+    unicode_layout_joining_type(code_point)
+}
+
+/// The joining type of the first character in `text[start..end]` that is not transparent to joining, such as most marks
+/// are, which shaping looks past for the letter that a letter joins.
+fn first_joining_type_in(text: &[u16], start: usize, end: usize) -> u8 {
+    let mut index = start;
+    while index < end {
+        let code_point = code_point_at(text, index);
+        let joining_type = joining_type(code_point);
+        if joining_type != joining_type::TRANSPARENT {
+            return joining_type;
+        }
+        index += code_unit_length_for_code_point(code_point);
+    }
+    joining_type::NON_JOINING
+}
+
+/// Like `first_joining_type_in()`, for the last such character.
+fn last_joining_type_in(text: &[u16], start: usize, end: usize) -> u8 {
+    let mut index = end;
+    while index > start {
+        let joining_type = joining_type(previous_code_point_at(text, &mut index));
+        if joining_type != joining_type::TRANSPARENT {
+            return joining_type;
+        }
+    }
+    joining_type::NON_JOINING
+}
+
+/// Whether the letters at the edges of `range` join the letters of `text` around it, so that shaping the range on its
+/// own gives them the forms they take in the whole text.
+pub(crate) fn joining_context(text: &[u16], range: std::ops::Range<usize>) -> libgfx_rust::text_layout::JoiningContext {
+    use joining_type::*;
+    if range.is_empty() {
+        return Default::default();
+    }
+    let joins_following = |joining_type| matches!(joining_type, DUAL_JOINING | JOIN_CAUSING | LEFT_JOINING);
+    let joins_preceding = |joining_type| matches!(joining_type, DUAL_JOINING | JOIN_CAUSING | RIGHT_JOINING);
+    libgfx_rust::text_layout::JoiningContext {
+        joins_before: joins_preceding(first_joining_type_in(text, range.start, range.end))
+            && joins_following(last_joining_type_in(text, 0, range.start)),
+        joins_after: joins_following(last_joining_type_in(text, range.start, range.end))
+            && joins_preceding(first_joining_type_in(text, range.end, text.len())),
+    }
 }
 
 // Classifies a code point for direction-run splitting: strong LTR/RTL, direction-neutral Common, or ContextDependent
@@ -287,8 +375,13 @@ mod unicode_test_stubs {
     }
 
     #[unsafe(no_mangle)]
-    extern "C" fn unicode_layout_line_break_class(_code_point: u32, _allow_conditional_japanese_starters: bool) -> u8 {
+    extern "C" fn unicode_layout_line_break_class(_code_point: u32) -> u8 {
         unreachable!("no unit test segments text");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_layout_joining_type(_code_point: u32) -> u8 {
+        unreachable!("no unit test shapes text");
     }
 
     #[unsafe(no_mangle)]
@@ -317,6 +410,8 @@ pub(crate) struct TextChunkInputs<'text> {
     pub word_break: u8,
     pub line_break: u8,
     pub line_break_language: LineBreakLanguage,
+    /// Whether a soft hyphen (U+00AD) gives a soft wrap opportunity after it, which it does unless hyphens is none.
+    pub breaks_after_soft_hyphen: bool,
     pub font_variant_emoji: u8,
     pub should_wrap_lines: bool,
     pub should_respect_linebreaks: bool,
@@ -781,6 +876,7 @@ pub(crate) fn trailing_regional_indicator_count(text: &[u16]) -> usize {
 /// of two text nodes that follow each other on a line. `code_unit_before` is the last code unit of the text before
 /// `before`, if any. `regional_indicators_before` is the number of regional indicators that end `before`, including
 /// any in text before it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn soft_wrap_opportunity_between(
     before: &[u16],
     after: &[u16],
@@ -789,10 +885,14 @@ pub(crate) fn soft_wrap_opportunity_between(
     word_break: u8,
     line_break: u8,
     line_break_language: LineBreakLanguage,
+    breaks_after_soft_hyphen: bool,
 ) -> bool {
     let (Some(&last), Some(&first)) = (before.last(), after.first()) else {
         return false;
     };
+    if last == SOFT_HYPHEN && !breaks_after_soft_hyphen {
+        return false;
+    }
     // NB: Whitespace gives its own soft wrap opportunities.
     if (last <= 0x7f && code_point_is_ascii_space(u32::from(last)))
         || (first <= 0x7f && code_point_is_ascii_space(u32::from(first)))
@@ -831,7 +931,94 @@ pub(crate) fn soft_wrap_opportunity_between(
     {
         return is_boundary;
     }
-    LineBreaker::new(&text, word_break, line_break, line_break_language).is_at_line_break_opportunity(boundary)
+    // https://drafts.csswg.org/css-text-3/#text-encoding
+    // [...] intervening inline box boundaries and out-of-flow elements must be ignored.
+    // NB: The chunker of a single text only looks for soft wrap opportunities between grapheme clusters, so there is
+    //     none inside a grapheme cluster that spans two texts either.
+    if GraphemeSegmenter::new(&text).next_boundary(boundary, true) != Some(boundary) {
+        return false;
+    }
+    LineBreaker::new(
+        &text,
+        word_break,
+        line_break,
+        line_break_language,
+        breaks_after_soft_hyphen,
+    )
+    .is_at_line_break_opportunity(boundary)
+}
+
+/// Whether there is a soft wrap opportunity between an atomic inline and the text after it.
+pub(crate) fn soft_wrap_opportunity_after_atomic_inline(after: &[u16]) -> bool {
+    let Some(&first) = after.first() else {
+        return false;
+    };
+    // NB: Whitespace gives its own soft wrap opportunities.
+    if first <= 0x7f && code_point_is_ascii_space(u32::from(first)) {
+        return false;
+    }
+    // https://drafts.csswg.org/css-text-3/#line-break-details
+    // [...] with the exception of U+00A0 NO-BREAK SPACE, there must be no soft wrap opportunity between atomic inlines
+    // and adjacent characters belonging to the Unicode GL, WJ, or ZWJ line breaking classes.
+    // AD-HOC: A combining mark stays with the atomic inline, as UAX #14 keeps it with any character before it, rather
+    //         than start the next line on its own.
+    let code_point = code_point_at(after, 0);
+    code_point == 0x00A0
+        || !matches!(
+            line_break_class(code_point),
+            line_break_class::GLUE
+                | line_break_class::WORD_JOINER
+                | line_break_class::ZERO_WIDTH_JOINER
+                | line_break_class::COMBINING_MARK
+        )
+}
+
+/// Whether `word-break: break-all` has a soft wrap opportunity between two characters that `word-break: normal` lacks.
+fn break_all_adds_soft_wrap_opportunity(before: u32, after: u32, line_break: u8) -> bool {
+    use line_break_class::*;
+    // https://drafts.csswg.org/css-text-3/#valdef-word-break-break-all
+    // Breaking is allowed within “words”: specifically, in addition to soft wrap opportunities allowed for normal, any
+    // typographic letter units (and any typographic character units resolving to the NU (“numeric”), AL
+    // (“alphabetic”), or SA (“Southeast Asian”) line breaking classes [UAX14]) are instead treated as ID (“ideographic
+    // characters”) for the purpose of line-breaking.
+    let is_treated_as_ideographic = |class| {
+        matches!(
+            class,
+            ALPHABETIC
+                | NUMERIC
+                | AMBIGUOUS
+                | COMPLEX_CONTEXT
+                | IDEOGRAPHIC
+                | CONDITIONAL_JAPANESE_STARTER
+                | HANGUL_JAMO
+        )
+    };
+    let before_class = line_break_class(before);
+    let after_class = line_break_class(after);
+    // NB: Treating a character as ID only adds soft wrap opportunities next to the classes that UAX #14 keeps with AL,
+    //     HL or NU but not with ID.
+    match (
+        is_treated_as_ideographic(before_class),
+        is_treated_as_ideographic(after_class),
+    ) {
+        (true, true) => true,
+        (true, false) => {
+            matches!(after_class, OPEN_PUNCTUATION | PREFIX_NUMERIC)
+                // https://drafts.csswg.org/css-text-3/#line-break-property
+                // The following breaks are allowed for loose line breaking if the preceding character belongs to the
+                // Unicode line breaking class ID [UAX14] (including when the preceding character is treated as ID due
+                // to word-break: break-all), and are otherwise forbidden:
+                // - breaks before hyphens: ‐ U+2010, – U+2013
+                || (line_break == line_break::LOOSE && matches!(after, 0x2010 | 0x2013))
+        }
+        (false, true) => {
+            matches!(
+                before_class,
+                CLOSE_PUNCTUATION | BREAK_SYMBOLS | INFIX_NUMERIC_SEPARATOR | POSTFIX_NUMERIC
+            ) || (before_class == HYPHEN && after_class == NUMERIC)
+        }
+        (false, false) => false,
+    }
 }
 
 /// Finds the soft wrap opportunities of a text.
@@ -839,31 +1026,40 @@ struct LineBreaker<'text> {
     text: &'text [u16],
     line_segmenter: LineSegmenter<'text>,
     word_break: u8,
-    allow_conditional_japanese_starters: bool,
+    line_break: u8,
+    breaks_after_soft_hyphen: bool,
 }
 
 impl<'text> LineBreaker<'text> {
-    fn new(text: &'text [u16], word_break: u8, line_break: u8, line_break_language: LineBreakLanguage) -> Self {
+    fn new(
+        text: &'text [u16],
+        word_break: u8,
+        line_break: u8,
+        line_break_language: LineBreakLanguage,
+        breaks_after_soft_hyphen: bool,
+    ) -> Self {
         Self {
             text,
             line_segmenter: LineSegmenter::new(text, line_break, line_break_language),
             word_break,
-            // NB: Apply CJ tailoring to word-break classification as well as to ICU's line segmenter.
-            allow_conditional_japanese_starters: matches!(line_break, line_break::NORMAL | line_break::LOOSE),
+            line_break,
+            breaks_after_soft_hyphen,
         }
     }
 
     fn is_at_line_break_opportunity(&self, index: usize) -> bool {
+        // https://drafts.csswg.org/css-text-3/#valdef-hyphens-none
+        // Words are not hyphenated, even if characters inside the word explicitly define hyphenation opportunities.
+        if !self.breaks_after_soft_hyphen && index > 0 && self.text.get(index - 1) == Some(&SOFT_HYPHEN) {
+            return false;
+        }
         let get_previous_code_point = || -> Option<u32> {
             if index == 0 {
                 return None;
             }
             let mut index = index;
             let mut previous_code_point = previous_code_point_at(self.text, &mut index);
-            while line_break_class(previous_code_point, self.allow_conditional_japanese_starters)
-                == line_break_class::COMBINING_MARK
-                && index > 0
-            {
+            while line_break_class(previous_code_point) == line_break_class::COMBINING_MARK && index > 0 {
                 previous_code_point = previous_code_point_at(self.text, &mut index);
             }
             Some(previous_code_point)
@@ -884,16 +1080,12 @@ impl<'text> LineBreaker<'text> {
                 if index >= self.text.len() {
                     return false;
                 }
-                use line_break_class::*;
-                let breaks_anywhere = |code_point| {
-                    matches!(
-                        line_break_class(code_point, self.allow_conditional_japanese_starters),
-                        ALPHABETIC | NUMERIC | COMPLEX_CONTEXT | IDEOGRAPHIC
-                    )
-                };
                 if let Some(previous_code_point) = get_previous_code_point()
-                    && breaks_anywhere(previous_code_point)
-                    && breaks_anywhere(code_point_at(self.text, index))
+                    && break_all_adds_soft_wrap_opportunity(
+                        previous_code_point,
+                        code_point_at(self.text, index),
+                        self.line_break,
+                    )
                 {
                     return true;
                 }
@@ -904,11 +1096,16 @@ impl<'text> LineBreaker<'text> {
                     return false;
                 }
                 use line_break_class::*;
-                let keeps_together = |code_point| {
-                    matches!(
-                        line_break_class(code_point, self.allow_conditional_japanese_starters),
-                        ALPHABETIC | NUMERIC | AMBIGUOUS | IDEOGRAPHIC
-                    )
+                // https://drafts.csswg.org/css-text-3/#valdef-word-break-keep-all
+                // Breaking is forbidden within “words”: implicit soft wrap opportunities between typographic letter
+                // units (or other typographic character units belonging to the NU, AL, AI, or ID Unicode line breaking
+                // classes [UAX14]) are suppressed, [...]
+                // NB: A letter in a class of its own, such as the iteration mark U+3005 (class NS), is a typographic
+                //     letter unit too.
+                let keeps_together = |code_point| match line_break_class(code_point) {
+                    ALPHABETIC | NUMERIC | AMBIGUOUS | IDEOGRAPHIC | CONDITIONAL_JAPANESE_STARTER | HANGUL_JAMO => true,
+                    OTHER => super::tree_builder::ladybird_layout_code_point_category_facts(code_point).is_letter,
+                    _ => false,
                 };
                 if let Some(previous_code_point) = get_previous_code_point()
                     && keeps_together(previous_code_point)
@@ -968,6 +1165,7 @@ impl<'text> TextChunker<'text> {
                 inputs.word_break,
                 inputs.line_break,
                 inputs.line_break_language,
+                inputs.breaks_after_soft_hyphen,
             ),
             font_variant_emoji: inputs.font_variant_emoji,
             should_collapse_whitespace: matches!(
@@ -1389,6 +1587,7 @@ pub(crate) fn text_chunks(
         } else {
             LineBreakLanguage::Other
         },
+        breaks_after_soft_hyphen: parent_style.hyphens() != hyphens::NONE,
         font_variant_emoji: parent_style.font_variant_emoji(),
         frozen_font_list: crate::css::style::pointer_key::PointerLookup::new(counted_frozen_font_list, ()),
         frozen_font_list_fill_generation: frozen_font_list.fill_generation(),
@@ -1407,6 +1606,7 @@ pub(crate) fn text_chunks(
             word_break: key.word_break,
             line_break: key.line_break,
             line_break_language: key.line_break_language,
+            breaks_after_soft_hyphen: key.breaks_after_soft_hyphen,
             font_variant_emoji: key.font_variant_emoji,
             should_wrap_lines,
             should_respect_linebreaks,

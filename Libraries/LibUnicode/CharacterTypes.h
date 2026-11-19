@@ -76,16 +76,39 @@ enum class BidiClass {
 BidiClass bidirectional_class(u32 code_point);
 
 enum class LineBreakClass {
-    Alphabetic,     // AL
-    Numeric,        // NU
-    Ideographic,    // ID
-    Ambiguous,      // AI
-    ComplexContext, // SA
-    CombiningMark,  // CM
+    Alphabetic,                 // AL
+    Numeric,                    // NU
+    Ideographic,                // ID
+    Ambiguous,                  // AI
+    ComplexContext,             // SA
+    CombiningMark,              // CM
+    ConditionalJapaneseStarter, // CJ
+    HangulJamo,                 // JL, JV, JT
+    OpenPunctuation,            // OP
+    ClosePunctuation,           // CL, CP
+    BreakSymbols,               // SY
+    InfixNumericSeparator,      // IS
+    PrefixNumeric,              // PR
+    PostfixNumeric,             // PO
+    Hyphen,                     // HY
+    Glue,                       // GL
+    WordJoiner,                 // WJ
+    ZeroWidthJoiner,            // ZWJ
     Other,
 };
 
 LineBreakClass line_break_class(u32 code_point);
+
+enum class JoiningType {
+    NonJoining,   // U
+    Transparent,  // T
+    DualJoining,  // D
+    JoinCausing,  // C
+    LeftJoining,  // L
+    RightJoining, // R
+};
+
+JoiningType joining_type(u32 code_point);
 
 struct CodePointRange {
     u32 from { 0 };

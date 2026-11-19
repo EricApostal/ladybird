@@ -23,22 +23,31 @@ public:
     }
 
 private:
-    virtual void install(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores) override
+    // The UI imports these images, so they're checked here first: A publication the UI would refuse is refused here as
+    // well, and never sent, so both come to the same result.
+    virtual ErrorOr<void> install(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores) override
     {
+        TRY(check_installed_backing_stores(backing_stores));
         track_installed_backing_stores(bitmap_ids);
         if (auto* ui = ConnectionFromUI::the())
             ui->async_view_install_backing_stores(m_view.view_id(), m_view.page().id().value(), move(bitmap_ids), move(backing_stores));
+        m_view.did_install_backing_stores_in_ui();
+        return {};
     }
 
-    virtual void add(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores) override
+    virtual ErrorOr<void> add(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores) override
     {
+        TRY(check_added_backing_stores(backing_stores));
         track_added_backing_stores(bitmap_ids);
         if (auto* ui = ConnectionFromUI::the())
             ui->async_view_add_backing_stores(m_view.view_id(), move(bitmap_ids), move(backing_stores));
+        return {};
     }
 
     virtual void retire(ReadonlySpan<i32> bitmap_ids) override
     {
+        if (refuses_backing_stores())
+            return;
         PageBackingStores::retire(bitmap_ids);
         if (auto* ui = ConnectionFromUI::the()) {
             Vector<i32> retired_bitmap_ids;
@@ -47,8 +56,14 @@ private:
         }
     }
 
+    // The UI hands back the backing stores it presents from, other than those of a refused installation, which it never
+    // got: Those go straight back from here.
     virtual PresentationResult present(i32 bitmap_id, Gfx::IntSize size, double device_pixel_ratio) override
     {
+        if (refuses_backing_stores()) {
+            m_view.page().release_presented_bitmap(bitmap_id);
+            return { .did_swap = false, .bitmap_id_to_release = bitmap_id };
+        }
         auto result = PageBackingStores::present(bitmap_id, size, device_pixel_ratio);
         if (auto* ui = ConnectionFromUI::the())
             ui->async_view_present_backing_store(m_view.view_id(), m_view.page().id().value(), bitmap_id, size, device_pixel_ratio);
@@ -88,6 +103,8 @@ View::View(InitialState initial_state)
     m_device_pixel_ratio = initial_state.device_pixel_ratio;
     m_maximum_frames_per_second = initial_state.maximum_frames_per_second;
     m_display_id = initial_state.display_id;
+    m_screen_shows_high_dynamic_range = initial_state.screen_shows_high_dynamic_range;
+    set_scales_frames_to_fit(initial_state.scales_frames_to_fit);
     m_backing_stores = make<BackingStoresInUI>(*this);
     forward_callbacks_to_ui(initial_state.is_tab);
 
@@ -110,6 +127,7 @@ View::InitialState View::initial_state_for_related_view() const
         .device_pixel_ratio = device_pixel_ratio(),
         .maximum_frames_per_second = maximum_frames_per_second(),
         .display_id = display_id(),
+        .screen_shows_high_dynamic_range = m_screen_shows_high_dynamic_range,
         .system_theme = m_system_theme,
         .screen_rects = m_screen_rects,
         .owner_view_id = {},
@@ -645,6 +663,7 @@ ViewState View::current_state() const
     state.crash_report_name = crash_report_name();
     state.crash_report_website = crash_report_website();
     state.crash_overlay_failed_url = crash_overlay_failed_url();
+    state.crash_overlay_is_for_memory_limit = crash_overlay_is_for_memory_limit();
     state.host_for_settings = current_host_for_settings();
     state.can_report_website_issue = can_report_website_issue();
     state.can_undo = can_undo();
@@ -684,6 +703,41 @@ void View::did_accept_presented_backing_store(i32 bitmap_id, Gfx::IntRect damage
 {
     if (auto* ui = ConnectionFromUI::the())
         ui->async_view_accept_presented_backing_store(view_id(), bitmap_id, damage_rect);
+}
+
+void View::did_create_remote_layer(Compositing::RemoteLayerHostHandle host_handle)
+{
+    m_ui_hosts_remote_layer = host_handle.kind != Compositing::RemoteLayerHostKind::None;
+    m_ui_awaits_first_frame_in_remote_layer = m_ui_hosts_remote_layer;
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_set_remote_layer(view_id(), host_handle);
+}
+
+// The UI shows the backing stores it was given, as when a page from another process comes to display the tab, until it
+// hears of a frame shown in the remote layer again.
+void View::did_install_backing_stores_in_ui()
+{
+    m_ui_awaits_first_frame_in_remote_layer = m_ui_hosts_remote_layer;
+}
+
+void View::did_present_frame_in_remote_layer(Gfx::IntSize size, double device_pixel_ratio)
+{
+    if (!exchange(m_ui_awaits_first_frame_in_remote_layer, false) && !m_wants_frame_notifications)
+        return;
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_did_present_frame_in_remote_layer(view_id(), size, device_pixel_ratio);
+}
+
+void View::did_hold_synchronized_resize_frame(u64 token)
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_did_hold_synchronized_resize_frame(view_id(), token);
+}
+
+void View::did_commit_synchronized_resize(u64 token)
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_did_commit_synchronized_resize(view_id(), token);
 }
 
 void View::prepare_page_for_navigable(WebView::WebContentPage& page)

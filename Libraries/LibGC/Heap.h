@@ -85,10 +85,27 @@ public:
     //     they are in the frame it runs in, and the frames below become the scan's floor. The definitions are
     //     NO_SANITIZE_ADDRESS so that the capture buffer stays on the real stack rather than ASan's fake one.
     NEVER_INLINE void collect_garbage(CollectionType = CollectionType::CollectGarbage, bool print_report = false);
+
+    // Collects garbage and gives the memory that this frees back to the system before it returns. Otherwise the sweep
+    // happens bit by bit after a collection, and the freed memory goes back to the system some time after that. For a
+    // process that is short of memory now.
+    void collect_garbage_and_return_memory_to_system();
+
+    // Collects without taking any root from the stack or the registers, so no stale or lookalike word there keeps a
+    // cell alive. Only safe where every cell the stack refers to is rooted some other way, as in the outermost turn of
+    // the event loop.
+    void collect_garbage_without_scanning_the_stack();
+
+    // Tells the heap that no frame on the stack of the outermost turn of this thread's event loop holds the only
+    // reference to a cell. The collections that the heap starts from its own timers then leave the stack out when they
+    // run in that turn. Only the embedder can promise this, since those frames include its own, like main().
+    void set_outermost_event_loop_turn_holds_no_cells(bool value) { m_outermost_event_loop_turn_holds_no_cells = value; }
     NEVER_INLINE AK::JsonObject dump_graph();
 
-    // A cell on a retaining path, which reaches the next one through a field it visits.
+    // A cell on a retaining path, which reaches the next one through a field it visits. The cell is live until the next
+    // garbage collection at least.
     struct RetainingPathStep {
+        RawPtr<Cell> cell;
         StringView class_name;
     };
     struct RetainingPath {
@@ -108,6 +125,12 @@ public:
     bool should_collect_on_every_allocation() const { return m_should_collect_on_every_allocation; }
     // This is true for any CollectEverything cycle, not only heap teardown.
     bool is_collecting_everything() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectEverything; }
+    // Whether a collection that marks the live cells runs, as opposed to one that only sweeps or a graph dump.
+    bool is_marking_for_collection() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectGarbage; }
+
+    // Whether collect_garbage_and_return_memory_to_system() runs, so that what hangs off the heap can let go of more
+    // than it does in other collections.
+    bool is_returning_memory_to_system() const { return m_is_returning_memory_to_system; }
 
     void set_incremental_sweep_enabled(bool enabled) { m_incremental_sweep_enabled = enabled; }
     void set_should_collect_on_every_allocation(bool);
@@ -264,7 +287,7 @@ private:
     void will_allocate(size_t, TriggersCollection = TriggersCollection::Yes);
     void update_allocation_rate();
     double next_growth_factor(size_t live_cell_bytes);
-    void update_gc_bytes_threshold(size_t live_external_bytes);
+    void update_gc_bytes_threshold();
     void limit_gc_bytes_threshold_for_abandoned_object_graph();
 
     enum class IncludeIncomingCrossHeapMembers {
@@ -277,12 +300,13 @@ private:
     struct ConservativeScanOrigin {
         FlatPtr stack_floor { 0 };
         ReadonlySpan<FlatPtr> callee_saved_registers;
+        bool scan_stack { true };
     };
 
     // NB: NEVER_INLINE so that these stay below their entry point's frame, and so that __builtin_frame_address(0)
     //     yields a floor that leaves out their own frames -- which is what keeps the collection's large locals from
     //     being scanned.
-    NEVER_INLINE void run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType, bool print_report);
+    NEVER_INLINE void run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType, bool print_report, bool scan_stack = true);
     NEVER_INLINE AK::JsonObject build_graph(ReadonlySpan<FlatPtr> callee_saved_registers);
     NEVER_INLINE Vector<RetainingPath> build_retaining_paths(ReadonlySpan<FlatPtr> callee_saved_registers, AK::Function<bool(Cell&)> const& is_target, size_t max_paths);
 
@@ -302,6 +326,7 @@ private:
     void start_incremental_sweep();
     void finish_incremental_sweep();
     void finish_pending_incremental_sweep();
+    void sweep_in_step_with_allocation();
     void start_incremental_sweep_timer();
     void stop_incremental_sweep_timer();
     void sweep_on_timer();
@@ -310,6 +335,7 @@ private:
     void idle_gc_on_timer();
     void on_abandoned_object_graph_timer();
     void schedule_release_of_abandoned_object_graph_memory();
+    void schedule_release_of_allocator_memory();
 
     struct Stats {
         AK_ALLOC_WITH_KMALLOC;
@@ -343,12 +369,14 @@ private:
     HashTable<CrossHeapMemberBase*> m_incoming_cross_heap_members;
     HeapGroup* m_group { nullptr };
     bool m_incremental_sweep_enabled { true };
+    bool m_is_returning_memory_to_system { false };
     WeakContainer::List m_weak_containers;
 
     Vector<Ptr<Cell>> m_uprooted_cells;
 
     size_t m_gc_deferrals { 0 };
     bool m_should_gc_when_deferral_ends { false };
+    bool m_should_return_memory_when_deferral_ends { false };
 
     bool m_collecting_garbage { false };
     bool m_weak_pointers_to_dead_cells_are_cleared { false };
@@ -367,13 +395,17 @@ private:
 
     bool m_incremental_sweep_active { false };
     size_t m_block_sweeps_in_progress { 0 };
+    size_t m_blocks_to_sweep { 0 };
+    size_t m_blocks_swept { 0 };
     size_t m_marked_cell_bytes { 0 };
-    size_t m_sweep_live_external_bytes { 0 };
+    size_t m_marked_external_bytes { 0 };
     Vector<GC::Ptr<Cell>> m_cells_allocated_during_sweep;
     CellAllocator::SweepList m_allocators_to_sweep;
     RefPtr<Core::Timer> m_incremental_sweep_timer;
 
     RefPtr<Core::Timer> m_idle_gc_timer;
+    bool m_outermost_event_loop_turn_holds_no_cells { false };
+    void collect_garbage_from_timer();
     enum class AbandonedObjectGraphState : u8 {
         None,
         WaitingToCollect,
@@ -381,6 +413,7 @@ private:
     };
     AbandonedObjectGraphState m_abandoned_object_graph_state { AbandonedObjectGraphState::None };
     RefPtr<Core::Timer> m_abandoned_object_graph_timer;
+    RefPtr<Core::Timer> m_allocator_memory_release_timer;
     u64 m_total_allocated_bytes { 0 };
     // The context a heap created through LibGC/CAPI.h was created with.
     void* m_foreign_context { nullptr };

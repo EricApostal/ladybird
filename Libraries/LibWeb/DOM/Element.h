@@ -11,6 +11,7 @@
 #include <AK/Concepts.h>
 #include <AK/Error.h>
 #include <AK/Optional.h>
+#include <AK/Time.h>
 #include <AK/Utf16String.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/DecodedImageFrame.h>
@@ -46,7 +47,6 @@
 namespace Web::Animations {
 
 struct AnimationUpdateContext;
-class KeyframeEffect;
 
 }
 
@@ -107,7 +107,12 @@ namespace Web::DOM {
 
 using ScrollIntoViewTarget = Variant<Element*, Range*>;
 
-void scroll_a_target_into_view(Layout::BegunRead const&, ScrollIntoViewTarget, Bindings::ScrollBehavior, Bindings::ScrollLogicalPosition block, Bindings::ScrollLogicalPosition inline_, GC::Ptr<Element> container = nullptr, GC::Ptr<WebIDL::Promise> promise = nullptr);
+enum class ScrollIntoViewMode {
+    Always,
+    IfNeeded,
+};
+
+void scroll_a_target_into_view(Layout::BegunRead const&, ScrollIntoViewTarget, Bindings::ScrollBehavior, Bindings::ScrollLogicalPosition block, Bindings::ScrollLogicalPosition inline_, GC::Ptr<Element> container = nullptr, GC::Ptr<WebIDL::Promise> promise = nullptr, ScrollIntoViewMode = ScrollIntoViewMode::Always);
 
 // https://html.spec.whatwg.org/multipage/custom-elements.html#upgrade-reaction
 // An upgrade reaction, which will upgrade the custom element and contains a custom element definition; or
@@ -326,8 +331,8 @@ public:
     WebIDL::ExceptionOr<void> attach_a_shadow_root(ShadowRootMode mode, bool clonable, bool serializable, bool delegates_focus, SlotAssignmentMode slot_assignment, GC::Ptr<HTML::CustomElementRegistry> registry);
     GC::Ptr<ShadowRoot> open_shadow_root() const;
 
-    WebIDL::ExceptionOr<bool> matches(Utf16View selectors) const;
-    WebIDL::ExceptionOr<DOM::Element const*> closest(Utf16View selectors) const;
+    WebIDL::ExceptionOr<bool> matches(Utf16String const& selectors) const;
+    WebIDL::ExceptionOr<DOM::Element const*> closest(Utf16String const& selectors) const;
 
     int client_top() const;
     int client_left() const;
@@ -362,6 +367,9 @@ public:
     // elements keep 0, which is what makes them free.
     [[nodiscard]] CSS::StyleNodeID style_node_id() const { return m_style_node_id; }
     void set_style_node_id(CSS::StyleNodeID);
+
+    GC::Ptr<Element> implicit_anchor_element() const;
+    void set_implicit_anchor_element(GC::Ptr<Element>);
     // Tells the hover of the render clock what link this element is, as its href or style node changed.
     void update_hover_link();
     void record_style_environment_change();
@@ -427,11 +435,12 @@ public:
     // Composes the style records swapped in for those of the element's pseudo-elements the `composed` mask names, a
     // bit at each kind: applies the plan each record decides, samples the animations over it, and runs the transition
     // step for those the `transition_steps` mask names, against the record each held before, which
-    // `before_change_style_records` names in the order of `computed_pseudo_elements`.
-    CSS::RequiredInvalidationAfterStyleChange compose_style_pseudo_element_records(Layout::BegunRead const& read, u16 composed, u16 transition_steps, Array<CSS::InstalledStyle, computed_pseudo_elements.size()> const& before_change_styles);
+    // `before_change_style_records` names in the order of `computed_pseudo_elements`. A pseudo-element the
+    // `displayed_before` mask names, which was displayed before its record was swapped in, ends the CSS animations and
+    // transitions it owns where the record is `display: none`.
+    CSS::RequiredInvalidationAfterStyleChange compose_style_pseudo_element_records(Layout::BegunRead const& read, u16 composed, u16 transition_steps, Array<CSS::InstalledStyle, computed_pseudo_elements.size()> const& before_change_styles, u16 displayed_before);
 
     void set_needs_layout_tree_rebuild(Layout::BegunRead const& read, SetNeedsLayoutTreeUpdateReason, CSS::LayoutTreeRebuildRoot);
-    bool apply_box_presence_change_in_place(Layout::BegunRead const& read, SetNeedsLayoutTreeUpdateReason);
 
     Optional<CSS::PseudoElement> associated_shadow_host_pseudo_element() const;
     void set_associated_shadow_host_pseudo_element(CSS::PseudoElement pseudo_element);
@@ -483,8 +492,8 @@ public:
     void refresh_computed_style(Layout::BegunRead const&, Optional<CSS::PseudoElement>, CSS::InstalledStyle);
     // Install the custom properties beside a pseudo-element record the style engine derived.
     void install_engine_pseudo_element_custom_property_data(Layout::BegunRead const& read, CSS::PseudoElement, u64 environment);
-    void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, Optional<CSS::PseudoElement>, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
-    void update_animated_properties_for_abstract_element(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
+    void update_animated_properties(Badge<Web::Animations::EffectRef> const&, Optional<CSS::PseudoElement>, Web::Animations::EffectRef const&, Web::Animations::AnimationUpdateContext&);
+    void update_animated_properties_for_abstract_element(Badge<Web::Animations::EffectRef> const&, DOM::AbstractElement, Web::Animations::EffectRef const&, Web::Animations::AnimationUpdateContext&);
 
     Optional<SyntheticPseudoElement&> get_synthetic_pseudo_element(CSS::PseudoElement) const;
     Optional<PseudoElement&> get_pseudo_element(CSS::PseudoElement) const;
@@ -696,7 +705,8 @@ public:
     [[nodiscard]] Vector<CSSPixelRect> get_client_rects() const;
 
     [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean() const;
-    [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean(Layout::BegunRead const& read, Compositing::AccumulatedVisualContextTree const&) const;
+    // The same, with the compositor's animations sampled at the time, as the screen shows them then.
+    [[nodiscard]] CSSPixelRect bounding_client_rect_assuming_layout_clean(Layout::BegunRead const& read, MonotonicTime visual_animation_sample_time) const;
 
     // Which principal box this element asks for, before its computed style has a say.
     virtual CSS::ElementBoxKind box_kind() const;
@@ -721,7 +731,6 @@ public:
         Yes,
     };
     bool is_potentially_scrollable(TreatOverflowClipOnBodyParentAsOverflowHidden) const;
-    bool is_scroll_container() const;
     bool is_viewport_propagation_source() const;
 
     double scroll_top() const;
@@ -744,7 +753,7 @@ public:
 
     // https://w3c.github.io/csswg-drafts/cssom-view-1/#dom-element-scrollintoview
     void scroll_into_view(Variant<bool, ScrollIntoViewOptions> const&, GC::Ptr<WebIDL::Promise>);
-    void scroll_into_view(ScrollIntoViewOptions const&, GC::Ptr<WebIDL::Promise>);
+    void scroll_into_view(ScrollIntoViewOptions const&, GC::Ptr<WebIDL::Promise>, ScrollIntoViewMode = ScrollIntoViewMode::Always);
 
     // https://www.w3.org/TR/wai-aria-1.2/#ARIAMixin
 #define __ENUMERATE_ARIA_ATTRIBUTE(name, attribute)      \
@@ -979,6 +988,7 @@ protected:
     struct RareData;
 
 private:
+    void publish_implicit_anchor_element();
     void bump_dom_tree_version_for_attribute_change();
     void clear_custom_highlight_styles();
     // The attributes of an element, in order, in the same allocation as their count and capacity.
@@ -1201,7 +1211,7 @@ enum class ValidateAndExtractError : u8 {
     XMLNSNamespaceWithoutXMLNSPrefix,
 };
 
-ErrorOr<QualifiedName, ValidateAndExtractError> validate_and_extract(Optional<FlyString> namespace_, FlyString const& qualified_name, ValidationContext context);
+ErrorOr<QualifiedName, ValidateAndExtractError> validate_and_extract(Optional<Utf16FlyString> namespace_, Utf16FlyString const& qualified_name, ValidationContext context);
 GC::Ref<WebIDL::DOMException> validate_and_extract_error_to_dom_exception(ValidateAndExtractError);
 
 }

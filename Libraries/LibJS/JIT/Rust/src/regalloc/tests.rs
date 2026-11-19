@@ -67,14 +67,14 @@ fn straight_line_code() {
         &dump_allocation(&graph, &allocation),
         "
         b0:
-          v0 Jump
+          v6 LoadSlot -> r0
+          v7 Jump
         b1:
-          v5 LoadSlot -> r0
-          v9 InitializeFrame temps r1, r2
-          v6 CallSlowPath (#10, r0) -> r0
-          v7 EmptyToUndefined (r0) -> r1
+          v14 InitializeFrame temps r1, r2
+          v11 CallSlowPath (#10, r0) -> r0
+          v12 EmptyToUndefined (r0) -> r1
           moves r1 -> r0
-          v8 Return (r0)
+          v13 Return (r0)
         spill slots: 0
         ",
     );
@@ -82,17 +82,54 @@ fn straight_line_code() {
 
 #[test]
 fn values_live_across_calls_are_spilled_at_their_definition() {
+    // NB: The argument is written later, so its frame slot is no home for the value loaded from it.
     let program = assemble(|_| {
         vec![
             Instruction::Mov { dst: r(6), src: a(0) },
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(7),
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                expression_string: None,
+                arguments: vec![r(6)],
+            },
+            Instruction::Mov { dst: a(0), src: r(7) },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let graph = build(&program);
+    let allocation = allocate_and_verify(&graph);
+    let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
+    assert_eq!(frame_home(&graph, argument), None);
+    assert!(allocation.node(argument).spill_slot.is_some());
+    assert_text(
+        &dump_allocation(&graph, &allocation),
+        "
+        b0:
+          v6 LoadSlot -> r0
+          v7 LoadSlot -> r1 spill s0
+          v8 Jump
+        b1:
+          v9 CallSlowPath (r0, r0, r1) -> r0 exit {6=s0}
+          moves s0 -> r0
+          v10 Return (r0)
+        spill slots: 1
+        ",
+    );
+}
+
+#[test]
+fn values_loaded_from_unwritten_slots_are_reloaded_from_the_frame() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Mov { dst: r(6), src: a(0) },
+            Instruction::Call {
+                call_feedback: 0,
+                dst: r(7),
+                callee: r(5),
+                this_value: r(5),
+                argument_count: 1,
                 arguments: vec![r(6)],
             },
             Instruction::Return { value: r(6) },
@@ -101,19 +138,20 @@ fn values_live_across_calls_are_spilled_at_their_definition() {
     let graph = build(&program);
     let allocation = allocate_and_verify(&graph);
     let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
-    assert!(allocation.node(argument).spill_slot.is_some());
+    assert_eq!(frame_home(&graph, argument), Some(a(0).raw()));
+    assert_eq!(allocation.node(argument).spill_slot, None);
     assert_text(
         &dump_allocation(&graph, &allocation),
         "
         b0:
-          v0 Jump
+          v6 LoadSlot -> r0
+          v7 LoadSlot -> r1
+          v8 Jump
         b1:
-          v1 LoadSlot -> r0 spill s0
-          v2 LoadSlot -> r1
-          v3 CallSlowPath (r1, r1, r0) -> r0 exit {6=s0}
-          moves s0 -> r0
-          v4 Return (r0)
-        spill slots: 1
+          v9 CallSlowPath (r0, r0, r1) -> r0 exit {6=frame12}
+          moves frame12 -> r0
+          v10 Return (r0)
+        spill slots: 0
         ",
     );
 }
@@ -251,34 +289,34 @@ fn swapping_loop_phis_go_through_a_temp_slot() {
         &dump_allocation(&graph, &allocation),
         "
         b0:
-          v0 Jump
+          v6 Jump
         b1:
           moves #0 -> r0, #10 -> r1
-          v6 Jump
-        b2:
-          v7 Phi -> r0
-          v8 Phi -> r1
-          v9 BranchTruthy (r0)
-        b3:
-          v10 Jump
-        b4:
           v11 Jump
+        b2:
+          v12 Phi -> r0
+          v13 Phi -> r1
+          v14 BranchTruthy (r0)
+        b3:
+          v15 Jump
+        b4:
+          v16 Jump
         b5:
           moves r0 -> r1
-          v12 ToBoolean (r1) -> r0
-          v13 Branch (r0)
+          v17 ToBoolean (r1) -> r0
+          v18 Branch (r0)
         b6:
           moves s0 -> r0, s1 -> r1
-          v14 Jump
+          v19 Jump
         b7:
           moves s1 -> r1
-          v15 Jump
+          v20 Jump
         b8:
           moves r1 -> r0
-          v16 Return (r0)
+          v21 Return (r0)
         b9:
           moves r0 -> s2, r1 -> r0, s2 -> r1
-          v17 Jump
+          v22 Jump
         spill slots: 3
         ",
     );
@@ -404,13 +442,11 @@ fn loops_leave_the_values_they_only_carry_through_in_their_stack_slots() {
             xor(4, r(9), r(8), argument),
             xor(14, r(11), r(9), argument),
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(14),
                 callee: r(15),
                 this_value: r(15),
                 argument_count: 0,
-                expression_string: None,
                 arguments: vec![],
             },
             xor(5, r(10), r(5), r(6)),
@@ -522,6 +558,116 @@ fn int32_operations_write_over_their_first_input_where_it_dies() {
 }
 
 #[test]
+fn shift_amounts_are_in_the_targets_shift_register_or_immediates() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::BitwiseXorRhsInt32 {
+                arith_feedback: 2,
+                dst: r(4),
+                lhs: a(0),
+                rhs: 5,
+            },
+            Instruction::LeftShift {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: r(4),
+            },
+            Instruction::RightShiftRhsInt32 {
+                arith_feedback: 1,
+                dst: r(6),
+                lhs: r(5),
+                rhs: 3,
+            },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, crate::bytecode::test_support::test_layout());
+    snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::INT32; 3];
+    let graph = crate::builder::tests::optimized_graph(&snapshot);
+    let shift = |op| find_node(&graph, |node| node.op == Op::Int32Binary { op });
+    let (variable, constant) = (
+        shift(crate::ir::BinaryOp::LeftShift),
+        shift(crate::ir::BinaryOp::RightShift),
+    );
+    for shift_amount_gpr in [None, Some(3), Some(4)] {
+        let registers = RegisterSet {
+            shift_amount_gpr,
+            ..RegisterSet::test_configuration()
+        };
+        let allocation = allocate(&graph, &registers);
+        if let Err(errors) = verify(&graph, &registers, &allocation) {
+            panic!("{errors}\n{}", dump_allocation(&graph, &allocation));
+        }
+        let dump = dump_allocation(&graph, &allocation);
+        let amount = allocation.node(variable).inputs[1];
+        match shift_amount_gpr {
+            Some(register) => assert_eq!(amount, Location::Register(register), "{dump}"),
+            None => assert!(matches!(amount, Location::Register(_)), "{dump}"),
+        }
+        assert!(
+            matches!(allocation.node(constant).inputs[1], Location::Constant(bits) if bits as u32 == 3),
+            "{dump}"
+        );
+    }
+}
+
+#[test]
+fn float64_operations_write_over_their_first_input_where_it_dies() {
+    // The first product dies at the second, whose output then takes its register, also for non-commutative
+    // operations; the argument stays live, so the first product does not take its register.
+    let program = assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::Mul {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: a(0),
+            },
+            Instruction::Sub {
+                arith_feedback: 1,
+                dst: r(6),
+                lhs: r(5),
+                rhs: a(0),
+            },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, crate::bytecode::test_support::test_layout());
+    snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::DOUBLE; 2];
+    let graph = crate::builder::tests::optimized_graph(&snapshot);
+    let allocation = allocate_and_verify(&graph);
+    let binaries = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node.op, Op::Float64Binary { .. }))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(binaries.len(), 2, "{}", dump_allocation(&graph, &allocation));
+    let (first, second) = (&allocation.nodes[binaries[0]], &allocation.nodes[binaries[1]]);
+    assert_ne!(
+        first.output,
+        Some(first.inputs[0]),
+        "{}",
+        dump_allocation(&graph, &allocation)
+    );
+    assert_eq!(
+        second.output,
+        Some(second.inputs[0]),
+        "{}",
+        dump_allocation(&graph, &allocation)
+    );
+    assert!(
+        matches!(second.output, Some(Location::Register(register)) if register >= FPR_BASE),
+        "{}",
+        dump_allocation(&graph, &allocation)
+    );
+}
+
+#[test]
 fn exits_find_constants_registers_and_spilled_values() {
     let program = assemble(|_| {
         vec![
@@ -578,15 +724,14 @@ fn the_verifier_finds_values_in_the_wrong_place() {
         vec![
             Instruction::Mov { dst: r(6), src: a(0) },
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(7),
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                expression_string: None,
                 arguments: vec![r(6)],
             },
+            Instruction::Mov { dst: a(0), src: r(7) },
             Instruction::Return { value: r(6) },
         ]
     });
@@ -609,6 +754,75 @@ fn the_verifier_finds_values_in_the_wrong_place() {
     };
     broken.nodes[call.index()].inputs[2] = Location::Register((register + 1) % 6);
     assert!(verify(&graph, &registers, &broken).is_err());
+}
+
+#[test]
+fn the_verifier_finds_values_reloaded_from_frame_slots_that_do_not_hold_them() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Mov { dst: r(6), src: a(0) },
+            Instruction::Call {
+                call_feedback: 0,
+                dst: r(7),
+                callee: r(5),
+                this_value: r(5),
+                argument_count: 1,
+                arguments: vec![r(6)],
+            },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let graph = build(&program);
+    let registers = RegisterSet::test_configuration();
+    let allocation = allocate(&graph, &registers);
+    verify(&graph, &registers, &allocation).unwrap();
+    let returned = find_node(&graph, |node| matches!(node.op, Op::Return));
+    assert_eq!(
+        allocation.node(returned).moves_before,
+        [Move {
+            from: Location::Frame(a(0).raw()),
+            to: Location::Register(0),
+        }]
+    );
+
+    // A frame slot that the code may write is no home.
+    let mut written = graph.clone();
+    written.unwritten_slots = crate::bitset::BitSet::new(0);
+    assert!(verify(&written, &registers, &allocation).is_err());
+
+    // Another frame slot holds another value.
+    let mut broken = allocation.clone();
+    broken.nodes[returned.index()].moves_before[0].from = Location::Frame(r(5).raw());
+    assert!(verify(&graph, &registers, &broken).is_err());
+
+    // A store to the slot, which nothing may do, makes it hold another value.
+    let mut stored = graph.clone();
+    let undefined = stored.add_node(crate::ir::Node::new(
+        Op::Constant(value::UNDEFINED),
+        vec![],
+        Some(Repr::Tagged),
+        0,
+    ));
+    let store = stored.add_node(crate::ir::Node::new(
+        Op::StoreSlot { slot: a(0).raw() },
+        vec![undefined],
+        None,
+        0,
+    ));
+    let block = stored
+        .blocks
+        .iter()
+        .position(|block| block.control == Some(returned))
+        .unwrap();
+    stored.blocks[block].body.push(store);
+    let mut allocation = allocation;
+    allocation.nodes.push(NodeAllocation::default());
+    allocation.nodes.push(NodeAllocation {
+        inputs: [Location::Constant(value::UNDEFINED)].into_iter().collect(),
+        ..NodeAllocation::default()
+    });
+    let errors = verify(&stored, &registers, &allocation).unwrap_err();
+    assert!(errors.contains("nothing writes"), "{errors}");
 }
 
 /// A tiny deterministic random number generator (xorshift64).
@@ -692,11 +906,9 @@ impl ProgramGenerator {
             let cache = u32::try_from(self.random.below(2)).unwrap();
             return if self.random.chance(60) {
                 Instruction::GetById {
-                    value_feedback: 0,
                     dst: self.writable(),
                     base: self.object_operand(),
                     property: crate::bytecode::PropertyKeyTableIndex(0),
-                    base_identifier: None,
                     cache,
                 }
             } else {
@@ -706,7 +918,6 @@ impl ProgramGenerator {
                     src: self.readable(),
                     kind: 0,
                     cache: 2 + cache,
-                    base_identifier: None,
                 }
             };
         }
@@ -741,13 +952,11 @@ impl ProgramGenerator {
             11 => {
                 let argument_count = self.random.below(3);
                 Instruction::Call {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: self.writable(),
                     callee: self.readable(),
                     this_value: self.readable(),
                     argument_count: u32::try_from(argument_count).unwrap(),
-                    expression_string: None,
                     arguments: (0..argument_count).map(|_| self.readable()).collect(),
                 }
             }
@@ -989,13 +1198,11 @@ fn float64_values_get_floating_point_registers() {
         vec![
             Instruction::Enter,
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(5),
                 callee: r(6),
                 this_value: r(7),
                 argument_count: 1,
-                expression_string: None,
                 arguments: vec![a(0)],
             },
             Instruction::Return { value: r(5) },

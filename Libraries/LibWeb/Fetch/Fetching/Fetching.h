@@ -18,6 +18,7 @@
 #include <LibRequests/RequestTransferLease.h>
 #include <LibURL/Forward.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Fetch/Engine/FetchEngineRecord.h>
 #include <LibWeb/Fetch/Engine/Ids.h>
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Forward.h>
@@ -51,8 +52,9 @@ ENUMERATE_BOOL_PARAMS
 
 WEB_API GC::Ref<Infrastructure::FetchController> fetch(JS::Realm&, Infrastructure::Request&, Infrastructure::FetchAlgorithms const&, UseParallelQueue use_parallel_queue = UseParallelQueue::No, CreateResponseBodyTransferLease = CreateResponseBodyTransferLease::No);
 GC::Ptr<PendingResponse> main_fetch(JS::Realm&, Infrastructure::FetchParams const&, Recursive recursive = Recursive::No);
+void upgrade_request_to_https_for_known_hsts_host_if_appropriate(Page&, Infrastructure::Request&);
 // Runs the in-parallel steps that main fetch deferred under the id.
-void run_deferred_main_fetch_steps(Engine::FetchId);
+void run_deferred_main_fetch_steps(Engine::FetchId, NonnullRefPtr<Engine::FetchEngineRecord>);
 void populate_request_from_client(Infrastructure::Request&, Optional<HTML::FetchClient> const& client);
 void fetch_response_handover(JS::Realm&, Infrastructure::FetchParams const&, GC::Ref<Infrastructure::FetchController>, Infrastructure::Response&);
 GC::Ref<PendingResponse> scheme_fetch(JS::Realm&, Infrastructure::FetchParams const&);
@@ -63,7 +65,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
 GC::Ref<PendingResponse> cors_preflight_fetch(JS::Realm&, Infrastructure::FetchParams const&);
 // on_network_settled runs at most once: when the network completes the body, or with an error when the body fails
 // or is stopped.
-GC::Ptr<Infrastructure::Body> adopt_navigation_response_body(JS::Realm&, Infrastructure::Response&, Optional<Utf16String> const& request_server_top_level_site, Requests::RequestTransferLeaseKey, RefPtr<Infrastructure::FetchTimingInfo>, GC::Ref<GC::Function<void(Optional<StringView> error)>> on_network_settled);
+WEB_API GC::Ptr<Infrastructure::Body> adopt_navigation_response_body(JS::Realm&, Infrastructure::Response&, Optional<Utf16String> const& request_server_top_level_site, Requests::RequestTransferLeaseKey, RefPtr<Infrastructure::FetchTimingInfo>, GC::Ref<GC::Function<void(Optional<StringView> error)>> on_network_settled);
 // Stopping the transport also cancels the channel.
 WEB_API NonnullRefPtr<Engine::WholeBodyTransport> create_whole_body_transport(Engine::FetchBodyDeliveryGate&, Engine::FetchByteChannel&);
 void set_sec_fetch_dest_header(Infrastructure::Request&);

@@ -14,11 +14,13 @@ mod wheel;
 
 use crate::async_scroll_update_outbox::{AsyncScrollUpdateOutbox, UserScrollGestureState};
 use crate::context_scene::ContextScene;
+use crate::display_list_coverage_watch::{DisplayListCoverageWatch, ShownOfDisplayList};
 use crate::elastic_overscroll_controller::ElasticOverscrollController;
 use crate::frame_inputs::FrameInputs;
 use crate::host::{ContextTimer, Host, PendingFrame, PresentationId, WebContentClientId};
 use crate::input_event::is_keyboard_scroll_key;
 use crate::keyboard_scroll_controller::{KeyRelease, KeyStep, KeyboardScrollController};
+use crate::overlays::{ContextOverlays, UIOverlays};
 use crate::scroll_fling_controller::ScrollFlingController;
 use crate::scroll_snap_controller::{ScrollSnapController, SnapScrollStart, StepDecision};
 use crate::scrollbar_controller::{Drag, ScrollbarController};
@@ -300,8 +302,10 @@ pub struct ContextState {
     scene: ContextScene,
     presents_to_client: bool,
     viewport_size: IntSize,
-    paused_debugger_overlay_is_shown: bool,
+    device_pixel_ratio: f64,
+    overlays: ContextOverlays,
     scroll_state_snapshot: ScrollStateSnapshot,
+    display_list_coverage_watch: DisplayListCoverageWatch,
 
     async_scroll_tree: AsyncScrollTree,
     scrollbar_controller: ScrollbarController,
@@ -399,8 +403,10 @@ impl ContextState {
             scene: Default::default(),
             presents_to_client: page_id.is_some(),
             viewport_size: Default::default(),
-            paused_debugger_overlay_is_shown: Default::default(),
+            device_pixel_ratio: 1.0,
+            overlays: Default::default(),
             scroll_state_snapshot: Default::default(),
+            display_list_coverage_watch: Default::default(),
             async_scroll_tree: Default::default(),
             scrollbar_controller: ScrollbarController::new(scrollbars_always_shown),
             scroll_snap_controller: Default::default(),
@@ -452,6 +458,43 @@ impl ContextState {
     }
     pub fn presents_to_client(&self) -> bool {
         self.presents_to_client
+    }
+    pub fn display_list(&self) -> Option<Rc<DisplayList>> {
+        self.scene.display_list().clone()
+    }
+    /// The handles of the video sinks that the display list draws.
+    pub fn video_sink_handles_drawn(&self) -> Vec<u64> {
+        match self.scene.display_list() {
+            Some(display_list) => display_list.storage().summary().video_sink_handles.clone(),
+            None => Vec::new(),
+        }
+    }
+    /// The ids of the fonts that the display list draws.
+    pub fn font_ids_drawn(&self) -> Vec<u64> {
+        match self.scene.display_list() {
+            Some(display_list) => display_list.storage().summary().font_ids.clone(),
+            None => Vec::new(),
+        }
+    }
+    /// The ids of the image frames that the display list and the filters of the visual context tree draw.
+    pub fn image_frame_ids_drawn(&self) -> Vec<u64> {
+        let mut image_frame_ids = match self.scene.display_list() {
+            Some(display_list) => display_list.storage().summary().image_frame_ids.clone(),
+            None => Vec::new(),
+        };
+        if let Some(visual_context_tree) = self.scene.visual_context_tree() {
+            visual_context_tree
+                .as_arc()
+                .for_each_effects_filter_image_frame_id(&mut |id| image_frame_ids.push(id));
+        }
+        image_frame_ids
+    }
+    /// The ids of the SVG images that the display list draws.
+    pub fn vector_image_ids_drawn(&self) -> Vec<u64> {
+        match self.scene.display_list() {
+            Some(display_list) => display_list.storage().summary().vector_image_ids.clone(),
+            None => Vec::new(),
+        }
     }
     pub fn context_id(&self) -> CompositorContextId {
         self.context_id
@@ -538,6 +581,7 @@ impl ContextState {
             || self.elastic_overscroll_controller.has_rebound()
             || self.visual_animations_need_frame(now)
             || self.scrollbar_controller.fades_need_frame(now)
+            || self.overlays.fades_need_frame()
     }
     pub fn has_active_scroll_fling(&self) -> bool {
         self.scroll_fling_controller.is_active()
@@ -600,6 +644,8 @@ impl ContextState {
                     return Some(damage_rect);
                 }
             }
+            // The core handles the timers of presenting.
+            ContextTimer::BackingStoreShrink | ContextTimer::SurplusStoreRetirement => {}
         }
         None
     }

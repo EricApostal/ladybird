@@ -105,9 +105,9 @@ pub unsafe extern "C" fn layout_script_intersection_observer_intersection_rect(
         FfiCssPixelRect,
     ) -> FfiCssPixelRect,
     out: &mut FfiCssPixelRect,
-) {
+) -> bool {
     let viewport_mapping = viewport_mapping.resolve();
-    *out = read_rows(host, |arena| {
+    let intersection_rect = read_rows(host, |arena| {
         crate::painting::intersection_observer::intersection_rect(
             arena,
             target,
@@ -120,8 +120,9 @@ pub unsafe extern "C" fn layout_script_intersection_observer_intersection_rect(
                 unsafe { inflate_scroll_container_clip_rect_by_scroll_margin(context, clip_rect.into()) }.into()
             },
         )
-        .into()
     });
+    *out = intersection_rect.unwrap_or_default().into();
+    intersection_rect.is_some()
 }
 
 #[unsafe(no_mangle)]
@@ -521,7 +522,7 @@ pub extern "C" fn layout_script_paintable_border_box_rect_of_fragments(
         if !arena.paintable_row_is_populated(slot) {
             return FfiCssPixelRect::default();
         }
-        crate::painting::paintable_geometry::absolute_border_box_rect(arena, slot).into()
+        crate::painting::client_rects::border_box_rect_of_fragments(arena, slot).into()
     });
 }
 
@@ -760,8 +761,7 @@ pub enum FfiAnchorSizedProperty {
 
 /// Writes the size `property` of the absolutely positioned box `slot` resolved to in the committed layout to `out`,
 /// when its anchor-size() functions resolved against an anchor box.
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_script_anchor_resolved_size(
+pub fn layout_script_anchor_resolved_size(
     host: &DocumentHost,
     slot: NodeSlotId,
     property: FfiAnchorSizedProperty,

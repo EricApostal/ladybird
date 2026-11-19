@@ -15,16 +15,19 @@
 
 mod bounds_check_elimination;
 mod branch_fusion;
+mod branch_splitting;
 mod check_elimination;
 mod dce;
 pub mod dominators;
 pub mod edit;
+mod enumerated_keys;
 mod escape_analysis;
 mod exit_unboxing;
 mod facts;
 mod frame_initialization;
 mod gvn;
 mod interrupt_check_elimination;
+mod key_strings;
 mod licm;
 mod loop_rotation;
 mod representation;
@@ -71,6 +74,10 @@ const PASSES: &[Pass] = &[
         run: simplify::run,
     },
     Pass {
+        name: "branch splitting",
+        run: branch_splitting::run,
+    },
+    Pass {
         name: "global value numbering",
         run: gvn::run,
     },
@@ -115,8 +122,16 @@ const PASSES: &[Pass] = &[
         run: dce::run,
     },
     Pass {
+        name: "enumerated keys",
+        run: enumerated_keys::run,
+    },
+    Pass {
         name: "branch fusion",
         run: branch_fusion::run,
+    },
+    Pass {
+        name: "key strings",
+        run: key_strings::run,
     },
 ];
 

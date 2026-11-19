@@ -117,7 +117,6 @@ public:
 
     void schedule_resume_check();
     void set_post_parse_action(Function<void()> action) { m_post_parse_action = move(action); }
-    void invoke_post_parse_action_for_testing() { invoke_post_parse_action(); }
 
 private:
     static GC::Ptr<DOM::DocumentFragment> try_parse_html_fragment_fast(DOM::Element&, Utf16View);
@@ -241,7 +240,5 @@ RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View, double& unclamped
 RefPtr<CSS::StyleValue const> parse_nonzero_dimension_value(Utf16View);
 Optional<Color> parse_legacy_color_value(Utf16View);
 RefPtr<CSS::StyleValue const> parse_table_child_element_align_value(Utf16View);
-
-u64 parser_non_append_insertions();
 
 }

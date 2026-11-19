@@ -10,12 +10,20 @@
 //! and stack slot, which value it holds on every path reaching each point.
 //! Every input, phi input and exit value must be found in the location the
 //! allocation claims, no matter which path led there.
+//!
+//! A slot of the compiled function's frame that nothing writes (see
+//! `frame_home()`) holds the value the function started with everywhere, and
+//! nothing on any path may store to it. Every load of such a slot loads that
+//! value, so the state names it by the slot rather than by a load.
 
 use super::Allocation;
 use super::Location;
 use super::Move;
 use super::RegisterSet;
 use super::liveness::phi_inputs_from;
+use crate::codegen::lowering_info::Clobbers;
+use crate::codegen::lowering_info::InputConstraint;
+use crate::codegen::lowering_info::lowering_info;
 use crate::ir::BlockId;
 use crate::ir::Graph;
 use crate::ir::NodeId;
@@ -27,6 +35,8 @@ use std::collections::BTreeMap;
 enum Content {
     Value(NodeId),
     Constant(u64),
+    /// The value a slot that nothing writes holds, which every load of it loads.
+    UnwrittenSlot(u32),
 }
 
 type State = BTreeMap<Location, Content>;
@@ -104,15 +114,21 @@ impl Verifier<'_> {
         if matches!(self.graph.node(value).op, Op::VirtualObject { .. }) {
             return Content::Constant(crate::ir::value::EMPTY);
         }
+        if let Op::LoadSlot { slot } = self.graph.node(value).op
+            && self.graph.is_unwritten_slot(slot)
+        {
+            return Content::UnwrittenSlot(slot);
+        }
         match self.graph.constant_value(value) {
             Some(bits) => Content::Constant(bits),
             None => Content::Value(value),
         }
     }
 
-    fn read(state: &State, location: Location) -> Option<Content> {
+    fn read(&self, state: &State, location: Location) -> Option<Content> {
         match location {
             Location::Constant(bits) => Some(Content::Constant(bits)),
+            Location::Frame(slot) if self.graph.is_unwritten_slot(slot) => Some(Content::UnwrittenSlot(slot)),
             _ => state.get(&location).copied(),
         }
     }
@@ -136,7 +152,7 @@ impl Verifier<'_> {
             for (phi, input) in phi_inputs_from(self.graph, *predecessor, block) {
                 let output = self.allocation.node(phi).output.expect("phis have a location");
                 for location in std::iter::once(output).chain(self.filled_slot(phi)) {
-                    if Self::read(&state, location) == Some(self.content_of_value(input)) {
+                    if self.read(&state, location) == Some(self.content_of_value(input)) {
                         state.insert(location, Content::Value(phi));
                     } else {
                         state.remove(&location);
@@ -162,7 +178,7 @@ impl Verifier<'_> {
             for (phi, input) in phi_inputs_from(self.graph, predecessor, block) {
                 let output = self.allocation.node(phi).output.expect("phis have a location");
                 for location in std::iter::once(output).chain(self.filled_slot(phi)) {
-                    let found = Self::read(exit, location);
+                    let found = self.read(exit, location);
                     if found != Some(self.content_of_value(input)) {
                         self.error(format!(
                             "phi v{} in b{}: input from b{} should be {:?} in {location:?}, found {found:?}",
@@ -193,12 +209,12 @@ impl Verifier<'_> {
 
     fn apply_moves(&mut self, state: &mut State, moves: &[Move], context: &str) {
         for m in moves {
-            if matches!(m.to, Location::Constant(_)) {
-                self.error(format!("{context}: move into a constant"));
+            if matches!(m.to, Location::Constant(_) | Location::Frame(_)) {
+                self.error(format!("{context}: move into {:?}", m.to));
                 continue;
             }
             self.check_location(m.to, context);
-            match Self::read(state, m.from) {
+            match self.read(state, m.from) {
                 Some(content) => {
                     state.insert(m.to, content);
                 }
@@ -227,7 +243,7 @@ impl Verifier<'_> {
 
     fn expect(&mut self, state: &State, location: Location, value: NodeId, context: &str) {
         let expected = self.content_of_value(value);
-        let found = Self::read(state, location);
+        let found = self.read(state, location);
         if found != Some(expected) {
             self.error(format!(
                 "{context}: expected {expected:?} in {location:?}, found {found:?}"
@@ -289,9 +305,22 @@ impl Verifier<'_> {
         debug_assert!(node.op != Op::Phi);
 
         self.apply_moves(state, &allocation.moves_before, &context);
+        if let Op::StoreSlot { slot } = node.op
+            && self.graph.is_unwritten_slot(slot)
+        {
+            self.error(format!("{context}: stores to slot {slot}, which nothing writes"));
+        }
         if allocation.inputs.len() != node.inputs.len() {
             self.error(format!("{context}: wrong number of input locations"));
             return;
+        }
+        let lowering = lowering_info(node);
+        if allocation.temps.len() != usize::from(lowering.temps) {
+            self.error(format!(
+                "{context}: {} temps, but its lowering takes {}",
+                allocation.temps.len(),
+                lowering.temps
+            ));
         }
         for (index, (input, location)) in node.inputs.iter().zip(&allocation.inputs).enumerate() {
             if let Location::Constant(bits) = location {
@@ -302,21 +331,14 @@ impl Verifier<'_> {
             }
             // NB: Slow path calls, and calls that store their operands, read
             //     them from where they are.
-            let reads_inputs_anywhere = matches!(
-                node.op,
-                Op::CallSlowPath { .. }
-                    | Op::CallDirect {
-                        stores_operands: true,
-                        ..
-                    }
-                    | Op::CallNative {
-                        stores_operands: true,
-                        ..
-                    }
-                    | Op::SlowPathOutput { .. }
-            );
-            if !matches!(location, Location::Register(_)) && !reads_inputs_anywhere {
+            let reads_input_anywhere = lowering.inputs[index] == InputConstraint::Anywhere;
+            if !matches!(location, Location::Register(_)) && !reads_input_anywhere {
                 self.error(format!("{context}: input {index} is not in a register"));
+            }
+            if let InputConstraint::Fixed(register) = self.registers.resolve(lowering.inputs[index], false)
+                && *location != Location::Register(self.registers.fixed(register))
+            {
+                self.error(format!("{context}: input {index} is not in its fixed register"));
             }
             self.check_location(*location, &context);
             self.expect(state, *location, *input, &format!("{context}, input {index}"));
@@ -324,7 +346,6 @@ impl Verifier<'_> {
 
         // A node may exit at any point after reading its inputs, including
         // after it wrote its temps and its output: exit values must survive both.
-        let properties = node.op.properties();
         for temp in &allocation.temps {
             self.check_location(Location::Register(*temp), &context);
             if allocation.inputs.contains(&Location::Register(*temp)) {
@@ -332,14 +353,13 @@ impl Verifier<'_> {
             }
             state.remove(&Location::Register(*temp));
         }
-        if properties.is_call {
-            for register in self.registers.caller_saved().iter() {
-                state.remove(&Location::Register(register));
-            }
-        } else if super::saves_only_gprs(&node.op) {
-            for register in self.registers.allocatable(super::RegisterClass::Float).iter() {
-                state.remove(&Location::Register(register));
-            }
+        let clobbered = match lowering.clobbers {
+            Clobbers::CallerSaved => self.registers.caller_saved(),
+            Clobbers::Floats => self.registers.allocatable(super::RegisterClass::Float),
+            Clobbers::Nothing => super::RegisterMask::default(),
+        };
+        for register in clobbered.iter() {
+            state.remove(&Location::Register(register));
         }
         if let Some(output @ Location::Register(_)) = allocation.output {
             // NB: Cloning the state instead would take time quadratic in the size of code that keeps many values in
@@ -359,9 +379,9 @@ impl Verifier<'_> {
                 if super::RegisterClass::of_register(register) != super::RegisterClass::of(node.repr) {
                     self.error(format!("{context}: the output is in a register of the other class"));
                 }
-                state.insert(Location::Register(register), Content::Value(node_id));
+                state.insert(Location::Register(register), self.content_of_value(node_id));
                 if let Some(slot) = allocation.spill_slot {
-                    state.insert(Location::Stack(slot), Content::Value(node_id));
+                    state.insert(Location::Stack(slot), self.content_of_value(node_id));
                 }
             }
             (false, None) => {}

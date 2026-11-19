@@ -4984,7 +4984,8 @@ impl<'pass> GridFormattingContext<'pass> {
             .axis_tracks(axis)
             .iter()
             .fold(CssPixels::default(), |sum, track| sum + track.base_size);
-        let minimum = self.resolved_gap(axis, AvailableSize::definite(container));
+        // NB: The tracks can add up to a saturated size, which is not a definite available size.
+        let minimum = self.resolved_gap(axis, AvailableSize::definite(clamp_to_max_dimension_value(container)));
         *axis.select(
             &mut self.resolved_column_gutter_size,
             &mut self.resolved_row_gutter_size,
@@ -5044,6 +5045,8 @@ impl<'pass> GridFormattingContext<'pass> {
     }
 
     fn rerun_rows_with_container_block_size(&mut self, block_size: CssPixels) {
+        // NB: The rows of the first run can add up to a saturated size, which is not a definite available size.
+        let block_size = clamp_to_max_dimension_value(block_size);
         self.available_space.as_mut().unwrap().block_size = AvailableSize::definite(block_size);
         self.initialize_gaps_for_axis(Axis::Row, AvailableSize::definite(block_size));
         self.resolve_item_metrics(Axis::Row);
@@ -7014,6 +7017,17 @@ fn definition_for(entry: &ComputedGridTrackEntry, auto_fit: bool, auto_repeat: b
     }
 }
 
+// NB: A repeat() copies its line names into every repetition, so a long name list repeated many times would expand into
+//     a huge number of names. Names past this limit are dropped, as lines past MAX_GRID_LINE_NUMBER are.
+const MAX_EXPANDED_LINE_NAMES: usize = 100_000;
+
+/// Appends `names` to `line`, dropping those past the `names_left` an expansion still may make.
+fn extend_line_names(line: &mut Vec<LineName>, names: impl Iterator<Item = LineName>, names_left: &mut usize) {
+    let length_before = line.len();
+    line.extend(names.take(*names_left));
+    *names_left -= line.len() - length_before;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expand_standalone_list<'pass>(
     source: TrackListSource<'pass>,
@@ -7021,17 +7035,23 @@ fn expand_standalone_list<'pass>(
     lines: &mut Vec<Vec<LineName>>,
     tracks: &mut Vec<TrackDefinition<'pass>>,
     pending_names: &mut Vec<LineName>,
+    names_left: &mut usize,
     auto_repeat_count: &mut impl FnMut(u32, &ComputedGridTrackEntry) -> usize,
     inherited_auto_fit: bool,
     inherited_auto_repeat: bool,
 ) {
     source.for_each_entry(list, |entry_index, entry| match entry.kind {
         kind if kind == ComputedGridTrackEntryKind::LineNames as u8 => {
-            pending_names.extend(source.names(entry));
+            extend_line_names(pending_names, source.names(entry), names_left);
         }
         kind if kind == ComputedGridTrackEntryKind::TrackSize as u8
             || kind == ComputedGridTrackEntryKind::MinMax as u8 =>
         {
+            // NB: Lines past the limit are dropped (see MAX_GRID_LINE_NUMBER), so a repeat() with a huge count does not
+            //     expand into more tracks than can be placed into.
+            if tracks.len() >= MAX_GRID_LINE_NUMBER as usize {
+                return;
+            }
             lines.push(std::mem::take(pending_names));
             tracks.push(definition_for(entry, inherited_auto_fit, inherited_auto_repeat));
         }
@@ -7044,12 +7064,16 @@ fn expand_standalone_list<'pass>(
                 _ => unreachable!("invalid grid repeat type"),
             };
             for _ in 0..repeat_count {
+                if tracks.len() >= MAX_GRID_LINE_NUMBER as usize {
+                    break;
+                }
                 expand_standalone_list(
                     source,
                     entry.repeat_list,
                     lines,
                     tracks,
                     pending_names,
+                    names_left,
                     auto_repeat_count,
                     inherited_auto_fit || is_auto_fit,
                     inherited_auto_repeat || is_auto_repeat,
@@ -7082,12 +7106,14 @@ pub(crate) fn expand_standalone(
 
     let mut result = ExpandedTrackList::default();
     let mut pending_names = Vec::new();
+    let mut names_left = MAX_EXPANDED_LINE_NAMES;
     expand_standalone_list(
         source,
         list,
         &mut result.lines,
         &mut result.tracks,
         &mut pending_names,
+        &mut names_left,
         &mut auto_repeat_count,
         false,
         false,
@@ -7122,6 +7148,7 @@ fn expand_subgrid_names(
     list: ComputedGridTrackList,
     lines: &mut [Vec<LineName>],
     line_index: &mut usize,
+    names_left: &mut usize,
 ) {
     let entries = {
         let mut entries: Vec<(u32, &ComputedGridTrackEntry)> = Vec::new();
@@ -7133,7 +7160,7 @@ fn expand_subgrid_names(
         match entry.kind {
             kind if kind == ComputedGridTrackEntryKind::LineNames as u8 => {
                 if let Some(line) = lines.get_mut(*line_index) {
-                    line.extend(source.names(entry));
+                    extend_line_names(line, source.names(entry), names_left);
                 }
                 *line_index += 1;
             }
@@ -7172,7 +7199,10 @@ fn expand_subgrid_names(
                     _ => unreachable!("invalid grid repeat type"),
                 };
                 for _ in 0..repeat_count {
-                    expand_subgrid_names(source, entry.repeat_list, lines, line_index);
+                    if *line_index >= lines.len() {
+                        break;
+                    }
+                    expand_subgrid_names(source, entry.repeat_list, lines, line_index, names_left);
                 }
             }
             _ => {}
@@ -7206,7 +7236,8 @@ pub(crate) fn expand_subgrid<'pass>(
         }));
     }
     let mut line_index = 0;
-    expand_subgrid_names(source, list, &mut lines, &mut line_index);
+    let mut names_left = MAX_EXPANDED_LINE_NAMES;
+    expand_subgrid_names(source, list, &mut lines, &mut line_index, &mut names_left);
     ExpandedTrackList {
         lines,
         tracks: Vec::new(),
