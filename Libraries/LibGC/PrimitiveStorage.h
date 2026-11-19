@@ -11,6 +11,7 @@
 #include <AK/Mutex.h>
 #include <AK/Noncopyable.h>
 #include <AK/Optional.h>
+#include <AK/Platform.h>
 #include <AK/StdLibExtras.h>
 #include <AK/Types.h>
 #include <AK/Vector.h>
@@ -31,7 +32,14 @@ public:
         Yes,
     };
 
+#if defined(AK_OS_ANDROID)
+    // NB: Most Android kernels give a process a 39-bit address space, 512 GiB in all, which a 4 TiB reservation can
+    //     never fit in, so WebContent died with ENOMEM as it started. 64 GiB of typed array and buffer storage is far
+    //     more than a phone has memory for. LibJS/Rust/build.rs mirrors this size for Android.
+    static constexpr size_t default_cage_size = 64ull * GiB;
+#else
     static constexpr size_t default_cage_size = 4ull * TiB;
+#endif
     static_assert(is_power_of_two(default_cage_size));
     static constexpr size_t cage_offset_mask = default_cage_size - 1;
     // NB: JIT code accesses typed array elements at a masked offset plus a
