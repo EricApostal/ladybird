@@ -42,6 +42,12 @@ if (LADYBIRD_GENERATE_SYMBOL_FILES AND MSVC)
     message(FATAL_ERROR "LADYBIRD_GENERATE_SYMBOL_FILES is not supported with MSVC-style toolchains")
 endif()
 option(LADYBIRD_BASELINE_CPU_TARGET "Use a common CPU baseline for portable binaries and ccache sharing" OFF)
+# NB: Meta/ladybird.py takes no CMake options, so a build that goes through it, as an embedder's does, asks for this with
+#     the environment. Rust's -Ctarget-cpu=native cannot be relied on in a virtual machine, where it can come out without
+#     the AES and SHA features that `ring` insists on for Apple's arm64, and distributed binaries need a baseline anyway.
+if (DEFINED ENV{LADYBIRD_BASELINE_CPU_TARGET} AND NOT "$ENV{LADYBIRD_BASELINE_CPU_TARGET}" STREQUAL "")
+    set(LADYBIRD_BASELINE_CPU_TARGET "$ENV{LADYBIRD_BASELINE_CPU_TARGET}" CACHE BOOL "Use a common CPU baseline for portable binaries and ccache sharing" FORCE)
+endif()
 
 set(LADYBIRD_VERSION "" CACHE STRING "Version of a release, such as 2026.46.0")
 set(LADYBIRD_BROWSER_VERSION "${PROJECT_VERSION}")
