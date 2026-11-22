@@ -281,7 +281,6 @@ pub fn generate() -> LayoutHeader {
     let mut w = HeaderWriter::new();
 
     w.section("Cell header, at the start of every cell");
-    offset!(w, "CELL_MARK", CellHeader, mark);
     offset!(w, "CELL_STATE", CellHeader, state);
     offset!(w, "CELL_KIND", CellHeader, kind);
     for kind in [CellKind::Other, CellKind::Object, CellKind::PrimitiveString, CellKind::Symbol, CellKind::BigInt, CellKind::Accessor] {
@@ -327,14 +326,13 @@ pub fn generate() -> LayoutHeader {
     w.section("ExecutionContext, whose value slots follow it directly");
     every_field_offset!(w, "EXECUTION_CONTEXT", ExecutionContext {
         function,
-        realm,
-        script_or_module,
+        realm_without_function,
+        script_or_module_without_function,
         lexical_environment,
-        variable_environment,
-        private_environment,
+        variable_environment_in_frame,
+        private_environment_in_frame,
         frame_id,
         program_counter,
-        skip_when_determining_incumbent_counter,
         yield_continuation,
         yield_is_await,
         yield_value_is_iterator_result,
@@ -371,11 +369,13 @@ pub fn generate() -> LayoutHeader {
     offset!(w, "VM_EXECUTION_CONTEXT_STACK_CAPACITY", VmHead, execution_context_stack_capacity);
     offset!(w, "VM_TYPE_ERROR_REALM_OVERRIDE", VmHead, type_error_realm_override);
     offset!(w, "VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH", VmHead, type_error_realm_override_depth);
+    offset!(w, "VM_CURRENT_REALM", VmHead, current_realm);
 
     w.section("ExecutionContextStackEntry, the entries of the VM's execution context stack");
     every_field_offset!(w, "EXECUTION_CONTEXT_STACK_ENTRY", ExecutionContextStackEntry {
         execution_context,
         previous_running_execution_context,
+        previous_realm,
     });
     size!(w, "EXECUTION_CONTEXT_STACK_ENTRY", ExecutionContextStackEntry);
 

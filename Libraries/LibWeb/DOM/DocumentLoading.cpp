@@ -25,6 +25,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoading.h>
 #include <LibWeb/DOM/IDLEventListener.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Response.h>
 #include <LibWeb/HTML/BrowsingContext.h>
@@ -303,15 +304,21 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_text_document(HTML::Navi
         // The rules for how to convert the bytes of the plain text document into actual characters, and the rules for
         // actually rendering the text to the user, are defined by the specifications for the computed MIME type of the
         // resource (i.e., type).
-        // NB: JSON text is UTF-8 [RFC8259]. Like other browsers, honor a BOM or an explicit charset parameter.
+        // NB: JSON text is UTF-8 [RFC8259], whatever a BOM or the charset parameter say.
         ByteString encoding;
-        if (mime.is_json())
-            encoding = HTML::run_bom_sniff(data).value_or(Fetch::Infrastructure::legacy_extract_an_encoding(mime, "UTF-8"sv));
-        else
+        Utf16String decoded;
+        if (mime.is_json()) {
+            encoding = "UTF-8"sv;
+            decoded = TextCodec::utf8_decode_to_utf16(data).release_value_but_fixme_should_propagate_errors();
+        } else {
             encoding = HTML::run_encoding_sniffing_algorithm(document, data, mime, container_document).encoding;
-        dbgln_if(HTML_PARSER_DEBUG, "The encoding sniffing algorithm returned encoding '{}'", encoding);
+            dbgln_if(HTML_PARSER_DEBUG, "The encoding sniffing algorithm returned encoding '{}'", encoding);
+            auto decoder = TextCodec::decoder_for(encoding);
+            VERIFY(decoder.has_value());
+            decoded = TextCodec::decode_to_utf16(data, *decoder).release_value_but_fixme_should_propagate_errors();
+        }
 
-        auto run_text_parser = GC::create_function(GC::Heap::the(), GC::captures(document, move(data), url, response_header_list, move(encoding)), [](auto& document, auto& data, auto& url, auto& response_header_list, auto& encoding) {
+        auto run_text_parser = GC::create_function(GC::Heap::the(), GC::captures(document, move(decoded), url, response_header_list, move(encoding)), [](auto& document, auto& decoded, auto& url, auto& response_header_list, auto& encoding) {
             auto parser = HTML::HTMLParser::create_with_open_input_stream(document);
             parser->tokenizer().update_insertion_point();
 
@@ -331,9 +338,6 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_text_document(HTML::Navi
             }
 
             parser->tokenizer().switch_to(HTML::HTMLTokenizer::State::PLAINTEXT);
-            auto decoder = TextCodec::decoder_for(encoding);
-            VERIFY(decoder.has_value());
-            auto decoded = TextCodec::decode_to_utf16(data, *decoder).release_value_but_fixme_should_propagate_errors();
             parser->tokenizer().insert_input_at_insertion_point(decoded);
             parser->tokenizer().insert_eof();
             parser->run(url);
@@ -460,7 +464,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_media_document(HTML::Nav
     if (image_element) {
         // INTEROP: All major engines present the image from the response that was navigated to rather than fetching it
         //          again. A second fetch would be subject to the Content-Security-Policy of that same response.
-        image_element->set_resource_from_navigation_response(HTML::SharedResourceRequest::create_from_navigation_response_body(document, *navigation_params.response->body(), stop_parsing));
+        image_element->set_resource_from_navigation_response(HTML::SharedResourceRequest::create_from_image_response_body(document, document->url(), *navigation_params.response->body(), false, stop_parsing));
     } else {
         navigation_params.response->body()->fully_read(
             realm,

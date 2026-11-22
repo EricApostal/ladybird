@@ -8,17 +8,33 @@
 //! stores of each context, the surfaces the window server shows, the media that live content comes from, GPU
 //! submission, and the display ticks. None of these calls comes back into the core before it returns.
 
-use libcompositing_rust::display_list::commands::CompositorContextId;
+use crate::backing_stores::{FfiNewStore, NewStore, Publication, SharedImageToPublish, StoreKind};
+use crate::cpp_object::{CppObject, FfiCppObject};
+use crate::host::WebContentClientId;
+use crate::remote_layers::{RemoteLayerHost, RemoteLayerObject, WindowServerObject};
+use crate::surfaces::painting_surface::PaintingSurface;
+use crate::surfaces::presentable_surface::PresentableSurface;
+use crate::webgl::host::{
+    ContextOptions, DefaultBuffers, ImageConversion, ImageConversionOutcome, PresentOutcome, VideoFrameCopy, WebGLHost,
+};
+use libcompositing_rust::display_list::commands::VideoSinkHandle;
+use libcompositing_rust::display_list::commands::{CanvasId, CompositorContextId, DisplayListCommandType};
 use libcompositing_rust::display_list::storage::{
-    PackedChunkSize, ReceivedChunk, receive_packed_chunks_from_shared_memory,
+    ListChunk, PackedChunkSize, receive_packed_chunks_from_shared_memory,
 };
 use libcompositing_rust::host::FfiRasterPainter;
-use libcompositing_rust::ipc_types::Core_AnonymousBuffer;
+use libcompositing_rust::ipc_types::{
+    Compositing_RemoteLayerHostHandle, Compositing_RemoteLayerHostKind, Core_AnonymousBuffer, Gfx_AlphaType,
+    Web_Bindings_PredefinedColorSpace,
+};
 use libcompositing_rust::time::MonotonicTime;
-use libgfx_rust::{Color, FloatRect, IntRect, IntSize, ScalingMode};
+use libcompositing_rust::webgl::ImageSource;
+use libgfx_rust::path::ffi::PathGeometryData;
+use libgfx_rust::{Color, CornerRadii, FloatRect, IntRect, IntSize, ScalingMode, WindingRule};
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 /// How a surface is drawn into another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,30 +53,6 @@ pub enum PaintingResources {
     Overlays,
 }
 
-/// Who shows the backing stores of a context.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum StorePublication {
-    #[default]
-    Unpublished,
-    /// The presentation shows the stores, and releases each when it shows another.
-    Published,
-    /// The compositor shows the stores itself, in a remote layer, so a store is replaced on screen by the next one.
-    ShownInRemoteLayer,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum StoreResizeOutcome {
-    Unchanged,
-    /// The stores were reallocated, and nothing that shows them was given them.
-    ReallocatedOffscreen,
-    /// The presentation or the remote layer that shows the stores was given the new ones.
-    ReallocatedForViewer,
-    /// The stores of a remote layer could not be allocated.
-    Failed,
-}
-
 /// When a frame can be handed to whoever shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -71,36 +63,10 @@ pub enum FrameHandOff {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
-pub struct FfiStoreState {
-    pub is_valid: bool,
-    pub is_rendering: bool,
-    pub has_available_store: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiStoreResize {
-    pub raster_size: IntSize,
-    pub window_resize_in_progress: bool,
-    pub publication: StorePublication,
-    pub gpu_sharing_allowed: bool,
-    pub has_presentation: bool,
-    pub presentation_id: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiAcquiredStore {
-    pub bitmap_id: i32,
-    pub surface: *mut c_void,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
 pub struct FfiCanvasContent {
     pub id: u64,
     pub content_generation: u64,
-    // Whether the window server can show the canvas as it is.
+    /// Whether the window server can show the canvas as it is.
     pub has_presentable_surface: bool,
 }
 
@@ -111,7 +77,7 @@ pub struct FfiVideoSinkContent {
     pub has_frame: bool,
     pub frame_id: u64,
     pub frame_holds_high_dynamic_range: bool,
-    // Whether the window server can show the frame as it is.
+    /// Whether the window server can show the frame as it is.
     pub frame_has_surface: bool,
 }
 
@@ -162,7 +128,57 @@ pub struct FfiSublayerPlacement {
     pub rounds_top_right: bool,
     pub rounds_bottom_right: bool,
     pub rounds_bottom_left: bool,
+    /// Whether the content is also clipped by a path, which is in a space of its own.
+    pub is_clipped_by_path: bool,
+    pub clip_path_identity: u64,
+    pub clip_path_fill_rule: WindingRule,
+    /// The a, b, c, d, e and f of the affine transform from the space of the path to the frame.
+    pub clip_path_to_frame: [f32; 6],
+    /// Lent for the call that builds the sublayers, or that asks whether a remote layer can show the placement: the
+    /// window server placement this is made from holds the path, and that of a sublayer lives in the layers of the
+    /// frame painted last. A copy kept past that call, as the sublayers of the latest frame are, is never read
+    /// through, so placements are told apart by the identity of the path, never by these contours.
+    pub clip_path_contours: PathGeometryData,
     pub scaling_mode: ScalingMode,
+}
+
+impl PartialEq for FfiSublayerPlacement {
+    fn eq(&self, other: &Self) -> bool {
+        // Each field is named, so a new field does not compile until it is compared too.
+        let Self {
+            content_rect,
+            content_to_frame,
+            clip_rect,
+            has_rounded_clip,
+            rounded_clip_rect,
+            rounded_clip_radius,
+            rounds_top_left,
+            rounds_top_right,
+            rounds_bottom_right,
+            rounds_bottom_left,
+            is_clipped_by_path,
+            clip_path_identity,
+            clip_path_fill_rule,
+            clip_path_to_frame,
+            clip_path_contours: _,
+            scaling_mode,
+        } = self;
+        *content_rect == other.content_rect
+            && *content_to_frame == other.content_to_frame
+            && *clip_rect == other.clip_rect
+            && *has_rounded_clip == other.has_rounded_clip
+            && *rounded_clip_rect == other.rounded_clip_rect
+            && *rounded_clip_radius == other.rounded_clip_radius
+            && *rounds_top_left == other.rounds_top_left
+            && *rounds_top_right == other.rounds_top_right
+            && *rounds_bottom_right == other.rounds_bottom_right
+            && *rounds_bottom_left == other.rounds_bottom_left
+            && *is_clipped_by_path == other.is_clipped_by_path
+            && *clip_path_identity == other.clip_path_identity
+            && *clip_path_fill_rule == other.clip_path_fill_rule
+            && *clip_path_to_frame == other.clip_path_to_frame
+            && *scaling_mode == other.scaling_mode
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,29 +187,145 @@ pub enum SublayerContentKind {
     Canvas,
     Video,
     PresentableSurface,
+    /// Holds the sublayers that name it as their group, which the window server places and clips together.
+    Group,
+    /// The surface of a tile of a painted layer, shown at `rect` of the group it is in.
+    Tile,
+    /// A fill of `rect` of the group it is in with `color`.
+    Color,
+    /// What the window server shows below the sublayer, within a rect of the group it is in, run through filters.
+    Backdrop,
 }
 
-/// A sublayer the window server shows above a frame: a canvas of the context by its id, a video by the handle of its
-/// sink, or a surface.
-#[derive(Clone, Copy, Debug)]
+/// What the window server shows below a sublayer, within `region` of the group the sublayer is in, run through a color
+/// matrix, a blur and another color matrix, in that order, each of which can be left out. A matrix is row-major with
+/// the offsets in the fifth column, for unpremultiplied colors from 0 to 1.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct FfiSublayerBackdrop {
+    pub region: FloatRect,
+    pub has_color_matrix_before_blur: bool,
+    pub color_matrix_before_blur: [f32; 20],
+    pub has_blur: bool,
+    /// In device pixels.
+    pub blur_standard_deviation: f32,
+    pub has_color_matrix_after_blur: bool,
+    pub color_matrix_after_blur: [f32; 20],
+}
+
+/// Where the window server places the sublayers of a group, how it clips them, and how it fades them together, in
+/// device pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FfiSublayerGroup {
+    /// The a, b, c, d, e and f of the affine transform from the pixels of the group to those of the group it is in, or
+    /// to those of the frame.
+    pub to_parent: [f32; 6],
+    /// Whether the group clips its sublayers to `clip_rect`, in its own pixels, with the corners of the rect rounded
+    /// by the radii.
+    pub clips: bool,
+    pub clip_rect: FloatRect,
+    pub corner_radii: CornerRadii,
+    /// The opacity the group composites its sublayers at, once they are composited with each other.
+    pub opacity: f32,
+}
+
+impl Default for FfiSublayerGroup {
+    fn default() -> Self {
+        Self {
+            to_parent: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            clips: false,
+            clip_rect: FloatRect::default(),
+            corner_radii: CornerRadii::default(),
+            opacity: 1.0,
+        }
+    }
+}
+
+/// A sublayer the window server shows of a frame: a canvas of the context by its id, a video by the handle of its sink,
+/// a surface, a tile, a fill, or a group of other sublayers.
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct FfiSublayer {
     pub identity: u64,
+    /// The index, among the sublayers of the frame, of the group the sublayer is in, or -1 for one in the frame itself.
+    /// A group comes before the sublayers in it, and sublayers of one group are shown bottom to top.
+    pub group_index: i32,
     pub content_kind: SublayerContentKind,
     pub media_id: u64,
-    pub presentable_surface: *mut c_void,
+    /// Of a surface or a tile.
+    pub presentable_surface: *const PresentableSurface,
+    /// Of a canvas, a video or a surface.
     pub placement: FfiSublayerPlacement,
+    pub group: FfiSublayerGroup,
+    /// Of a tile or a fill, in the pixels of the group it is in.
+    pub rect: IntRect,
+    pub color: Color,
+    /// Of a tile.
+    pub every_pixel_is_opaque: bool,
+    pub backdrop: FfiSublayerBackdrop,
+}
+
+impl FfiSublayer {
+    /// A sublayer of the frame itself that shows nothing, for the fields of each kind of content to be set on.
+    pub fn of_kind(identity: u64, content_kind: SublayerContentKind) -> Self {
+        Self {
+            identity,
+            group_index: -1,
+            content_kind,
+            media_id: 0,
+            presentable_surface: std::ptr::null(),
+            placement: FfiSublayerPlacement::default(),
+            group: FfiSublayerGroup::default(),
+            rect: IntRect::default(),
+            color: Color::TRANSPARENT,
+            every_pixel_is_opaque: false,
+            backdrop: FfiSublayerBackdrop::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiRemoteLayerFrame {
-    /// Without the store, the frame shown before stays, and only the sublayers change.
-    pub uses_store: bool,
+    /// Lent for the call. Without the store, the store shown before stays, and only the sublayers change, unless the
+    /// frame shows no store.
+    pub store: *const PresentableSurface,
+    /// Whether the sublayers are all of the frame, which then shows no store below them.
+    pub shows_no_store: bool,
     pub painted_size: IntSize,
     pub device_pixel_ratio: f64,
-    /// Whether the page laid out the frame at the size it is painted at.
-    pub laid_out_by_page: bool,
+    /// Where the frame is scaled to fit within the view, in device pixels, rather than shown at its own size.
+    pub has_fit_within: bool,
+    pub fit_within: IntSize,
+}
+
+/// How the presentation shows a remote layer: the kind of its host handle, which is that of
+/// `Compositing::RemoteLayerHostKind`, and its id.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct FfiRemoteLayerHostHandle {
+    pub kind: u8,
+    pub id: u64,
+}
+
+/// What the window server that shows a context composites by itself of the layers of its frames, besides the canvases
+/// and videos it shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiWindowServerCompositing {
+    /// Whether it shows each tile of a painted layer as a sublayer of its own, in a group it places and clips.
+    pub shows_tiles_of_painted_layers: bool,
+    /// Whether it runs what it shows below a sublayer through a blur and color matrices.
+    pub filters_what_is_below_layers: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiCanvas2DPainter {
+    pub player: *mut c_void,
+    /// Plays a command, whose payload is lent for the call.
+    pub play_command: unsafe extern "C" fn(*mut c_void, DisplayListCommandType, ak::Span<'_, u8>),
 }
 
 /// The entry points of the mechanism the core drives, and the object they are called on:
@@ -203,58 +335,47 @@ pub struct FfiRemoteLayerFrame {
 pub struct FfiRasterHost {
     pub host: *mut c_void,
 
-    pub surface_retain: unsafe extern "C" fn(*mut c_void),
-    pub surface_release: unsafe extern "C" fn(*mut c_void),
-    /// Writes the size of the surface. NB: A C++ function returns Gfx::IntSize in memory rather than in a register
-    ///     on Windows, so the size does not come back as the return value.
-    pub surface_size: unsafe extern "C" fn(*mut c_void, *mut IntSize),
-    /// Null where the surface could not be made. The surface is made like the one given, or for the GPU the compositor
-    /// renders with where none is given. The last argument also inherits LCD text for pixel-aligned copies.
-    pub create_surface: unsafe extern "C" fn(*mut c_void, IntSize, *mut c_void, bool) -> *mut c_void,
-    pub surfaces_share_backend: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
-    pub surface_uses_gpu: unsafe extern "C" fn(*mut c_void) -> bool,
-    pub surface_save: unsafe extern "C" fn(*mut c_void) -> i32,
-    pub surface_restore_to_count: unsafe extern "C" fn(*mut c_void, i32),
-    pub surface_translate: unsafe extern "C" fn(*mut c_void, f32, f32),
-    pub surface_scale: unsafe extern "C" fn(*mut c_void, f32, f32),
-    pub surface_clip_rect: unsafe extern "C" fn(*mut c_void, IntRect),
-    pub surface_clear: unsafe extern "C" fn(*mut c_void, Color),
+    /// A new surface with one reference that the caller takes over, or null where it could not be made. The surface is
+    /// made like the one given, or for the GPU the compositor renders with where none is given. The last argument also
+    /// inherits LCD text for pixel-aligned copies.
+    pub create_surface:
+        unsafe extern "C" fn(*mut c_void, IntSize, *const PaintingSurface, bool) -> *const PaintingSurface,
+    pub surface_save: unsafe extern "C" fn(*const PaintingSurface) -> i32,
+    pub surface_restore_to_count: unsafe extern "C" fn(*const PaintingSurface, i32),
+    pub surface_translate: unsafe extern "C" fn(*const PaintingSurface, f32, f32),
+    pub surface_scale: unsafe extern "C" fn(*const PaintingSurface, f32, f32),
+    pub surface_clip_rect: unsafe extern "C" fn(*const PaintingSurface, IntRect),
+    pub surface_clear: unsafe extern "C" fn(*const PaintingSurface, Color),
     /// Arguments: the target, the source, the rect of the source drawn, the rect of the target it is drawn into, and
     /// how it is blended.
-    pub surface_draw_surface: unsafe extern "C" fn(*mut c_void, *mut c_void, IntRect, IntRect, SurfaceBlend),
-    pub flush_surface: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    pub surface_draw_surface:
+        unsafe extern "C" fn(*const PaintingSurface, *const PaintingSurface, IntRect, IntRect, SurfaceBlend),
+    pub flush_surface: unsafe extern "C" fn(*const PaintingSurface),
 
     /// Arguments: the host, the context, the surface, whose resources it draws with, whether it allows LCD text,
     /// and where the painter is written. The painting lasts until `end_painting`, and paintings nest.
     pub begin_painting:
-        unsafe extern "C" fn(*mut c_void, u64, *mut c_void, PaintingResources, bool, *mut FfiRasterPainter),
+        unsafe extern "C" fn(*mut c_void, u64, *const PaintingSurface, PaintingResources, bool, *mut FfiRasterPainter),
     pub end_painting: unsafe extern "C" fn(*mut c_void),
     /// Lets the raster caches of the context's page drop what the frames before the one that starts did not use.
     pub start_raster_cache_frame: unsafe extern "C" fn(*mut c_void, u64),
 
-    pub store_state: unsafe extern "C" fn(*mut c_void, u64) -> FfiStoreState,
-    pub resize_stores: unsafe extern "C" fn(*mut c_void, u64, *const FfiStoreResize) -> StoreResizeOutcome,
-    pub invalidate_stores: unsafe extern "C" fn(*mut c_void, u64),
-    pub acquire_store: unsafe extern "C" fn(*mut c_void, u64, *mut FfiAcquiredStore) -> bool,
-    pub complete_rendering: unsafe extern "C" fn(*mut c_void, u64, i32),
-    pub release_store: unsafe extern "C" fn(*mut c_void, u64, i32) -> bool,
-    pub release_all_presented_stores: unsafe extern "C" fn(*mut c_void, u64),
-    /// Lent; null before any store was rendered into.
-    pub latest_rendered_store_surface: unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void,
-    /// Arguments: the context, and the presentation that shows its stores, if it has one. Answers whether a store was
-    /// added.
-    pub add_store_if_window_server_reads_every_released_store:
-        unsafe extern "C" fn(*mut c_void, u64, bool, u64) -> bool,
-    /// The same arguments. Answers whether surplus stores are left.
-    pub retire_idle_surplus_stores: unsafe extern "C" fn(*mut c_void, u64, bool, u64) -> bool,
+    /// Makes a store of the context, writing what it made. Answers false where none could be made.
+    /// Arguments: the context, the kind and size of the store, the window server that shows it, if one does, and where
+    /// the store is written.
+    pub create_store: unsafe extern "C" fn(*mut c_void, u64, StoreKind, IntSize, *mut c_void, *mut FfiNewStore) -> bool,
+    /// Arguments: the presentation, the context, whether the stores were added to those it has rather than replacing
+    /// them, and the stores with their images, which it takes over.
+    pub publish_stores: unsafe extern "C" fn(*mut c_void, u64, u64, bool, ak::Span<'_, i32>, ak::Span<'_, *mut c_void>),
+    /// Arguments: the presentation, the context, and the stores that it no longer has.
+    pub retire_published_stores: unsafe extern "C" fn(*mut c_void, u64, u64, ak::Span<'_, i32>),
 
-    /// Arguments: the context, the pool, the size, and a surface the new one is made like. Null where none could be had.
-    pub next_presentable_surface: unsafe extern "C" fn(*mut c_void, u64, u32, IntSize, *mut c_void) -> *mut c_void,
-    pub drop_presentable_surface_pool: unsafe extern "C" fn(*mut c_void, u64, u32),
-    pub presentable_surface_retain: unsafe extern "C" fn(*mut c_void),
-    pub presentable_surface_release: unsafe extern "C" fn(*mut c_void),
-    /// Lent for as long as the presentable surface lives.
-    pub presentable_surface_painting_surface: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    /// A new surface of the size, made like the one given, with one reference that the caller takes over, or null
+    /// where none could be made.
+    pub create_presentable_surface:
+        unsafe extern "C" fn(*mut c_void, IntSize, *const PaintingSurface) -> *const PresentableSurface,
+    /// What the window server composites by itself of the layers of the frames its remote layers show.
+    pub window_server_compositing: unsafe extern "C" fn(*mut c_void) -> FfiWindowServerCompositing,
 
     pub live_content: unsafe extern "C" fn(
         *mut c_void,
@@ -263,25 +384,35 @@ pub struct FfiRasterHost {
         *mut c_void,
         unsafe extern "C" fn(*mut c_void, *const FfiLiveContent<'_>),
     ),
+    /// Arguments: the remote layer, the context, the media, where it is placed, and the device pixel ratio.
     pub remote_layer_can_show:
-        unsafe extern "C" fn(*mut c_void, u64, MediaKind, u64, *const FfiSublayerPlacement, f64) -> bool,
+        unsafe extern "C" fn(*mut c_void, *mut c_void, u64, MediaKind, u64, *const FfiSublayerPlacement, f64) -> bool,
     /// Resolves the content of the sublayers, which the window server then holds busy until the list is destroyed or
     /// shown.
     pub build_sublayers: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, FfiSublayer>) -> *mut c_void,
     pub destroy_sublayers: unsafe extern "C" fn(*mut c_void),
 
-    pub frame_hand_off: unsafe extern "C" fn(*mut c_void, u64) -> FrameHandOff,
     /// Submits the GPU work drawn into the surface, or into the surfaces the window server shows where it is null,
     /// answering a token that `compositor_core_gpu_work_finished` hands back once it is done, on a later turn.
-    pub submit_frame: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> u64,
+    pub submit_frame: unsafe extern "C" fn(*mut c_void, u64, *const PaintingSurface) -> u64,
     /// Calls `compositor_core_frame_ready_for_hand_off` with the token on a later turn, once the work is scheduled.
     pub hand_off_once_gpu_work_is_scheduled: unsafe extern "C" fn(*mut c_void, u64),
-    /// Shows a frame in the remote layer that shows the context, with the sublayers given, which it takes over. Answers
-    /// false where the layer could not show it, after which the context is no longer shown in it. Writes the
-    /// presentation the layer is in.
-    pub show_frame_in_remote_layer:
-        unsafe extern "C" fn(*mut c_void, u64, *const FfiRemoteLayerFrame, *mut c_void, *mut u64) -> bool,
-    pub stop_showing_in_remote_layer: unsafe extern "C" fn(*mut c_void, u64),
+    /// Writes the window server of a new presentation, or nothing where frames reach the screen only through the
+    /// presentation.
+    pub create_window_server: unsafe extern "C" fn(*mut c_void, *mut FfiCppObject) -> bool,
+    pub window_server_frame_hand_off: unsafe extern "C" fn(*mut c_void) -> FrameHandOff,
+    /// While held, what every remote layer of the window server shows changes nowhere on screen, and changes all at
+    /// once when released.
+    pub window_server_hold_changes_on_screen: unsafe extern "C" fn(*mut c_void),
+    pub window_server_release_changes_held_off_screen: unsafe extern "C" fn(*mut c_void),
+    /// Arguments: the window server, the id of the layer, and where the layer and its host handle are written.
+    pub create_remote_layer:
+        unsafe extern "C" fn(*mut c_void, u64, *mut FfiCppObject, *mut FfiRemoteLayerHostHandle) -> bool,
+    /// Arguments: the layer, whether the frame is scaled to fit, and the size it fits within.
+    pub remote_layer_place_frame: unsafe extern "C" fn(*mut c_void, bool, IntSize),
+    /// Shows the frame in the layer with the sublayers given, which it takes over. Answers false where the layer could
+    /// not show it.
+    pub remote_layer_show_frame: unsafe extern "C" fn(*mut c_void, *const FfiRemoteLayerFrame, *mut c_void) -> bool,
     pub log_presented_frame: unsafe extern "C" fn(*mut c_void, u64, IntRect),
     /// Calls `compositor_core_presented_store_released` on a later turn.
     pub release_store_later: unsafe extern "C" fn(*mut c_void, u64, i32),
@@ -297,7 +428,7 @@ pub struct FfiRasterHost {
 
     /// Maps the shared memory of the descriptor, which it takes over, answering a mapping that `unmap_shared_memory`
     /// drops, or null where the descriptor does not hold that much. Writes where the memory is and its size.
-    pub map_shared_memory: unsafe extern "C" fn(*mut c_void, i32, u64, *mut *const u8, *mut usize) -> *mut c_void,
+    pub map_shared_memory: unsafe extern "C" fn(*mut c_void, i32, u64, *mut *mut u8, *mut usize) -> *mut c_void,
     pub unmap_shared_memory: unsafe extern "C" fn(*mut c_void),
     /// Arguments: the context, and the ids of the image frames that a display list or a visual context tree draws.
     /// Has the context hold those it lacks of the image frames its client registered, and answers whether it then
@@ -326,56 +457,153 @@ pub struct FfiRasterHost {
     pub begin_staged_rasterization: unsafe extern "C" fn(*mut c_void, u64, u64, *mut FfiRasterPainter) -> bool,
     /// Ends the painting that began, flushes it into the target, and drops what was staged.
     pub finish_staged_rasterization: unsafe extern "C" fn(*mut c_void, u64, u64),
+
+    /// Reserves canvas IDs that name nothing else, as many as asked for, and answers the first of them.
+    pub reserve_canvas_ids: unsafe extern "C" fn(*mut c_void, u64) -> u64,
+    /// Arguments: the client, the canvas, the size of the context, whether it has alpha, whether it will be read
+    /// frequently, and the color space of its pixels. Answers whether the context could be made.
+    pub create_canvas_2d_context: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        CanvasId,
+        IntSize,
+        bool,
+        bool,
+        Web_Bindings_PredefinedColorSpace,
+    ) -> bool,
+    pub destroy_canvas_2d_context: unsafe extern "C" fn(*mut c_void, u64, CanvasId),
+    /// Arguments: the client, the canvas, the rect, the alpha type and the color space of the pixels, where they go,
+    /// how many bytes fit there, and where the size of what was read is written.
+    pub read_back_canvas_2d_pixels: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        CanvasId,
+        IntRect,
+        u8,
+        Web_Bindings_PredefinedColorSpace,
+        *mut u8,
+        usize,
+        *mut IntSize,
+    ) -> bool,
+    /// Arguments: the client, the canvas of a context it made, and where the painter is written. The painting lasts
+    /// until `end_canvas_2d_painting`.
+    pub begin_canvas_2d_painting: unsafe extern "C" fn(*mut c_void, u64, CanvasId, *mut FfiCanvas2DPainter),
+    /// Answers whether the painting sampled a frame of a video on the GPU.
+    pub end_canvas_2d_painting: unsafe extern "C" fn(*mut c_void) -> bool,
+    /// Arguments: the client and the canvas. Makes what the context drew the content the canvas shows, and answers
+    /// whether it could.
+    pub present_canvas_2d_context: unsafe extern "C" fn(*mut c_void, u64, CanvasId) -> bool,
+    /// Arguments: the client and canvases of its contexts. Submits the GPU work drawn into their surfaces.
+    pub flush_canvas_2d_contexts: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, CanvasId>),
+
+    /// Answers the address of the GL function of the name, or null.
+    pub gl_proc_address: unsafe extern "C" fn(*mut c_void, *const c_char) -> *const c_void,
+    /// Arguments: the client, the canvas, and what its context is made with. Answers whether a GL context with a
+    /// drawing buffer could be made.
+    pub create_webgl_context: unsafe extern "C" fn(*mut c_void, u64, CanvasId, ContextOptions) -> bool,
+    pub destroy_webgl_context: unsafe extern "C" fn(*mut c_void, u64, CanvasId),
+    /// Makes the GL context of the client's canvas current, and writes its default framebuffer and renderbuffer.
+    pub make_webgl_context_current: unsafe extern "C" fn(*mut c_void, u64, CanvasId, *mut DefaultBuffers),
+    pub set_webgl_drawing_buffer_size: unsafe extern "C" fn(*mut c_void, u64, CanvasId, IntSize),
+    /// Arguments: the client, the canvas, whether the drawing buffer is preserved, and whether the frame presented last
+    /// goes on being shown where there is one.
+    pub present_webgl_context: unsafe extern "C" fn(*mut c_void, u64, CanvasId, bool, bool) -> PresentOutcome,
+    /// Arguments: the client, the canvas, whether the frame presented last is read rather than the drawing buffer, the
+    /// rect, where the pixels go, how many bytes fit there, and where the size of what was read is written.
+    pub read_back_webgl_drawing_buffer:
+        unsafe extern "C" fn(*mut c_void, u64, CanvasId, bool, IntRect, *mut u8, usize, *mut IntSize) -> bool,
+    pub webgl_can_copy_images_into_textures: unsafe extern "C" fn(*mut c_void, u64, CanvasId) -> bool,
+    /// Arguments: the client, the sink of the video, the generation of its frame, and where the frame and its size are
+    /// written. Answers whether the client holds that frame.
+    pub held_video_frame: unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut FfiCppObject, *mut IntSize) -> bool,
+    /// Writes an image of the frame on the GPU, which is null where there cannot be one.
+    pub video_frame_image: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut FfiCppObject),
+    pub copy_video_frame_image_into_bound_texture:
+        unsafe extern "C" fn(*mut c_void, u64, CanvasId, *mut c_void, VideoFrameCopy) -> bool,
+    pub convert_image_source_for_webgl: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        FfiImageSource,
+        FfiImageConversion,
+        *mut FfiConvertedPixels,
+    ) -> FfiImageConversionOutcome,
 }
 
-/// A surface of the C++ side, which this keeps alive.
-pub struct SurfaceHandle {
-    surface: NonNull<c_void>,
-    release: unsafe extern "C" fn(*mut c_void),
-    retain: unsafe extern "C" fn(*mut c_void),
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiImageSource {
+    pub is_held_video_frame: bool,
+    pub id: u64,
+    pub generation: u64,
 }
 
-impl SurfaceHandle {
-    pub fn as_ptr(&self) -> *mut c_void {
-        self.surface.as_ptr()
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiImageConversion {
+    /// A `Gfx::ExportFormat`.
+    pub export_format: u8,
+    pub flip_y: bool,
+    pub premultiply_alpha: bool,
+    pub has_target_size: bool,
+    pub target_size: IntSize,
+}
+
+#[repr(C)]
+pub struct FfiConvertedPixels {
+    pub pixels: FfiCppObject,
+    pub data: *const u8,
+    pub size: usize,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FfiImageConversionOutcome {
+    Converted,
+    UnknownImageFrame,
+    Failed,
+}
+
+pub struct ConvertedPixels {
+    _owner: CppObject,
+    data: *const u8,
+    size: usize,
+}
+
+impl AsRef<[u8]> for ConvertedPixels {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: The owner keeps the bytes for as long as this lives, and nothing writes them.
+        unsafe { ak::slice_from_raw_parts(self.data, self.size) }
     }
 }
 
-impl Clone for SurfaceHandle {
-    fn clone(&self) -> Self {
-        // SAFETY: The surface is live, as this holds it.
-        unsafe { (self.retain)(self.surface.as_ptr()) };
-        Self {
-            surface: self.surface,
-            release: self.release,
-            retain: self.retain,
-        }
+/// Shared memory that WebContent sent, mapped until this is dropped.
+pub struct SharedMemory {
+    mapping: NonNull<c_void>,
+    data: *mut u8,
+    len: usize,
+    unmap: unsafe extern "C" fn(*mut c_void),
+}
+
+impl SharedMemory {
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.data
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
-impl Drop for SurfaceHandle {
+impl Drop for SharedMemory {
     fn drop(&mut self) {
-        // SAFETY: This holds the reference it gives back.
-        unsafe { (self.release)(self.surface.as_ptr()) };
-    }
-}
-
-/// A surface the window server shows, which this keeps alive.
-pub struct PresentableSurfaceHandle {
-    surface: NonNull<c_void>,
-    release: unsafe extern "C" fn(*mut c_void),
-}
-
-impl PresentableSurfaceHandle {
-    pub fn as_ptr(&self) -> *mut c_void {
-        self.surface.as_ptr()
-    }
-}
-
-impl Drop for PresentableSurfaceHandle {
-    fn drop(&mut self) {
-        // SAFETY: This holds the reference it gives back.
-        unsafe { (self.release)(self.surface.as_ptr()) };
+        // SAFETY: The mapping came from the host, and nothing uses it after this.
+        unsafe { (self.unmap)(self.mapping.as_ptr()) };
     }
 }
 
@@ -414,60 +642,17 @@ impl RasterHost {
         self.0.host
     }
 
-    /// Takes a reference to a surface the C++ side lends.
-    pub fn retain_surface(&self, surface: *mut c_void) -> Option<SurfaceHandle> {
-        let surface = NonNull::new(surface)?;
-        // SAFETY: The C++ side lends a live surface.
-        unsafe { (self.0.surface_retain)(surface.as_ptr()) };
-        Some(SurfaceHandle {
-            surface,
-            release: self.0.surface_release,
-            retain: self.0.surface_retain,
-        })
-    }
-
-    /// Hands the reference the handle holds over to the C++ side.
-    pub fn leak_surface(&self, surface: SurfaceHandle) -> *mut c_void {
-        let pointer = surface.as_ptr();
-        std::mem::forget(surface);
-        pointer
-    }
-
-    // Adopts the reference the C++ side handed over with a new surface.
-    fn adopt_surface(&self, surface: *mut c_void) -> Option<SurfaceHandle> {
-        Some(SurfaceHandle {
-            surface: NonNull::new(surface)?,
-            release: self.0.surface_release,
-            retain: self.0.surface_retain,
-        })
-    }
-
-    pub fn surface_size(&self, surface: &SurfaceHandle) -> IntSize {
-        let mut size = IntSize::default();
-        // SAFETY: The surface is live, and the host writes the size during the call.
-        unsafe { (self.0.surface_size)(surface.as_ptr(), &raw mut size) };
-        size
-    }
-
     pub fn create_surface(
         &self,
         size: IntSize,
-        like: Option<&SurfaceHandle>,
+        like: Option<&Rc<PaintingSurface>>,
         inherits_lcd_text: bool,
-    ) -> Option<SurfaceHandle> {
-        let like = like.map_or(std::ptr::null_mut(), SurfaceHandle::as_ptr);
-        // SAFETY: The host outlives this, and the surface it is made like is live.
-        self.adopt_surface(unsafe { (self.0.create_surface)(self.host(), size, like, inherits_lcd_text) })
-    }
-
-    pub fn surfaces_share_backend(&self, a: &SurfaceHandle, b: &SurfaceHandle) -> bool {
-        // SAFETY: Both surfaces are live.
-        unsafe { (self.0.surfaces_share_backend)(a.as_ptr(), b.as_ptr()) }
-    }
-
-    pub fn surface_uses_gpu(&self, surface: &SurfaceHandle) -> bool {
-        // SAFETY: The surface is live.
-        unsafe { (self.0.surface_uses_gpu)(surface.as_ptr()) }
+    ) -> Option<Rc<PaintingSurface>> {
+        let like = like.map_or(std::ptr::null(), Rc::as_ptr);
+        // SAFETY: The host outlives this, and hands over a new surface or null.
+        unsafe {
+            PaintingSurface::adopted_from_ffi((self.0.create_surface)(self.host(), size, like, inherits_lcd_text))
+        }
     }
 
     pub fn start_raster_cache_frame(&self, context_id: CompositorContextId) {
@@ -475,58 +660,60 @@ impl RasterHost {
         unsafe { (self.0.start_raster_cache_frame)(self.host(), context_id.0) };
     }
 
-    pub fn save(&self, surface: &SurfaceHandle) -> i32 {
+    pub fn save(&self, surface: &Rc<PaintingSurface>) -> i32 {
         // SAFETY: The surface is live.
-        unsafe { (self.0.surface_save)(surface.as_ptr()) }
+        unsafe { (self.0.surface_save)(Rc::as_ptr(surface)) }
     }
 
-    pub fn restore_to_count(&self, surface: &SurfaceHandle, count: i32) {
+    pub fn restore_to_count(&self, surface: &Rc<PaintingSurface>, count: i32) {
         // SAFETY: The surface is live.
-        unsafe { (self.0.surface_restore_to_count)(surface.as_ptr(), count) };
+        unsafe { (self.0.surface_restore_to_count)(Rc::as_ptr(surface), count) };
     }
 
-    pub fn translate(&self, surface: &SurfaceHandle, x: f32, y: f32) {
+    pub fn translate(&self, surface: &Rc<PaintingSurface>, x: f32, y: f32) {
         // SAFETY: The surface is live.
-        unsafe { (self.0.surface_translate)(surface.as_ptr(), x, y) };
+        unsafe { (self.0.surface_translate)(Rc::as_ptr(surface), x, y) };
     }
 
-    pub fn scale(&self, surface: &SurfaceHandle, x: f32, y: f32) {
+    pub fn scale(&self, surface: &Rc<PaintingSurface>, x: f32, y: f32) {
         // SAFETY: The surface is live.
-        unsafe { (self.0.surface_scale)(surface.as_ptr(), x, y) };
+        unsafe { (self.0.surface_scale)(Rc::as_ptr(surface), x, y) };
     }
 
-    pub fn clip_rect(&self, surface: &SurfaceHandle, rect: IntRect) {
+    pub fn clip_rect(&self, surface: &Rc<PaintingSurface>, rect: IntRect) {
         // SAFETY: The surface is live.
-        unsafe { (self.0.surface_clip_rect)(surface.as_ptr(), rect) };
+        unsafe { (self.0.surface_clip_rect)(Rc::as_ptr(surface), rect) };
     }
 
-    pub fn clear(&self, surface: &SurfaceHandle, color: Color) {
+    pub fn clear(&self, surface: &Rc<PaintingSurface>, color: Color) {
         // SAFETY: The surface is live.
-        unsafe { (self.0.surface_clear)(surface.as_ptr(), color) };
+        unsafe { (self.0.surface_clear)(Rc::as_ptr(surface), color) };
     }
 
     pub fn draw_surface(
         &self,
-        target: &SurfaceHandle,
-        source: &SurfaceHandle,
+        target: &Rc<PaintingSurface>,
+        source: &Rc<PaintingSurface>,
         source_rect: IntRect,
         target_rect: IntRect,
         blend: SurfaceBlend,
     ) {
         // SAFETY: Both surfaces are live.
-        unsafe { (self.0.surface_draw_surface)(target.as_ptr(), source.as_ptr(), source_rect, target_rect, blend) };
+        unsafe {
+            (self.0.surface_draw_surface)(Rc::as_ptr(target), Rc::as_ptr(source), source_rect, target_rect, blend);
+        }
     }
 
-    pub fn flush(&self, surface: &SurfaceHandle) {
-        // SAFETY: The host outlives this, and the surface is live.
-        unsafe { (self.0.flush_surface)(self.host(), surface.as_ptr()) };
+    pub fn flush(&self, surface: &Rc<PaintingSurface>) {
+        // SAFETY: The surface is live.
+        unsafe { (self.0.flush_surface)(Rc::as_ptr(surface)) };
     }
 
     /// Paints into the surface through a painter, which `paint` drives.
     pub fn paint(
         &self,
         context_id: CompositorContextId,
-        surface: &SurfaceHandle,
+        surface: &Rc<PaintingSurface>,
         resources: PaintingResources,
         allows_lcd_text: bool,
         paint: impl FnOnce(&mut FfiRasterPainter),
@@ -537,7 +724,7 @@ impl RasterHost {
             (self.0.begin_painting)(
                 self.host(),
                 context_id.0,
-                surface.as_ptr(),
+                Rc::as_ptr(surface),
                 resources,
                 allows_lcd_text,
                 painter.as_mut_ptr(),
@@ -549,106 +736,73 @@ impl RasterHost {
         unsafe { (self.0.end_painting)(self.host()) };
     }
 
-    pub fn store_state(&self, context_id: CompositorContextId) -> FfiStoreState {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.store_state)(self.host(), context_id.0) }
-    }
-
-    pub fn resize_stores(&self, context_id: CompositorContextId, resize: &FfiStoreResize) -> StoreResizeOutcome {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.resize_stores)(self.host(), context_id.0, resize) }
-    }
-
-    pub fn invalidate_stores(&self, context_id: CompositorContextId) {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.invalidate_stores)(self.host(), context_id.0) };
-    }
-
-    pub fn acquire_store(&self, context_id: CompositorContextId) -> Option<(i32, SurfaceHandle)> {
-        let mut acquired = FfiAcquiredStore {
-            bitmap_id: -1,
-            surface: std::ptr::null_mut(),
-        };
-        // SAFETY: The host outlives this.
-        if !unsafe { (self.0.acquire_store)(self.host(), context_id.0, &raw mut acquired) } {
+    pub fn create_store(
+        &self,
+        context_id: CompositorContextId,
+        kind: StoreKind,
+        size: IntSize,
+        window_server: Option<&WindowServerObject>,
+    ) -> Option<NewStore> {
+        let mut store = FfiNewStore::default();
+        let window_server = window_server.map_or(std::ptr::null_mut(), WindowServerObject::as_ptr);
+        // SAFETY: The host outlives this, the window server is live, and the host writes the store it made.
+        if !unsafe { (self.0.create_store)(self.host(), context_id.0, kind, size, window_server, &raw mut store) } {
             return None;
         }
-        Some((acquired.bitmap_id, self.retain_surface(acquired.surface)?))
+        // SAFETY: The host handed the store over.
+        unsafe { NewStore::adopt(store) }
     }
 
-    pub fn complete_rendering(&self, context_id: CompositorContextId, bitmap_id: i32) {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.complete_rendering)(self.host(), context_id.0, bitmap_id) };
-    }
-
-    pub fn release_store(&self, context_id: CompositorContextId, bitmap_id: i32) -> bool {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.release_store)(self.host(), context_id.0, bitmap_id) }
-    }
-
-    pub fn release_all_presented_stores(&self, context_id: CompositorContextId) {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.release_all_presented_stores)(self.host(), context_id.0) };
-    }
-
-    pub fn latest_rendered_store_surface(&self, context_id: CompositorContextId) -> Option<SurfaceHandle> {
-        // SAFETY: The host outlives this.
-        self.retain_surface(unsafe { (self.0.latest_rendered_store_surface)(self.host(), context_id.0) })
-    }
-
-    pub fn add_store_if_window_server_reads_every_released_store(
+    pub fn publish_stores(
         &self,
+        presentation_id: u64,
         context_id: CompositorContextId,
-        presentation_id: Option<u64>,
-    ) -> bool {
-        // SAFETY: The host outlives this.
+        added: bool,
+        publication: Publication,
+    ) {
+        let shared_images: Vec<*mut c_void> = publication
+            .shared_images
+            .into_iter()
+            .map(SharedImageToPublish::into_raw)
+            .collect();
+        // SAFETY: The host outlives this, and takes the images over.
         unsafe {
-            (self.0.add_store_if_window_server_reads_every_released_store)(
+            (self.0.publish_stores)(
                 self.host(),
+                presentation_id,
                 context_id.0,
-                presentation_id.is_some(),
-                presentation_id.unwrap_or_default(),
-            )
+                added,
+                ak::Span::new(&publication.bitmap_ids),
+                ak::Span::new(&shared_images),
+            );
         }
     }
 
-    pub fn retire_idle_surplus_stores(&self, context_id: CompositorContextId, presentation_id: Option<u64>) -> bool {
+    pub fn retire_published_stores(&self, presentation_id: u64, context_id: CompositorContextId, bitmap_ids: &[i32]) {
         // SAFETY: The host outlives this.
         unsafe {
-            (self.0.retire_idle_surplus_stores)(
-                self.host(),
-                context_id.0,
-                presentation_id.is_some(),
-                presentation_id.unwrap_or_default(),
-            )
+            (self.0.retire_published_stores)(self.host(), presentation_id, context_id.0, ak::Span::new(bitmap_ids));
         }
     }
 
-    pub fn next_presentable_surface(
+    pub fn create_presentable_surface(
         &self,
-        context_id: CompositorContextId,
-        pool: u32,
         size: IntSize,
-        like: &SurfaceHandle,
-    ) -> Option<PresentableSurfaceHandle> {
-        // SAFETY: The host outlives this, and the surface is live.
-        let surface =
-            unsafe { (self.0.next_presentable_surface)(self.host(), context_id.0, pool, size, like.as_ptr()) };
-        Some(PresentableSurfaceHandle {
-            surface: NonNull::new(surface)?,
-            release: self.0.presentable_surface_release,
-        })
+        like: &Rc<PaintingSurface>,
+    ) -> Option<Rc<PresentableSurface>> {
+        // SAFETY: The host outlives this, and hands over a new surface or null.
+        unsafe {
+            PresentableSurface::adopted_from_ffi((self.0.create_presentable_surface)(
+                self.host(),
+                size,
+                Rc::as_ptr(like),
+            ))
+        }
     }
 
-    pub fn drop_presentable_surface_pool(&self, context_id: CompositorContextId, pool: u32) {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.drop_presentable_surface_pool)(self.host(), context_id.0, pool) };
-    }
-
-    pub fn painting_surface_of(&self, surface: &PresentableSurfaceHandle) -> SurfaceHandle {
-        // SAFETY: The presentable surface is live, and lends its painting surface.
-        self.retain_surface(unsafe { (self.0.presentable_surface_painting_surface)(surface.as_ptr()) })
-            .expect("a presentable surface has a painting surface")
+    pub fn window_server_compositing(&self, window_server: &WindowServerObject) -> FfiWindowServerCompositing {
+        // SAFETY: The window server is live.
+        unsafe { (self.0.window_server_compositing)(window_server.as_ptr()) }
     }
 
     pub fn live_content(&self, context_id: CompositorContextId, canvas_ids: &[u64]) -> LiveContent {
@@ -690,14 +844,25 @@ impl RasterHost {
 
     pub fn remote_layer_can_show(
         &self,
+        remote_layer: &RemoteLayerObject,
         context_id: CompositorContextId,
         kind: MediaKind,
         id: u64,
         placement: &FfiSublayerPlacement,
         device_pixel_ratio: f64,
     ) -> bool {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.remote_layer_can_show)(self.host(), context_id.0, kind, id, placement, device_pixel_ratio) }
+        // SAFETY: The host outlives this, and the layer is live.
+        unsafe {
+            (self.0.remote_layer_can_show)(
+                self.host(),
+                remote_layer.as_ptr(),
+                context_id.0,
+                kind,
+                id,
+                placement,
+                device_pixel_ratio,
+            )
+        }
     }
 
     pub fn build_sublayers(&self, context_id: CompositorContextId, sublayers: &[FfiSublayer]) -> SublayersHandle {
@@ -709,13 +874,22 @@ impl RasterHost {
         }
     }
 
-    pub fn frame_hand_off(&self, context_id: CompositorContextId) -> FrameHandOff {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.frame_hand_off)(self.host(), context_id.0) }
+    /// When a frame shown through the presentation can be handed to it.
+    pub fn frame_hand_off_through_presentation() -> FrameHandOff {
+        if cfg!(target_os = "macos") {
+            FrameHandOff::OnceGpuWorkIsScheduled
+        } else {
+            FrameHandOff::OnceGpuWorkIsFinished
+        }
     }
 
-    pub fn submit_frame(&self, context_id: CompositorContextId, surface: Option<&SurfaceHandle>) -> u64 {
-        let surface = surface.map_or(std::ptr::null_mut(), SurfaceHandle::as_ptr);
+    pub fn window_server_frame_hand_off(&self, window_server: &WindowServerObject) -> FrameHandOff {
+        // SAFETY: The window server is live.
+        unsafe { (self.0.window_server_frame_hand_off)(window_server.as_ptr()) }
+    }
+
+    pub fn submit_frame(&self, context_id: CompositorContextId, surface: Option<&Rc<PaintingSurface>>) -> u64 {
+        let surface = surface.map_or(std::ptr::null(), Rc::as_ptr);
         // SAFETY: The host outlives this, and the surface is live.
         unsafe { (self.0.submit_frame)(self.host(), context_id.0, surface) }
     }
@@ -725,30 +899,14 @@ impl RasterHost {
         unsafe { (self.0.hand_off_once_gpu_work_is_scheduled)(self.host(), token) };
     }
 
-    /// Answers the presentation of the remote layer that showed the frame, or none where it could not show it.
-    pub fn show_frame_in_remote_layer(
+    pub fn remote_layer_show_frame(
         &self,
-        context_id: CompositorContextId,
+        remote_layer: &RemoteLayerObject,
         frame: &FfiRemoteLayerFrame,
         sublayers: SublayersHandle,
-    ) -> Option<u64> {
-        let mut presentation_id = 0;
-        // SAFETY: The host outlives this, and takes the sublayers over.
-        let shown = unsafe {
-            (self.0.show_frame_in_remote_layer)(
-                self.host(),
-                context_id.0,
-                frame,
-                sublayers.into_raw(),
-                &raw mut presentation_id,
-            )
-        };
-        shown.then_some(presentation_id)
-    }
-
-    pub fn stop_showing_in_remote_layer(&self, context_id: CompositorContextId) {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.stop_showing_in_remote_layer)(self.host(), context_id.0) };
+    ) -> bool {
+        // SAFETY: The layer is live, and takes the sublayers over.
+        unsafe { (self.0.remote_layer_show_frame)(remote_layer.as_ptr(), frame, sublayers.into_raw()) }
     }
 
     pub fn log_presented_frame(&self, page_id: u64, damage_rect: IntRect) {
@@ -823,34 +981,41 @@ impl RasterHost {
         &self,
         buffer: Core_AnonymousBuffer,
         sizes: &[PackedChunkSize],
-    ) -> Result<Vec<ReceivedChunk>, &'static str> {
-        let Some((size, file)) = buffer.shared_memory else {
+    ) -> Result<Vec<ListChunk>, &'static str> {
+        let Some(memory) = self.map_shared_memory(buffer) else {
+            return Err("Display list buffer is smaller than it claims");
+        };
+        let Some(memory) = memory else {
             // SAFETY: Nothing is read from an empty buffer.
             return unsafe { receive_packed_chunks_from_shared_memory(std::ptr::null(), 0, sizes) };
+        };
+        // SAFETY: The mapping holds as many readable bytes until it is dropped, after the chunks are copied out.
+        unsafe { receive_packed_chunks_from_shared_memory(memory.as_ptr(), memory.len(), sizes) }
+    }
+
+    /// Maps shared memory that WebContent sent, which is empty where the buffer holds nothing. None where the buffer
+    /// does not hold as much memory as it claims.
+    pub fn map_shared_memory(&self, buffer: Core_AnonymousBuffer) -> Option<Option<SharedMemory>> {
+        let Some((size, file)) = buffer.shared_memory else {
+            return Some(None);
         };
         #[cfg(unix)]
         let descriptor = std::os::fd::IntoRawFd::into_raw_fd(file.0);
         #[cfg(windows)]
         let descriptor = file.0.into_raw();
-        let mut data = std::ptr::null();
-        let mut data_size = 0;
+        let mut data = std::ptr::null_mut();
+        let mut mapped_size = 0;
         // SAFETY: The host outlives this, and takes the descriptor over.
         let mapping =
-            unsafe { (self.0.map_shared_memory)(self.host(), descriptor, size, &raw mut data, &raw mut data_size) };
-        if mapping.is_null() {
-            return Err("Display list buffer is smaller than it claims");
-        }
-        // The mapping may hold more than the chunks, which fill the size the buffer was sent with.
-        let chunks = match usize::try_from(size) {
-            Ok(size) if size <= data_size => {
-                // SAFETY: The mapping holds `data_size` readable bytes at `data` until it is dropped below.
-                unsafe { receive_packed_chunks_from_shared_memory(data, size, sizes) }
-            }
-            _ => Err("Display list buffer is smaller than it claims"),
+            unsafe { (self.0.map_shared_memory)(self.host(), descriptor, size, &raw mut data, &raw mut mapped_size) };
+        let mut memory = SharedMemory {
+            mapping: NonNull::new(mapping)?,
+            data,
+            len: mapped_size,
+            unmap: self.0.unmap_shared_memory,
         };
-        // SAFETY: The mapping came from the host, which drops it once.
-        unsafe { (self.0.unmap_shared_memory)(mapping) };
-        chunks
+        memory.len = usize::try_from(size).ok().filter(|&size| size <= mapped_size)?;
+        Some(Some(memory))
     }
 
     pub fn take_registered_image_frames(&self, context_id: CompositorContextId, image_frame_ids: &[u64]) -> bool {
@@ -921,5 +1086,362 @@ impl RasterHost {
         // SAFETY: The host outlives this.
         unsafe { (self.0.finish_staged_rasterization)(self.host(), client, token) };
         began
+    }
+
+    pub fn reserve_canvas_ids(&self, count: u64) -> u64 {
+        // SAFETY: The host outlives this.
+        unsafe { (self.0.reserve_canvas_ids)(self.host(), count) }
+    }
+
+    pub fn create_canvas_2d_context(
+        &self,
+        client: u64,
+        canvas_id: CanvasId,
+        size: IntSize,
+        alpha: bool,
+        will_read_frequently: bool,
+        color_space: Web_Bindings_PredefinedColorSpace,
+    ) -> bool {
+        // SAFETY: The host outlives this.
+        unsafe {
+            (self.0.create_canvas_2d_context)(
+                self.host(),
+                client,
+                canvas_id,
+                size,
+                alpha,
+                will_read_frequently,
+                color_space,
+            )
+        }
+    }
+
+    pub fn destroy_canvas_2d_context(&self, client: u64, canvas_id: CanvasId) {
+        // SAFETY: The host outlives this.
+        unsafe { (self.0.destroy_canvas_2d_context)(self.host(), client, canvas_id) };
+    }
+
+    pub fn read_back_canvas_2d_pixels(
+        &self,
+        client: u64,
+        canvas_id: CanvasId,
+        rect: IntRect,
+        alpha_type: Gfx_AlphaType,
+        color_space: Web_Bindings_PredefinedColorSpace,
+        pixels: &SharedMemory,
+    ) -> Option<IntSize> {
+        let mut size = IntSize::default();
+        // SAFETY: The host outlives this, the mapping holds as many writable bytes, and the host writes the size.
+        unsafe {
+            (self.0.read_back_canvas_2d_pixels)(
+                self.host(),
+                client,
+                canvas_id,
+                rect,
+                alpha_type as u8,
+                color_space,
+                pixels.as_ptr(),
+                pixels.len(),
+                &raw mut size,
+            )
+        }
+        .then_some(size)
+    }
+
+    pub fn begin_canvas_2d_painting(&self, client: u64, canvas_id: CanvasId) -> Canvas2DPainting<'_> {
+        let mut painter = std::mem::MaybeUninit::<FfiCanvas2DPainter>::uninit();
+        // SAFETY: The host outlives this, and writes the painter.
+        unsafe { (self.0.begin_canvas_2d_painting)(self.host(), client, canvas_id, painter.as_mut_ptr()) };
+        Canvas2DPainting {
+            raster: self,
+            // SAFETY: The host wrote the painter.
+            painter: unsafe { painter.assume_init() },
+        }
+    }
+
+    pub fn try_present_canvas_2d_context(&self, client: u64, canvas_id: CanvasId) -> bool {
+        // SAFETY: The host outlives this.
+        unsafe { (self.0.present_canvas_2d_context)(self.host(), client, canvas_id) }
+    }
+
+    pub fn flush_canvas_2d_contexts(&self, client: u64, canvas_ids: &[CanvasId]) {
+        // SAFETY: The host outlives this, and reads the IDs during the call.
+        unsafe { (self.0.flush_canvas_2d_contexts)(self.host(), client, ak::Span::new(canvas_ids)) };
+    }
+}
+
+impl WebGLHost for RasterHost {
+    type Pixels = ConvertedPixels;
+    type VideoFrame = CppObject;
+    type VideoFrameImage = CppObject;
+
+    fn gl_proc_address(&self, name: &CStr) -> *const c_void {
+        // SAFETY: The host outlives this, and reads the name during the call.
+        unsafe { (self.0.gl_proc_address)(self.host(), name.as_ptr()) }
+    }
+
+    fn allocate_canvas_id(&self) -> CanvasId {
+        CanvasId(self.reserve_canvas_ids(1))
+    }
+
+    fn create_webgl_context(&self, client: WebContentClientId, canvas_id: CanvasId, options: ContextOptions) -> bool {
+        // SAFETY: The host outlives this.
+        unsafe { (self.0.create_webgl_context)(self.host(), client.0, canvas_id, options) }
+    }
+
+    fn destroy_webgl_context(&self, client: WebContentClientId, canvas_id: CanvasId) {
+        // SAFETY: The host outlives this.
+        unsafe { (self.0.destroy_webgl_context)(self.host(), client.0, canvas_id) };
+    }
+
+    fn make_webgl_context_current(&self, client: WebContentClientId, canvas_id: CanvasId) -> DefaultBuffers {
+        let mut defaults = DefaultBuffers::default();
+        // SAFETY: The host outlives this, and writes the default buffers.
+        unsafe { (self.0.make_webgl_context_current)(self.host(), client.0, canvas_id, &raw mut defaults) };
+        defaults
+    }
+
+    fn set_webgl_drawing_buffer_size(&self, client: WebContentClientId, canvas_id: CanvasId, size: IntSize) {
+        // SAFETY: The host outlives this.
+        unsafe { (self.0.set_webgl_drawing_buffer_size)(self.host(), client.0, canvas_id, size) };
+    }
+
+    fn present_webgl_context(
+        &self,
+        client: WebContentClientId,
+        canvas_id: CanvasId,
+        preserve_drawing_buffer: bool,
+        show_presented_frame: bool,
+    ) -> PresentOutcome {
+        // SAFETY: The host outlives this.
+        unsafe {
+            (self.0.present_webgl_context)(
+                self.host(),
+                client.0,
+                canvas_id,
+                preserve_drawing_buffer,
+                show_presented_frame,
+            )
+        }
+    }
+
+    unsafe fn read_back_webgl_drawing_buffer(
+        &self,
+        client: WebContentClientId,
+        canvas_id: CanvasId,
+        from_presented_frame: bool,
+        rect: IntRect,
+        pixels: *mut u8,
+        pixels_size: usize,
+    ) -> Option<IntSize> {
+        let mut size = IntSize::default();
+        // SAFETY: The host outlives this, the caller passes as many writable bytes, and the host writes the size.
+        unsafe {
+            (self.0.read_back_webgl_drawing_buffer)(
+                self.host(),
+                client.0,
+                canvas_id,
+                from_presented_frame,
+                rect,
+                pixels,
+                pixels_size,
+                &raw mut size,
+            )
+        }
+        .then_some(size)
+    }
+
+    fn webgl_can_copy_images_into_textures(&self, client: WebContentClientId, canvas_id: CanvasId) -> bool {
+        // SAFETY: The host outlives this.
+        unsafe { (self.0.webgl_can_copy_images_into_textures)(self.host(), client.0, canvas_id) }
+    }
+
+    fn held_video_frame(
+        &self,
+        client: WebContentClientId,
+        sink_handle: VideoSinkHandle,
+        generation: u64,
+    ) -> Option<(CppObject, IntSize)> {
+        let mut frame = FfiCppObject::default();
+        let mut size = IntSize::default();
+        // SAFETY: The host outlives this, and writes the frame and its size where it answers true.
+        let held = unsafe {
+            (self.0.held_video_frame)(
+                self.host(),
+                client.0,
+                sink_handle.0,
+                generation,
+                &raw mut frame,
+                &raw mut size,
+            )
+        };
+        if !held {
+            return None;
+        }
+        // SAFETY: The host handed the frame over.
+        unsafe { CppObject::adopt(frame) }.map(|frame| (frame, size))
+    }
+
+    fn video_frame_image(&self, frame: &CppObject) -> Option<CppObject> {
+        let mut image = FfiCppObject::default();
+        // SAFETY: The host outlives this, the frame is one it made, and it writes an image or null.
+        unsafe { (self.0.video_frame_image)(self.host(), frame.as_ptr(), &raw mut image) };
+        // SAFETY: The host handed the image over, if there is one.
+        unsafe { CppObject::adopt(image) }
+    }
+
+    fn copy_video_frame_image_into_bound_texture(
+        &self,
+        client: WebContentClientId,
+        canvas_id: CanvasId,
+        image: &CppObject,
+        copy: VideoFrameCopy,
+    ) -> bool {
+        // SAFETY: The host outlives this, and the image is one it made.
+        unsafe {
+            (self.0.copy_video_frame_image_into_bound_texture)(self.host(), client.0, canvas_id, image.as_ptr(), copy)
+        }
+    }
+
+    fn convert_image_source(
+        &self,
+        client: WebContentClientId,
+        source: ImageSource,
+        conversion: ImageConversion,
+    ) -> ImageConversionOutcome<ConvertedPixels> {
+        let source = match source {
+            ImageSource::RegisteredImageFrame(id) => FfiImageSource {
+                is_held_video_frame: false,
+                id: id.0,
+                generation: 0,
+            },
+            ImageSource::HeldVideoFrame {
+                sink_handle,
+                generation,
+            } => FfiImageSource {
+                is_held_video_frame: true,
+                id: sink_handle.0,
+                generation,
+            },
+        };
+        let conversion = FfiImageConversion {
+            export_format: conversion.export_format as u8,
+            flip_y: conversion.flip_y,
+            premultiply_alpha: conversion.premultiply_alpha,
+            has_target_size: conversion.target_size.is_some(),
+            target_size: conversion.target_size.unwrap_or_default(),
+        };
+        let mut converted = FfiConvertedPixels {
+            pixels: FfiCppObject::default(),
+            data: std::ptr::null(),
+            size: 0,
+            width: 0,
+            height: 0,
+        };
+        // SAFETY: The host outlives this, and writes the converted pixels where it answers that it converted them.
+        let outcome = unsafe {
+            (self.0.convert_image_source_for_webgl)(self.host(), client.0, source, conversion, &raw mut converted)
+        };
+        match outcome {
+            FfiImageConversionOutcome::Converted => {
+                // SAFETY: The host handed the pixels over.
+                let owner = unsafe { CppObject::adopt(converted.pixels) }.expect("converted pixels have an owner");
+                ImageConversionOutcome::Converted {
+                    pixels: ConvertedPixels {
+                        _owner: owner,
+                        data: converted.data,
+                        size: converted.size,
+                    },
+                    width: converted.width,
+                    height: converted.height,
+                }
+            }
+            FfiImageConversionOutcome::UnknownImageFrame => ImageConversionOutcome::UnknownImageFrame,
+            FfiImageConversionOutcome::Failed => ImageConversionOutcome::Failed,
+        }
+    }
+}
+
+pub struct Canvas2DPainting<'a> {
+    raster: &'a RasterHost,
+    painter: FfiCanvas2DPainter,
+}
+
+impl Canvas2DPainting<'_> {
+    pub fn play_command(&self, command_type: DisplayListCommandType, payload: &[u8]) {
+        // SAFETY: The painting has not ended, and the player reads the payload during the call.
+        unsafe { (self.painter.play_command)(self.painter.player, command_type, ak::Span::new(payload)) };
+    }
+
+    pub fn end_reporting_whether_video_frames_were_sampled_on_the_gpu(self) -> bool {
+        // SAFETY: The host outlives this.
+        unsafe { (self.raster.0.end_canvas_2d_painting)(self.raster.host()) }
+    }
+}
+
+impl RemoteLayerHost for RasterHost {
+    fn create_window_server(&self) -> Option<WindowServerObject> {
+        let mut window_server = FfiCppObject::default();
+        // SAFETY: The host outlives this, and writes the window server it made.
+        if !unsafe { (self.0.create_window_server)(self.host(), &raw mut window_server) } {
+            return None;
+        }
+        // SAFETY: The host handed a window server over.
+        unsafe { WindowServerObject::adopt(window_server) }
+    }
+
+    fn create_remote_layer(
+        &self,
+        window_server: &WindowServerObject,
+        remote_layer_id: u64,
+    ) -> Option<(RemoteLayerObject, Compositing_RemoteLayerHostHandle)> {
+        let mut layer = FfiCppObject::default();
+        let mut host_handle = FfiRemoteLayerHostHandle::default();
+        // SAFETY: The window server is live, and the host writes the layer it made with its handle.
+        if !unsafe {
+            (self.0.create_remote_layer)(
+                window_server.as_ptr(),
+                remote_layer_id,
+                &raw mut layer,
+                &raw mut host_handle,
+            )
+        } {
+            return None;
+        }
+        // SAFETY: The host handed the layer over.
+        let layer = unsafe { RemoteLayerObject::adopt(layer) }?;
+        let kind = match host_handle.kind {
+            1 => Compositing_RemoteLayerHostKind::CoreAnimationContext,
+            2 => Compositing_RemoteLayerHostKind::Win32ChildWindow,
+            _ => return None,
+        };
+        Some((
+            layer,
+            Compositing_RemoteLayerHostHandle {
+                kind,
+                id: host_handle.id,
+            },
+        ))
+    }
+
+    fn place_frame(&self, remote_layer: &RemoteLayerObject, fit_within: Option<IntSize>) {
+        // SAFETY: The layer is live.
+        unsafe {
+            (self.0.remote_layer_place_frame)(
+                remote_layer.as_ptr(),
+                fit_within.is_some(),
+                fit_within.unwrap_or_default(),
+            );
+        }
+    }
+
+    fn hold_changes_on_screen(&self, window_server: &WindowServerObject) {
+        // SAFETY: The window server is live.
+        unsafe { (self.0.window_server_hold_changes_on_screen)(window_server.as_ptr()) };
+    }
+
+    fn release_changes_held_off_screen(&self, window_server: &WindowServerObject) {
+        // SAFETY: The window server is live.
+        unsafe { (self.0.window_server_release_changes_held_off_screen)(window_server.as_ptr()) };
     }
 }

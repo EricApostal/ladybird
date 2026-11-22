@@ -129,6 +129,8 @@ public:
     RefPtr<CanonicalDocument> hosted_document_with_id(Web::HTML::CrossProcessId) const;
     bool hosts_a_document_with_top_level_origin(URL::Origin const&) const;
     bool document_may_use(Web::HTML::CrossProcessId, Web::Permissions::PermissionName) const;
+    // Whether a hosted document of a file: page may use the permission, which it was granted for as long as it lives.
+    bool hosts_a_local_file_document_that_may_use(Web::Permissions::PermissionName) const;
 
     Web::Permissions::PermissionSnapshot set_permission_for_testing(Web::HTML::CrossProcessId document_id, String const& name, String const& state);
     void set_next_permission_prompt_outcome_for_testing(String const& name, String const& outcome, bool held);
@@ -152,6 +154,7 @@ public:
     bool consume_transient_user_activation();
 
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
+    bool had_user_edits() const { return m_had_user_edits; }
     bool detached_close_pending() const { return m_detached_close_pending; }
     void set_detached_close_pending(bool pending) { m_detached_close_pending = pending; }
 
@@ -168,6 +171,7 @@ public:
     // Returns whether the event was posted; a page without a compositor sends it to WebContent itself.
     bool handle_and_dispatch_mouse_event_in_compositor(Web::MouseEvent const&);
     void did_consume_input_event_in_compositor(u64 event_id);
+    void did_update_compositor_layers(Compositing::CompositorLayersDescription const&);
     void did_not_dispatch_input_event_through_compositor(u64 event_id);
     void did_dispatch_input_event_through_compositor(u64 event_id, bool performed_default_action);
     void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio);
@@ -184,6 +188,7 @@ public:
     Optional<PresentedBackingStores> take_presented_backing_stores();
     void release_presented_bitmap(i32 bitmap_id);
     void fail_renderer_owned_downloads();
+    bool has_renderer_owned_downloads() const { return !m_renderer_owned_downloads.is_empty(); }
     void reset_state_for_testing();
 
 private:
@@ -192,7 +197,6 @@ private:
     bool holds_container_of(CanonicalNavigable const& child_frame, StringView message_name);
     bool continue_navigation_population_in_selected_process(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id);
     void for_each_hosted_document(Function<IterationDecision(CanonicalDocument&)> const&) const;
-    bool populates_a_navigation_to_local_file(ByteString const& path) const;
     Optional<CanonicalDocument&> document_with_hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
     StorageJar* storage_jar(Web::StorageAPI::StorageEndpointType) const;
     Optional<String> canonical_storage_key(Web::HTML::EnvironmentId const&) const;
@@ -248,6 +252,7 @@ private:
     virtual void did_complete_debugger_breakpoint_operation(u64 request_id, Optional<String> error) override;
     virtual void did_take_screenshot(Gfx::ShareableBitmap screenshot) override;
     virtual void did_get_internal_page_info(WebView::PageInfoType type, Optional<Core::AnonymousBuffer> info) override;
+    virtual void did_describe_owners_of_visual_context_nodes(u64 structural_epoch, Vector<u32> spatial_node_indices, Vector<u32> effect_node_indices, Vector<String> owners) override;
     virtual void did_get_selected_text(u64 request_id, ByteString selection) override;
     virtual void did_get_selected_text_for_lookup(u64 request_id, Optional<DictionaryLookup> lookup) override;
     virtual void did_select_word_for_dictionary_lookup(u64 request_id, bool selected) override;
@@ -266,6 +271,9 @@ private:
     void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls);
     Messages::WebContentClient::ConnectToStorageAreaResponse connect_to_storage_area(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id);
     virtual void did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
+    virtual void did_change_had_user_edits(bool had_user_edits) override;
+    virtual void did_save_session_history_entry_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryPersistedState persisted_state) override;
+    virtual void did_save_session_history_entry_states() override;
     virtual void did_consume_user_activation(Web::HTML::UserActivationConsumption consumption) override;
     virtual void did_notify_about_user_activation(Web::HTML::CrossProcessId document_id) override;
     virtual void webdriver_user_prompt_handling_complete(u64 request_id, Web::WebDriver::Response response) override;
@@ -285,6 +293,7 @@ private:
     virtual void did_change_picture_in_picture_video_size(Gfx::IntSize video_size) override;
     virtual void did_change_picture_in_picture_player_controls_visibility(bool shown) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
+    virtual void did_request_file_for_webdriver(u64 command_id, ByteString path, i32 request_id) override;
     virtual void did_request_color_picker(Color current_color) override;
     virtual void did_request_date_picker(Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum) override;
     virtual void did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId document_id) override;
@@ -445,6 +454,7 @@ private:
     bool m_capturing_audio { false };
     Optional<PresentedBackingStores> m_presented_backing_stores;
     bool m_needs_beforeunload_check { true };
+    bool m_had_user_edits { false };
     bool m_detached_close_pending { false };
     Optional<String> m_history_recorded_url_for_current_load;
     HashTable<u64> m_renderer_owned_downloads;

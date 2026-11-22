@@ -8,7 +8,7 @@
 //! and encodings of the fields it accesses, from the same layout types the interpreter is compiled against.
 
 use core::mem::offset_of;
-use std::sync::Arc;
+use std::sync::OnceLock;
 
 use libjs_abi::Builtin;
 use libjs_abi::value as nan_box;
@@ -82,7 +82,7 @@ const _: () =
 pub struct RuntimeFunctionAddresses {
     /// The address of the slow path JIT code calls for each generic opcode, indexed by opcode, or 0 for opcodes
     /// without one (the compiler refuses to compile those generically).
-    slow_paths: Arc<[u64]>,
+    slow_paths: &'static [u64],
     try_get_by_id_cache: u64,
     try_put_by_id_cache: u64,
     raw_native_exception: u64,
@@ -101,11 +101,15 @@ impl RuntimeFunctionAddresses {
                 .map(|(_, address)| *address as u64)
                 .unwrap_or_else(|| panic!("the runtime has no function {symbol}"))
         };
+        // NB: The table holds addresses of functions, which are the same for every VM of the process.
+        static SLOW_PATHS: OnceLock<Box<[u64]>> = OnceLock::new();
         Self {
-            slow_paths: (0..=u8::MAX)
-                .map_while(OpCode::from_u8)
-                .map(|opcode| slow_path_symbol(opcode).map_or(0, |symbol| address(&symbol)))
-                .collect(),
+            slow_paths: SLOW_PATHS.get_or_init(|| {
+                (0..=u8::MAX)
+                    .map_while(OpCode::from_u8)
+                    .map(|opcode| slow_path_symbol(opcode).map_or(0, |symbol| address(&symbol.to_string())))
+                    .collect()
+            }),
             try_get_by_id_cache: address("asm_try_get_by_id_cache"),
             try_put_by_id_cache: address("asm_try_put_by_id_cache"),
             raw_native_exception: if RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS {
@@ -122,12 +126,13 @@ fn runtime_offsets() -> RuntimeOffsets {
     RuntimeOffsets {
         execution_context_program_counter: offset(offset_of!(ExecutionContext, program_counter)),
         execution_context_lexical_environment: offset(offset_of!(ExecutionContext, lexical_environment)),
-        execution_context_private_environment: offset(offset_of!(ExecutionContext, private_environment)),
+        execution_context_private_environment: offset(offset_of!(ExecutionContext, private_environment_in_frame)),
         execution_context_frame_initialized: offset(offset_of!(ExecutionContext, frame_initialized)),
         execution_context_executable: offset(offset_of!(ExecutionContext, executable)),
         executable_idle_collection_count: offset(offset_of!(ExecutableHead, idle_collection_count)),
         execution_context_slots: offset(size_of::<ExecutionContext>()),
         vm_running_execution_context: offset(offset_of!(VmHead, running_execution_context)),
+        vm_current_realm: offset(offset_of!(VmHead, current_realm)),
         vm_jit_native_stack_limit: offset(offset_of!(Vm, jit_native_stack_limit)),
         private_environment_outer: offset(offset_of!(PrivateEnvironment, outer)),
         object_flags: offset(offset_of!(Object, flags)),
@@ -140,14 +145,8 @@ fn runtime_offsets() -> RuntimeOffsets {
         accessor_getter: offset(offset_of!(Accessor, getter)),
         accessor_setter: offset(offset_of!(Accessor, setter)),
         execution_context_function: offset(offset_of!(ExecutionContext, function)),
-        execution_context_realm: offset(offset_of!(ExecutionContext, realm)),
-        execution_context_script_or_module: offset(offset_of!(ExecutionContext, script_or_module)),
-        execution_context_variable_environment: offset(offset_of!(ExecutionContext, variable_environment)),
+        execution_context_variable_environment: offset(offset_of!(ExecutionContext, variable_environment_in_frame)),
         execution_context_frame_id: offset(offset_of!(ExecutionContext, frame_id)),
-        execution_context_skip_when_determining_incumbent_counter: offset(offset_of!(
-            ExecutionContext,
-            skip_when_determining_incumbent_counter
-        )),
         execution_context_yield_continuation: offset(offset_of!(ExecutionContext, yield_continuation)),
         execution_context_yield_is_await: offset(offset_of!(ExecutionContext, yield_is_await)),
         execution_context_yield_value_is_iterator_result: offset(offset_of!(
@@ -177,7 +176,6 @@ fn runtime_offsets() -> RuntimeOffsets {
             EcmascriptFunctionObjectWithRareData,
             private_environment
         )),
-        shared_function_script_or_module: offset(offset_of!(SharedFunctionInstanceData, script_or_module)),
         object_class_bits: offset(offset_of!(Object, class_bits)),
         ecmascript_function_flag_has_rare_data: ecmascript_function_flags::HAS_RARE_DATA.into(),
         vm_execution_generation: offset(offset_of!(VmHead, execution_generation)),
@@ -521,7 +519,7 @@ pub fn runtime_info(
     };
     let mut info = RuntimeInfo {
         no_htmldda_objects: !vm.jit.htmldda_objects_exist(),
-        slow_paths: Arc::clone(&addresses.slow_paths),
+        slow_paths: addresses.slow_paths,
         jit_call: jit_function_address!(super::calls::libjs_jit_call),
         call_forwarding_arguments: jit_function_address!(super::calls::libjs_jit_call_forwarding_arguments),
         finish_direct_call: jit_function_address!(super::calls::libjs_jit_finish_direct_call),

@@ -170,6 +170,8 @@ pub struct LineRecord {
     pub(crate) horizontal_extent: CssPixels,
     pub(crate) reusable_atomic_prefix: bool,
     pub inline_length: CssPixels,
+    /// The text-indent the line begins with, which its inline length includes.
+    pub(crate) indent: CssPixels,
     pub inline_length_before_block_ellipsis: Option<CssPixels>,
     pub block_length: CssPixels,
     pub block_start: CssPixels,
@@ -422,6 +424,8 @@ pub struct FragmentRecord {
     pub direction: u8,
     pub writing_mode: u8,
     pub is_block_ellipsis: bool,
+    /// Whether the fragment is the ellipsis that text-overflow draws, rather than content.
+    pub is_text_overflow_ellipsis: bool,
     pub is_atomic_inline: bool,
     pub white_space_collapse: u8,
     pub(crate) content_baselines: Option<formatting_context::DerivedBaselines>,
@@ -698,8 +702,9 @@ impl InlineContent {
     }
 
     fn drop_repeated_placeholder_pieces(&mut self) {
-        let is_placeholder =
-            |piece: &InlineBoxPieceRecord| piece.is_geometry_only_placeholder && piece.fragment_count == 0;
+        // NB: An inline box that's empty within one fragment has a piece there with no fragment of its content,
+        //     which is a placeholder unless the box is empty in every fragment it's laid out in.
+        let is_placeholder = |piece: &InlineBoxPieceRecord| piece.fragment_count == 0;
         if !self.inline_box_pieces.iter().any(is_placeholder) {
             return;
         }
@@ -713,15 +718,21 @@ impl InlineContent {
         let mut kept_count = 0u32;
         self.inline_box_pieces.retain(|piece| {
             let keep = !is_placeholder(piece) || nodes_with_pieces.insert(piece.node);
-            new_indices.push(kept_count);
+            new_indices.push(keep.then_some(kept_count));
             kept_count += u32::from(keep);
             keep
         });
-        for item in &mut self.items {
-            if let InlineItem::BoxPiece(index) = item {
-                *index = new_indices[*index as usize];
-            }
-        }
+        // NB: A dropped piece that isn't a geometry-only placeholder is painted, so its item goes too.
+        self.items.retain_mut(|item| match item {
+            InlineItem::BoxPiece(index) => match new_indices[*index as usize] {
+                Some(new_index) => {
+                    *index = new_index;
+                    true
+                }
+                None => false,
+            },
+            _ => true,
+        });
     }
 
     fn append_translated(

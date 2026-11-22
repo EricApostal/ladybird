@@ -34,17 +34,43 @@
 //!   from the frame) or `Suspend` reads (see `verify_frame_writes()`), and
 //!   never one of `Graph::unwritten_slots`.
 
+use ak::Zone;
+use ak::ZoneVec;
+use core::fmt;
+
 use super::dominators::Dominators;
 use crate::bytecode::FrameLayout;
 use crate::bytecode::Operand;
 use crate::bytecode::RESERVED_REGISTER_COUNT;
 use crate::code::Repr;
+use crate::debug_text::DebugText;
 use crate::ir::BlockId;
 use crate::ir::ElementsKind;
 use crate::ir::Graph;
 use crate::ir::Locations;
 use crate::ir::NodeId;
 use crate::ir::Op;
+
+/// The descriptions of the violated invariants, one on each line.
+struct Errors<'w>(DebugText<'w>);
+
+impl<'w> Errors<'w> {
+    fn new_in(work: &'w Zone) -> Self {
+        Self(DebugText::new_in(work))
+    }
+
+    /// Adds the description of a violated invariant. This is what `write!` calls.
+    fn write_fmt(&mut self, message: fmt::Arguments<'_>) {
+        if !self.0.is_empty() {
+            self.0.push('\n');
+        }
+        self.0.write_fmt(message);
+    }
+
+    fn finish(self) -> Result<(), DebugText<'w>> {
+        if self.0.is_empty() { Ok(()) } else { Err(self.0) }
+    }
+}
 
 /// Where a node is: its block and its position there (phis come first, then
 /// the body, then the control node).
@@ -57,25 +83,23 @@ struct Place {
 /// Checks that `StoreSlot` writes frame memory only where something reads it: written constants, which live there,
 /// the arguments the compiled function's legacy `arguments` shows, and the slots a node that reads the frame reads,
 /// right before it. Merges and back edges never write frame memory: slots that differ get phis.
-pub fn verify_frame_writes(graph: &Graph, layout: &FrameLayout) -> Result<(), String> {
-    let mut errors = Vec::new();
+pub fn verify_frame_writes<'w>(graph: &Graph, layout: &FrameLayout, work: &'w Zone) -> Result<(), DebugText<'w>> {
+    let mut errors = Errors::new_in(work);
+    let mut nodes = ZoneVec::new_in(work);
     for (index, block) in graph.blocks.iter().enumerate() {
-        let nodes = block
-            .body
-            .iter()
-            .chain(block.control.iter())
-            .copied()
-            .collect::<Vec<_>>();
+        nodes.assign(&block.body);
+        nodes.extend(block.control);
         for (position, node) in nodes.iter().enumerate() {
             let Op::StoreSlot { slot } = graph.node(*node).op else {
                 continue;
             };
             let operand = Operand::from_raw(slot).raw();
             if graph.is_unwritten_slot(operand) {
-                errors.push(format!(
+                write!(
+                    errors,
                     "StoreSlot v{} in b{index} writes slot {operand}, which nothing writes (see `Graph::unwritten_slots`)",
                     node.0
-                ));
+                );
             }
             let is_constant = operand >= layout.registers_and_locals_count && operand < layout.arguments_base();
             if is_constant || graph.legacy_arguments.contains(&operand) {
@@ -102,63 +126,62 @@ pub fn verify_frame_writes(graph: &Graph, layout: &FrameLayout) -> Result<(), St
                     || matches!(op, Op::Suspend { .. })
             });
             if !reads_frame {
-                errors.push(format!(
+                write!(
+                    errors,
                     "StoreSlot v{} in b{index} writes a slot that no node reading the frame reads next",
                     node.0
-                ));
+                );
             }
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("\n"))
-    }
+    errors.finish()
 }
 
-/// Returns a description of every violated invariant, or `Ok` if there is none.
-pub fn verify(graph: &Graph) -> Result<(), String> {
-    let places = verify_blocks(graph)?;
-    verify_edges(graph)?;
-    verify_nodes(graph, &places)?;
-    verify_frame_states(graph)
+/// Returns a description of every violated invariant, one on each line, or `Ok` if there is none. The description and
+/// the lists of the checks are in `work`.
+pub fn verify_with<'w>(graph: &Graph, work: &'w Zone) -> Result<(), DebugText<'w>> {
+    let places = verify_blocks(graph, work)?;
+    verify_edges(graph, work)?;
+    verify_nodes(graph, &places, work)?;
+    verify_frame_states(graph, work)
 }
 
 /// Checks what each block holds, and returns where each node is.
-fn verify_blocks(graph: &Graph) -> Result<Vec<Option<Place>>, String> {
-    let mut errors: Vec<String> = Vec::new();
-    let mut places: Vec<Option<Place>> = vec![None; graph.nodes.len()];
+fn verify_blocks<'w>(graph: &Graph, work: &'w Zone) -> Result<ZoneVec<'w, Option<Place>>, DebugText<'w>> {
+    let mut errors = Errors::new_in(work);
+    let mut places: ZoneVec<Option<Place>> = ZoneVec::from_elem_in(None, graph.nodes.len(), work);
     for (index, block) in graph.blocks.iter().enumerate() {
         let block_id = BlockId::from_index(index);
         let Some(control) = block.control else {
-            errors.push(format!("b{index} has no control node"));
+            write!(errors, "b{index} has no control node");
             continue;
         };
         if !graph.node(control).op.is_control() {
-            errors.push(format!("b{index} ends in v{}, which is not a control node", control.0));
+            write!(errors, "b{index} ends in v{}, which is not a control node", control.0);
         }
         for phi in &block.phis {
             if graph.node(*phi).op != Op::Phi {
-                errors.push(format!("b{index} has v{} among its phis", phi.0));
+                write!(errors, "b{index} has v{} among its phis", phi.0);
             }
             if graph.node(*phi).inputs.len() != block.predecessors.len() {
-                errors.push(format!(
+                write!(
+                    errors,
                     "phi v{} of b{index} has {} inputs for {} predecessors",
                     phi.0,
                     graph.node(*phi).inputs.len(),
                     block.predecessors.len()
-                ));
+                );
             }
         }
         for node in &block.body {
             let op = &graph.node(*node).op;
             if *op == Op::Phi || op.is_control() || matches!(op, Op::Constant(_)) {
-                errors.push(format!("b{index} has {} v{} in its body", op.name(), node.0));
+                write!(errors, "b{index} has {} v{} in its body", op.name(), node.0);
             }
         }
         for (position, node) in graph.block_nodes(block_id).enumerate() {
             match places[node.index()] {
-                Some(other) => errors.push(format!("v{} is in b{} and in b{index}", node.0, other.block.0)),
+                Some(other) => write!(errors, "v{} is in b{} and in b{index}", node.0, other.block.0),
                 None => {
                     places[node.index()] = Some(Place {
                         block: block_id,
@@ -168,16 +191,12 @@ fn verify_blocks(graph: &Graph) -> Result<Vec<Option<Place>>, String> {
             }
         }
     }
-    if errors.is_empty() {
-        Ok(places)
-    } else {
-        Err(errors.join("\n"))
-    }
+    errors.finish().map(|()| places)
 }
 
 /// Checks the edges between blocks and their order.
-fn verify_edges(graph: &Graph) -> Result<(), String> {
-    let mut errors: Vec<String> = Vec::new();
+fn verify_edges<'w>(graph: &Graph, work: &'w Zone) -> Result<(), DebugText<'w>> {
+    let mut errors = Errors::new_in(work);
     for (index, block) in graph.blocks.iter().enumerate() {
         let block_id = BlockId::from_index(index);
         for successor in graph.successors(block_id) {
@@ -189,53 +208,60 @@ fn verify_edges(graph: &Graph) -> Result<(), String> {
                 .filter(|predecessor| **predecessor == block_id)
                 .count();
             if edges_out != edges_in {
-                errors.push(format!(
+                write!(
+                    errors,
                     "b{index} has {edges_out} edges to b{}, which lists it {edges_in} times",
                     successor.0
-                ));
+                );
             }
         }
         if !block.phis.is_empty() {
             for predecessor in &block.predecessors {
                 if graph.successors(*predecessor).len() != 1 {
-                    errors.push(format!(
+                    write!(
+                        errors,
                         "b{index} has phis, but its predecessor b{} also leads elsewhere",
                         predecessor.0
-                    ));
+                    );
                 }
             }
         }
         for predecessor in &block.predecessors {
             if !graph.successors(*predecessor).contains(&block_id) {
-                errors.push(format!(
+                write!(
+                    errors,
                     "b{index} lists b{} as a predecessor, which does not branch to it",
                     predecessor.0
-                ));
+                );
             }
             // NB: Cold code comes after the code it rejoins.
             if predecessor.index() >= index
                 && !block.is_loop_header
                 && !(graph.block(*predecessor).is_cold && !block.is_cold)
             {
-                errors.push(format!(
+                write!(
+                    errors,
                     "b{index} is reached from the later b{} but is no loop header",
                     predecessor.0
-                ));
+                );
             }
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("\n"))
-    }
+    errors.finish()
 }
 
 /// Checks that values are defined before their uses, and the rules of each
 /// kind of node.
-fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
-    let mut errors: Vec<String> = Vec::new();
-    let dominators = Dominators::compute(graph);
+fn verify_nodes<'w>(graph: &Graph, places: &[Option<Place>], work: &'w Zone) -> Result<(), DebugText<'w>> {
+    let mut errors = Errors::new_in(work);
+    if graph.blocks.len() > Dominators::MAX_BLOCKS {
+        write!(
+            errors,
+            "the graph has more blocks than the tables of the dominators hold"
+        );
+        return errors.finish();
+    }
+    let dominators = &Dominators::of(graph, work);
     let is_defined_before = |value: NodeId, block: BlockId, index: usize| -> bool {
         // NB: Virtual objects are in no block; their properties are listed
         //     with the frame state values that need them.
@@ -254,33 +280,36 @@ fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
         let block_id = BlockId::from_index(index);
         let is_entry = graph.entries().any(|entry| entry == block_id);
         if block.predecessors.is_empty() != is_entry {
-            errors.push(format!(
+            write!(
+                errors,
                 "b{index} has {} predecessors, but is {}",
                 block.predecessors.len(),
                 if is_entry { "an entry" } else { "no entry" }
-            ));
+            );
         }
         if !dominators.is_reachable(block_id) {
-            errors.push(format!("b{index} is reachable from no entry"));
+            write!(errors, "b{index} is reachable from no entry");
             continue;
         }
         for phi in &block.phis {
             for (input, predecessor) in graph.node(*phi).inputs.iter().zip(&block.predecessors) {
                 if graph.node(*input).repr != graph.node(*phi).repr {
-                    errors.push(format!(
+                    write!(
+                        errors,
                         "phi v{} of b{index} is {:?}, but its input v{} is {:?}",
                         phi.0,
                         graph.node(*phi).repr,
                         input.0,
                         graph.node(*input).repr
-                    ));
+                    );
                 }
                 let end = graph.block_nodes(*predecessor).count();
                 if !is_defined_before(*input, *predecessor, end) {
-                    errors.push(format!(
+                    write!(
+                        errors,
                         "phi v{} of b{index} uses v{} from b{}, where it is not defined",
                         phi.0, input.0, predecessor.0
-                    ));
+                    );
                 }
             }
         }
@@ -291,71 +320,75 @@ fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
             }
             for input in &node.inputs {
                 if !is_defined_before(*input, block_id, position) {
-                    errors.push(format!(
+                    write!(
+                        errors,
                         "v{} ({}) in b{index} uses v{}, which is not defined before it",
                         node_id.0,
                         node.op.name(),
                         input.0
-                    ));
+                    );
                 } else if graph.node(*input).repr.is_none() {
-                    errors.push(format!(
+                    write!(
+                        errors,
                         "v{} ({}) uses v{}, which has no value",
                         node_id.0,
                         node.op.name(),
                         input.0
-                    ));
+                    );
                 }
             }
             // NB: Lazy exits of calls find their values after the call, but
             //     those are defined before it all the same.
             if let Some(frame_state) = node.frame_state {
-                for (slot, value) in graph.frame_state_values(frame_state) {
+                for (slot, value) in graph.frame_state_values(frame_state, work) {
                     if graph.node(value).repr.is_none() && !matches!(graph.node(value).op, Op::VirtualObject { .. }) {
-                        errors.push(format!(
+                        write!(
+                            errors,
                             "the frame state of v{} has v{} for slot {slot}, which has no value",
                             node_id.0, value.0
-                        ));
+                        );
                     }
                     // NB: Only the environments of virtual closures are cell addresses (see `VirtualObjectKind`).
                     if graph.node(value).repr == Some(Repr::Pointer) && slot != crate::ir::VIRTUAL_OBJECT_PROPERTY {
-                        errors.push(format!(
+                        write!(
+                            errors,
                             "the frame state of v{} has the cell address v{} for slot {slot}",
                             node_id.0, value.0
-                        ));
+                        );
                     }
                     if !is_defined_before(value, block_id, position) {
-                        errors.push(format!(
+                        write!(
+                            errors,
                             "the frame state of v{} ({}) in b{index} has v{} for slot {slot}, which is not defined before it",
                             node_id.0,
                             node.op.name(),
                             value.0
-                        ));
+                        );
                     }
                 }
             }
-            if let Some(message) = check_input_reprs(graph, node_id) {
-                errors.push(message);
-            }
+            check_input_reprs(graph, node_id, &mut errors);
             if (node.op.can_eager_exit() || node.op.properties().can_lazy_exit) && node.frame_state.is_none() {
-                errors.push(format!(
+                write!(
+                    errors,
                     "v{} ({}) can exit, but has no frame state",
                     node_id.0,
                     node.op.name()
-                ));
+                );
             }
             match node.op {
                 Op::Jump { .. } if !node.inputs.is_empty() => {
-                    errors.push(format!("v{} (Jump) has inputs", node_id.0));
+                    write!(errors, "v{} (Jump) has inputs", node_id.0);
                 }
                 Op::Branch {
                     condition: crate::ir::BranchCondition::Shape(_),
                     ..
-                } => errors.push(format!("v{} branches on a shape", node_id.0)),
+                } => write!(errors, "v{} branches on a shape", node_id.0),
                 _ => {}
             }
             if let Op::CallSlowPath { .. } = node.op {
                 if node.frame_state.is_none() {
-                    errors.push(format!("v{} (CallSlowPath) has no frame state", node_id.0));
+                    write!(errors, "v{} (CallSlowPath) has no frame state", node_id.0);
                 }
                 if matches!(
                     node.op,
@@ -365,10 +398,11 @@ fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
                     }
                 ) && !block.is_cold
                 {
-                    errors.push(format!(
+                    write!(
+                        errors,
                         "v{} (CallSlowPath) is in b{index}, which is not cold",
                         node_id.0
-                    ));
+                    );
                 }
             }
             if let Op::Refine { .. } = node.op {
@@ -376,21 +410,23 @@ fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
                     .iter()
                     .all(|other| matches!(graph.node(*other).op, Op::Refine { .. }));
                 if !at_head || block.predecessors.len() != 1 {
-                    errors.push(format!(
+                    write!(
+                        errors,
                         "v{} (Refine) is not at the head of b{index}, a block with one predecessor",
                         node_id.0
-                    ));
+                    );
                 }
             }
             if let Some(index) = node.op.refined_input()
                 && node.repr.is_some()
                 && node.repr != graph.node(node.inputs[index]).repr
             {
-                errors.push(format!(
+                write!(
+                    errors,
                     "v{} ({}) changes the representation of the value it refines",
                     node_id.0,
                     node.op.name()
-                ));
+                );
             }
             // NB: Typed-array element accesses take the storage offset from
             //     its load or the check that it is valid, which they rely on.
@@ -402,11 +438,12 @@ fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
             } = node.op
                 && graph.node(node.inputs[0]).op != Op::TypedArrayDataAddress
             {
-                errors.push(format!(
+                write!(
+                    errors,
                     "v{} ({}) takes no typed array data address",
                     node_id.0,
                     node.op.name()
-                ));
+                );
             }
             if node.op == Op::TypedArrayDataAddress
                 && !matches!(
@@ -414,83 +451,78 @@ fn verify_nodes(graph: &Graph, places: &[Option<Place>]) -> Result<(), String> {
                     Op::LoadTypedArrayDataOffset | Op::CheckTypedArrayStorage
                 )
             {
-                errors.push(format!(
-                    "v{} (TypedArrayDataAddress) takes no storage offset",
-                    node_id.0
-                ));
+                write!(errors, "v{} (TypedArrayDataAddress) takes no storage offset", node_id.0);
             }
             // A slow path's further outputs are where its call left them only
             // until anything else runs.
             if let Op::SlowPathOutput { .. } = node.op {
                 let call = node.inputs[0];
-                let before = graph.block_nodes(block_id).take(position).collect::<Vec<_>>();
+                let before = || graph.block_nodes(block_id).take(position);
                 let follows_call = matches!(graph.node(call).op, Op::CallSlowPath { .. })
-                    && before.iter().position(|other| *other == call).is_some_and(|start| {
-                        before[start + 1..]
-                            .iter()
-                            .all(|other| matches!(graph.node(*other).op, Op::SlowPathOutput { .. }))
+                    && before().position(|other| other == call).is_some_and(|start| {
+                        before()
+                            .skip(start + 1)
+                            .all(|other| matches!(graph.node(other).op, Op::SlowPathOutput { .. }))
                     });
                 if !follows_call {
-                    errors.push(format!(
+                    write!(
+                        errors,
                         "v{} (SlowPathOutput) does not follow its slow path call v{} directly",
                         node_id.0, call.0
-                    ));
+                    );
                 }
             }
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("\n"))
-    }
+    errors.finish()
 }
 
 /// Checks that frame states list each slot once.
-fn verify_frame_states(graph: &Graph) -> Result<(), String> {
-    let mut errors: Vec<String> = Vec::new();
+fn verify_frame_states<'w>(graph: &Graph, work: &'w Zone) -> Result<(), DebugText<'w>> {
+    let mut errors = Errors::new_in(work);
+    let mut slots = ZoneVec::new_in(work);
     for (index, frame_state) in graph.frame_states.iter().enumerate() {
-        let mut slots: Vec<u32> = frame_state
-            .values
-            .iter()
-            .map(|(slot, _)| *slot)
-            .chain(frame_state.in_frame.iter().copied())
-            .collect();
+        slots.clear();
+        slots.extend(frame_state.values.iter().map(|(slot, _)| *slot));
+        slots.extend_from_slice(&frame_state.in_frame);
         slots.sort_unstable();
         if slots.windows(2).any(|pair| pair[0] == pair[1]) {
-            errors.push(format!("fs{index} lists a slot more than once"));
+            write!(errors, "fs{index} lists a slot more than once");
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("\n"))
-    }
+    errors.finish()
 }
 
-fn check_input_reprs(graph: &Graph, node_id: NodeId) -> Option<String> {
+/// Reports the first input of `node_id` that does not have the representation its op takes, or a wrong count of inputs.
+fn check_input_reprs(graph: &Graph, node_id: NodeId, errors: &mut Errors<'_>) {
     let node = graph.node(node_id);
     let expected = match node.op.info().inputs.reprs(node.inputs.len()) {
-        Ok(expected) => expected?,
+        Ok(Some(expected)) => expected,
+        Ok(None) => return,
         Err(count) => {
-            return Some(format!(
+            write!(
+                errors,
                 "v{} ({}) has {} inputs, but takes {count}",
                 node_id.0,
                 node.op.name(),
                 node.inputs.len(),
-            ));
+            );
+            return;
         }
     };
     for (input, repr) in node.inputs.iter().zip(expected) {
-        let actual = graph.node(*input).repr?;
+        let Some(actual) = graph.node(*input).repr else {
+            return;
+        };
         if actual != repr {
-            return Some(format!(
+            write!(
+                errors,
                 "v{} ({}) takes v{} as {repr:?}, but it is {actual:?}",
                 node_id.0,
                 node.op.name(),
                 input.0
-            ));
+            );
+            return;
         }
     }
-    None
 }

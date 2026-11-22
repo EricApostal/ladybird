@@ -39,6 +39,9 @@ class WEBVIEW_API SettingsUI final
     WEB_UI(SettingsUI);
     friend class SettingsUISitePermissionsObserver;
 
+public:
+    void default_browser_status_changed(Badge<Application>) { broadcast_settings_change(); }
+
 private:
     virtual void register_interfaces() override;
 
@@ -67,6 +70,7 @@ private:
     void broadcast_settings_change();
 
     void complete_first_run(JsonValue const&);
+    void make_default_browser(JsonValue const&);
 
     void set_new_tab_page_url(JsonValue const&);
     void set_restore_previous_session(JsonValue const&);
@@ -98,7 +102,9 @@ private:
 
     void set_services_network_access_enabled(JsonValue const&);
     void set_filter_list_updates_enabled(JsonValue const&);
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     void set_update_checks_enabled(JsonValue const&);
+#endif
     void update_content_blocker_lists(JsonValue const&);
     void set_content_blocker_enabled(JsonValue const&);
     void set_content_blocker_enabled_for_site(JsonValue const&);

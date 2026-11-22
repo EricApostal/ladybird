@@ -21,6 +21,7 @@
 #include <LibGfx/Rect.h>
 #include <LibJS/Forward.h>
 #include <LibMedia/Forward.h>
+#include <LibMedia/SeekMode.h>
 #include <LibMedia/VideoSinkHandle.h>
 #include <LibMediaClient/Forward.h>
 #include <LibWeb/DOM/Document.h>
@@ -130,6 +131,7 @@ public:
 
     double current_playback_position() const;
     void set_official_playback_position(double);
+    double earliest_possible_position() const;
 
     double duration() const;
     JS::Object* get_start_date(JS::Object& relevant_global_object) const;
@@ -315,6 +317,7 @@ private:
     void on_video_track_added(Media::Track const&);
     void on_metadata_parsed(SourceType);
     void on_playback_manager_state_change();
+    void on_playback_manager_seek_decided(Media::SeekDecision);
     void upon_current_playback_position_possibly_changed();
     void start_or_stop_playback_position_update_timer();
     void play_element();

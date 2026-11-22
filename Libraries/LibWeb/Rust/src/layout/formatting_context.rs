@@ -98,7 +98,11 @@ pub(super) enum SizeDimension {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TableWrapperInlineSizeMode {
-    ClampToAvailableInlineSize,
+    /// An auto-width table shrinks to fit the available inline size, but never below its minimum inline size, and the
+    /// wrapper is as wide as the table box, even when that's wider than the available inline size: A table that
+    /// doesn't fit there reports its real size, so that its captions are laid out as wide as it is, and a table too
+    /// wide for the space next to floats is placed below them.
+    ShrinkToAvailableInlineSize,
     UseTableUsedInlineSizeIfNotAuto,
     /// The wrapper is as wide as the table box, even when that's wider than the available inline size, as for an
     /// absolutely positioned table.
@@ -1477,10 +1481,10 @@ pub(crate) fn formatting_context_type_created_by_node_data(
         });
     }
     let display = style.map(|style| style.display());
-    // NB: A flex fieldset lays out its legend and anonymous content box in a block formatting context.
-    //     Flex layout applies only to the anonymous content box.
+    // NB: A flex or grid fieldset lays out its legend and anonymous content box in a block formatting context.
+    //     Flex or grid layout applies only to the anonymous content box.
     if data.kind.get() == crate::layout::node_data::NodeKind::FieldSetBox
-        && display.is_some_and(|display| display.is_flex_inside())
+        && display.is_some_and(|display| display.is_flex_inside() || display.is_grid_inside())
     {
         return Some(FormattingContextType::Block);
     }
@@ -3794,6 +3798,7 @@ pub(crate) struct LayoutStageFacts {
     pub(crate) viewport_inline_size: CssPixels,
     pub(crate) viewport_block_size: CssPixels,
     pub(crate) document_in_quirks_mode: bool,
+    pub(crate) document_in_limited_quirks_mode: bool,
 }
 
 /// What a layout stage computes from: the arena and the layout stage's scratch, borrowed for the
@@ -4233,6 +4238,7 @@ mod baseline_tests {
                 viewport_inline_size: CssPixels::from_integer(800),
                 viewport_block_size: CssPixels::from_integer(600),
                 document_in_quirks_mode: false,
+                document_in_limited_quirks_mode: false,
             },
         );
         RunState::with_root(pass, parent, Node::INVALID, None, |_, pass| {

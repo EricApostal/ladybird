@@ -162,6 +162,7 @@ enum class WithColorElement : u8 {
     WithTwoByteMasteringLuminance,
     WithOnlyMasteringLuminances,
     WithOutOfRangeMasteringChromaticity,
+    WithNineByteMaximumContentLightLevel,
 };
 
 ByteBuffer make_matroska_with_av1_track(WithColorElement with_color_element, Function<void(ByteBuffer&)> const& append_cluster_contents = {})
@@ -195,7 +196,10 @@ ByteBuffer make_matroska_with_av1_track(WithColorElement with_color_element, Fun
         finish_ebml_master(data, color);
     } else if (with_color_element != WithColorElement::No) {
         auto color = begin_ebml_master(data, Media::Matroska::COLOR_ENTRY_ID);
-        append_ebml_uint(data, Media::Matroska::MAX_CLL_ID, 1005);
+        if (with_color_element == WithColorElement::WithNineByteMaximumContentLightLevel)
+            append_ebml_binary(data, Media::Matroska::MAX_CLL_ID, Array<u8, 9> { 0, 0, 0, 0, 0, 0, 0, 0x03, 0xed });
+        else
+            append_ebml_uint(data, Media::Matroska::MAX_CLL_ID, 1005);
         append_ebml_uint(data, Media::Matroska::MAX_FALL_ID, 315);
         auto mastering_metadata = begin_ebml_master(data, Media::Matroska::MASTERING_METADATA_ID);
         if (with_color_element != WithColorElement::WithOnlyMasteringLuminances) {
@@ -928,6 +932,14 @@ TEST_CASE(seeking)
         EXPECT_EQ(first_block.timestamp().value().to_milliseconds(), 0);
         EXPECT(first_block.only_keyframes());
 
+        auto second_block = MUST(iterator.next_block());
+        EXPECT(!second_block.only_keyframes());
+        EXPECT(second_block.timestamp().value() < AK::Duration::from_milliseconds(50));
+        auto seeked_within_first_keyframe = MUST(matroska_reader.seek_to_random_access_point(iterator, AK::Duration::from_milliseconds(50)));
+        auto block_after_seek_within_first_keyframe = MUST(seeked_within_first_keyframe.next_block());
+        EXPECT_EQ(block_after_seek_within_first_keyframe.timestamp().value().to_milliseconds(), 0);
+        EXPECT(block_after_seek_within_first_keyframe.only_keyframes());
+
         iterator = MUST(matroska_reader.seek_to_random_access_point(iterator, AK::Duration::from_milliseconds(150)));
         auto block_after_forward_seek = MUST(iterator.next_block());
         EXPECT_EQ(block_after_forward_seek.timestamp().value().to_milliseconds(), 100);
@@ -948,6 +960,23 @@ TEST_CASE(seeking)
         EXPECT_EQ(block_exact_100.timestamp().value().to_milliseconds(), 100);
         EXPECT(block_exact_100.only_keyframes());
     }
+}
+
+TEST_CASE(keeps_its_position_while_reading_the_targets_keyframe_without_cues)
+{
+    auto file = MUST(Core::File::open("./test-matroska-seeking-without-cues.mkv"sv, Core::File::OpenMode::Read));
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
+    auto demuxer = MUST(Media::Matroska::MatroskaDemuxer::from_stream(stream));
+    auto track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video)).release_value();
+    MUST(demuxer->create_context_for_track(track));
+
+    MUST(demuxer->get_next_sample_for_track(track));
+    auto second_sample = MUST(demuxer->get_next_sample_for_track(track));
+    EXPECT(second_sample.presentation_timestamp() < AK::Duration::from_milliseconds(50));
+
+    EXPECT_EQ(MUST(demuxer->seek_to_most_recent_keyframe(track, AK::Duration::from_milliseconds(50), Media::DemuxerSeekOptions::None)), Media::DemuxerSeekResult::KeptCurrentPosition);
+    auto sample_after_seek = MUST(demuxer->get_next_sample_for_track(track));
+    EXPECT(sample_after_seek.presentation_timestamp() > second_sample.presentation_timestamp());
 }
 
 TEST_CASE(opus_frame_duration)
@@ -1022,17 +1051,17 @@ TEST_CASE(buffered_time_ranges_full_file)
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(file_data);
     auto demuxer = MUST(Media::Matroska::MatroskaDemuxer::from_stream(stream));
 
-    // The video track starts later and the audio track ends later.
+    // The video track starts later, but data from the first cluster is playable from zero. The audio track ends later.
     auto ranges = wait_for_buffered_ranges(loop, *demuxer, [](auto const& ranges) { return !ranges.is_empty(); });
     EXPECT_EQ(ranges.size(), 1u);
-    EXPECT_EQ(ranges[0].start, AK::Duration::from_milliseconds(11));
+    EXPECT_EQ(ranges[0].start, AK::Duration::zero());
     EXPECT_EQ(ranges[0].end, AK::Duration::from_microseconds(1021500));
 }
 
 TEST_CASE(buffered_time_ranges_incremental_thirds)
 {
     auto file_data = load_test_file_data("./vp9_in_webm.webm"sv);
-    auto start = AK::Duration::from_milliseconds(11);
+    auto start = AK::Duration::zero();
     size_t one_third = file_data.size() / 3;
     size_t two_thirds = one_third * 2;
 
@@ -1188,8 +1217,8 @@ TEST_CASE(buffered_time_ranges_cues_only_tail_does_not_reach_end_of_stream)
 
 TEST_CASE(buffered_time_ranges_intersect_tracks)
 {
-    // vp9_in_webm.webm contains a VP9 video track (11ms-1011ms) and an Opus audio track (0.5ms-1021.5ms). The
-    // source's ranges start where both tracks have data, and since both reach the end of the stream, the video
+    // vp9_in_webm.webm contains a VP9 video track (11ms-1011ms) and an Opus audio track (0.5ms-1021.5ms). Both tracks
+    // have data from the first cluster, so both start at zero, and since both reach the end of the stream, the video
     // track does not cut off the audio track that runs longer.
     auto file_data = load_test_file_data("./vp9_in_webm.webm"sv);
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(file_data);
@@ -1206,7 +1235,7 @@ TEST_CASE(buffered_time_ranges_intersect_tracks)
     EXPECT_EQ(ranges.size(), 1u);
     if (ranges.is_empty())
         return;
-    EXPECT_EQ(ranges[0].start, AK::Duration::from_milliseconds(11));
+    EXPECT_EQ(ranges[0].start, AK::Duration::zero());
     EXPECT_EQ(ranges[0].end, AK::Duration::from_microseconds(1021500));
 }
 
@@ -1360,6 +1389,23 @@ TEST_CASE(mastering_metadata_with_a_float_of_an_invalid_size_is_left_out)
     EXPECT(color_metadata.content_light_level_information.has_value());
 }
 
+TEST_CASE(light_level_integer_too_large_to_read_is_skipped)
+{
+    auto data = make_matroska_with_av1_track(WithColorElement::WithNineByteMaximumContentLightLevel);
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(data);
+    auto reader = MUST(Media::Matroska::Reader::from_stream(stream->create_cursor()));
+    auto track_entry = MUST(reader.track_for_track_number(1));
+
+    auto track = Media::Matroska::track_from_track_entry(*track_entry, true);
+    auto const& color_metadata = track.video_data().color_metadata;
+    EXPECT(color_metadata.mastering_display_color_volume.has_value());
+    EXPECT(color_metadata.content_light_level_information.has_value());
+    if (color_metadata.content_light_level_information.has_value()) {
+        EXPECT_EQ(color_metadata.content_light_level_information->maximum_content_light_level, 0);
+        EXPECT_EQ(color_metadata.content_light_level_information->maximum_frame_average_light_level, 315);
+    }
+}
+
 // HDR10+ with one processing window whose brightest component is 364.1 cd/m².
 // clang-format off
 constexpr auto HDR10_PLUS_T35_MESSAGE = to_array<u8>({
@@ -1372,6 +1418,7 @@ enum class BlockAdditionsDefect : u8 {
     None,
     OversizedBlockAddID,
     OversizedBlockAdditional,
+    BlockAdditionalOverrunningItsParents,
 };
 
 static void append_block_group_with_hdr10_plus(ByteBuffer& data, i16 timestamp, BlockAdditionsDefect defect)
@@ -1380,6 +1427,15 @@ static void append_block_group_with_hdr10_plus(ByteBuffer& data, i16 timestamp, 
     // Track 1, the timestamp, no flags, and a temporal delimiter OBU as the frame.
     Array<u8, 6> block { 0x81, static_cast<u8>(timestamp >> 8), static_cast<u8>(timestamp & 0xff), 0x00, 0x12, 0x00 };
     append_ebml_binary(data, Media::Matroska::BLOCK_ID, block);
+    if (defect == BlockAdditionsDefect::BlockAdditionalOverrunningItsParents) {
+        // A two-byte BlockMore holding a BlockAdditional that claims the next 16 bytes.
+        append_ebml_id(data, Media::Matroska::BLOCK_ADDITIONS_ID);
+        append_ebml_size(data, 4);
+        for (u8 byte : { 0xa6, 0x82, 0xa5, 0x90 })
+            data.append(byte);
+        finish_ebml_master(data, block_group);
+        return;
+    }
     auto block_additions = begin_ebml_master(data, Media::Matroska::BLOCK_ADDITIONS_ID);
     auto block_more = begin_ebml_master(data, Media::Matroska::BLOCK_MORE_ID);
     if (defect == BlockAdditionsDefect::OversizedBlockAddID) {
@@ -1441,6 +1497,29 @@ TEST_CASE(block_additional_too_large_to_be_hdr10_plus_is_skipped)
     auto first_block = MUST(iterator.next_block());
     EXPECT(!first_block.maximum_scene_luminance().has_value());
     auto second_block = MUST(iterator.next_block());
+    EXPECT(second_block.maximum_scene_luminance().has_value());
+}
+
+TEST_CASE(block_additional_overrunning_its_parents_is_skipped_without_reading_into_the_next_block)
+{
+    auto data = make_matroska_with_av1_track(WithColorElement::No, [](ByteBuffer& data) {
+        append_block_group_with_hdr10_plus(data, 0, BlockAdditionsDefect::BlockAdditionalOverrunningItsParents);
+        append_block_group_with_hdr10_plus(data, 33, BlockAdditionsDefect::None);
+    });
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(data);
+    auto reader = MUST(Media::Matroska::Reader::from_stream(stream->create_cursor()));
+    auto iterator = MUST(reader.create_sample_iterator(stream->create_cursor(), 1));
+
+    auto first_block = MUST(iterator.next_block());
+    EXPECT_EQ(first_block.timestamp().value().to_milliseconds(), 0);
+    EXPECT(!first_block.maximum_scene_luminance().has_value());
+
+    auto second_block_or_error = iterator.next_block();
+    EXPECT(!second_block_or_error.is_error());
+    if (second_block_or_error.is_error())
+        return;
+    auto second_block = second_block_or_error.release_value();
+    EXPECT_EQ(second_block.timestamp().value().to_milliseconds(), 33);
     EXPECT(second_block.maximum_scene_luminance().has_value());
 }
 

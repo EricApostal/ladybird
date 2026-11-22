@@ -113,18 +113,21 @@ struct JS_API ExecutionContext {
 
     GC_VISITS_THROUGH_FOREIGN_IMPLEMENTATION void visit_edges(GC::Cell::Visitor&);
 
-    GC::Ptr<FunctionObject> function;                // [[Function]]
-    GC::Ptr<Realm> realm;                            // [[Realm]]
-    ScriptOrModule script_or_module;                 // [[ScriptOrModule]]
-    GC::Ptr<Environment> lexical_environment;        // [[LexicalEnvironment]]
-    GC::Ptr<Environment> variable_environment;       // [[VariableEnvironment]]
-    GC::Ptr<PrivateEnvironment> private_environment; // [[PrivateEnvironment]]
+    GC::Ptr<FunctionObject> function; // [[Function]]
+    // The [[Realm]] of a context without a function. A context with a function runs in the function's realm, and
+    // this holds an old value: use realm() and set_realm().
+    GC::Ptr<Realm> realm_without_function;
+    // The [[ScriptOrModule]] of a context without a function. That of a context with a function comes from the
+    // function, and this holds an old value: use script_or_module() and set_script_or_module().
+    ScriptOrModule script_or_module_without_function;
+    GC::Ptr<Environment> lexical_environment; // [[LexicalEnvironment]]
+    // NB: Only valid in frames that keep their own variable environment (see the Rust ExecutionContext).
+    GC::Ptr<Environment> variable_environment_in_frame;
+    // NB: Only valid in frames without a function, and frames of code that makes private environments.
+    GC::Ptr<PrivateEnvironment> private_environment_in_frame;
 
     u64 frame_id { 0 };
     u32 program_counter { 0 };
-
-    // https://html.spec.whatwg.org/multipage/webappapis.html#skip-when-determining-incumbent-counter
-    u32 skip_when_determining_incumbent_counter { 0 };
 
     static constexpr u32 no_yield_continuation = NumericLimits<u32>::max();
     u32 yield_continuation { no_yield_continuation };
@@ -194,6 +197,14 @@ struct JS_API ExecutionContext {
     // that runs no bytecode, such as a native function's, has no source code and an empty function name. The source
     // code is the runtime's own, whose address identifies it.
     SourceCode const* source_code() const;
+
+    // [[Realm]]
+    GC::Ptr<Realm> realm() const;
+    void set_realm(GC::Ptr<Realm>);
+
+    // [[ScriptOrModule]]
+    ScriptOrModule script_or_module() const;
+    void set_script_or_module(ScriptOrModule);
     Utf16FlyString function_name() const;
 };
 
@@ -204,14 +215,13 @@ static_assert(sizeof(Optional<Value>) == sizeof(Value));
     static_assert(__builtin_offsetof(ExecutionContext, field) == JS_LAYOUT_EXECUTION_CONTEXT_##layout_name##_OFFSET); \
     static_assert(sizeof(ExecutionContext::field) == JS_LAYOUT_EXECUTION_CONTEXT_##layout_name##_SIZE);
 JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(function, FUNCTION)
-JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(realm, REALM)
-JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(script_or_module, SCRIPT_OR_MODULE)
+JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(realm_without_function, REALM_WITHOUT_FUNCTION)
+JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(script_or_module_without_function, SCRIPT_OR_MODULE_WITHOUT_FUNCTION)
 JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(lexical_environment, LEXICAL_ENVIRONMENT)
-JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(variable_environment, VARIABLE_ENVIRONMENT)
-JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(private_environment, PRIVATE_ENVIRONMENT)
+JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(variable_environment_in_frame, VARIABLE_ENVIRONMENT_IN_FRAME)
+JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(private_environment_in_frame, PRIVATE_ENVIRONMENT_IN_FRAME)
 JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(frame_id, FRAME_ID)
 JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(program_counter, PROGRAM_COUNTER)
-JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(skip_when_determining_incumbent_counter, SKIP_WHEN_DETERMINING_INCUMBENT_COUNTER)
 JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(yield_continuation, YIELD_CONTINUATION)
 JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(yield_is_await, YIELD_IS_AWAIT)
 JS_ASSERT_EXECUTION_CONTEXT_FIELD_LAYOUT(yield_value_is_iterator_result, YIELD_VALUE_IS_ITERATOR_RESULT)

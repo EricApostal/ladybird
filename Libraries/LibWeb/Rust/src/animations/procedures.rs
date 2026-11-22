@@ -10,7 +10,9 @@
 //! A procedure changes the records it runs on and records what it asks the host to do as `HostEffects`, in the order
 //! its steps ask for them, which the host performs once it has returned.
 
-use super::animation::{AnimationHandle, AnimationKind, CssAnimationFlag, TransitionPhase};
+use super::animation::{
+    AnimationCell, AnimationHandle, AnimationKind, AnimationRecord, CssAnimationFlag, TransitionPhase,
+};
 use super::composite_order::{TreeOrder, composite_order};
 use super::effect::{EffectFlag, EffectHandle};
 use super::host_effects::{HostEffectKind, HostEffects, PlaybackEventType};
@@ -71,6 +73,18 @@ pub(crate) fn run<T>(
     run_on(animation, timeline, procedure)
 }
 
+/// Answers what `procedure`, which only reads, finds of `animation`. Unlike `run`, this does not note that the
+/// animation may need updates.
+pub(crate) fn query<T>(animation: &AnimationHandle, procedure: impl FnOnce(&Procedures<'_>) -> T) -> T {
+    let timeline = animation.borrow().timeline_state();
+    let mut effects = HostEffects::default();
+    procedure(&Procedures {
+        animation,
+        timeline,
+        effects: &mut effects,
+    })
+}
+
 /// Runs `procedure` on `animation`, whose timeline reads `timeline` now, if it has one, and hands back what it asks
 /// the host to do.
 fn run_on<T>(
@@ -83,8 +97,33 @@ fn run_on<T>(
         animation,
         timeline,
         effects: &mut effects,
-    })?;
-    Ok((value, effects))
+    });
+    note_animation_may_need_update(animation);
+    Ok((value?, effects))
+}
+
+/// OPTIMIZATION: Notes that an update of the current time of the timeline of `animation`, if any, may change it, as a
+///               procedure ran on it. The timeline updates only those of its animations.
+pub(crate) fn note_animation_may_need_update(animation: &AnimationHandle) {
+    let timeline = animation.borrow().timeline().cloned();
+    if let Some(timeline) = timeline {
+        timeline.animations_needing_update().borrow_mut().insert(animation);
+    }
+}
+
+/// Whether an update of the current time of its timeline leaves `animation` as it is until a procedure runs on it: it
+/// has finished on a monotonically increasing timeline that is not progress-based, and has no pending task, which is
+/// what the update of an animation as its timeline updates skips.
+pub(crate) fn update_leaves_animation_as_it_is(animation: &AnimationCell) -> bool {
+    let record = animation.borrow();
+    let playback = record.playback();
+    if !playback.is_finished || playback.pending() {
+        return false;
+    }
+    record
+        .timeline_state()
+        .is_some_and(|timeline| timeline.sample.is_monotonically_increasing && !timeline.is_progress_based)
+        && record.play_state() == AnimationPlayState::Finished
 }
 
 /// An animation and its timeline as it is now, on which the procedures run, and what they ask the host to do so far.
@@ -1561,6 +1600,11 @@ impl Procedures<'_> {
         // 8. Let the timeline of animation be new timeline.
         if let Some(old_timeline) = &old_timeline {
             old_timeline.associated_animations().borrow_mut().remove(self.animation);
+            // NB: Nothing the old timeline updates is left of the animation for it to update.
+            old_timeline
+                .animations_needing_update()
+                .borrow_mut()
+                .remove(self.animation);
         }
         if let Some(new_timeline) = &new_timeline {
             new_timeline.associated_animations().borrow_mut().insert(self.animation);
@@ -1682,6 +1726,7 @@ impl Procedures<'_> {
                 effects: &mut *self.effects,
             }
             .set_the_associated_effect(None, Invalidate::Yes);
+            note_animation_may_need_update(&previous_animation);
         }
 
         // 6. Let the associated effect of animation be new effect.
@@ -1842,15 +1887,8 @@ impl Procedures<'_> {
 
         // - The existence of the animation is not prescribed by markup. That is, it is not a CSS animation with an
         //   owning element, nor a CSS transition with an owning element.
-        {
-            let animation = self.animation.borrow();
-            if matches!(
-                animation.kind(),
-                AnimationKind::CssAnimation(_) | AnimationKind::CssTransition(_)
-            ) && animation.owning_element().is_some()
-            {
-                return false;
-            }
+        if is_prescribed_by_markup(&self.animation.borrow()) {
+            return false;
         }
 
         // - The animation's play state is finished.
@@ -2024,6 +2062,16 @@ pub(crate) fn set_effect_target(effect: &EffectHandle, element: Option<NonNull<c
     effects
 }
 
+/// Whether the existence of `animation` is prescribed by markup: it is a CSS animation or a CSS transition with an
+/// owning element.
+/// https://www.w3.org/TR/web-animations-1/#replaceable-animation
+fn is_prescribed_by_markup(animation: &AnimationRecord) -> bool {
+    matches!(
+        animation.kind(),
+        AnimationKind::CssAnimation(_) | AnimationKind::CssTransition(_)
+    ) && animation.owning_element().is_some()
+}
+
 /// https://www.w3.org/TR/web-animations-1/#remove-replaced-animations
 /// For the document whose associated timelines are `timelines`, where `is_descendant_of_document` answers whether the
 /// host's `DOM::Element` is a descendant of it, and `tree_order` compares elements in tree order. Hands back what that
@@ -2053,6 +2101,11 @@ pub(crate) fn remove_replaced_animations<'a>(
             if matches!(animation.borrow().kind(), AnimationKind::Smil { .. }) {
                 continue;
             }
+            // OPTIMIZATION: A CSS animation or CSS transition with an owning element is never replaceable. Rule those
+            //               out before looking up the effect target and running the full replaceability check.
+            if is_prescribed_by_markup(&animation.borrow()) {
+                continue;
+            }
             let target = animation
                 .borrow()
                 .effect()
@@ -2060,11 +2113,11 @@ pub(crate) fn remove_replaced_animations<'a>(
             if !target.is_some_and(&is_descendant_of_document) {
                 continue;
             }
-            let Ok((true, _)) = run(&animation, |procedures| {
-                Ok(procedures.is_replaceable() && procedures.playback().replace_state == AnimationReplaceState::Active)
-            }) else {
+            if !query(&animation, |procedures| {
+                procedures.is_replaceable() && procedures.playback().replace_state == AnimationReplaceState::Active
+            }) {
                 continue;
-            };
+            }
             // NB: Every animation effect is a keyframe effect, whose composite order is defined.
             replaceable_animations.push(animation);
         }

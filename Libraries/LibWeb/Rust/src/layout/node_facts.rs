@@ -109,6 +109,7 @@ struct ReplacedContentStyle {
     is_horizontal: bool,
     appearance_is_none: bool,
     field_sizing_is_content: bool,
+    zoom: f32,
 }
 
 impl ReplacedContentStyle {
@@ -154,7 +155,15 @@ impl ReplacedContentStyle {
             is_horizontal: style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB,
             appearance_is_none: style.appearance() == crate::css::css_enums::appearance::NONE,
             field_sizing_is_content: style_sizes_field_to_content(style),
+            zoom: style.effective_zoom(),
         }
+    }
+
+    // AD-HOC: A slider has no in-flow content to size itself from, so it gets a default content-box size of 129px by
+    //         16px in its writing mode, which zoom scales.
+    fn slider_size(self) -> (CssPixels, CssPixels) {
+        let zoomed = |length: i64| CssPixels::from_integer(length).scaled(f64::from(self.zoom));
+        self.in_writing_mode(zoomed(129), zoomed(16))
     }
 
     /// `count` characters, the `ch` unit.
@@ -237,6 +246,15 @@ fn replaced_content_facts(
             facts.default_preferred_height = Some(height);
         }
     }
+    if matches!(input, ReplacedContentInput::RangeInput) {
+        facts.is_slider = true;
+        // NB: A slider without its native appearance keeps the size of one.
+        if style.appearance_is_none {
+            let (width, height) = style.slider_size();
+            facts.default_preferred_width = Some(width);
+            facts.default_preferred_height = Some(height);
+        }
+    }
     facts
 }
 
@@ -248,6 +266,8 @@ pub(crate) struct ReplacedContentFacts {
     pub(crate) default_preferred_height: Option<CssPixels>,
     pub(crate) text_entry_content_is_ordinary_box: bool,
     pub(crate) include_number_stepper: bool,
+    /// Whether the box is a slider's, with or without its native appearance.
+    pub(crate) is_slider: bool,
     /// The default object size of an SVG `<image>`, which applies once something has decoded. The SVG formatting
     /// context reads it as it is: it is no preferred size the sizing of an ordinary replaced box would take.
     pub(crate) svg_image_default_object_size: CssPixelSize,
@@ -318,9 +338,7 @@ fn auto_content_size(
         NodeKind::RadioButton => {
             ReplacedIntrinsicSize::of_size((CssPixels::from_integer(12), CssPixels::from_integer(12)))
         }
-        // AD-HOC: A slider has no in-flow content to size itself from, so provide a default content-box size for when
-        //         its `width` or `height` is `auto`: 20ch by 16px.
-        NodeKind::RangeInputBox => ReplacedIntrinsicSize::of_size((style.characters(20), CssPixels::from_integer(16))),
+        NodeKind::RangeInputBox => ReplacedIntrinsicSize::of_size(style.slider_size()),
         NodeKind::TextAreaBox => {
             let ReplacedContentInput::TextArea { cols, rows } = input else {
                 panic!("a textarea publishes its cols and rows as it arrives");
@@ -443,7 +461,7 @@ pub(crate) fn node_display(style: Option<ComputedValuesView<'_>>) -> crate::css:
 
 pub(crate) fn node_can_have_children(data: &impl NodeShape) -> bool {
     match data.kind() {
-        NodeKind::BreakNode => false,
+        NodeKind::BreakNode | NodeKind::WordBreakOpportunityNode => false,
         NodeKind::AudioBox | NodeKind::VideoBox => has_flag(data, NodeFlag::ReplacedBoxCanHaveChildren),
         NodeKind::SVGSVGBox => true,
         kind if kind_is_replaced_box(kind) => false,
@@ -610,7 +628,8 @@ pub(crate) fn node_is_fieldset_content_wrapper(data: &NodeData, style: Option<Co
         && data.generated_for.get() == 0
         && style.is_some_and(|style| {
             let display = style.display();
-            display.is_block_outside() && (display.is_flow_root_inside() || display.is_flex_inside())
+            display.is_block_outside()
+                && (display.is_flow_root_inside() || display.is_flex_inside() || display.is_grid_inside())
         })
 }
 
@@ -646,6 +665,13 @@ pub(crate) fn construction_fact_word(facts: &super::node_data::NodeConstructionF
     .fold(0, |word, (bit, _)| word | bit)
 }
 
+/// Whether an element with the published construction facts `construction_facts` is a replaced element, whatever kind
+/// of box it gets.
+pub(crate) fn construction_facts_name_replaced_element(construction_facts: u32) -> bool {
+    use crate::css::style::bridge::element_construction_fact as fact;
+    construction_facts & (fact::IS_HTML_INPUT_ELEMENT | fact::IS_HTML_PROGRESS_OR_METER_ELEMENT) != 0
+}
+
 /// The flags a row of `kind` is built with, from its node's published construction facts.
 pub(crate) fn construction_flags(kind: NodeKind, is_anonymous: bool, construction_facts: u32) -> u32 {
     use crate::css::style::bridge::element_construction_fact as fact;
@@ -656,7 +682,7 @@ pub(crate) fn construction_flags(kind: NodeKind, is_anonymous: bool, constructio
     // NB: A progress or meter element lays out its internal shadow tree on its own, as other engines do, so no margin
     //     inside it collapses with the content around it.
     let is_replaced_element =
-        kind_is_replaced_box(kind) || has(fact::IS_HTML_INPUT_ELEMENT) || has(fact::IS_HTML_PROGRESS_OR_METER_ELEMENT);
+        kind_is_replaced_box(kind) || construction_facts_name_replaced_element(construction_facts);
     [
         (NodeFlag::Anonymous, is_anonymous),
         (NodeFlag::HasStyle, has_style),
@@ -768,6 +794,7 @@ pub(crate) fn kind_is_box(kind: NodeKind) -> bool {
         kind,
         NodeKind::Unset
             | NodeKind::BreakNode
+            | NodeKind::WordBreakOpportunityNode
             | NodeKind::InlineNode
             | NodeKind::Node
             | NodeKind::GeneratedTextNode
@@ -982,9 +1009,8 @@ impl<'pass> NodeFacts<'pass> {
             let size = &mut facts.auto_content_size;
             let zoomed = |length: Option<CssPixels>| length.map(|length| length.scaled(f64::from(zoom)));
             match self.data().kind.get() {
-                // NB: These dimensions are derived from font metrics that already include zoom.
-                NodeKind::TextAreaBox | NodeKind::TextInputBox => {}
-                NodeKind::RangeInputBox => size.height = zoomed(size.height),
+                // NB: These dimensions are derived from font metrics that already include zoom, or zoomed already.
+                NodeKind::TextAreaBox | NodeKind::TextInputBox | NodeKind::RangeInputBox => {}
                 _ => {
                     size.width = zoomed(size.width);
                     size.height = zoomed(size.height);
@@ -1104,6 +1130,10 @@ impl<'pass> NodeFacts<'pass> {
         self.data().kind.get() == NodeKind::BreakNode
     }
 
+    pub(crate) fn is_word_break_opportunity_node(&self) -> bool {
+        self.data().kind.get() == NodeKind::WordBreakOpportunityNode
+    }
+
     pub(crate) fn is_box(&self) -> bool {
         kind_is_box(self.data().kind.get())
     }
@@ -1118,12 +1148,18 @@ impl<'pass> NodeFacts<'pass> {
 
     /// https://drafts.csswg.org/css-sizing-3/#min-content-zero
     /// A box whose cyclic percentage width resolves against zero for its min-content contribution: a replaced box, or a
-    /// compressible form control (a text entry input, a textarea, or a select).
+    /// compressible form control (a text entry input, a slider, a textarea, or a select).
     pub(crate) fn resolves_cyclic_percentages_like_replaced_box(&self) -> bool {
         self.is_replaced_box()
             || self.is_text_input()
+            || self.is_slider()
             || self.data().kind.get() == NodeKind::TextAreaBox
             || self.is_select_box()
+    }
+
+    /// Whether the box is a range input's, with or without its native appearance.
+    pub(crate) fn is_slider(&self) -> bool {
+        self.is_range_input_box() || self.replaced_content().is_slider
     }
 
     /// Whether the box is a select element's own box. Its kind is that of any box with its display type, so only the
@@ -1312,14 +1348,6 @@ impl<'pass> NodeFacts<'pass> {
 
     pub(crate) fn can_have_children(&self) -> bool {
         node_can_have_children(self.data())
-    }
-
-    pub(crate) fn has_replaced_element_table_display_adjustment(&self) -> bool {
-        has_flag(self.data(), NodeFlag::IsReplacedElement)
-            && self.computed_values_view_if_styled().is_some_and(|style| {
-                let display = style.display_before_box_type_transformation();
-                display.is_table_inside() || display.is_internal_table() || display.is_table_caption()
-            })
     }
 
     pub(crate) fn creates_block_formatting_context(&self) -> bool {
@@ -1602,6 +1630,13 @@ impl<'pass> NodeFacts<'pass> {
         self.pass.document_in_quirks_mode
     }
 
+    // https://quirks.spec.whatwg.org/#the-line-height-calculation-quirk
+    // In quirks mode and limited-quirks mode, an inline box that matches the following conditions, must, for the
+    // purpose of line height calculation, act as if the box had a line-height of zero.
+    pub(crate) fn document_in_line_height_quirks_mode(&self) -> bool {
+        self.pass.document_in_quirks_mode || self.pass.document_in_limited_quirks_mode
+    }
+
     pub(crate) fn is_in_user_agent_shadow_tree(&self) -> bool {
         has_flag(self.data(), NodeFlag::IsInUserAgentShadowTree)
     }
@@ -1612,6 +1647,64 @@ impl<'pass> NodeFacts<'pass> {
 
     pub(crate) fn is_html_body_element(&self) -> bool {
         has_flag(self.data(), NodeFlag::IsBody)
+    }
+
+    // https://html.spec.whatwg.org/multipage/rendering.html#margin-collapsing-quirks
+    // In quirks mode, any element with default margins that is the child of a body, td, or th element and has no
+    // substantial previous siblings is expected to have a user-agent level style sheet rule that sets its
+    // 'margin-block-start' property to zero.
+    // AD-HOC: Instead of that rule and the three after it, which zero the margins of the children of body, td and th by
+    //         their siblings, a quirks-mode body or table cell ignores the quirky margins that collapse into its own
+    //         start or end, however deep in it they are, and keeps a margin an author sets. See
+    //         https://github.com/whatwg/html/issues/10296.
+    /// Whether the box is a quirks-mode body or table cell, which ignores the quirky margins of its contents that
+    /// collapse into its own block-start or block-end.
+    pub(crate) fn ignores_quirky_margins_at_its_edges(&self) -> bool {
+        self.document_in_quirks_mode() && (self.is_html_body_element() || self.display().is_table_cell())
+    }
+
+    /// Whether the block-start margin of the box is a quirky one: one the user agent's style sheet gives an element
+    /// with default margins.
+    pub(crate) fn has_quirky_block_start_margin(&self) -> bool {
+        use crate::css::style::bridge::element_construction_fact;
+        self.has_quirky_margin(element_construction_fact::HAS_QUIRKY_BLOCK_START_MARGIN, true)
+    }
+
+    /// Whether the block-end margin of the box is a quirky one: one the user agent's style sheet gives a p element or
+    /// an element laid out as preformatted text.
+    pub(crate) fn has_quirky_block_end_margin(&self) -> bool {
+        use crate::css::style::bridge::element_construction_fact;
+        self.has_quirky_margin(element_construction_fact::HAS_QUIRKY_BLOCK_END_MARGIN, false)
+    }
+
+    fn has_quirky_margin(&self, construction_fact: u32, is_block_start: bool) -> bool {
+        use crate::css::computed_value_types::user_agent_margin_side;
+        use crate::css::css_enums::writing_mode;
+        if !self.document_in_quirks_mode() {
+            return false;
+        }
+        let Some(style) = self.computed_values_view_if_styled() else {
+            return false;
+        };
+        // The user agent's margins are recorded by physical side, so the block-start and block-end sides are those the
+        // box's writing mode puts there.
+        let (block_start, block_end) = match style.writing_mode() {
+            writing_mode::VERTICAL_RL | writing_mode::SIDEWAYS_RL => {
+                (user_agent_margin_side::RIGHT, user_agent_margin_side::LEFT)
+            }
+            writing_mode::VERTICAL_LR | writing_mode::SIDEWAYS_LR => {
+                (user_agent_margin_side::LEFT, user_agent_margin_side::RIGHT)
+            }
+            _ => (user_agent_margin_side::TOP, user_agent_margin_side::BOTTOM),
+        };
+        let side = if is_block_start { block_start } else { block_end };
+        if style.user_agent_margin_sides() & side == 0 {
+            return false;
+        }
+        let arena = self.pass.arena();
+        arena.dom_node_style_node(self.node).is_some_and(|element| {
+            arena.with_style_store(|engine| engine.element_construction_facts(element)) & construction_fact != 0
+        })
     }
 }
 
@@ -1659,6 +1752,7 @@ mod node_facts_tests {
             is_horizontal: true,
             appearance_is_none: false,
             field_sizing_is_content: false,
+            zoom: 1.0,
         }
     }
 

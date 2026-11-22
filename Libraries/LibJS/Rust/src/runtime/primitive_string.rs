@@ -79,7 +79,9 @@ const _: () = assert!(size_of::<Substring>() == 32);
 
 // SAFETY: The characters hold no cells.
 unsafe impl Trace for InlineString {
-    fn trace(&self, _: &mut Visitor) {}
+    fn trace(&self, visitor: &mut Visitor) {
+        self.base.trace(visitor);
+    }
 }
 
 /// OPTIMIZATION: Copies the at most INLINE_STRING_CAPACITY bytes of `source` to the start of `destination` with two

@@ -2816,14 +2816,16 @@ impl<'a> Planner<'a> {
         // the content (including the '::before' and '::after' pseudo-elements) of the fieldset element except for the
         // rendered legend, if there is one.
         let legend = self.tree.rendered_legend(node);
-        let is_flex = self
+        let content_display_inside = self
             .tree
             .style_of(node)
-            .is_some_and(|style| style.display().is_flex_inside());
-        if legend.is_invalid() && !is_flex {
+            .map_or(crate::css::css_enums::display_inside::FLOW_ROOT, |style| {
+                crate::css::style::layout_style::fieldset_content_display_inside(style.display())
+            });
+        if legend.is_invalid() && content_display_inside == crate::css::css_enums::display_inside::FLOW_ROOT {
             return;
         }
-        let wrapper = self.tree.wrap_fieldset_contents(node, legend, is_flex);
+        let wrapper = self.tree.wrap_fieldset_contents(node, legend, content_display_inside);
         self.commit_one_by_one(
             wrapper,
             OneByOneRowSource::ContentsWrapper {
@@ -3310,7 +3312,7 @@ impl<'a> Planner<'a> {
             };
         }
 
-        let resolved = resolve_content(arena, tree_scope, view, None, None);
+        let resolved = resolve_content(arena, tree_scope, view, None, &[], None);
         if resolved.renders_list_item_counter_value {
             self.report_list_item_counter_rendering(element);
         }
@@ -4154,17 +4156,27 @@ fn prepare_element(
         layout_svg_pattern,
     );
     prepared_style.layout_kind = layout_kind;
+    // NB: A replaced element whose kind of box follows from its display gets the kind for the display it uses, so a
+    //     table display never makes it a table part. And as an atomic inline, an inline one gets a block container.
+    let kind_display = if node_facts::construction_facts_name_replaced_element(construction_facts) {
+        let display = crate::layout::tree_builder::used_display_of_replaced_element(published_display);
+        if display.is_inline_outside() && display.is_flow_inside() {
+            FfiDisplay::outside_and_inside(display.outside, crate::css::css_enums::display_inside::FLOW_ROOT, false)
+        } else {
+            display
+        }
+    } else {
+        published_display
+    };
     let kind = match layout_kind {
         ElementLayoutKind::ContentReplacement => Some(NodeKind::ImageBox),
         ElementLayoutKind::SvgMask => Some(NodeKind::SVGMaskBox),
         ElementLayoutKind::SvgClipPath => Some(NodeKind::SVGClipBox),
         ElementLayoutKind::SvgPattern => Some(NodeKind::SVGPatternBox),
-        ElementLayoutKind::Normal => {
-            match node_kind_for_element_box_kind(box_kind, published_display, summary.appearance) {
-                Some(NodeKind::ListItemBox) if uses_button_layout => Some(NodeKind::BlockContainer),
-                kind => kind,
-            }
-        }
+        ElementLayoutKind::Normal => match node_kind_for_element_box_kind(box_kind, kind_display, summary.appearance) {
+            Some(NodeKind::ListItemBox) if uses_button_layout => Some(NodeKind::BlockContainer),
+            kind => kind,
+        },
     };
     let Some(kind) = kind else {
         return PreparedElement {
@@ -4237,7 +4249,7 @@ fn prepare_element(
 /// Whether a box of `kind`, with `flags`, holds the boxes of its children. See `node_facts::node_can_have_children`.
 fn kind_can_have_children(kind: NodeKind, flags: u32) -> bool {
     match kind {
-        NodeKind::BreakNode => false,
+        NodeKind::BreakNode | NodeKind::WordBreakOpportunityNode => false,
         NodeKind::AudioBox | NodeKind::VideoBox => flags & NodeFlag::ReplacedBoxCanHaveChildren as u32 != 0,
         NodeKind::SVGSVGBox => true,
         kind if node_facts::kind_is_replaced_box(kind) => false,

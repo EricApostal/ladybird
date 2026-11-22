@@ -51,6 +51,9 @@ mod shape_flag {
     pub const HAS_WATCHED_SLOTS: u8 = 1 << 2;
     /// See `Shape::is_non_extensible()`.
     pub const NON_EXTENSIBLE: u8 = 1 << 3;
+    /// JIT code allocates objects of the shape from a template that holds its address (see
+    /// `Shape::note_in_allocation_template()`).
+    pub const IN_ALLOCATION_TEMPLATE: u8 = 1 << 4;
     /// The flags a shape gets from the shape it comes from.
     pub const INHERITED: u8 = HAS_PARAMETER_MAP | NON_EXTENSIBLE;
     /// An object may have left the shape (see `Shape::is_stable()`).
@@ -288,7 +291,8 @@ unsafe impl Trace for ShapeStorage {
 // SAFETY: Visits the keys.
 unsafe impl Trace for OwnStringKeys {
     fn trace(&self, visitor: &mut Visitor) {
-        visitor.visit_values(&self.keys);
+        // SAFETY: The keys are the shape's own, which only with_own_string_keys() replaces, and nothing writes them.
+        unsafe { visitor.visit_owned_values(&self.keys) };
     }
 }
 
@@ -323,6 +327,11 @@ define_cell!(Shape, Other);
 // the storage owns.
 unsafe impl Trace for Shape {
     fn trace(&self, visitor: &mut Visitor) {
+        // NB: The VM keeps the compiled code that depends on a shape by the address of the shape, and JIT code copies
+        //     the address from allocation templates, so such shapes stay where they are.
+        if self.flags.get() & (shape_flag::HAS_DEPENDENT_CODE | shape_flag::IN_ALLOCATION_TEMPLATE) != 0 {
+            visitor.pin(Gc::from_ref(self));
+        }
         self.realm.trace(visitor);
         self.prototype.trace(visitor);
         self.prototype_chain_validity.trace(visitor);
@@ -403,11 +412,15 @@ impl ConstructShapeCache {
     pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
         for entry in &self.entries {
             let construct_shape = entry.get();
-            if construct_shape.constructor.is_some_and(|cell| sweep.is_dead(cell))
+            if construct_shape
+                .constructor
+                .is_some_and(|cell| sweep.is_dead_or_moving(cell))
                 || construct_shape
                     .constructor_shape
-                    .is_some_and(|cell| sweep.is_dead(cell))
-                || construct_shape.this_shape.is_some_and(|cell| sweep.is_dead(cell))
+                    .is_some_and(|cell| sweep.is_dead_or_moving(cell))
+                || construct_shape
+                    .this_shape
+                    .is_some_and(|cell| sweep.is_dead_or_moving(cell))
             {
                 entry.set(ConstructShape::default());
             }
@@ -467,8 +480,16 @@ impl PrototypeTransitionCache {
     pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
         for entry in &self.entries {
             let transition = entry.get();
-            let is_dead = |shape| sweep.is_dead(shape);
-            if transition.from.is_some_and(is_dead) || transition.target.is_some_and(is_dead) {
+            // NB: The entry is found by the addresses of the shape and the prototype, which change if they move.
+            let is_dead = |shape| sweep.is_dead_or_moving(shape);
+            if transition.from.is_some_and(is_dead)
+                || transition.target.is_some_and(|target| {
+                    is_dead(target)
+                        || target
+                            .prototype()
+                            .is_some_and(|prototype| sweep.is_dead_or_moving(prototype))
+                })
+            {
                 entry.set(PrototypeTransition::default());
             }
         }
@@ -769,7 +790,9 @@ impl Shape {
         let key = prototype_address(prototype);
         self.with_existing_rare_data(vm, |rare_data| {
             let target = rare_data.prototype_transitions.get(&key)?;
-            let Some(shape) = target.get() else {
+            // NB: The entry is keyed by the address of a prototype, which may have moved since, and another object
+            //     may be at that address now.
+            let Some(shape) = target.get().filter(|shape| shape.prototype() == prototype) else {
                 // The cached prototype transition has gone stale (from garbage collection). Prune it.
                 rare_data.prototype_transitions.remove(&key);
                 return None;
@@ -1299,6 +1322,12 @@ impl Shape {
     /// Notes that JIT code depends on the shape staying stable.
     pub fn set_has_dependent_code(&self) {
         self.flags.set(self.flags.get() | shape_flag::HAS_DEPENDENT_CODE);
+    }
+
+    /// Notes that the words of a template JIT code allocates cells from hold the address of the shape, which keeps the
+    /// shape from moving from now on.
+    pub fn note_in_allocation_template(&self) {
+        self.flags.set(self.flags.get() | shape_flag::IN_ALLOCATION_TEMPLATE);
     }
 
     /// Whether the objects of this shape are not extensible. Preventing extensions moves an object to such a shape, so

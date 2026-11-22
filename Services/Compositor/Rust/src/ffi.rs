@@ -7,23 +7,24 @@
 //! The entry points of the compositor's logic for the C++ of the Compositor around it, which calls them from its event
 //! loop only.
 
-use crate::core::messages::{MessagesFromPresentation, MessagesFromWebContent};
+use crate::core::messages::{MessagesFromControl, MessagesFromPresentation, MessagesFromWebContent};
 use crate::core::presenting::{GpuBackend, PresentationCapabilities};
 use crate::core::{CompositorCore, ContextOwnerCheckResult};
-use crate::host::{ContextTimer, FfiCompositorCoreHost, Host, PresentationId, WebContentClientId};
+use crate::host::{FfiCompositorCoreHost, Host, PresentationId, WebContentClientId};
 use crate::overlays::{
-    PausedDebuggerOverlayAction, PausedDebuggerOverlayState, PictureInPictureControl, PictureInPictureControlsState,
-    UIOverlays,
+    CompositorLayersOverlayState, PausedDebuggerOverlayAction, PausedDebuggerOverlayState, PictureInPictureControl,
+    PictureInPictureControlsState, UIOverlays,
 };
 use crate::raster_host::{FfiRasterHost, RasterHost};
+use crate::surfaces::painting_surface::PaintingSurface;
 use libcompositing_rust::display_list::commands::CompositorContextId;
 use libcompositing_rust::ipc_types::{
-    Compositing_ContextVisibility as ContextVisibility, compositor_presentation_server, compositor_web_content_server,
+    Compositing_ContextVisibility as ContextVisibility, compositor_control_server, compositor_presentation_server,
+    compositor_web_content_server,
 };
 use libcompositing_rust::time::MonotonicTime;
 use libgfx_rust::{IntRect, IntSize};
 use libipc_rust::cpp_connection::RawMessage;
-use std::ffi::c_void;
 use std::rc::Rc;
 
 fn time(nanoseconds: i64) -> MonotonicTime {
@@ -251,16 +252,6 @@ pub extern "C" fn compositor_core_bind_presentation(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_shown_in_remote_layer(
-    core: &CompositorCore,
-    context_id: u64,
-    shown: bool,
-    now_nanoseconds: i64,
-) {
-    core.set_shown_in_remote_layer(CompositorContextId(context_id), shown, time(now_nanoseconds));
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn compositor_core_set_display_metadata(
     core: &CompositorCore,
     context_id: u64,
@@ -418,38 +409,35 @@ pub extern "C" fn compositor_core_canvas_content_changed(
 ///
 /// # Safety
 ///
-/// `surface` must be a live surface, which the call lends.
+/// `surface` must be a live surface.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn compositor_core_paint_screenshot(
     core: &CompositorCore,
     context_id: u64,
-    surface: *mut c_void,
+    surface: *const PaintingSurface,
     now_nanoseconds: i64,
 ) -> bool {
-    let Some(surface) = core.raster().retain_surface(surface) else {
-        return false;
-    };
+    // SAFETY: The caller lends a live surface, which the painting holds while it lasts.
+    let surface = unsafe { PaintingSurface::retained_from_ffi(surface) };
     core.paint_screenshot(CompositorContextId(context_id), &surface, time(now_nanoseconds))
 }
 
 /// The surface that holds the frame on screen as a whole, with one reference that the caller takes over, and the size
-/// of the frame in it. Answers false where no frame is on screen.
+/// of the frame in it. Answers null where no frame is on screen.
 #[unsafe(no_mangle)]
 pub extern "C" fn compositor_core_presented_frame_for_snapshot(
     core: &CompositorCore,
     context_id: u64,
     now_nanoseconds: i64,
-    surface: &mut *mut c_void,
     frame_size: &mut IntSize,
-) -> bool {
+) -> *const PaintingSurface {
     let Some((source, size)) =
         core.presented_frame_for_snapshot(CompositorContextId(context_id), time(now_nanoseconds))
     else {
-        return false;
+        return std::ptr::null();
     };
-    *surface = core.raster().leak_surface(source);
     *frame_size = size;
-    true
+    PaintingSurface::into_ffi(source)
 }
 
 /// Takes a message of the CompositorWebContentServer endpoint that is marked [RustReceiver].
@@ -500,6 +488,28 @@ pub unsafe extern "C" fn compositor_core_handle_presentation_message(
     core.finish_message(time(now_nanoseconds));
 }
 
+/// Takes a message of the CompositorControlServer endpoint that is marked [RustReceiver].
+///
+/// # Safety
+///
+/// `message` must be one `IPC::RawMessage::hand_to_rust()` made.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compositor_core_handle_control_message(
+    core: &CompositorCore,
+    message: RawMessage<'_>,
+    now_nanoseconds: i64,
+) {
+    let mut stub = MessagesFromControl {
+        core,
+        now: time(now_nanoseconds),
+    };
+    // SAFETY: The caller hands over a message of that endpoint.
+    unsafe {
+        message.hand_to(|bytes, attachments| compositor_control_server::dispatch(&mut stub, bytes, attachments));
+    };
+    core.finish_message(time(now_nanoseconds));
+}
+
 /// What the browser draws over a context's page. An action or control is none where it is out of range.
 #[repr(C)]
 pub struct FfiUIOverlays<'a> {
@@ -512,6 +522,14 @@ pub struct FfiUIOverlays<'a> {
     pub picture_in_picture_controls_shown: bool,
     pub picture_in_picture_controls_has_hovered_control: bool,
     pub picture_in_picture_controls_hovered_control: u8,
+    pub has_compositor_layers: bool,
+    pub compositor_layers_has_font_family: bool,
+    pub compositor_layers_font_family: ak::Span<'a, u8>,
+    pub compositor_layers_hidden_layer_ids: ak::Span<'a, u64>,
+    pub compositor_layers_selected_layer_ids: ak::Span<'a, u64>,
+    pub compositor_layers_has_hovered_layer_id: bool,
+    pub compositor_layers_hovered_layer_id: u64,
+    pub compositor_layers_raster_count_reset_generation: u64,
 }
 
 #[unsafe(no_mangle)]
@@ -534,17 +552,8 @@ pub extern "C" fn compositor_core_set_visibility(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_timer_fired(
-    core: &CompositorCore,
-    context_id: u64,
-    timer: ContextTimer,
-    now_nanoseconds: i64,
-) {
-    core.timer_fired(
-        CompositorContextId(context_id),
-        timer,
-        MonotonicTime::from_nanoseconds(now_nanoseconds),
-    );
+pub extern "C" fn compositor_core_timer_fired(core: &CompositorCore, timer_number: u64, now_nanoseconds: i64) {
+    core.timer_fired(timer_number, MonotonicTime::from_nanoseconds(now_nanoseconds));
 }
 
 #[unsafe(no_mangle)]
@@ -586,9 +595,27 @@ pub extern "C" fn compositor_core_set_ui_overlays(
         UIOverlays {
             paused_debugger,
             picture_in_picture_controls,
+            compositor_layers: ui_overlays.has_compositor_layers.then(|| CompositorLayersOverlayState {
+                font_family: ui_overlays.compositor_layers_has_font_family.then(|| {
+                    String::from_utf8_lossy(ui_overlays.compositor_layers_font_family.as_slice()).into_owned()
+                }),
+                hidden_layer_ids: ui_overlays.compositor_layers_hidden_layer_ids.as_slice().to_vec(),
+                selected_layer_ids: ui_overlays.compositor_layers_selected_layer_ids.as_slice().to_vec(),
+                hovered_layer_id: ui_overlays
+                    .compositor_layers_has_hovered_layer_id
+                    .then_some(ui_overlays.compositor_layers_hovered_layer_id),
+                raster_count_reset_generation: ui_overlays.compositor_layers_raster_count_reset_generation,
+            }),
         },
         MonotonicTime::from_nanoseconds(now_nanoseconds),
     );
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn compositor_core_forget_web_content_client(core: &CompositorCore, web_content_client_id: u64) {
+    let client = WebContentClientId(web_content_client_id);
+    core.canvas_2d_contexts().forget_client(client);
+    core.webgl_contexts().forget_client(client);
 }
 
 #[unsafe(no_mangle)]

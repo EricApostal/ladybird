@@ -44,7 +44,7 @@ pub fn can_enter_jit_code(vm: &Vm, executable: &Executable) -> bool {
 pub unsafe extern "C" fn libjs_jit_not_compiled_call_entry(vm: *const Vm, frame: *mut ExecutionContext) -> JitResult {
     // SAFETY: JIT code passes its live VM.
     let vm = unsafe { &*vm };
-    vm.head.running_execution_context.set(frame);
+    vm.set_running_frame_in_current_realm(frame);
     JitResult {
         value: 0,
         status: EntryStatus::Resume,
@@ -202,6 +202,8 @@ pub fn helper_enter_jit_code(vm: &Vm) -> i64 {
         return 0;
     }
     let frame = vm.running_execution_context().expect("a frame is running");
+    // NB: The interpreter's Call enters the code before the callee's Enter could bind its this value.
+    crate::interpreter::execution_context::coerce_this(vm, frame_of(frame));
     let result = enter_jit_code(vm, frame);
     match result.status {
         EntryStatus::Returned => {
@@ -236,7 +238,7 @@ pub unsafe extern "C" fn libjs_jit_exit(
     // NB: The frame's executable keeps the code attached while JIT code runs the frame, also after it was discarded.
     let executable = executable_of(frame_of(root));
     let code = executable.jit_code(vm).expect("the code is attached");
-    match code.site(site).kind {
+    match code.site(site).kind() {
         SiteKind::Exit(_) => translate::exit(vm, root, code, site, dump),
         SiteKind::Leave => translate::leave(vm, root, code, site, dump),
         SiteKind::Publish => translate::publish(vm, root, code, site, dump),
@@ -297,8 +299,8 @@ pub unsafe extern "C" fn libjs_jit_finish_inlined_direct_call(
         .jit_code(vm_ref)
         .expect("the code is attached")
         .site(site)
-        .frames[0]
-        .pc;
+        .frame(0)
+        .pc();
     // SAFETY: The innermost frame of the inlined calls is the call's frame now.
     unsafe { super::calls::libjs_jit_finish_direct_call(vm, innermost.as_ptr(), pc, status) }
 }

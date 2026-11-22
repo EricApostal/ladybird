@@ -79,7 +79,7 @@ pub use crate::runtime::native_function::{NativeFunction, RawNativeFunction};
 pub use crate::runtime::number_object::NumberObject;
 pub use crate::runtime::object::{IntegrityLevel, Object, PropertyKind, ShouldThrowExceptions};
 pub use crate::runtime::primitive_string::PrimitiveString;
-pub use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
+pub use crate::runtime::promise::{Promise, PromiseState, RejectionOperation, safe_promise_resolve};
 pub use crate::runtime::promise_capability::{PromiseCapability, new_promise_capability};
 pub use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
 pub use crate::runtime::property_key::PropertyKey;
@@ -98,6 +98,8 @@ pub use crate::runtime::typed_array::{
     typed_array_byte_length, typed_array_length,
 };
 pub use crate::runtime::value::{number_to_string, same_value};
-pub use crate::utf16::{Utf16Display, Utf16View, to_well_formed, utf16_formatted};
+pub use crate::utf16::{
+    Utf16Display, Utf16StringBuilder, Utf16View, to_well_formed, utf16_formatted, utf16_string_external_memory_size,
+};
 /// Derives Trace for a type of the embedder, which marks the type `#[gc(crate = libjs_rust)]`.
 pub use libjs_runtime_macros::Trace;

@@ -323,6 +323,11 @@ void HubConnection::app_did_disable_devtools()
     Application::the().did_disable_devtools();
 }
 
+void HubConnection::app_gpu_painting_changed(bool gpu_painting_enabled)
+{
+    Application::the().did_change_gpu_painting(gpu_painting_enabled);
+}
+
 void HubConnection::app_open_urls_in_new_tabs(Vector<URL::URL> urls)
 {
     Application::the().open_urls_in_new_tabs(urls);
@@ -343,9 +348,11 @@ void HubConnection::app_display_error_dialog(String message)
     Application::the().display_error_dialog(message);
 }
 
-void HubConnection::app_display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger)
+void HubConnection::app_display_update_check_result([[maybe_unused]] WebView::UpdateCheckResult::Kind kind, [[maybe_unused]] Optional<String> version, [[maybe_unused]] WebView::InstallMethod install_method, [[maybe_unused]] WebView::UpdateCheckTrigger trigger)
 {
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     Application::the().display_update_check_result(kind, version, install_method, trigger);
+#endif
 }
 
 void HubConnection::app_display_download_confirmation_dialog(String download_name, ByteString path)
@@ -580,6 +587,18 @@ void HubConnection::microphone_request_authorization()
     }
     authorizer->request_authorization([this](WebView::MicrophoneAuthorization authorization) {
         async_microphone_authorization_changed(authorization);
+    });
+}
+
+void HubConnection::default_browser_make_default()
+{
+    auto* default_browser = Application::the().default_browser();
+    if (!default_browser) {
+        async_default_browser_make_default_finished(true, {});
+        return;
+    }
+    default_browser->make_default([this](WebView::MakeDefaultBrowserResult const& result) {
+        async_default_browser_make_default_finished(result.failed, result.system_message);
     });
 }
 
@@ -884,6 +903,12 @@ void HubConnection::view_activate_tab(u64 view_id)
         view->on_activate_tab();
 }
 
+void HubConnection::view_discard(u64 view_id)
+{
+    if (auto* view = RemoteView::find(view_id); view && view->on_discard)
+        view->on_discard();
+}
+
 void HubConnection::view_close(u64 view_id)
 {
     if (auto* view = RemoteView::find(view_id); view && view->on_close)
@@ -1152,6 +1177,12 @@ void HubConnection::view_performance_stats(u64 view_id, WebView::TabPerformanceS
 {
     if (auto* view = RemoteView::find(view_id); view && view->on_performance_stats)
         view->on_performance_stats(move(stats));
+}
+
+void HubConnection::view_compositor_layers_change(u64 view_id, Compositing::CompositorLayersDescription layers)
+{
+    if (auto* view = RemoteView::find(view_id); view && view->on_compositor_layers_change)
+        view->on_compositor_layers_change(layers);
 }
 
 }

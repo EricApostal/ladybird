@@ -33,15 +33,15 @@ use crate::bytecode::operand::*;
 use crate::bytecode::source_map::SourceOffset;
 use crate::parser::EnclosingCode;
 use crate::parser::FunctionRow;
-use crate::parser::columns::NONE;
-use crate::parser::columns::function_flag;
-use crate::parser::token::N_ARGUMENTS;
-use crate::parser::token::N_DOT_NEW_TARGET;
-use crate::parser::token::N_DOT_SUPER;
-use crate::parser::token::N_DOT_THIS;
-use crate::parser::token::N_DOT_UNBOUND;
 use crate::slice_block::SliceBlock;
 use crate::u32_from_usize;
+use libjs_parser::columns::NONE;
+use libjs_parser::columns::function_flag;
+use libjs_parser::token::N_ARGUMENTS;
+use libjs_parser::token::N_DOT_NEW_TARGET;
+use libjs_parser::token::N_DOT_SUPER;
+use libjs_parser::token::N_DOT_THIS;
+use libjs_parser::token::N_DOT_UNBOUND;
 
 use super::EnclosingEnvironmentScope;
 use super::bindings::*;
@@ -436,6 +436,9 @@ impl Generator<'_> {
         // NB: The this value of a derived constructor is not initialized until it calls super(), which its frame keeps
         //     track of if it has no environment for it.
         self.this_value_needs_resolution = this_from_environment || flags & function_flag::DERIVED_CONSTRUCTOR != 0;
+        self.coerces_this = flags & (function_flag::STRICT | function_flag::ARROW) == 0
+            && flags & function_flag::INSIGHT_USES_THIS != 0
+            && !self.this_value_needs_resolution;
         self.enclosing_function_kind = FunctionKind::from_async_generator(
             flags & function_flag::ASYNC != 0,
             flags & function_flag::GENERATOR != 0,
@@ -1344,6 +1347,7 @@ impl Generator<'_> {
                 && (scope.has_function_in_parameters || parameters_have_environment));
         if needs_variable_environment {
             self.note_creates_environment();
+            self.keeps_own_environments = true;
             let environment = self.held_register();
             self.in_head(|generator| {
                 generator.put(op::CreateVariableEnvironment {
@@ -1685,13 +1689,13 @@ impl Generator<'_> {
         resolution.set_is_inside_scope_with_eval();
         let names = index.capture_names[captures..captures + capture_count]
             .iter()
-            .map(|&capture| Name(capture & !crate::parser::base::USE_IN_WITH))
+            .map(|&capture| Name(capture & !libjs_parser::base::USE_IN_WITH))
             .chain(std::iter::once(Name(N_DOT_UNBOUND)));
         for name in names {
             self.context
                 .scope
                 .scope_resolutions
-                .push(crate::parser::resolve::outer_entry(row, name, resolution));
+                .push(crate::parser::outer_entry(row, name, resolution));
         }
     }
 
@@ -1699,12 +1703,12 @@ impl Generator<'_> {
     fn note_function_resolutions(&mut self, row: u32) {
         let has_direct_eval = self.has_direct_eval();
         let unbound = self.unbound_resolution();
-        let tree: &SyntaxTree = self.tree;
+        let tree: &SyntaxTree<'_> = self.tree;
         let index = &tree.script.index;
         let captures = index.capture_start[row as usize] as usize;
         let capture_count = index.capture_count[row as usize] as usize;
         for &capture in &index.capture_names[captures..captures + capture_count] {
-            let name = Name(capture & !crate::parser::base::USE_IN_WITH);
+            let name = Name(capture & !libjs_parser::base::USE_IN_WITH);
             if matches!(name.0, N_DOT_THIS | N_DOT_NEW_TARGET | N_DOT_SUPER) {
                 continue;
             }
@@ -1714,7 +1718,7 @@ impl Generator<'_> {
                 self.context
                     .scope
                     .scope_resolutions
-                    .push(crate::parser::resolve::outer_entry(row, name, resolution));
+                    .push(crate::parser::outer_entry(row, name, resolution));
                 continue;
             }
             let scope = &mut self.context.scope;
@@ -1728,7 +1732,7 @@ impl Generator<'_> {
                     resolution.set_is_inside_scope_with_eval();
                     scope
                         .scope_resolutions
-                        .push(crate::parser::resolve::outer_entry(row, name, resolution));
+                        .push(crate::parser::outer_entry(row, name, resolution));
                 }
                 continue;
             };
@@ -1738,7 +1742,7 @@ impl Generator<'_> {
             }
             scope
                 .scope_resolutions
-                .push(crate::parser::resolve::outer_entry(row, name, resolution));
+                .push(crate::parser::outer_entry(row, name, resolution));
         }
         let mut resolution = Resolution::default();
         if unbound.is_inside_scope_with_eval() || has_direct_eval {
@@ -1753,11 +1757,7 @@ impl Generator<'_> {
         self.context
             .scope
             .scope_resolutions
-            .push(crate::parser::resolve::outer_entry(
-                row,
-                Name(N_DOT_UNBOUND),
-                resolution,
-            ));
+            .push(crate::parser::outer_entry(row, Name(N_DOT_UNBOUND), resolution));
     }
 
     /// What the function at `row` captures of scopes inside this function has to be noted while those are around.
@@ -1766,7 +1766,7 @@ impl Generator<'_> {
         let captures = index.capture_start[row as usize] as usize;
         let capture_count = index.capture_count[row as usize] as usize;
         for &capture in &index.capture_names[captures..captures + capture_count] {
-            let name = Name(capture & !crate::parser::base::USE_IN_WITH);
+            let name = Name(capture & !libjs_parser::base::USE_IN_WITH);
             let scope = &mut self.context.scope;
             let Some(binding) = scope.binding_of(name) else {
                 continue;
@@ -1781,7 +1781,7 @@ impl Generator<'_> {
             }
             scope
                 .scope_resolutions
-                .push(crate::parser::resolve::outer_entry(row, name, resolution));
+                .push(crate::parser::outer_entry(row, name, resolution));
         }
     }
 
@@ -2030,7 +2030,7 @@ impl Generator<'_> {
 
     /// Finishes the function: what the functions nested in it need, what the function object needs, and the code.
     pub(super) fn finish_function(&mut self) -> PrecompiledFunction {
-        let tree: &SyntaxTree = self.tree;
+        let tree: &SyntaxTree<'_> = self.tree;
         let script = &tree.script;
         let index = &script.index;
         let row = self.context.scope.row;

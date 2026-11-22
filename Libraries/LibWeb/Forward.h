@@ -619,9 +619,6 @@ namespace Web::Gamepad {
 
 class NavigatorGamepadPartial;
 class Gamepad;
-class GamepadButton;
-class GamepadEvent;
-class GamepadHapticActuator;
 
 }
 
@@ -660,7 +657,6 @@ class Canvas2DContextBase;
 class CanvasHost;
 class CanvasRenderingContext2D;
 class CheckUnloadingCanceledState;
-class RemoteCanvas2DTransport;
 class ClassicScript;
 class CloseEvent;
 class CloseWatcher;
@@ -683,7 +679,6 @@ class ElementInternals;
 class ErrorEvent;
 class EventHandler;
 class EventLoop;
-class EventSource;
 class External;
 class FormAssociatedElement;
 class FormAssociatedTextControlElement;
@@ -781,7 +776,6 @@ class LocalTraversableNavigable;
 class Location;
 class MediaError;
 class MediaStreamPlayback;
-class MessageEvent;
 class MessagePort;
 class MimeType;
 class MimeTypeArray;
@@ -1222,7 +1216,6 @@ class PeriodicWave;
 
 namespace Web::WebGL {
 
-class RemoteWebGLTransport;
 class WebGL2RenderingContext;
 class WebGLRenderingContext;
 class WebGLRenderingContextBase;
@@ -1268,7 +1261,6 @@ class WebSocket;
 namespace Web::WebVTT {
 
 class VTTCue;
-class VTTRegion;
 
 }
 

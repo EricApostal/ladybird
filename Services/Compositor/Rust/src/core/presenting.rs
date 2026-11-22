@@ -7,12 +7,13 @@
 //! When the frames of the contexts are presented, the frames in flight on the GPU, and whom each is delivered to.
 
 use super::CompositorCore;
+use crate::backing_stores::{StorePublication, StoreResizeOutcome};
 use crate::context_state::ContextState;
-use crate::host::{PendingFrame, PresentScheduling, PresentationId};
+use crate::host::{PendingFrame, PresentScheduling};
 use crate::presenting::{ContextPresenting, NestedContexts, PresentingEnvironment};
-use crate::raster_host::{
-    FfiRemoteLayerFrame, FrameHandOff, StorePublication, StoreResizeOutcome, SublayersHandle, SurfaceHandle,
-};
+use crate::raster_host::{FfiRemoteLayerFrame, FrameHandOff, RasterHost, SublayersHandle};
+use crate::remote_layers::{RemoteLayer, ResizeNotice, WindowServerObject};
+use crate::surfaces::painting_surface::PaintingSurface;
 use libcompositing_rust::display_list::commands::CompositorContextId;
 use libcompositing_rust::display_list::replay::{CompositedContexts, NoCompositedContexts, ResolvedCompositedContext};
 use libcompositing_rust::ipc_types::{
@@ -23,6 +24,7 @@ use libcompositing_rust::time::MonotonicTime;
 use libgfx_rust::{FloatMatrix4x4, FloatRect, IntRect, IntSize};
 use std::cell::RefCell;
 use std::io::Write;
+use std::rc::Rc;
 
 /// A frame submitted to the GPU, which is delivered once its work is done, or once it is scheduled where the window
 /// server waits for it.
@@ -38,8 +40,10 @@ pub(crate) struct PendingAsyncPresent {
     // A frame that started rendering before its context was bound has no published buffer to present to.
     publish_to_presentation: bool,
     shows_in_remote_layer: bool,
-    // A frame that changes only what the window server shows above the frame on screen.
+    // A frame that changes only what the window server shows by itself.
     keeps_shown_store: bool,
+    // A frame the window server shows every layer of by itself, with no store below them.
+    shows_no_store: bool,
     sublayers: Option<SublayersHandle>,
 }
 
@@ -53,6 +57,7 @@ struct Delivery {
     publish_to_presentation: bool,
     shows_in_remote_layer: bool,
     keeps_shown_store: bool,
+    shows_no_store: bool,
     sublayers: Option<SublayersHandle>,
 }
 
@@ -127,6 +132,11 @@ impl CompositorCore {
     ) -> PresentingEnvironment<'a> {
         PresentingEnvironment {
             context_id,
+            remote_layer: self
+                .remote_layers
+                .borrow()
+                .layer_showing(context_id)
+                .map(RemoteLayer::showing_layer),
             raster: &self.raster,
             host: &self.host,
             now,
@@ -330,10 +340,7 @@ impl CompositorCore {
         let Some(presenting) = self.presenting_of(context_id) else {
             return;
         };
-        if !presenting
-            .borrow()
-            .can_schedule_pending_present_frame_if_unblocked(&self.raster, context_id)
-        {
+        if !presenting.borrow().can_schedule_pending_present_frame_if_unblocked() {
             return;
         }
         if self.try_present_frame_during_resize(context_id, now) {
@@ -355,9 +362,7 @@ impl CompositorCore {
         if !self.context_is_effectively_visible_inner(context_id) {
             return false;
         }
-        let pending_frame = presenting
-            .borrow_mut()
-            .take_pending_present_frame_if_unblocked(&self.raster, context_id);
+        let pending_frame = presenting.borrow_mut().take_pending_present_frame_if_unblocked();
         let Some(pending_frame) = pending_frame else {
             return false;
         };
@@ -427,9 +432,27 @@ impl CompositorCore {
         };
         let environment = self.environment(context_id, now, &nested_contexts);
         let mut presenting = presenting.borrow_mut();
-        let Some(prepared_frame) =
-            presenting.prepare_frame(&environment, pending_frame, display_list.as_ref(), frame_inputs)
-        else {
+        let prepared_frame = presenting.prepare_frame(&environment, pending_frame, display_list.as_ref(), frame_inputs);
+        if let Some(presentation_id) = bound_presentation
+            && let Some(layers) = presenting.take_description_of_layers_to_publish(now)
+        {
+            self.host.post_to_presentation(
+                presentation_id,
+                compositor_presentation_client::messages::DidUpdateCompositorLayers { context_id, layers },
+            );
+        }
+        // If the frame was not painted, as while the stores are not valid, the overlay is still that of an earlier
+        // frame, which can need frames until a time that is past.
+        let layer_overlay_needs_frames_until = presenting
+            .layer_overlay_needs_frames_until()
+            .filter(|&until| until > now);
+        context
+            .borrow_mut()
+            .set_compositor_layers_overlay_needs_frames_until(layer_overlay_needs_frames_until);
+        if layer_overlay_needs_frames_until.is_some() {
+            self.host.request_display_ticks(context_id);
+        }
+        let Some(prepared_frame) = prepared_frame else {
             return;
         };
 
@@ -455,6 +478,7 @@ impl CompositorCore {
             publish_to_presentation: !shows_in_remote_layer && bound_presentation.is_some(),
             shows_in_remote_layer,
             keeps_shown_store: prepared_frame.rendered_surface.is_none(),
+            shows_no_store: prepared_frame.window_server_shows_every_layer,
             sublayers,
         });
         presenting.did_submit_prepared_frame(pending_frame.viewport_rect);
@@ -464,7 +488,7 @@ impl CompositorCore {
         let hands_off_early = presenting.presents_to_client
             && self.gpu.has_gpu
             && !presenting.presents_from_cpu_memory
-            && self.raster.frame_hand_off(context_id) == FrameHandOff::OnceGpuWorkIsScheduled;
+            && self.frame_hand_off(context_id) == FrameHandOff::OnceGpuWorkIsScheduled;
         drop(presenting);
         if hands_off_early {
             self.raster.hand_off_once_gpu_work_is_scheduled(token);
@@ -491,6 +515,7 @@ impl CompositorCore {
             publish_to_presentation: present.publish_to_presentation,
             shows_in_remote_layer: present.shows_in_remote_layer,
             keeps_shown_store: present.keeps_shown_store,
+            shows_no_store: present.shows_no_store,
             sublayers: present.sublayers.take(),
         })
     }
@@ -528,7 +553,6 @@ impl CompositorCore {
         else {
             return;
         };
-        let environment = self.environment(context_id, now, &NoCompositedContexts);
         let viewport_size = IntSize {
             width: delivery.viewport_rect.width,
             height: delivery.viewport_rect.height,
@@ -538,7 +562,7 @@ impl CompositorCore {
             if delivery.keeps_shown_store {
                 presenting.did_deliver_frame_without_store();
             } else {
-                presenting.did_finish_gpu_present(&environment, delivery.bitmap_id, viewport_size);
+                presenting.did_finish_gpu_present(delivery.bitmap_id, viewport_size);
             }
             presenting.presents_to_client
         };
@@ -582,32 +606,98 @@ impl CompositorCore {
 
     fn show_frame_in_remote_layer(&self, delivery: &mut Delivery, viewport_size: IntSize, now: MonotonicTime) {
         let context_id = delivery.context_id;
-        let laid_out_by_page = self
-            .presenting_of(context_id)
+        let shown_in = self
+            .remote_layers
+            .borrow()
+            .layer_showing(context_id)
+            .map(|remote_layer| {
+                (
+                    remote_layer.showing_layer(),
+                    remote_layer.presentation(),
+                    remote_layer.fit_within(),
+                )
+            });
+        let Some((remote_layer, presentation, fit_within)) = shown_in else {
+            self.stop_showing_context_in_remote_layer(context_id, now);
+            return;
+        };
+        let presenting = self.presenting_of(context_id);
+        let laid_out_by_page = presenting
+            .as_ref()
             .is_some_and(|presenting| presenting.borrow().size_laid_out_by_page == viewport_size);
+        let store = if delivery.keeps_shown_store {
+            None
+        } else {
+            let store = presenting.as_ref().and_then(|presenting| {
+                presenting
+                    .borrow()
+                    .window_server_surface_of_latest_rendered_store()
+                    .cloned()
+            });
+            Some(store.expect("a frame shown in a remote layer was rendered into a store the window server shows"))
+        };
         // The sublayers go with the frame, which keeps them.
         let sublayers = delivery
             .sublayers
             .take()
             .unwrap_or_else(|| self.raster.build_sublayers(context_id, &[]));
         let frame = FfiRemoteLayerFrame {
-            uses_store: !delivery.keeps_shown_store,
+            store: store.as_ref().map_or(std::ptr::null(), |store| store.as_ffi()),
+            shows_no_store: delivery.shows_no_store,
             painted_size: viewport_size,
             device_pixel_ratio: delivery.device_pixel_ratio,
-            laid_out_by_page,
+            has_fit_within: fit_within.is_some(),
+            fit_within: fit_within.unwrap_or_default(),
         };
-        let shown = self.raster.show_frame_in_remote_layer(context_id, &frame, sublayers);
-        match shown {
-            None => self.stop_showing_context_in_remote_layer(context_id, now),
-            Some(presentation_id) => self.host.post_to_presentation(
-                PresentationId(presentation_id),
-                compositor_presentation_client::messages::DidPresentFrameInRemoteLayer {
-                    context_id,
-                    content_rect: delivery.viewport_rect,
-                    damage_rect: delivery.damage_rect,
-                    device_pixel_ratio: delivery.device_pixel_ratio,
+        if !self
+            .raster
+            .remote_layer_show_frame(&remote_layer.layer, &frame, sublayers)
+        {
+            self.remote_layers.borrow_mut().stop_showing_context(context_id);
+            self.stop_showing_context_in_remote_layer(context_id, now);
+            return;
+        }
+        let held = self
+            .remote_layers
+            .borrow_mut()
+            .did_show_frame(context_id, viewport_size, laid_out_by_page);
+        self.tell_of_held_synchronized_resize_frames(held);
+        self.host.post_to_presentation(
+            presentation,
+            compositor_presentation_client::messages::DidPresentFrameInRemoteLayer {
+                context_id,
+                content_rect: delivery.viewport_rect,
+                damage_rect: delivery.damage_rect,
+                device_pixel_ratio: delivery.device_pixel_ratio,
+            },
+        );
+    }
+
+    pub(super) fn tell_of_held_synchronized_resize_frames(&self, held: Vec<ResizeNotice>) {
+        for notice in held {
+            self.host.post_to_presentation(
+                notice.presentation,
+                compositor_presentation_client::messages::DidHoldSynchronizedResizeFrame {
+                    remote_layer_id: notice.remote_layer_id,
+                    token: notice.token,
                 },
-            ),
+            );
+        }
+    }
+
+    fn window_server_showing(&self, context_id: CompositorContextId) -> Option<Rc<WindowServerObject>> {
+        self.remote_layers
+            .borrow()
+            .layer_showing(context_id)
+            .map(|remote_layer| remote_layer.showing_layer().window_server)
+    }
+
+    pub(super) fn frame_hand_off(&self, context_id: CompositorContextId) -> FrameHandOff {
+        match self.remote_layers.borrow().layer_showing(context_id) {
+            Some(remote_layer) => self
+                .raster
+                .window_server_frame_hand_off(&remote_layer.showing_layer().window_server),
+            None => RasterHost::frame_hand_off_through_presentation(),
         }
     }
 
@@ -636,8 +726,7 @@ impl CompositorCore {
         };
         presenting.borrow_mut().shown_in_remote_layer = false;
         self.stop_delivering_in_flight_frames_to_their_viewer(context_id);
-        let environment = self.environment(context_id, now, &NoCompositedContexts);
-        presenting.borrow_mut().invalidate_backing_stores(&environment);
+        presenting.borrow_mut().invalidate_backing_stores();
         self.resize_backing_stores_if_needed(context_id, now);
         self.schedule_pending_present_frame_if_unblocked(context_id, now);
     }
@@ -649,9 +738,10 @@ impl CompositorCore {
         presenting.borrow_mut().shown_in_remote_layer = true;
         self.stop_delivering_in_flight_frames_to_their_viewer(context_id);
         // The presentation no longer shows the stores it was given, so none of them is waiting to be released by it.
-        self.raster.release_all_presented_stores(context_id);
-        let environment = self.environment(context_id, now, &NoCompositedContexts);
-        presenting.borrow_mut().invalidate_backing_stores(&environment);
+        if let Some(presenting) = self.presenting_of(context_id) {
+            presenting.borrow_mut().release_all_presented_stores();
+        }
+        presenting.borrow_mut().invalidate_backing_stores();
         self.resize_backing_stores_if_needed(context_id, now);
         self.schedule_pending_present_frame_if_unblocked(context_id, now);
     }
@@ -676,11 +766,19 @@ impl CompositorCore {
         !capabilities.is_some_and(|capabilities| capabilities.cannot_present_gpu_images)
     }
 
-    pub(super) fn resize_backing_stores_if_needed(&self, context_id: CompositorContextId, now: MonotonicTime) {
+    pub(super) fn resize_backing_stores_if_needed(
+        &self,
+        context_id: CompositorContextId,
+        now: MonotonicTime,
+    ) -> StoreResizeOutcome {
         let (Some(context), Some(presenting)) = (self.context_if_present(context_id), self.presenting_of(context_id))
         else {
-            return;
+            return StoreResizeOutcome::Unchanged;
         };
+        // A hidden context renders nothing into its stores, so they are fitted to it once it is shown again.
+        if presenting.borrow().stores_are_retired_while_hidden() {
+            return StoreResizeOutcome::Unchanged;
+        }
         let bound_presentation = context.borrow().bound_presentation();
         let publication = if presenting.borrow().shown_in_remote_layer {
             StorePublication::ShownInRemoteLayer
@@ -701,10 +799,11 @@ impl CompositorCore {
             StoreResizeOutcome::Unchanged | StoreResizeOutcome::ReallocatedOffscreen => {}
             StoreResizeOutcome::ReallocatedForViewer => self.present_current_frame(context_id, now),
             StoreResizeOutcome::Failed => {
-                self.raster.stop_showing_in_remote_layer(context_id);
+                self.remote_layers.borrow_mut().stop_showing_context(context_id);
                 self.stop_showing_context_in_remote_layer(context_id, now);
             }
         }
+        outcome
     }
 
     pub(super) fn add_backing_store_for_pending_frame_if_needed(&self, context_id: CompositorContextId) {
@@ -720,16 +819,19 @@ impl CompositorCore {
         if bound_presentation.is_none() && !presenting.shown_in_remote_layer {
             return;
         }
-        if !presenting.wants_backing_store_for_pending_frame(display_list.as_ref(), &self.raster, context_id) {
+        if !presenting.wants_backing_store_for_pending_frame(display_list.as_ref()) {
             return;
         }
         let publishing_presentation = bound_presentation
             .filter(|_| presenting.store_publication() == StorePublication::Published)
             .map(|presentation| presentation.0);
-        if self
-            .raster
-            .add_store_if_window_server_reads_every_released_store(context_id, publishing_presentation)
-        {
+        let window_server = self.window_server_showing(context_id);
+        if presenting.add_store_if_window_server_still_reads_every_released_store(
+            &self.raster,
+            context_id,
+            publishing_presentation,
+            window_server.as_deref(),
+        ) {
             presenting.schedule_surplus_store_retirement(context_id, &self.host);
         }
     }
@@ -745,12 +847,66 @@ impl CompositorCore {
         let publishing_presentation = bound_presentation
             .filter(|_| presenting.store_publication() == StorePublication::Published)
             .map(|presentation| presentation.0);
-        if self
-            .raster
-            .retire_idle_surplus_stores(context_id, publishing_presentation)
-        {
+        if presenting.retire_idle_surplus_stores(&self.raster, context_id, publishing_presentation) {
             presenting.schedule_surplus_store_retirement(context_id, &self.host);
         }
+    }
+
+    pub(super) fn retire_backing_stores_of_hidden_context(&self, context_id: CompositorContextId) {
+        let (Some(context), Some(presenting)) = (self.context_if_present(context_id), self.presenting_of(context_id))
+        else {
+            return;
+        };
+        if context.borrow().visibility() == ContextVisibility::Visible {
+            return;
+        }
+        let bound_presentation = context.borrow().bound_presentation();
+        let mut presenting = presenting.borrow_mut();
+        if !presenting.presents_to_client {
+            return;
+        }
+        presenting.start_retiring_stores_while_hidden();
+        let publishing_presentation = bound_presentation
+            .filter(|_| presenting.store_publication() == StorePublication::Published)
+            .map(|presentation| presentation.0);
+        if presenting.retire_stores_of_hidden_context(&self.raster, context_id, publishing_presentation) {
+            presenting.retry_hidden_store_retirement(context_id, &self.host);
+        }
+    }
+
+    /// Gives a context that is shown again the stores it retired while it was hidden, before it presents.
+    pub(super) fn restore_backing_stores_retired_while_hidden(
+        &self,
+        context_id: CompositorContextId,
+        now: MonotonicTime,
+    ) {
+        let (Some(context), Some(presenting)) = (self.context_if_present(context_id), self.presenting_of(context_id))
+        else {
+            return;
+        };
+        if !presenting.borrow_mut().stop_retiring_stores_as_shown() {
+            return;
+        }
+        // Stores that no longer fit the context, as its viewport or how it is shown changed while it was hidden, are
+        // allocated anew.
+        if self.resize_backing_stores_if_needed(context_id, now) != StoreResizeOutcome::Unchanged {
+            return;
+        }
+        let bound_presentation = context.borrow().bound_presentation();
+        let publishing_presentation = bound_presentation
+            .filter(|_| presenting.borrow().store_publication() == StorePublication::Published)
+            .map(|presentation| presentation.0);
+        let window_server = self.window_server_showing(context_id);
+        if presenting.borrow_mut().restore_stores_retired_while_hidden(
+            &self.raster,
+            context_id,
+            publishing_presentation,
+            window_server.as_deref(),
+        ) {
+            return;
+        }
+        presenting.borrow_mut().invalidate_backing_stores();
+        self.resize_backing_stores_if_needed(context_id, now);
     }
 
     // A context scrolls elastically, takes presses on scrollbar tracks, and ends touchpad gestures as the presentation of
@@ -791,11 +947,12 @@ impl CompositorCore {
             }
         }
         // Nobody is left to release the buffers the presentation was showing.
-        self.raster.release_all_presented_stores(context_id);
+        if let Some(presenting) = self.presenting_of(context_id) {
+            presenting.borrow_mut().release_all_presented_stores();
+        }
         self.update_scroll_capabilities();
         if let Some(presenting) = self.presenting_of(context_id) {
-            let environment = self.environment(context_id, now, &NoCompositedContexts);
-            presenting.borrow_mut().invalidate_backing_stores(&environment);
+            presenting.borrow_mut().invalidate_backing_stores();
         }
         self.resize_backing_stores_if_needed(context_id, now);
         self.schedule_pending_present_frame_if_unblocked(context_id, now);
@@ -1089,9 +1246,7 @@ impl CompositorCore {
             }
 
             self.add_backing_store_for_pending_frame_if_needed(context_id);
-            let pending_frame = presenting
-                .borrow_mut()
-                .take_pending_present_frame_if_unblocked(&self.raster, context_id);
+            let pending_frame = presenting.borrow_mut().take_pending_present_frame_if_unblocked();
             let Some(pending_frame) = pending_frame else {
                 let present_is_scheduled = {
                     let presenting = presenting.borrow();
@@ -1116,7 +1271,7 @@ impl CompositorCore {
     pub(super) fn paint_screenshot_inner(
         &self,
         context_id: CompositorContextId,
-        target: &SurfaceHandle,
+        target: &Rc<PaintingSurface>,
         now: MonotonicTime,
     ) -> bool {
         let (Some(context), Some(presenting)) = (self.context_if_present(context_id), self.presenting_of(context_id))
@@ -1156,7 +1311,7 @@ impl CompositorCore {
         &self,
         context_id: CompositorContextId,
         now: MonotonicTime,
-    ) -> Option<(SurfaceHandle, IntSize)> {
+    ) -> Option<(Rc<PaintingSurface>, IntSize)> {
         let presenting = self.presenting_of(context_id)?;
         if !presenting.borrow().presents_to_client {
             return None;

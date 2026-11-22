@@ -233,6 +233,15 @@ static Microsoft::WRL::ComPtr<ID3D11Device1> get_d3d11_device(EGLDisplay display
 }
 #endif
 
+void const* OpenGLContext::address_of_function([[maybe_unused]] char const* name)
+{
+#ifdef ENABLE_WEBGL
+    return reinterpret_cast<void const*>(eglGetProcAddress(name));
+#else
+    return nullptr;
+#endif
+}
+
 OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, WebGLVersion webgl_version, [[maybe_unused]] DrawingBufferOptions drawing_buffer_options)
 {
 #ifdef ENABLE_WEBGL
@@ -379,53 +388,6 @@ OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia
     (void)skia_backend_context;
     (void)webgl_version;
     return {};
-#endif
-}
-
-void OpenGLContext::clear_buffer_to_default_values()
-{
-#ifdef ENABLE_WEBGL
-    GLint original_framebuffer;
-    GLint original_renderbuffer;
-    GLenum framebuffer_target = GL_FRAMEBUFFER;
-    GLenum framebuffer_binding = GL_FRAMEBUFFER_BINDING;
-    if (m_webgl_version == WebGLVersion::WebGL2) {
-        framebuffer_target = GL_DRAW_FRAMEBUFFER;
-        framebuffer_binding = GL_DRAW_FRAMEBUFFER_BINDING;
-    }
-    glGetIntegerv(framebuffer_binding, &original_framebuffer);
-    glGetIntegerv(GL_RENDERBUFFER_BINDING, &original_renderbuffer);
-
-    glBindFramebuffer(framebuffer_target, default_framebuffer());
-    glBindRenderbuffer(GL_RENDERBUFFER, default_renderbuffer());
-
-    Array<GLfloat, 4> current_clear_color;
-    glGetFloatv(GL_COLOR_CLEAR_VALUE, current_clear_color.data());
-
-    GLfloat current_clear_depth;
-    glGetFloatv(GL_DEPTH_CLEAR_VALUE, &current_clear_depth);
-
-    GLint current_clear_stencil;
-    glGetIntegerv(GL_STENCIL_CLEAR_VALUE, &current_clear_stencil);
-
-    // The implicit clear value for the color buffer is (0, 0, 0, 0)
-    glClearColor(0, 0, 0, 0);
-
-    // The implicit clear value for the depth buffer is 1.0.
-    glClearDepthf(1.0f);
-
-    // The implicit clear value for the stencil buffer is 0.
-    glClearStencil(0);
-
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-
-    // Restore the clear values.
-    glClearColor(current_clear_color[0], current_clear_color[1], current_clear_color[2], current_clear_color[3]);
-    glClearDepthf(current_clear_depth);
-    glClearStencil(current_clear_stencil);
-
-    glBindFramebuffer(framebuffer_target, original_framebuffer);
-    glBindRenderbuffer(GL_RENDERBUFFER, original_renderbuffer);
 #endif
 }
 
@@ -631,13 +593,14 @@ void OpenGLContext::allocate_cpu_painting_surface(ColorBuffer& color_buffer)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+        auto has_pixel_buffer_objects = supports_pixel_buffer_objects();
         GLint original_pixel_unpack_buffer = 0;
-        if (m_webgl_version == WebGLVersion::WebGL2) {
+        if (has_pixel_buffer_objects) {
             glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &original_pixel_unpack_buffer);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         }
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_size.width(), m_size.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        if (m_webgl_version == WebGLVersion::WebGL2)
+        if (has_pixel_buffer_objects)
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, original_pixel_unpack_buffer);
     });
 }
@@ -672,14 +635,18 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
     glGetIntegerv(GL_PACK_ALIGNMENT, &original_pack_alignment);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
 
+    auto has_pixel_buffer_objects = supports_pixel_buffer_objects();
     GLint original_pixel_pack_buffer = 0;
+    if (has_pixel_buffer_objects) {
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    }
+
+    auto has_pack_subimage_parameters = supports_pack_subimage_parameters();
     GLint original_pack_row_length = 0;
     GLint original_pack_skip_pixels = 0;
     GLint original_pack_skip_rows = 0;
-    if (m_webgl_version == WebGLVersion::WebGL2) {
-        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-
+    if (has_pack_subimage_parameters) {
         glGetIntegerv(GL_PACK_ROW_LENGTH, &original_pack_row_length);
         glGetIntegerv(GL_PACK_SKIP_PIXELS, &original_pack_skip_pixels);
         glGetIntegerv(GL_PACK_SKIP_ROWS, &original_pack_skip_rows);
@@ -688,9 +655,11 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
         glPixelStorei(GL_PACK_SKIP_ROWS, 0);
     }
 
-    // ANGLE's Direct3D 11 backend waits for the GPU on every glReadPixels(), so the frame is read with one call.
+    // ANGLE's Direct3D 11 backend waits for the GPU on every glReadPixels(), so the frame is read with one call. The
+    // page's pack state decides where in the bitmap that call writes, so ANGLE is told the size of the bitmap and
+    // refuses to write past it.
     VERIFY(bitmap->pitch() == static_cast<size_t>(m_size.width()) * sizeof(Gfx::RawPixel));
-    glReadPixels(0, 0, m_size.width(), m_size.height(), GL_RGBA, GL_UNSIGNED_BYTE, bitmap->scanline_u8(0));
+    glReadPixelsRobustANGLE(0, 0, m_size.width(), m_size.height(), GL_RGBA, GL_UNSIGNED_BYTE, static_cast<GLsizei>(bitmap->size_in_bytes()), nullptr, nullptr, nullptr, bitmap->scanline_u8(0));
 
     // GL's rows go from the bottom of the image up, so flip them into the bitmap's top-down order.
     for (int top = 0, bottom = m_size.height() - 1; top < bottom; ++top, --bottom) {
@@ -700,12 +669,13 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
             swap(top_row[x], bottom_row[x]);
     }
 
-    if (m_webgl_version == WebGLVersion::WebGL2) {
+    if (has_pack_subimage_parameters) {
         glPixelStorei(GL_PACK_ROW_LENGTH, original_pack_row_length);
         glPixelStorei(GL_PACK_SKIP_PIXELS, original_pack_skip_pixels);
         glPixelStorei(GL_PACK_SKIP_ROWS, original_pack_skip_rows);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
     }
+    if (has_pixel_buffer_objects)
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
     glPixelStorei(GL_PACK_ALIGNMENT, original_pack_alignment);
 
     glBindFramebuffer(framebuffer_target, original_framebuffer);
@@ -915,28 +885,25 @@ bool OpenGLContext::supports_copy_texture()
 }
 #endif
 
-GLenum OpenGLContext::get_error()
+// WebGL 2 runs on OpenGL ES 3, where this pixel store state is core. WebGL 1 runs on OpenGL ES 2, which only holds it
+// while ANGLE has the extension for it enabled.
+bool OpenGLContext::is_webgl2_or_has_enabled_extension([[maybe_unused]] StringView extension) const
 {
-    if (!m_stashed_errors.is_empty())
-        return m_stashed_errors.take_first();
-    return GLFunctions::get_error();
+#ifdef ENABLE_WEBGL
+    return m_webgl_version == WebGLVersion::WebGL2 || extension_list_contains(GL_EXTENSIONS, extension);
+#else
+    return false;
+#endif
 }
 
-bool OpenGLContext::stash_errors()
+bool OpenGLContext::supports_pixel_buffer_objects() const
 {
-    auto stashed_any_errors = false;
-    for (auto error = GLFunctions::get_error(); error != GL_NO_ERROR; error = GLFunctions::get_error()) {
-        if (!m_stashed_errors.contains_slow(error))
-            m_stashed_errors.append(error);
-        stashed_any_errors = true;
-    }
-    return stashed_any_errors;
+    return is_webgl2_or_has_enabled_extension("GL_NV_pixel_buffer_object"sv);
 }
 
-void OpenGLContext::discard_errors()
+bool OpenGLContext::supports_pack_subimage_parameters() const
 {
-    for (auto error = GLFunctions::get_error(); error != GL_NO_ERROR; error = GLFunctions::get_error())
-        dbgln("Compositor: Discarding GL error {:#x} raised by the Compositor's own work", error);
+    return is_webgl2_or_has_enabled_extension("GL_NV_pack_subimage"sv);
 }
 
 bool OpenGLContext::can_copy_images_into_textures()
@@ -969,7 +936,7 @@ static Optional<GLenum> texture_binding_for_copy_destination(GLenum target)
 }
 #endif
 
-bool OpenGLContext::copy_image_into_bound_texture([[maybe_unused]] SkImage const& image, [[maybe_unused]] Gfx::IntSize source_size, [[maybe_unused]] Gfx::IntSize size, [[maybe_unused]] GLenum target, [[maybe_unused]] GLint level, [[maybe_unused]] GLint xoffset, [[maybe_unused]] GLint yoffset, [[maybe_unused]] bool flip_y, [[maybe_unused]] bool premultiply_alpha)
+bool OpenGLContext::copy_image_into_bound_texture([[maybe_unused]] SkImage const& image, [[maybe_unused]] Gfx::IntSize source_size, [[maybe_unused]] Gfx::IntSize size, [[maybe_unused]] u32 target, [[maybe_unused]] i32 level, [[maybe_unused]] i32 xoffset, [[maybe_unused]] i32 yoffset, [[maybe_unused]] bool flip_y, [[maybe_unused]] bool premultiply_alpha)
 {
 #ifdef ENABLE_WEBGL
     auto destination_binding = texture_binding_for_copy_destination(target);
@@ -1035,32 +1002,6 @@ u32 OpenGLContext::default_renderbuffer() const
 u32 OpenGLContext::default_framebuffer() const
 {
     return m_impl->framebuffer;
-}
-
-Vector<String> OpenGLContext::get_supported_opengl_extensions()
-{
-#ifdef ENABLE_WEBGL
-    make_current();
-
-    Vector<String> extensions;
-
-    if (auto const* extensions_string = reinterpret_cast<char const*>(glGetString(GL_EXTENSIONS))) {
-        StringView extensions_view(extensions_string, strlen(extensions_string));
-        for (auto extension : extensions_view.split_view(' '))
-            extensions.append(MUST(String::from_utf8(extension)));
-    }
-
-    if (auto const* requestable_extensions_string = reinterpret_cast<char const*>(glGetString(GL_REQUESTABLE_EXTENSIONS_ANGLE))) {
-        StringView requestable_extensions_view(requestable_extensions_string, strlen(requestable_extensions_string));
-        for (auto extension : requestable_extensions_view.split_view(' '))
-            extensions.append(MUST(String::from_utf8(extension)));
-    }
-
-    return extensions;
-#else
-    (void)m_webgl_version;
-    return {};
-#endif
 }
 
 }

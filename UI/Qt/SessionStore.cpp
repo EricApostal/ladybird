@@ -28,6 +28,8 @@ static constexpr u32 SESSIONS_SCHEMA_LAUNCH_RESTORE_VERSION = 7u;
 static constexpr u32 SESSIONS_SCHEMA_WINDOW_GEOMETRY_VERSION = 8u;
 static constexpr u32 SESSIONS_SCHEMA_UPGRADE_INSECURE_REQUESTS_VERSION = 9u;
 static constexpr u32 SESSIONS_SCHEMA_RESTART_VERSION = 10u;
+static constexpr u32 SESSIONS_SCHEMA_LOCAL_FILE_CONTENT_VERSION = 11u;
+static constexpr u32 SESSIONS_SCHEMA_LOCAL_FILE_ROOTS_VERSION = 12u;
 
 // After this many unclean exits in a row, launch restore stops, so a session that crashes the browser doesn't restore
 // into the same crash every time.
@@ -296,6 +298,20 @@ ErrorOr<Database::MigrationOutcome> SessionStore::PersistedStorage::migrate_sche
             .version = SESSIONS_SCHEMA_RESTART_VERSION,
             .sql = R"#(
                 ALTER TABLE SessionLifecycle ADD COLUMN restart INTEGER NOT NULL DEFAULT 0;
+            )#"sv,
+        },
+        {
+            .version = SESSIONS_SCHEMA_LOCAL_FILE_CONTENT_VERSION,
+            .sql = R"#(
+                ALTER TABLE SessionEntries ADD COLUMN held_local_file_content INTEGER NOT NULL DEFAULT 0;
+            )#"sv,
+        },
+        {
+            .version = SESSIONS_SCHEMA_LOCAL_FILE_ROOTS_VERSION,
+            .sql = R"#(
+                ALTER TABLE SessionEntries DROP COLUMN held_local_file_content;
+                ALTER TABLE SessionEntries ADD COLUMN local_file_root_path TEXT;
+                ALTER TABLE SessionEntries ADD COLUMN local_file_root_scope INTEGER;
             )#"sv,
         },
     });
@@ -1534,6 +1550,10 @@ static bool snapshots_match(Optional<WebView::SessionHistorySnapshot> const& a, 
     if (!a.has_value())
         return true;
     if (a->current_used_step_index != b->current_used_step_index || a->used_steps != b->used_steps)
+        return false;
+    auto const& a_roots = a->local_file_roots_of_document_states;
+    auto const& b_roots = b->local_file_roots_of_document_states;
+    if (a_roots.size() != b_roots.size() || !all_of(a_roots, [&](auto const& root) { return b_roots.contains_slow(root); }))
         return false;
     return session_history_entry_descriptors_match(a->entries, b->entries);
 }

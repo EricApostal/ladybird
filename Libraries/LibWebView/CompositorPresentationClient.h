@@ -33,7 +33,7 @@ public:
     using FrameSnapshotCallback = Function<void(Optional<Gfx::ShareableBitmap>)>;
     // The frame the context shows, scaled down to fit within the size given. None if it has no frame, or if the
     // Compositor goes away first.
-    void take_frame_snapshot(Web::CompositorContextId, Optional<Gfx::IntSize> maximum_size, FrameSnapshotCallback);
+    void take_frame_snapshot(Web::CompositorContextId, FrameSnapshotCallback);
     void fail_pending_frame_snapshots();
 
 private:
@@ -45,6 +45,7 @@ private:
     virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio) override;
     virtual void did_present_frame_in_remote_layer(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, double device_pixel_ratio) override;
     virtual void did_consume_input_event(Web::CompositorContextId, u64 event_id) override;
+    virtual void did_update_compositor_layers(Web::CompositorContextId, Compositing::CompositorLayersDescription) override;
     virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) override;
     virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool performed_default_action) override;
     virtual void did_take_frame_snapshot(u64 request_id, Optional<Gfx::ShareableBitmap>) override;

@@ -37,6 +37,8 @@ class QWindow;
 
 namespace Ladybird {
 
+class MenuZoomRow;
+
 class Tab;
 class TabBarButton;
 class WebContentView;
@@ -169,6 +171,7 @@ public:
     BookmarksBar& bookmarks_bar() const { return m_tabs_container->bookmarks_bar(); }
     // Closes a tab that isn't worth reopening, such as an empty tab that other tabs took the place of.
     void close_tab_without_keeping_it(int index);
+    void discard_tab(Tab&);
 
     // Pinned tabs always fill the start of the strip: indices [0, pinned_tab_count()).
     int pinned_tab_count() const;
@@ -252,6 +255,9 @@ public:
     void on_devtools_disabled();
 
     void set_window_rect(Optional<Web::DevicePixels> x, Optional<Web::DevicePixels> y, Optional<Web::DevicePixels> width, Optional<Web::DevicePixels> height);
+    // Returns the rect made no larger than the bounds, and moved to be inside them.
+    static QRect rect_fitted_into(QRect, QRect const& bounds);
+    void place_popup_window(Web::HTML::WebViewHints const&, QScreen const& opener_screen);
 
 public slots:
     void tab_title_changed(int index, QString const&);
@@ -308,9 +314,6 @@ private:
     void initialize_application_actions();
     void initialize_application_menu();
     void initialize_ladybird_menu();
-    QAction* create_ladybird_menu_zoom_row();
-    void update_ladybird_menu_zoom_icons();
-    void update_ladybird_menu_zoom_level();
     void initialize_window_context_menu();
 
     void update_chrome_style();
@@ -351,10 +354,7 @@ private:
     QToolButton* m_menu_bar_close_window_button { nullptr };
 
     QMenu* m_ladybird_menu { nullptr };
-    QWidget* m_ladybird_menu_zoom_row { nullptr };
-    QPushButton* m_ladybird_menu_zoom_out { nullptr };
-    QPushButton* m_ladybird_menu_zoom_level { nullptr };
-    QPushButton* m_ladybird_menu_zoom_in { nullptr };
+    MenuZoomRow* m_ladybird_menu_zoom_row { nullptr };
 
     QMenu* m_window_context_menu { nullptr };
     QAction* m_reopen_closed_tab_action { nullptr };
@@ -368,6 +368,7 @@ private:
     size_t m_acknowledged_failed_download_count { 0 };
     Optional<i64> m_window_close_active_tab_index;
     bool m_window_was_fullscreen_before_page { false };
+    bool m_window_was_maximized_before_page { false };
     QPointer<Tab> m_window_close_original_active_tab;
     QPointer<Tab> m_window_close_current_preflight_tab;
     Vector<QPointer<Tab>> m_window_close_approved_tabs;

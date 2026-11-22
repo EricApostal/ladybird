@@ -107,6 +107,7 @@ private:
     virtual void translator_translate(u64 request_id, u64 session_id, Web::TranslationUnit unit) override;
     virtual void translator_open_language_download_settings() override;
     virtual void microphone_request_authorization() override;
+    virtual void default_browser_make_default() override;
     virtual void gamepad_start(bool ignore_system_gamepads) override;
     virtual void gamepad_set_polling(bool polling) override;
     virtual void gamepad_rumble(u32 handle, u16 low_frequency_magnitude, u16 high_frequency_magnitude, u32 duration_ms) override;
@@ -136,6 +137,7 @@ private:
     virtual void app_quit_for_signal() override;
     virtual void app_did_enable_devtools(u16 port) override;
     virtual void app_did_disable_devtools() override;
+    virtual void app_gpu_painting_changed(bool gpu_painting_enabled) override;
     virtual void app_open_urls_in_new_tabs(Vector<URL::URL> urls) override;
     virtual void app_activate_or_open_tab_with_url(URL::URL url) override;
     virtual void app_open_view_in_new_tab(u64 view_id, Optional<u64> source_view_id, WebView::IsPrivate is_private, Web::HTML::ActivateTab activate_tab) override;
@@ -187,6 +189,7 @@ private:
     virtual void view_load_finish(u64 view_id, URL::URL url) override;
     virtual void view_activate_tab(u64 view_id) override;
     virtual void view_close(u64 view_id) override;
+    virtual void view_discard(u64 view_id) override;
     virtual void view_link_hover(u64 view_id, URL::URL url) override;
     virtual void view_link_unhover(u64 view_id) override;
     virtual void view_title_change(u64 view_id, Utf16String title) override;
@@ -231,6 +234,7 @@ private:
     virtual void view_crash_overlay_state_change(u64 view_id, bool active) override;
     virtual void view_crash_report_saved(u64 view_id) override;
     virtual void view_performance_stats(u64 view_id, WebView::TabPerformanceStats stats) override;
+    virtual void view_compositor_layers_change(u64 view_id, Compositing::CompositorLayersDescription layers) override;
 };
 
 }

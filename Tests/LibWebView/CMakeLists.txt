@@ -5,6 +5,7 @@ if (BUILD_TESTING AND NOT WIN32)
         ladybird_python_test(test-devtools-network-events.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-iframe-console.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-console-previews.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-console-output-escapes-control-characters.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-message-port-collection.py ARGS $<TARGET_FILE:WebDriver>)
         ladybird_python_test(test-shared-stylesheet-memory.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
         ladybird_python_test(test-user-agent-preset-reaches-child-frames.py ARGS $<TARGET_FILE:ladybird>)
@@ -23,11 +24,19 @@ if (BUILD_TESTING AND NOT WIN32)
         endforeach()
     endif()
 
+    # The browser's UI runs on Qt's offscreen platform here, with no display. The macOS UI takes every window for an
+    # AppKit view, which only the Cocoa platform makes.
+    if (LINUX)
+        ladybird_python_test(test-webdriver-graphical-pointer-actions.py ARGS $<TARGET_FILE:WebDriver>)
+    endif()
+
     ladybird_python_test(test-webdriver-bidi.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-command-privileges.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-content-blockers.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
+    ladybird_python_test(test-webdriver-default-browser.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-delete-session.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-element-screenshot.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-element-send-keys-files.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-error-keep-alive.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-force-dark.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-permissions-settings.py ARGS $<TARGET_FILE:WebDriver>)
@@ -53,6 +62,8 @@ if (BUILD_BROWSER_TESTS_ONLY)
 endif()
 
 ladybird_test_suite(LibWebView)
+# TestHelperProcessPaths looks for these where the browser would.
+add_dependencies(TestLibWebView Compositor ImageDecoder RequestServer SystemProbe WebContent)
 
 set(TEST_SOURCES
     TestAccessibilityTreeManager.cpp
@@ -69,6 +80,7 @@ set(TEST_SOURCES
     TestFaviconStore.cpp
     TestForceDarkSettings.cpp
     TestHelperProcessEnvironment.cpp
+    TestHelperProcessPaths.cpp
     TestHistoryStore.cpp
     TestHSTSStore.cpp
     TestLingeringIndicator.cpp
@@ -90,11 +102,14 @@ set(TEST_SOURCES
     TestStorageJar.cpp
     TestTabIndicators.cpp
     TestTabPerformanceStats.cpp
-    TestUpdateCheck.cpp
     TestWebDriverBiDiNetwork.cpp
     TestWebViewURL.cpp
     TestWebWorkerClient.cpp
 )
+
+if (LADYBIRD_ENABLE_UPDATE_CHECK)
+    list(APPEND TEST_SOURCES TestUpdateCheck.cpp)
+endif()
 
 if (APPLE OR LINUX)
     list(APPEND TEST_SOURCES
@@ -102,6 +117,8 @@ if (APPLE OR LINUX)
         TestCrashReportReview.cpp
         TestCrashReportStore.cpp
         TestFontService.cpp
+        TestLocalFileRoot.cpp
+        TestOpenLocalFileForRenderer.cpp
         TestRendererFontService.cpp
     )
 endif()
@@ -149,11 +166,13 @@ if (NOT WIN32)
         TestInputMethodState.cpp
         TestInspectDOMTree.cpp
         TestLinkHoverStatus.cpp
+        TestLocalFileNavigation.cpp
         TestNavigationDownloads.cpp
         TestPictureInPictureUserActivation.cpp
         TestPictureInPictureWindowControls.cpp
         TestPictureInPictureWindowLifetime.cpp
         TestRendererAttentionClaims.cpp
+        TestRendererClipboardFormats.cpp
         TestRendererCookieAccess.cpp
         TestRendererOriginClaims.cpp
         TestRendererResponseBodyClaims.cpp

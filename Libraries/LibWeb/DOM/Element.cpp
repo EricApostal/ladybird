@@ -177,6 +177,11 @@ namespace Web::DOM {
 extern "C" {
 
 // Called by Bindings/Rust/src/dom/element.rs.
+FlatPtr web_dom_element_local_name(Element const*);
+FlatPtr web_dom_element_get_attribute_ns(Element const*, FlatPtr namespace_, FlatPtr name);
+void web_dom_element_set_attribute_value(Element*, FlatPtr name, FlatPtr value);
+void web_dom_element_remove_attribute(Element*, FlatPtr name);
+void web_dom_element_for_each_attribute(Element const*, void* callback, void (*on_attribute)(void*, FlatPtr name, FlatPtr value));
 void web_dom_element_attribute(Element*, ReadonlyBytes name, void* value, void (*on_value)(void*, FlatPtr));
 }
 
@@ -1382,6 +1387,10 @@ CSS::ElementBoxKind Element::box_kind() const
 {
     if (local_name() == u"noscript"sv && document().is_scripting_enabled())
         return CSS::ElementBoxKind::NoBox;
+    // https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-wbr-element
+    // "The wbr element represents a line break opportunity."
+    if (is_html_element() && local_name() == HTML::TagNames::wbr)
+        return CSS::ElementBoxKind::WordBreakOpportunity;
     return CSS::ElementBoxKind::FromDisplay;
 }
 
@@ -1795,10 +1804,9 @@ void Element::swap_in_style_record(Layout::BegunRead const& read, Optional<CSS::
     // A new style can change the states and the text formatting the accessibility tree reports for the element.
     if (document().page().accessibility_interested())
         document().invalidate_cached_accessibility_records_after_style_change(*this);
-    auto const style_record = m_installed_style.record();
     // NB: The render side installed the record in a box it styles itself, which the box adopts.
     if (auto* layout_node = unsafe_layout_node(read))
-        layout_node->set_style_record_identity(style_record);
+        layout_node->set_style_record_identity(m_installed_style);
 }
 
 Element::CustomHighlightStyles const* Element::custom_highlight_styles() const
@@ -2066,39 +2074,33 @@ void Element::settle_animations_of_flat_tree_subtree(Layout::BegunRead const& re
     });
 }
 
-void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunRead const& read)
+void Element::clear_computed_style_below_display_none(Layout::BegunRead const& read)
 {
-    for_each_inclusive_descendant_element_in_flat_tree(*this, [this, &read](Element& descendant) {
-        if (&descendant == this)
-            return TraversalDecision::Continue;
-        auto* element = &descendant;
-        if (!element->has_style())
-            return TraversalDecision::SkipChildrenAndContinue;
+    if (!has_style())
+        return;
 
-        // Anchor names are registered outside the style record, so unregister them before discarding the only record
-        // that identifies them. Rematerializing the element's style will register its current names again.
-        if (element->is_connected() && unregister_current_anchor_names(*element, element->root()))
-            element->document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
+    // Anchor names are registered outside the style record, so unregister them before discarding the only record
+    // that identifies them. Rematerializing the element's style will register its current names again.
+    if (is_connected() && unregister_current_anchor_names(*this, root()))
+        document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
 
-        // The layout tree is torn down after the style update. Keep its style alive until then without
-        // retaining the record as the descendant's current computed style.
-        if (auto* layout_node = element->unsafe_layout_node(read))
-            layout_node->pin_style_record_for_detachment();
-        element->m_installed_style = {};
+    // The layout tree is torn down after the style update. Keep its style alive until then without
+    // retaining the record as the descendant's current computed style.
+    if (auto* layout_node = unsafe_layout_node(read))
+        layout_node->pin_style_record_for_detachment();
+    m_installed_style = {};
 
-        // NB: SVG resources can still affect rendering when a DOM ancestor has display:none.
-        //     Restore their styles in this style update, so painting never needs to materialize
-        //     styles for referenced resources. The engine still holds their records and settles
-        //     the reaction from them.
-        if (auto const* svg_element = as_if<SVG::SVGElement>(*element); svg_element && svg_element->is_referenceable_in_display_none_subtree())
-            element->document().style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
+    // NB: SVG resources can still affect rendering when a DOM ancestor has display:none.
+    //     Restore their styles in this style update, so painting never needs to materialize
+    //     styles for referenced resources. The engine still holds their records and settles
+    //     the reaction from them.
+    if (auto const* svg_element = as_if<SVG::SVGElement>(*this); svg_element && svg_element->is_referenceable_in_display_none_subtree())
+        document().style_computer().style_engine().record_derived_element_style_input_change(style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 
-        element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
-            pseudo_element.clear_computed_style();
-        });
-        element->clear_custom_highlight_styles();
-        return TraversalDecision::Continue;
+    for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
+        pseudo_element.clear_computed_style();
     });
+    clear_custom_highlight_styles();
 }
 
 void Element::invalidate_descendant_styles_depending_on_style_container_query()
@@ -2649,15 +2651,6 @@ void Element::synchronize_style_attribute() const
     }
 
     CSS::record_element_attribute_changed(element, HTML::AttributeNames::style, {}, old_value, new_value);
-}
-
-// https://dom.spec.whatwg.org/#element-html-uppercased-qualified-name
-Utf16FlyString Element::make_html_uppercased_qualified_name() const
-{
-    // This is allowed by the spec: "User agents could optimize qualified name and HTML-uppercased qualified name by storing them in internal slots."
-    if (namespace_uri() == Namespace::HTML && document().document_type() == Document::Type::HTML)
-        return qualified_name().to_ascii_uppercase();
-    return qualified_name();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#queue-an-element-task
@@ -5077,8 +5070,6 @@ void Element::setup_custom_element_from_constructor(HTML::CustomElementDefinitio
 void Element::set_prefix(Optional<Utf16FlyString> value)
 {
     m_qualified_name.set_prefix(move(value));
-    if (auto* rare_data = element_rare_data())
-        rare_data->html_uppercased_qualified_name.clear();
 }
 
 // https://dom.spec.whatwg.org/#locate-a-namespace-prefix
@@ -5277,7 +5268,7 @@ void Element::replace_installed_style(Layout::BegunRead const& read, CSS::Instal
     // what it moves from, and everything below that compares against the old record is read from it, before the
     // element lets go of it. The engine keeps the old record until it takes the new one in.
     if (auto* layout_node = unsafe_layout_node(read))
-        layout_node->set_style_record_identity(m_installed_style.record());
+        layout_node->set_style_record_identity(m_installed_style);
     bool const was_display_none = !held_before || held_before.display_is_none();
     // https://drafts.csswg.org/scroll-animations-1/#timeline-scoping
     bool const timeline_declarations_changed = timeline_declarations_differ(held_before, m_installed_style);
@@ -6409,7 +6400,7 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
             });
         }
         if (auto* rare_data = element_rare_data(); rare_data && rare_data->class_list)
-            rare_data->class_list->associated_attribute_changed(value_or_empty);
+            rare_data->class_list->associated_attribute_changed(value);
 
         if (old_style_engine_classes.has_value())
             CSS::record_element_class_list_changed(*this, *old_style_engine_classes, m_classes);
@@ -6507,7 +6498,7 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
             }
         }
         if (auto* rare_data = element_rare_data(); rare_data && rare_data->part_list)
-            rare_data->part_list->associated_attribute_changed(value_or_empty);
+            rare_data->part_list->associated_attribute_changed(value);
         CSS::record_element_parts_changed(*this);
     } else if (local_name == HTML::AttributeNames::exportparts) {
         CSS::Invalidation::invalidate_style_after_exportparts_attribute_change(*this);
@@ -6914,13 +6905,13 @@ GC::Ptr<NamedNodeMap const> Element::attributes() const
     return const_cast<Element&>(*this).attributes();
 }
 
+// https://dom.spec.whatwg.org/#element-html-uppercased-qualified-name
 Utf16FlyString const& Element::html_uppercased_qualified_name() const
 {
-    // NB: Whether the qualified name is uppercased depends on the node document, which can change when the element is
-    //     adopted. So we only use the cached uppercased name while it applies.
+    // This is allowed by the spec: "User agents could optimize qualified name and HTML-uppercased qualified name by storing them in internal slots."
     if (namespace_uri() != Namespace::HTML || document().document_type() != Document::Type::HTML)
         return qualified_name();
-    return ensure_element_rare_data().html_uppercased_qualified_name.ensure([&] { return make_html_uppercased_qualified_name(); });
+    return m_qualified_name.ascii_uppercased_as_string();
 }
 
 void Element::play_or_cancel_animations_after_display_property_change()
@@ -7162,6 +7153,37 @@ bool Element::is_potentially_render_blocking()
         start = i + 1;
     }
     return false;
+}
+
+FlatPtr web_dom_element_local_name(Element const* element)
+{
+    return element->local_name().raw_identity();
+}
+
+FlatPtr web_dom_element_get_attribute_ns(Element const* element, FlatPtr namespace_, FlatPtr name)
+{
+    Optional<Utf16FlyString> namespace_name;
+    if (namespace_ != 0)
+        namespace_name = Utf16FlyString::from_raw(namespace_);
+    auto attribute = element->get_attribute_ns(namespace_name, Utf16FlyString::from_raw(name));
+    return attribute.has_value() ? attribute.release_value().into_raw() : 0;
+}
+
+void web_dom_element_set_attribute_value(Element* element, FlatPtr name, FlatPtr value)
+{
+    element->set_attribute_value(Utf16FlyString::from_raw(name), Utf16String::adopt_raw(value));
+}
+
+void web_dom_element_remove_attribute(Element* element, FlatPtr name)
+{
+    element->remove_attribute(Utf16FlyString::from_raw(name));
+}
+
+void web_dom_element_for_each_attribute(Element const* element, void* callback, void (*on_attribute)(void*, FlatPtr name, FlatPtr value))
+{
+    element->for_each_attribute([&](Utf16FlyString const& name, Utf16String const& value) {
+        on_attribute(callback, name.raw_identity(), value.raw_identity());
+    });
 }
 
 void web_dom_element_attribute(Element* element, ReadonlyBytes name, void* value, void (*on_value)(void*, FlatPtr))

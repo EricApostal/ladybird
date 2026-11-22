@@ -9,7 +9,6 @@
 #include <LibCore/Timer.h>
 #include <LibIPC/File.h>
 #include <LibURL/Parser.h>
-#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalNavigable.h>
@@ -175,7 +174,7 @@ WorkerAgentManager::StartedWorkerAgent WorkerAgentManager::start_worker_agent(We
     m_shared_workers.set(agent.shared_worker_key, agent_id);
     m_agents.set(agent_id, move(agent));
 
-    start_worker(*client, move(request), *outside_settings, has_cross_site_ancestor, owner_client.may_read_local_files(), host_has_only_this_worker);
+    start_worker(*client, move(request), *outside_settings, has_cross_site_ancestor, owner_client.local_file_roots(), host_has_only_this_worker);
 
     // NB: The task manager lists a process with the site of its pages. One that has none left only runs on for its shared
     //     workers, so it goes by the site of their origin.
@@ -195,7 +194,7 @@ void WorkerAgentManager::register_dedicated_worker(WebContentClient& owner_clien
         .is_private = owner_client.is_private(),
         .process = owner_client,
         .request_server_site_bindings = owner_client.request_server_site_bindings(),
-        .may_read_local_files = owner_client.may_read_local_files(),
+        .local_file_roots = owner_client.local_file_roots(),
         .has_cross_site_ancestor = page_environment_has_cross_site_ancestor(owner_client, page_id, *outside_settings),
     };
     register_dedicated_worker(owner, *outside_settings, move(request), move(worker_transport));
@@ -210,7 +209,7 @@ void WorkerAgentManager::register_dedicated_worker(WebWorkerClient& owner_client
         .is_private = owner_client.is_private(),
         .process = *host,
         .request_server_site_bindings = owner_client.request_server_site_bindings(),
-        .may_read_local_files = owner_client.may_read_local_files(),
+        .local_file_roots = owner_client.local_file_roots(),
         .has_cross_site_ancestor = static_cast<CanonicalWorkerEnvironmentSettingsObject const&>(*outside_settings).has_cross_site_ancestor(),
     };
     register_dedicated_worker(owner, *outside_settings, move(request), move(worker_transport));
@@ -239,7 +238,7 @@ void WorkerAgentManager::register_dedicated_worker(DedicatedWorkerOwner const& o
     }
 
     auto client = client_or_error.release_value();
-    start_worker(*client, move(request), outside_settings, owner.has_cross_site_ancestor, owner.may_read_local_files, false);
+    start_worker(*client, move(request), outside_settings, owner.has_cross_site_ancestor, owner.local_file_roots, false);
 }
 
 bool WorkerAgentManager::page_environment_has_cross_site_ancestor(WebContentClient& client, Web::PageId page_id, CanonicalEnvironmentSettingsObject const& environment)
@@ -290,7 +289,7 @@ ErrorOr<NonnullRefPtr<WebWorkerClient>> WorkerAgentManager::create_worker_client
     return client;
 }
 
-void WorkerAgentManager::start_worker(WebWorkerClient& client, Web::HTML::WorkerAgentStartRequest request, CanonicalEnvironmentSettingsObject const& outside_settings, bool has_cross_site_ancestor, bool owner_may_read_local_files, bool has_process_to_itself)
+void WorkerAgentManager::start_worker(WebWorkerClient& client, Web::HTML::WorkerAgentStartRequest request, CanonicalEnvironmentSettingsObject const& outside_settings, bool has_cross_site_ancestor, Vector<LocalFileRoot> const& owner_local_file_roots, bool has_process_to_itself)
 {
     // https://html.spec.whatwg.org/multipage/workers.html#set-up-a-worker-environment-settings-object
     // 3. Let origin be a unique opaque origin if worker global scope's url's scheme is "data"; otherwise outside
@@ -309,8 +308,7 @@ void WorkerAgentManager::start_worker(WebWorkerClient& client, Web::HTML::Worker
 
     // NB: A worker reads local files as its owner does. A worker of a file origin that local file content starts is
     //     local file content too.
-    auto may_read_local_files = inside_origin.is_file_origin() && owner_may_read_local_files;
-    client.set_inside_settings(move(inside_settings), may_read_local_files);
+    client.set_inside_settings(move(inside_settings), inside_origin.is_file_origin() ? owner_local_file_roots : Vector<LocalFileRoot> {});
 
     // NB: The worker's URL was parsed with its blob URL entry, so revoking the URL must not stop the worker from
     //     fetching its script.
@@ -332,15 +330,7 @@ bool WorkerAgentManager::owner_process_may_host_shared_worker(Owner const& owner
 
     // NB: Nothing in a cross-origin isolated process may have been loaded without the consent of its origin. A shared
     //     worker is in an agent cluster of its own, and needs no such consent unless its response says so.
-    if (page->hosted_environment_is_cross_origin_isolated(outside_settings.id()).value_or(true))
-        return false;
-
-    // NB: Isolating only top-level documents leaves a cross-site frame with the process of its parent's site.
-    if (site_isolation_mode() == SiteIsolationMode::TopLevel) {
-        auto top_level_origin = outside_settings.top_level_origin();
-        return top_level_origin.has_value() && top_level_origin->is_same_site(outside_settings.origin());
-    }
-    return true;
+    return !page->hosted_environment_is_cross_origin_isolated(outside_settings.id()).value_or(true);
 }
 
 bool WorkerAgentManager::hosts_shared_worker(WebContentClient const& process) const
@@ -398,6 +388,14 @@ void WorkerAgentManager::update_preferred_languages(Vector<String> const& prefer
 {
     for_each_client_with_inside_settings([&](WebWorkerClient& client, auto const&) {
         client.async_set_preferred_languages(preferred_languages);
+        return IterationDecision::Continue;
+    });
+}
+
+void WorkerAgentManager::notify_compositor_process_reconnected(u64 compositor_generation)
+{
+    for_each_client_with_inside_settings([compositor_generation](WebWorkerClient& client, auto const&) {
+        client.async_compositor_process_reconnected(compositor_generation);
         return IterationDecision::Continue;
     });
 }
@@ -497,6 +495,15 @@ void WorkerAgentManager::for_each_request_server_site_bindings(Function<Iteratio
     for_each_client_with_inside_settings([&](WebWorkerClient& client, auto const&) {
         return callback(client.request_server_site_bindings());
     });
+}
+
+WebContentClient* WorkerAgentManager::host_of_request_server_client(int client_id) const
+{
+    for (auto const& client : m_clients) {
+        if (client->request_server_site_bindings().has_client(client_id))
+            return client->host();
+    }
+    return nullptr;
 }
 
 ErrorOr<void> WorkerAgentManager::simulate_request_server_connection_loss_for_testing(WebContentClient& owner, Web::PageId page_id)

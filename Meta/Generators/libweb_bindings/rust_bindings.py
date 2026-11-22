@@ -97,6 +97,7 @@ SUPPORTED_INTERFACE_EXTENDED_ATTRIBUTES = {
     "LegacyNamespace",
     # NB: The C++ bindings only leave the interface object of such an interface off the global object.
     "LegacyNoInterfaceObject",
+    "LegacyOverrideBuiltIns",
     "NavigatorCompatibilityMode",
     "SecureContext",
     # NB: The implementation implements structured_data::Serializable or structured_data::Transferable, whose steps
@@ -249,21 +250,25 @@ def write_cpp_named_properties(
     includes.add("LibWeb/WebIDL/ExceptionOr.h")
     name = wrapper_name(interface)
     legacy_info = f"{name}_legacy_platform_object_info"
+    setter = named_properties.setter
+    deleter = named_properties.deleter
     info_fields = [
         "    .supports_named_properties = true,\n",
     ]
-    if named_properties.setter is not None:
+    if setter is not None:
         info_fields.append("    .has_named_property_setter = true,\n")
-    if named_properties.deleter is not None:
+    if deleter is not None:
         info_fields.append("    .has_named_property_deleter = true,\n")
-    if named_properties.setter is not None:
+    if "LegacyOverrideBuiltIns" in interface.extended_attributes:
+        info_fields.append("    .has_legacy_override_built_ins_interface_extended_attribute = true,\n")
+    if setter is not None and setter.operation.name:
         info_fields.append("    .named_property_setter_has_identifier = true,\n")
-    if named_properties.deleter is not None:
+    if deleter is not None and deleter.operation.name:
         info_fields.append("    .named_property_deleter_has_identifier = true,\n")
     info_fields.append(f"    .named_item_value = {name}_named_item_value,\n")
-    if named_properties.setter is not None:
-        info_fields.append(f"    .set_value_of_named_property = {name}_set_value_of_named_property,\n")
-    if named_properties.deleter is not None:
+    setter_hooks_and_entry_points = named_property_setter_hooks_and_entry_points(interface, setter)
+    info_fields.extend(f"    .{hook} = {name}_{hook},\n" for hook, _ in setter_hooks_and_entry_points)
+    if deleter is not None:
         info_fields.append(f"    .delete_value = {name}_delete_value,\n")
     info_fields.append(f"    .supported_property_names = {name}_supported_property_names,\n")
 
@@ -290,24 +295,26 @@ static Vector<Utf16FlyString> {name}_supported_property_names(JS::HostObject con
 }}
 """
     )
-    if named_properties.setter is not None:
+    for hook, entry_point in setter_hooks_and_entry_points:
         out.write(
             f"""
-static WebIDL::ExceptionOr<void> {name}_set_value_of_named_property(JS::HostObject& wrapper, JS::Realm& realm, Utf16FlyString const& name, JS::Value value)
+static WebIDL::ExceptionOr<void> {name}_{hook}(JS::HostObject& wrapper, JS::Realm& realm, Utf16FlyString const& name, JS::Value value)
 {{
-    TRY(JS::HostABI::completion_from_abi<JS::Value>({set_value_of_named_property_entry_point(interface)}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(&wrapper), name.raw_identity(), JS::HostABI::value_to_abi(value))));
+    TRY(JS::HostABI::completion_from_abi<JS::Value>({entry_point}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(&wrapper), name.raw_identity(), JS::HostABI::value_to_abi(value))));
     return {{}};
 }}
 """
         )
-    if named_properties.deleter is not None:
+    if deleter is not None:
+        # NB: An anonymous deleter's Rust method reports no failed deletion.
+        deletion_result = "NotRelevant" if deleter.operation.name else "DidNotFail"
         out.write(
             f"""
 static WebIDL::ExceptionOr<NamedPropertyDeletionResult> {name}_delete_value(JS::HostObject& wrapper, Utf16FlyString const& name)
 {{
     auto& realm = wrapper.shape().realm();
     TRY(JS::HostABI::completion_from_abi<JS::Value>({delete_value_entry_point(interface)}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(&wrapper), name.raw_identity())));
-    return NamedPropertyDeletionResult::NotRelevant;
+    return NamedPropertyDeletionResult::{deletion_result};
 }}
 """
         )
@@ -406,11 +413,10 @@ void {initialize_constructor}(JSVM*, void* realm, JSObject* constructor);
             f"void {supported_property_names_entry_point(interface)}(JSVM*, void* realm, JSObject* wrapper, "
             "void* names, void (*append)(void* names, FlatPtr name));\n"
         )
-        if named_properties.setter is not None:
-            out.write(
-                f"JSCompletion {set_value_of_named_property_entry_point(interface)}(JSVM*, void* realm, "
-                "JSObject* wrapper, FlatPtr name, JSValue value);\n"
-            )
+        out.writelines(
+            f"JSCompletion {entry_point}(JSVM*, void* realm, JSObject* wrapper, FlatPtr name, JSValue value);\n"
+            for _, entry_point in named_property_setter_hooks_and_entry_points(interface, named_properties.setter)
+        )
         if named_properties.deleter is not None:
             out.write(
                 f"JSCompletion {delete_value_entry_point(interface)}(JSVM*, void* realm, JSObject* wrapper, "
@@ -890,6 +896,27 @@ def implementation_method_signatures(
                 f"fn {method}(&self, cx: &mut CallContext, index: u32, value: {value_type}) -> WebIdlResult<()>"
             )
     if members.named_properties is not None:
+        named_properties = members.named_properties
+        getter = named_properties.getter
+        if not getter.operation.name:
+            what = f"the named property getter of {interface.name}"
+            signatures.append(
+                f"fn {getter.method}(&self, cx: &mut CallContext, name: Utf16String) -> "
+                f"WebIdlResult<{rust_type(getter.operation.return_type, context, what, is_result=True)}>"
+            )
+        setter = named_properties.setter
+        if setter is not None and not setter.operation.name:
+            what = f"the named property setter of {interface.name}"
+            value_type = rust_parameter_type(setter.operation.parameters[1], context, what)
+            signatures.extend(
+                f"fn {hook}(&self, cx: &mut CallContext, name: Utf16String, value: {value_type}) -> WebIdlResult<()>"
+                for hook, _ in named_property_setter_hooks_and_entry_points(interface, setter)
+            )
+        deleter = named_properties.deleter
+        if deleter is not None and not deleter.operation.name:
+            signatures.append(
+                f"fn {deleter.method}(&self, cx: &mut CallContext, name: Utf16String) -> WebIdlResult<()>"
+            )
         signatures.append("fn supported_property_names(&self, cx: &mut CallContext) -> Vec<Utf16String>")
     for attribute in members.static_attributes:
         what = f"{interface.name}.{attribute.attribute.name}"
@@ -1154,7 +1181,8 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
         to_long_long_clamping, to_long_long_enforcing_range, to_object, to_promise, to_shared_array_buffer, to_typed_array,
         to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_clamping,
         to_unsigned_long_enforcing_range,
-        to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string,
+        to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string, to_window_proxy,
+        window_proxy_from_object, window_proxy_to_js,
     };
     use crate::bindings::interface::{
         Inherits, Interface, Ref, Wrapped, cell_class, construct_arguments, construct_wrapper, create_dictionary_object,
@@ -1798,8 +1826,17 @@ def supported_property_names_entry_point(interface: Interface) -> str:
     return rust_entry_point_name(interface, "supported_property_names")
 
 
-def set_value_of_named_property_entry_point(interface: Interface) -> str:
-    return rust_entry_point_name(interface, "set_value_of_named_property")
+def named_property_setter_hooks_and_entry_points(
+    interface: Interface, setter: Optional[RustOperation]
+) -> List[Tuple[str, str]]:
+    """The functions of LegacyPlatformObjectInfo that set a named property, each with the entry point of the Rust
+    bindings that it calls."""
+    if setter is None:
+        return []
+    hooks = ["set_value_of_named_property"]
+    if not setter.operation.name:
+        hooks = ["set_value_of_new_named_property", "set_value_of_existing_named_property"]
+    return [(hook, rust_entry_point_name(interface, hook)) for hook in hooks]
 
 
 def delete_value_entry_point(interface: Interface) -> str:
@@ -1934,7 +1971,13 @@ def write_rust_named_properties(
     https://webidl.spec.whatwg.org/#dfn-legacy-platform-object"""
     getter = named_properties.getter
     what = f"the named property getter of {interface.name}"
-    conversion = rust_to_js_value(getter.operation.return_type.without_nullable(), "value", "&cx", context, what)
+    return_type = getter.operation.return_type
+    getter_result = "Ok(value)"
+    # NB: A getter with an identifier gives None for the names that are not supported property names.
+    if getter.operation.name:
+        return_type = return_type.without_nullable()
+        getter_result = "Ok(Some(value))"
+    conversion = rust_to_js_value(return_type, "value", "&cx", context, what)
     out.write(
         f"""
     /// The value of the named property of the wrapper, which LibWeb's C++ asks for, if the name is a supported
@@ -1958,7 +2001,7 @@ def write_rust_named_properties(
         let name = Utf16String::from(unsafe {{ Utf16FlyString::from_raw_borrowed(name) }});
         let implementation = implementation_of::<Implementation>(wrapper);
         let mut cx = CallContext::new(vm, realm);
-        let Ok(Some(value)) = Implementation::{getter.method}(&implementation, &mut cx, name) else {{
+        let {getter_result} = Implementation::{getter.method}(&implementation, &mut cx, name) else {{
             return false;
         }};
         let value = {conversion}.expect("converting a named property value to a JS value does not throw");
@@ -2004,8 +2047,13 @@ def write_rust_named_properties(
             what,
             keeps_cells_alive=True,
         )
-        out.write(
-            f"""
+        for hook, entry_point in named_property_setter_hooks_and_entry_points(interface, setter):
+            method = setter.method if setter.operation.name else hook
+            call = f"Implementation::{method}(&implementation, &mut cx, name, idl_value)"
+            if "CEReactions" in setter.operation.extended_attributes:
+                call = with_ce_reactions(call)
+            out.write(
+                f"""
     /// Sets the named property of the wrapper, https://webidl.spec.whatwg.org/#invoke-named-setter
     ///
     /// # Safety
@@ -2013,7 +2061,7 @@ def write_rust_named_properties(
     /// The pointers must be the VM, a live realm and a live wrapper of the interface, and the name a live
     /// AK::Utf16FlyString.
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn {set_value_of_named_property_entry_point(interface)}(
+    pub unsafe extern "C" fn {entry_point}(
         vm: *mut c_void,
         realm: *mut c_void,
         wrapper: *mut c_void,
@@ -2030,16 +2078,19 @@ def write_rust_named_properties(
         let mut cx = CallContext::new(vm, realm);
         let steps = || -> ThrowCompletionOr<Value> {{
             let idl_value = {value_conversion}?;
-            Implementation::{setter.method}(&implementation, &mut cx, name, idl_value)
+            {call}
                 .map_err(|exception| exception.throw_in_current_realm(cx.vm()))?;
             Ok(Value::UNDEFINED)
         }};
         RawNativeFunctionResult::from_completion(steps())
     }}
 """
-        )
+            )
     if named_properties.deleter is not None:
         deleter = named_properties.deleter
+        call = f"Implementation::{deleter.method}(&implementation, &mut cx, name)"
+        if "CEReactions" in deleter.operation.extended_attributes:
+            call = with_ce_reactions(call)
         out.write(
             f"""
     /// Deletes the named property of the wrapper, https://webidl.spec.whatwg.org/#legacy-platform-object-delete
@@ -2061,7 +2112,7 @@ def write_rust_named_properties(
         let name = Utf16String::from(unsafe {{ Utf16FlyString::from_raw_borrowed(name) }});
         let implementation = implementation_of::<Implementation>(wrapper);
         let mut cx = CallContext::new(vm, realm);
-        let result = Implementation::{deleter.method}(&implementation, &mut cx, name)
+        let result = {call}
             .map(|()| Value::UNDEFINED)
             .map_err(|exception| exception.throw_in_current_realm(cx.vm()));
         RawNativeFunctionResult::from_completion(result)
@@ -2576,7 +2627,8 @@ pub(crate) mod definitions {
         to_long_enforcing_range, to_long_long, to_long_long_enforcing_range, to_object, to_shared_array_buffer, to_typed_array,
         to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_clamping,
         to_unsigned_long_enforcing_range,
-        to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string,
+        to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string, to_window_proxy,
+        window_proxy_from_object, window_proxy_to_js,
     };
     use crate::bindings::interface::{
         Interface, Ref, create_dictionary_object, implementation_if, implementation_of, set_dictionary_member,

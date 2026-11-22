@@ -73,8 +73,7 @@ fn base_text(vm: &Vm) -> Option<Utf16FlyString> {
 fn running_private_environment(vm: &Vm) -> Gc<PrivateEnvironment> {
     vm.running_execution_context_if_any()
         .expect("private names are used in an execution context")
-        .private_environment
-        .get()
+        .private_environment()
         .expect("private names are used where a private environment is active")
 }
 
@@ -1471,7 +1470,7 @@ pub fn try_inline_get_by_id_accessor(vm: &Vm, pc: u32, instruction: &op::GetById
         return false;
     };
 
-    if !getter_function.can_inline_call() {
+    if !getter_function.can_inline_call() || !vm.is_in_current_realm(getter_function.as_function_object_gc()) {
         return false;
     }
 

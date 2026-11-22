@@ -208,10 +208,10 @@ impl Realm {
         new_context.function.set(None);
 
         // 9. Set the Realm of newContext to realm.
-        new_context.realm.set(Some(realm));
+        new_context.set_realm(Some(realm));
 
         // 10. Set the ScriptOrModule of newContext to null.
-        new_context.script_or_module.set(ScriptOrModule::Empty);
+        new_context.set_script_or_module(ScriptOrModule::Empty);
 
         // 11. Push newContext onto the execution context stack; newContext is now the running execution context.
         vm.push_execution_context(NonNull::from(new_context));

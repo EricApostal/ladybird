@@ -28,8 +28,8 @@ use crate::bindings::interface::{
     with_temporary_execution_context_and_callbacks,
 };
 use crate::bindings::promise::{
-    TaskSource, WebIdlPromise, create_promise, get_promise_for_wait_for_all, is_promise_fulfilled, promise_from_abi,
-    queue_a_task, react_to_promise, reject_promise, reject_promise_with_exception, resolve_promise,
+    TaskSource, WebIdlPromise, create_promise, get_promise_for_wait_for_all, promise_from_abi, queue_a_task,
+    react_to_promise, reject_promise, reject_promise_with_exception, resolve_promise,
 };
 use crate::bindings::setlike::context_of_set;
 use crate::bindings::setlike::{Setlike, WorldEntries};
@@ -198,9 +198,11 @@ pub(crate) struct FontFaceSet {
     #[gc(untraced)]
     status: Cell<FontFaceSetLoadStatus>,
     is_pending_on_the_environment: Cell<bool>,
+    ready_promise_is_resolved: Cell<bool>,
 }
 
 impl Wrappable for FontFaceSet {
+    const TRACED_ON_OWNER_THREAD_ONLY: bool = true;
     fn relevant_realm(&self) -> Option<Gc<Realm>> {
         Some(self.realm)
     }
@@ -231,6 +233,7 @@ impl FontFaceSet {
             failed_fonts: GcRefCell::new(Vec::new()),
             status: Cell::new(FontFaceSetLoadStatus::Loaded),
             is_pending_on_the_environment: Cell::new(true),
+            ready_promise_is_resolved: Cell::new(false),
         });
         object.this.set(Some(object));
         object.event_target.set_owner(object);
@@ -657,7 +660,7 @@ impl FontFaceSet {
     pub(crate) fn ready(&self, _: &mut CallContext) -> WebIdlResult<WebIdlPromise> {
         // Pending style or layout changes can start a deferred font load. Flush them before returning an already
         // fulfilled promise so switching the FontFaceSet to loading can replace it with a new pending promise.
-        if is_promise_fulfilled(self.ready_promise()) {
+        if self.ready_promise_is_resolved.get() {
             // SAFETY: The set is live.
             unsafe { web_css_font_face_set_update_layout(self.as_abi(), false) };
         }
@@ -725,7 +728,9 @@ impl FontFaceSet {
 
         // 3. If font face set’s [[ReadyPromise]] slot currently holds a fulfilled promise, replace it with a fresh
         //    pending promise.
-        if is_promise_fulfilled(self.ready_promise()) {
+        // AD-HOC: A promise that was resolved with a set whose "then" lookup may run script is fulfilled later, so
+        //         we check whether the promise was resolved instead.
+        if self.ready_promise_is_resolved.replace(false) {
             let realm = self.realm;
             self.ready_promise.set(Some(with_temporary_execution_context(realm, || {
                 create_promise(vm, realm)
@@ -733,8 +738,10 @@ impl FontFaceSet {
         }
 
         // 4. Queue a task to fire a font load event named loading at font face set.
-        queue_a_task(vm, self.realm, TaskSource::FontLoading, self.this(), |vm, this| {
-            this.fire_a_font_load_event(vm, "loading", &MarkedVec::new(vm));
+        queue_a_task(vm, TaskSource::FontLoading, self.this(), |vm, this| {
+            with_temporary_execution_context_and_callbacks(this.realm, || {
+                this.fire_a_font_load_event(vm, "loading", &MarkedVec::new(vm));
+            });
         });
     }
 
@@ -760,6 +767,7 @@ impl FontFaceSet {
 
         // 4. Fulfill font face set’s [[ReadyPromise]] attribute’s value with font face set.
         let realm = self.realm;
+        self.ready_promise_is_resolved.set(true);
         with_temporary_execution_context_and_callbacks(realm, || {
             let cx = CallContext::new(vm, realm);
             let value = self.this().to_js(&cx).expect("wrapping a FontFaceSet can't throw");
@@ -773,21 +781,23 @@ impl FontFaceSet {
         }
 
         // 5. Queue a task to perform the following steps synchronously:
-        queue_a_task(vm, realm, TaskSource::FontLoading, self.this(), |vm, this| {
-            // 1. Let loaded fonts be the (possibly empty) contents of font face set’s [[LoadedFonts]] slot.
-            // 2. Let failed fonts be the (possibly empty) contents of font face set’s [[FailedFonts]] slot.
-            // 3. Reset the [[LoadedFonts]] and [[FailedFonts]] slots to empty lists.
-            let loaded_fonts = take_font_faces(vm, &this.loaded_fonts);
-            let failed_fonts = take_font_faces(vm, &this.failed_fonts);
+        queue_a_task(vm, TaskSource::FontLoading, self.this(), |vm, this| {
+            with_temporary_execution_context_and_callbacks(this.realm, || {
+                // 1. Let loaded fonts be the (possibly empty) contents of font face set’s [[LoadedFonts]] slot.
+                // 2. Let failed fonts be the (possibly empty) contents of font face set’s [[FailedFonts]] slot.
+                // 3. Reset the [[LoadedFonts]] and [[FailedFonts]] slots to empty lists.
+                let loaded_fonts = take_font_faces(vm, &this.loaded_fonts);
+                let failed_fonts = take_font_faces(vm, &this.failed_fonts);
 
-            // 4. Fire a font load event named loadingdone at font face set with loaded fonts.
-            this.fire_a_font_load_event(vm, "loadingdone", &loaded_fonts);
+                // 4. Fire a font load event named loadingdone at font face set with loaded fonts.
+                this.fire_a_font_load_event(vm, "loadingdone", &loaded_fonts);
 
-            // 5. If font face set’s failed fonts is non-empty, fire a font load event named loadingerror at font face
-            //    set with failed fonts.
-            if !failed_fonts.is_empty() {
-                this.fire_a_font_load_event(vm, "loadingerror", &failed_fonts);
-            }
+                // 5. If font face set’s failed fonts is non-empty, fire a font load event named loadingerror at font face
+                //    set with failed fonts.
+                if !failed_fonts.is_empty() {
+                    this.fire_a_font_load_event(vm, "loadingerror", &failed_fonts);
+                }
+            });
         });
     }
 }

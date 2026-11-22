@@ -28,6 +28,9 @@ pub use info::OpInfo;
 pub use dump::dump;
 pub use dump::node_text;
 
+use ak::Zone;
+use ak::ZoneVec;
+
 use crate::bytecode::OpCode;
 use crate::code::ExitKind;
 use crate::code::Repr;
@@ -87,15 +90,17 @@ pub enum FrameField {
     PrivateEnvironment,
     Realm,
     Executable,
+    Function,
 }
 
 impl FrameField {
-    pub const ALL: [FrameField; 5] = [
+    pub const ALL: [FrameField; 6] = [
         FrameField::LexicalEnvironment,
         FrameField::VariableEnvironment,
         FrameField::PrivateEnvironment,
         FrameField::Realm,
         FrameField::Executable,
+        FrameField::Function,
     ];
 
     /// Whether instructions of the frame's function can change the field:
@@ -424,11 +429,11 @@ pub enum VirtualObjectKind {
     /// A plain object of `shape`, whose properties are the inputs in offset
     /// order.
     Object { shape: CellId },
-    /// A closure like `sample`, the sample of the closure template the
-    /// `AllocateFunction` it stands for copies, with the lexical and private
-    /// environments in inputs 0 and 1: cell pointers, the latter null for
-    /// none.
-    Closure { sample: CellId },
+    /// A closure like the sample in `sample_slot`, of the closure template
+    /// the `AllocateFunction` it stands for copies, with the lexical and
+    /// private environments in inputs 0 and 1: cell pointers, the latter null
+    /// for none.
+    Closure { sample_slot: CellId },
 }
 
 /// Defines `Op` and `Op::name()`, the name of each variant, so that names cannot drift from the variants. Everything
@@ -436,7 +441,7 @@ pub enum VirtualObjectKind {
 macro_rules! define_ops {
     (
         $(#[$attribute:meta])*
-        pub enum Op {
+        pub enum Op<$zone:lifetime> {
             $(
                 $(#[$variant_attribute:meta])*
                 $variant:ident $(($($tuple:ty),* $(,)?))? $({
@@ -446,7 +451,7 @@ macro_rules! define_ops {
         }
     ) => {
         $(#[$attribute])*
-        pub enum Op {
+        pub enum Op<$zone> {
             $(
                 $(#[$variant_attribute])*
                 $variant $(($($tuple),*))? $({
@@ -455,7 +460,7 @@ macro_rules! define_ops {
             ),*
         }
 
-        impl Op {
+        impl Op<'_> {
             pub fn name(&self) -> &'static str {
                 match self {
                     $(Op::$variant { .. } => stringify!($variant)),*
@@ -482,7 +487,7 @@ define_ops! {
     /// becomes a use of the value it refines (see `edit::remove_refinements()`).
     /// `CheckInt32` refines and unboxes its input at once.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum Op {
+    pub enum Op<'z> {
         /// A NaN-boxed constant.
         Constant(u64),
         /// Reads frame slot `slot` (a flat operand index).
@@ -546,6 +551,9 @@ define_ops! {
         SetLexicalEnvironment,
         /// The `LeavePrivateEnvironment` bytecode.
         LeavePrivateEnvironment,
+        /// What `EnterWithOwnEnvironments` does besides `InitializeFrame`: a frame of a function keeps the function's
+        /// private environment and its lexical environment as its variable environment.
+        KeepOwnEnvironments,
         /// The `IsCallable` bytecode: a boolean value telling whether input 0 is a function object.
         IsCallable,
         /// Truthiness of the tagged input 0 as a `Repr::Bool`, computed by the
@@ -824,14 +832,14 @@ define_ops! {
         /// an inlined one's), a copy of its closure template (see
         /// `FunctionAllocationInfo`) with the lexical environment (a cell
         /// pointer) in input 0 and the private environment in input 1. Like
-        /// `AllocateObject`, the node only allocates. `sample` is the sample
-        /// of the template. `legacy_caller` tells whether the frames of
+        /// `AllocateObject`, the node only allocates. `sample_slot` holds the
+        /// sample of the template. `legacy_caller` tells whether the frames of
         /// inlined calls of the closure show it as the legacy "caller" of the
         /// functions they call.
         AllocateFunction {
             executable: u32,
             shared_function_data_index: u32,
-            sample: CellId,
+            sample_slot: CellId,
             legacy_caller: bool,
         },
         /// A new lexical environment of the compiled function's
@@ -886,7 +894,7 @@ define_ops! {
         /// Exits unless the object in input 0 has one of `shapes`. An optional
         /// input 1 is the object's `CellAddress`.
         CheckShape {
-            shapes: Vec<ShapeCheck>,
+            shapes: &'z [ShapeCheck],
         },
         /// Exits unless the `WatchpointSet` cell `validity` is still valid.
         CheckPrototypeChainValid {
@@ -1004,11 +1012,13 @@ define_ops! {
             if_true: BlockId,
             if_false: BlockId,
         },
-        /// Continues at the block of the first case whose shape the object in
-        /// input 0 has, or exits if there is none. An optional input 1 is the
-        /// object's `CellAddress`.
+        /// Continues at the block of `targets` for the first of `shapes` that the
+        /// object in input 0 has, or exits if it has none of them. There is one
+        /// block for each shape. An optional input 1 is the object's
+        /// `CellAddress`.
         ShapeSwitch {
-            cases: Vec<(ShapeCheck, BlockId)>,
+            shapes: &'z [ShapeCheck],
+            targets: &'z [BlockId],
         },
         /// Returns input 0 from the function, as is: the `End` bytecode, and the
         /// `Return` bytecode of a value whose empty value became `undefined`.
@@ -1394,9 +1404,9 @@ impl Float64Function {
     }
 }
 
-impl Op {
+impl<'z> Op<'z> {
     /// The blocks a control node can continue at.
-    pub fn successors(&self) -> Successors {
+    pub fn successors(&self) -> Successors<'z> {
         let inline = |blocks: &[BlockId]| {
             let mut inline = [BlockId(0); 3];
             inline[..blocks.len()].copy_from_slice(blocks);
@@ -1415,37 +1425,72 @@ impl Op {
                 if_false,
                 fallback,
             } => inline(&[*if_true, *if_false, *fallback]),
-            Op::ShapeSwitch { cases } => Successors::Cases(cases.iter().map(|(_, block)| *block).collect()),
+            Op::ShapeSwitch { targets, .. } => Successors::Cases(targets),
             _ => inline(&[]),
         }
     }
 
-    fn successors_mut(&mut self) -> Vec<&mut BlockId> {
+    /// Calls `visit` with each block a control node can continue at, in the order of `successors()`.
+    pub fn for_each_successor(&self, mut visit: impl FnMut(BlockId)) {
         match self {
-            Op::Jump { target } => vec![target],
+            Op::Jump { target } => visit(*target),
             Op::Branch { if_true, if_false, .. } | Op::BranchOnPc { if_true, if_false, .. } => {
-                vec![if_true, if_false]
+                visit(*if_true);
+                visit(*if_false);
             }
             Op::BranchTruthy {
                 if_true,
                 if_false,
                 fallback,
-            } => vec![if_true, if_false, fallback],
-            Op::ShapeSwitch { cases } => cases.iter_mut().map(|(_, block)| block).collect(),
-            _ => Vec::new(),
+            } => {
+                visit(*if_true);
+                visit(*if_false);
+                visit(*fallback);
+            }
+            Op::ShapeSwitch { targets, .. } => {
+                for block in *targets {
+                    visit(*block);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Makes a control node continue at `map(block)` where it continued at `block`. A shape switch that changes
+    /// gets its new list of blocks from `zone`.
+    fn map_successors(&mut self, zone: &'z Zone, map: impl Fn(BlockId) -> BlockId) {
+        match self {
+            Op::Jump { target } => *target = map(*target),
+            Op::Branch { if_true, if_false, .. } | Op::BranchOnPc { if_true, if_false, .. } => {
+                *if_true = map(*if_true);
+                *if_false = map(*if_false);
+            }
+            Op::BranchTruthy {
+                if_true,
+                if_false,
+                fallback,
+            } => {
+                *if_true = map(*if_true);
+                *if_false = map(*if_false);
+                *fallback = map(*fallback);
+            }
+            Op::ShapeSwitch { targets, .. } if targets.iter().any(|block| map(*block) != *block) => {
+                *targets = zone.alloc_slice_from_iter(targets.iter().map(|block| map(*block)));
+            }
+            _ => {}
         }
     }
 }
 
 /// The blocks a control node can continue at (see `Op::successors()`):
 /// those of jumps and branches inline, and the cases of shape switches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Successors {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Successors<'z> {
     Inline { blocks: [BlockId; 3], count: u8 },
-    Cases(Vec<BlockId>),
+    Cases(&'z [BlockId]),
 }
 
-impl std::ops::Deref for Successors {
+impl core::ops::Deref for Successors<'_> {
     type Target = [BlockId];
 
     fn deref(&self) -> &[BlockId] {
@@ -1456,11 +1501,11 @@ impl std::ops::Deref for Successors {
     }
 }
 
-impl IntoIterator for Successors {
+impl<'z> IntoIterator for Successors<'z> {
     type Item = BlockId;
-    type IntoIter = SuccessorsIntoIter;
+    type IntoIter = SuccessorsIntoIter<'z>;
 
-    fn into_iter(self) -> SuccessorsIntoIter {
+    fn into_iter(self) -> SuccessorsIntoIter<'z> {
         SuccessorsIntoIter {
             successors: self,
             next: 0,
@@ -1468,12 +1513,12 @@ impl IntoIterator for Successors {
     }
 }
 
-pub struct SuccessorsIntoIter {
-    successors: Successors,
+pub struct SuccessorsIntoIter<'z> {
+    successors: Successors<'z>,
     next: usize,
 }
 
-impl Iterator for SuccessorsIntoIter {
+impl Iterator for SuccessorsIntoIter<'_> {
     type Item = BlockId;
 
     fn next(&mut self) -> Option<BlockId> {
@@ -1484,9 +1529,9 @@ impl Iterator for SuccessorsIntoIter {
 }
 
 #[derive(Debug, Clone)]
-pub struct Node {
-    pub op: Op,
-    pub inputs: Vec<NodeId>,
+pub struct Node<'z> {
+    pub op: Op<'z>,
+    pub inputs: ZoneVec<'z, NodeId>,
     /// The representation of the value this node produces, if it produces one.
     pub repr: Option<Repr>,
     /// The interpreter state to rebuild if this node exits.
@@ -1495,9 +1540,9 @@ pub struct Node {
     pub pc: u32,
 }
 
-impl Node {
+impl<'z> Node<'z> {
     /// A node without a frame state.
-    pub fn new(op: Op, inputs: Vec<NodeId>, repr: Option<Repr>, pc: u32) -> Self {
+    pub fn new(op: Op<'z>, inputs: ZoneVec<'z, NodeId>, repr: Option<Repr>, pc: u32) -> Self {
         Self {
             op,
             inputs,
@@ -1508,11 +1553,11 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Block {
-    pub predecessors: Vec<BlockId>,
-    pub phis: Vec<NodeId>,
-    pub body: Vec<NodeId>,
+#[derive(Debug, Clone)]
+pub struct Block<'z> {
+    pub predecessors: ZoneVec<'z, BlockId>,
+    pub phis: ZoneVec<'z, NodeId>,
+    pub body: ZoneVec<'z, NodeId>,
     /// The control node ending this block. Every finished block has one.
     pub control: Option<NodeId>,
     /// The bytecode offset of the first instruction, for blocks that start a
@@ -1532,7 +1577,21 @@ pub struct Block {
     pub start_frame_state: Option<FrameStateId>,
 }
 
-impl Block {
+impl<'z> Block<'z> {
+    /// A block with no nodes and no predecessors, whose lists are in `zone`.
+    pub fn new_in(zone: &'z Zone) -> Self {
+        Self {
+            predecessors: ZoneVec::new_in(zone),
+            phis: ZoneVec::new_in(zone),
+            body: ZoneVec::new_in(zone),
+            control: None,
+            bytecode_start: None,
+            is_loop_header: false,
+            is_cold: false,
+            start_frame_state: None,
+        }
+    }
+
     /// The block's nodes, in order: its phis, its body and its control node.
     pub fn nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.phis.iter().chain(&self.body).chain(&self.control).copied()
@@ -1541,7 +1600,7 @@ impl Block {
 
 /// The interpreter state of a frame at a point where compiled code may exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrameState {
+pub struct FrameState<'z> {
     /// Index into `Snapshot::executables`.
     pub executable: u32,
     pub pc: u32,
@@ -1549,7 +1608,7 @@ pub struct FrameState {
     /// The SSA value of every live frame slot (a flat operand index) whose
     /// frame memory does not already hold it, in slot order. Frames of
     /// inlined calls have no memory, so they list every live slot.
-    pub values: Vec<(u32, NodeId)>,
+    pub values: ZoneVec<'z, (u32, NodeId)>,
     /// The live frame slots whose value frame memory holds: the compiled
     /// function's slots that are in sync, and the slots a slow path in an
     /// inlined callee wrote into the frames pushed for it. With `values`,
@@ -1558,7 +1617,7 @@ pub struct FrameState {
     /// where the instruction did not continue (it threw, or its callee runs
     /// in the interpreter and writes it when it returns), that is what the
     /// frame needs. Exits after the instruction keep what it wrote.
-    pub in_frame: Vec<u32>,
+    pub in_frame: ZoneVec<'z, u32>,
     /// For frames of inlined calls, the frame state of the caller: resuming
     /// after its `Call` instruction, with the call's result in `dst`.
     pub parent: Option<FrameStateId>,
@@ -1572,29 +1631,34 @@ pub struct FrameState {
     pub legacy_arguments: core::ops::Range<u32>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Graph {
-    pub nodes: Vec<Node>,
+/// The memory of all the lists of a graph is in one zone (see `ak::Zone`): a graph makes no block of the heap, and
+/// all of it goes away when its zone is reset.
+#[derive(Debug)]
+pub struct Graph<'z> {
+    /// Where the lists of the graph are, and where its nodes, blocks and frame states get their lists.
+    pub zone: &'z Zone,
+    /// Every node the graph ever had: passes remove nodes from blocks, never from here.
+    pub nodes: ZoneVec<'z, Node<'z>>,
     /// Blocks in linear order. Block 0 is the entry, and every block comes
     /// after all its predecessors except those reaching it over a loop back
     /// edge, and cold ones once the passes moved cold blocks last.
-    pub blocks: Vec<Block>,
-    pub frame_states: Vec<FrameState>,
+    pub blocks: ZoneVec<'z, Block<'z>>,
+    pub frame_states: ZoneVec<'z, FrameState<'z>>,
     /// Cells the graph compares against or reads from (shapes, prototype
     /// holders, validity cells, inlined functions). The code is only valid
     /// while they live.
-    pub embedded_cells: Vec<CellId>,
+    pub embedded_cells: ZoneVec<'z, CellId>,
     /// What the code assumes keeps holding where it has `Op::AssumeValid`
     /// nodes (see `Dependency`).
-    pub dependencies: Vec<crate::code::Dependency>,
+    pub dependencies: ZoneVec<'z, crate::code::Dependency>,
     /// The shapes from the snapshot that were stable, which check
     /// elimination may make the code depend on.
-    pub stable_shapes: Vec<CellId>,
+    pub stable_shapes: ZoneVec<'z, CellId>,
     /// Immutable properties of embedded typed arrays. Their fixed lengths
     /// require a valid cached storage offset before each access.
-    pub typed_array_constants: Vec<(u64, crate::snapshot::TypedArraySnapshot)>,
+    pub typed_array_constants: ZoneVec<'z, (u64, crate::snapshot::TypedArraySnapshot)>,
     /// The targets of `Op::CallDirect` nodes that call function constants.
-    pub direct_call_targets: Vec<crate::snapshot::DirectCallTarget>,
+    pub direct_call_targets: ZoneVec<'z, crate::snapshot::DirectCallTarget>,
     /// The most bytes of interpreter stack that materializing the frames of
     /// inlined calls, and the frames of direct and native calls on top of
     /// them, take at once. Compiled code checks at entry that they fit.
@@ -1604,43 +1668,177 @@ pub struct Graph {
     /// each one starts at: a loop back edge, the continuation of a generator,
     /// or the instruction after the `Catch` of an exception handler. The frame
     /// holds every value.
-    pub osr_entries: Vec<(u32, BlockId)>,
+    pub osr_entries: ZoneVec<'z, (u32, BlockId)>,
     /// The pcs of the loop back edges in the loops of the on-stack
     /// replacement entries (including those of the entries), from where a
     /// frame running in the interpreter reaches an entry.
-    pub osr_loop_back_edges: Vec<u32>,
+    pub osr_loop_back_edges: ZoneVec<'z, u32>,
     /// The pcs of the loop back edges in the loops around the loops of the
     /// on-stack replacement entries, from where a frame running in the
     /// interpreter may reach an entry on a later iteration.
-    pub osr_outer_loop_back_edges: Vec<u32>,
+    pub osr_outer_loop_back_edges: ZoneVec<'z, u32>,
     /// The pcs of the `Catch` of the exception handlers that got no catch
     /// entry because they never caught an exception before the compile (see
     /// `builder::osr`). A compile after they caught gives them one.
-    pub uncaught_handlers: Vec<u32>,
+    pub uncaught_handlers: ZoneVec<'z, u32>,
     /// The register-saving `CallSlowPath` nodes that may run before the
     /// frame is initialized, and so initialize it first if it is not.
-    pub slow_paths_initializing_frame: Vec<NodeId>,
+    pub slow_paths_initializing_frame: ZoneVec<'z, NodeId>,
     /// Where exits of each executable were taken before, as (executable,
     /// pc, kind), for passes that must not repeat a failed speculation.
-    pub exit_sites: Vec<(u32, u32, ExitKind)>,
+    pub exit_sites: ZoneVec<'z, (u32, u32, ExitKind)>,
     /// The nodes that loop invariant code motion moved out of blocks that not
     /// every iteration of their loop runs, which exit with
     /// `ExitKind::Hoisted` instead of their own kind of exit.
-    pub speculatively_hoisted: Vec<NodeId>,
+    pub speculatively_hoisted: ZoneVec<'z, NodeId>,
     /// The argument slots of the compiled function that its legacy
     /// `arguments` shows. Empty for functions without legacy `arguments`.
     pub legacy_arguments: core::ops::Range<u32>,
     /// The `AssumeLegacyArgumentsUnread` nodes, each with the nodes of its
     /// instruction that run code.
-    pub legacy_arguments_guards: Vec<(NodeId, Vec<NodeId>)>,
+    pub legacy_arguments_guards: ZoneVec<'z, (NodeId, ZoneVec<'z, NodeId>)>,
     /// The slots of the compiled function (as operands) whose frame memory holds the value the function started with
     /// wherever its code runs: the arguments and the `this` value register, unless an instruction writes them. Nothing
     /// stores to them (the verifier enforces this), so the register allocator reloads what was loaded from them from
     /// there (see `regalloc::frame_home()`).
-    pub unwritten_slots: crate::bitset::BitSet,
+    pub unwritten_slots: ak::ZoneBitSet<'z>,
 }
 
-impl Graph {
+impl<'z> Graph<'z> {
+    /// A graph with nothing in it, whose lists are in `zone`.
+    pub fn new_in(zone: &'z Zone) -> Self {
+        Self {
+            zone,
+            nodes: ZoneVec::new_in(zone),
+            blocks: ZoneVec::new_in(zone),
+            frame_states: ZoneVec::new_in(zone),
+            embedded_cells: ZoneVec::new_in(zone),
+            dependencies: ZoneVec::new_in(zone),
+            stable_shapes: ZoneVec::new_in(zone),
+            typed_array_constants: ZoneVec::new_in(zone),
+            direct_call_targets: ZoneVec::new_in(zone),
+            materialized_frame_bytes: 0,
+            osr_entries: ZoneVec::new_in(zone),
+            osr_loop_back_edges: ZoneVec::new_in(zone),
+            osr_outer_loop_back_edges: ZoneVec::new_in(zone),
+            uncaught_handlers: ZoneVec::new_in(zone),
+            slow_paths_initializing_frame: ZoneVec::new_in(zone),
+            exit_sites: ZoneVec::new_in(zone),
+            speculatively_hoisted: ZoneVec::new_in(zone),
+            legacy_arguments: 0..0,
+            legacy_arguments_guards: ZoneVec::new_in(zone),
+            unwritten_slots: ak::ZoneBitSet::new_in(0, zone),
+        }
+    }
+
+    /// A copy of the graph, whose lists are in `zone`.
+    pub fn clone_in<'c>(&self, zone: &'c Zone) -> Graph<'c>
+    where
+        'z: 'c,
+    {
+        let Graph {
+            zone: _,
+            nodes,
+            blocks,
+            frame_states,
+            embedded_cells,
+            dependencies,
+            stable_shapes,
+            typed_array_constants,
+            direct_call_targets,
+            materialized_frame_bytes,
+            osr_entries,
+            osr_loop_back_edges,
+            osr_outer_loop_back_edges,
+            uncaught_handlers,
+            slow_paths_initializing_frame,
+            exit_sites,
+            speculatively_hoisted,
+            legacy_arguments,
+            legacy_arguments_guards,
+            unwritten_slots,
+        } = self;
+        let list = |values: &[NodeId]| ZoneVec::from_slice_in(values, zone);
+        let mut unwritten = ak::ZoneBitSet::new_in(unwritten_slots.capacity(), zone);
+        unwritten.union_with(unwritten_slots);
+        Graph {
+            zone,
+            nodes: ZoneVec::from_iter_in(
+                nodes.iter().map(|node| Node {
+                    op: node.op.clone(),
+                    inputs: list(&node.inputs),
+                    repr: node.repr,
+                    frame_state: node.frame_state,
+                    pc: node.pc,
+                }),
+                zone,
+            ),
+            blocks: ZoneVec::from_iter_in(
+                blocks.iter().map(|block| Block {
+                    predecessors: ZoneVec::from_slice_in(&block.predecessors, zone),
+                    phis: list(&block.phis),
+                    body: list(&block.body),
+                    control: block.control,
+                    bytecode_start: block.bytecode_start,
+                    is_loop_header: block.is_loop_header,
+                    is_cold: block.is_cold,
+                    start_frame_state: block.start_frame_state,
+                }),
+                zone,
+            ),
+            frame_states: ZoneVec::from_iter_in(
+                frame_states.iter().map(|frame_state| FrameState {
+                    executable: frame_state.executable,
+                    pc: frame_state.pc,
+                    mode: frame_state.mode,
+                    values: ZoneVec::from_slice_in(&frame_state.values, zone),
+                    in_frame: ZoneVec::from_slice_in(&frame_state.in_frame, zone),
+                    parent: frame_state.parent,
+                    passed_argument_count: frame_state.passed_argument_count,
+                    legacy_arguments: frame_state.legacy_arguments.clone(),
+                }),
+                zone,
+            ),
+            embedded_cells: ZoneVec::from_slice_in(embedded_cells, zone),
+            dependencies: ZoneVec::from_slice_in(dependencies, zone),
+            stable_shapes: ZoneVec::from_slice_in(stable_shapes, zone),
+            typed_array_constants: ZoneVec::from_slice_in(typed_array_constants, zone),
+            direct_call_targets: ZoneVec::from_slice_in(direct_call_targets, zone),
+            materialized_frame_bytes: *materialized_frame_bytes,
+            osr_entries: ZoneVec::from_slice_in(osr_entries, zone),
+            osr_loop_back_edges: ZoneVec::from_slice_in(osr_loop_back_edges, zone),
+            osr_outer_loop_back_edges: ZoneVec::from_slice_in(osr_outer_loop_back_edges, zone),
+            uncaught_handlers: ZoneVec::from_slice_in(uncaught_handlers, zone),
+            slow_paths_initializing_frame: list(slow_paths_initializing_frame),
+            exit_sites: ZoneVec::from_slice_in(exit_sites, zone),
+            speculatively_hoisted: list(speculatively_hoisted),
+            legacy_arguments: legacy_arguments.clone(),
+            legacy_arguments_guards: ZoneVec::from_iter_in(
+                legacy_arguments_guards
+                    .iter()
+                    .map(|(guard, nodes)| (*guard, list(nodes))),
+                zone,
+            ),
+            unwritten_slots: unwritten,
+        }
+    }
+
+    /// A list of `values` in the memory of the graph.
+    pub fn list<T: Clone>(&self, values: &[T]) -> ZoneVec<'z, T> {
+        ZoneVec::from_slice_in(values, self.zone)
+    }
+
+    /// A block with no nodes and no predecessors, whose lists are in the memory of the graph.
+    pub fn new_block(&self) -> Block<'z> {
+        Block::new_in(self.zone)
+    }
+
+    /// Adds a node with `inputs` and no frame state.
+    pub fn add(&mut self, op: Op<'z>, inputs: &[NodeId], repr: Option<Repr>, pc: u32) -> NodeId {
+        let inputs = self.list(inputs);
+        self.add_node(Node::new(op, inputs, repr, pc))
+    }
+
     /// Records that the code relies on `dependency`, which makes the
     /// runtime discard the code once it no longer holds.
     pub fn depend_on(&mut self, dependency: crate::code::Dependency) {
@@ -1649,20 +1847,21 @@ impl Graph {
         }
     }
 
-    pub fn node(&self, id: NodeId) -> &Node {
+    pub fn node(&self, id: NodeId) -> &Node<'z> {
         &self.nodes[id.index()]
     }
 
     /// Whether `node` never is the empty value. `arguments` are the slots
     /// of the compiled function's arguments, which always hold values.
-    pub fn is_known_non_empty(&self, node: NodeId, arguments: core::ops::Range<u32>) -> bool {
-        let mut pending = vec![node];
-        let mut seen = Vec::new();
-        while let Some(node) = pending.pop() {
+    pub fn is_known_non_empty(&self, node: NodeId, arguments: core::ops::Range<u32>, work: &Zone) -> bool {
+        // NB: Only phis lead to other nodes, so only they are kept in `seen`.
+        let mut pending = ZoneVec::new_in(work);
+        let mut seen = ZoneVec::new_in(work);
+        let mut next = Some(node);
+        while let Some(node) = next.take().or_else(|| pending.pop()) {
             if seen.contains(&node) {
                 continue;
             }
-            seen.push(node);
             let data = self.node(node);
             if data.repr.is_some_and(|repr| repr != Repr::Tagged) {
                 continue;
@@ -1670,7 +1869,10 @@ impl Graph {
             match &data.op {
                 Op::Constant(bits) if *bits != value::EMPTY => {}
                 Op::LoadSlot { slot } if arguments.contains(&crate::bytecode::Operand::from_raw(*slot).raw()) => {}
-                Op::Phi => pending.extend(data.inputs.iter().copied()),
+                Op::Phi => {
+                    seen.push(node);
+                    pending.extend(data.inputs.iter().copied());
+                }
                 op if op.info().never_empty => {}
                 _ => return false,
             }
@@ -1678,55 +1880,52 @@ impl Graph {
         true
     }
 
-    pub fn block(&self, id: BlockId) -> &Block {
+    pub fn block(&self, id: BlockId) -> &Block<'z> {
         &self.blocks[id.index()]
     }
 
-    pub fn frame_state(&self, id: FrameStateId) -> &FrameState {
+    pub fn frame_state(&self, id: FrameStateId) -> &FrameState<'z> {
         &self.frame_states[id.index()]
     }
 
     /// A frame state and its callers' frame states, innermost first.
-    pub fn frame_state_chain(&self, id: FrameStateId) -> Vec<FrameStateId> {
-        let mut chain = vec![id];
-        while let Some(parent) = self.frame_state(*chain.last().expect("the chain is not empty")).parent {
-            chain.push(parent);
-        }
-        chain
+    pub fn frame_state_chain(&self, id: FrameStateId) -> impl Iterator<Item = FrameStateId> + Clone + '_ {
+        core::iter::successors(Some(id), |id| self.frame_state(*id).parent)
     }
 
     /// The values `node` uses: its inputs, then the values of its frame
     /// state.
-    pub fn used_values(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    pub fn used_values<'a>(&'a self, node: NodeId, work: &'a Zone) -> impl Iterator<Item = NodeId> + 'a {
         let data = self.node(node);
         data.inputs.iter().copied().chain(
             data.frame_state
                 .into_iter()
-                .flat_map(|id| self.frame_state_values(id).map(|(_, value)| value)),
+                .flat_map(move |id| self.frame_state_values(id, work).map(|(_, value)| value)),
         )
     }
 
     /// The values that code `node` runs may read through the legacy
     /// `arguments` of the frames of its frame state chain for which
     /// `frames` holds.
-    pub fn legacy_argument_values_read_by(&self, node: NodeId, frames: impl Fn(&FrameState) -> bool) -> Vec<NodeId> {
+    pub fn legacy_argument_values_read_by(
+        &self,
+        node: NodeId,
+        frames: impl Fn(&FrameState<'z>) -> bool,
+    ) -> impl Iterator<Item = NodeId> {
         let data = self.node(node);
-        let Some(frame_state) = data.frame_state.filter(|_| data.op.properties().runs_code) else {
-            return Vec::new();
-        };
-        let mut values = Vec::new();
-        for id in self.frame_state_chain(frame_state) {
-            let frame_state = self.frame_state(id);
-            if !frames(frame_state) {
-                continue;
-            }
-            for (slot, value) in &frame_state.values {
-                if frame_state.legacy_arguments.contains(slot) {
-                    values.push(*value);
-                }
-            }
-        }
-        values
+        let frame_state = data.frame_state.filter(|_| data.op.properties().runs_code);
+        frame_state
+            .into_iter()
+            .flat_map(|frame_state| self.frame_state_chain(frame_state))
+            .map(|id| self.frame_state(id))
+            .filter(move |frame_state| frames(frame_state))
+            .flat_map(|frame_state| {
+                frame_state
+                    .values
+                    .iter()
+                    .filter(|(slot, _)| frame_state.legacy_arguments.contains(slot))
+                    .map(|(_, value)| *value)
+            })
     }
 
     /// Whether code that `node` runs may read objects the code never
@@ -1735,7 +1934,6 @@ impl Graph {
     /// node's site (see `Op::AssumeLegacyArgumentsUnread`).
     pub fn defers_legacy_argument_objects(&self, node: NodeId) -> bool {
         self.legacy_argument_values_read_by(node, |_| true)
-            .into_iter()
             .any(|value| matches!(self.node(value).op, Op::VirtualObject { .. }))
     }
 
@@ -1744,9 +1942,15 @@ impl Graph {
     /// They are followed by the properties of the virtual objects among them
     /// (see `virtual_objects()`), in order, with the slot
     /// `VIRTUAL_OBJECT_PROPERTY`: exits need those values too.
-    pub fn frame_state_values(&self, id: FrameStateId) -> impl Iterator<Item = (u32, NodeId)> + '_ {
+    ///
+    /// The list of the virtual objects goes in `work`, if the chain has any.
+    pub fn frame_state_values<'a>(
+        &'a self,
+        id: FrameStateId,
+        work: &'a Zone,
+    ) -> impl Iterator<Item = (u32, NodeId)> + 'a {
         self.chain_values(id).chain(
-            std::iter::once_with(move || self.virtual_objects(id))
+            core::iter::once_with(move || self.virtual_objects(id, work))
                 .flatten()
                 .flat_map(|object| {
                     self.node(object)
@@ -1760,34 +1964,36 @@ impl Graph {
     /// The virtual objects the values of a frame state chain refer to,
     /// directly or through other virtual objects, each once, in the order
     /// they are first referred to.
-    pub fn virtual_objects(&self, id: FrameStateId) -> Vec<NodeId> {
+    pub fn virtual_objects<'w>(&self, id: FrameStateId, work: &'w Zone) -> ZoneVec<'w, NodeId> {
         let is_virtual_object = |value: NodeId| matches!(self.node(value).op, Op::VirtualObject { .. });
+        let mut objects = ZoneVec::new_in(work);
         // NB: Most frame states refer to no virtual object.
         if !self.chain_values(id).any(|(_, value)| is_virtual_object(value)) {
-            return Vec::new();
+            return objects;
         }
-        let mut objects = Vec::new();
-        let mut pending = self.chain_values(id).map(|(_, value)| value).collect::<Vec<_>>();
-        pending.reverse();
-        while let Some(value) = pending.pop() {
-            if !is_virtual_object(value) || objects.contains(&value) {
-                continue;
+        let mut pending = ZoneVec::new_in(work);
+        for (_, value) in self.chain_values(id) {
+            pending.push(value);
+            while let Some(value) = pending.pop() {
+                if !is_virtual_object(value) || objects.contains(&value) {
+                    continue;
+                }
+                objects.push(value);
+                pending.extend(self.node(value).inputs.iter().rev().copied());
             }
-            objects.push(value);
-            pending.extend(self.node(value).inputs.iter().rev().copied());
         }
         objects
     }
 
     fn chain_values(&self, id: FrameStateId) -> impl Iterator<Item = (u32, NodeId)> + '_ {
-        std::iter::successors(Some(id), |id| self.frame_state(*id).parent)
+        self.frame_state_chain(id)
             .flat_map(|id| self.frame_state(id).values.iter().copied())
     }
 
     /// The blocks code starts at: block 0, and the on-stack replacement
     /// entries.
     pub fn entries(&self) -> impl Iterator<Item = BlockId> + '_ {
-        std::iter::once(BlockId(0)).chain(self.osr_entries.iter().map(|(_, entry)| *entry))
+        core::iter::once(BlockId(0)).chain(self.osr_entries.iter().map(|(_, entry)| *entry))
     }
 
     /// The control node ending `block`, which every block has once built.
@@ -1795,27 +2001,27 @@ impl Graph {
         self.block(block).control.expect("finished blocks have a control node")
     }
 
-    pub fn control(&self, block: BlockId) -> &Node {
+    pub fn control(&self, block: BlockId) -> &Node<'z> {
         self.node(self.control_id(block))
     }
 
-    pub fn successors(&self, block: BlockId) -> Successors {
+    pub fn successors(&self, block: BlockId) -> Successors<'z> {
         self.control(block).op.successors()
     }
 
-    pub fn add_node(&mut self, node: Node) -> NodeId {
+    pub fn add_node(&mut self, node: Node<'z>) -> NodeId {
         let id = NodeId::from_index(self.nodes.len());
         self.nodes.push(node);
         id
     }
 
-    pub fn add_block(&mut self, block: Block) -> BlockId {
+    pub fn add_block(&mut self, block: Block<'z>) -> BlockId {
         let id = BlockId::from_index(self.blocks.len());
         self.blocks.push(block);
         id
     }
 
-    pub fn add_frame_state(&mut self, frame_state: FrameState) -> FrameStateId {
+    pub fn add_frame_state(&mut self, frame_state: FrameState<'z>) -> FrameStateId {
         let id = FrameStateId(u32::try_from(self.frame_states.len()).expect("frame state count fits in u32"));
         self.frame_states.push(frame_state);
         id
@@ -1831,38 +2037,36 @@ impl Graph {
         let control = self.blocks[block.index()]
             .control
             .expect("finished blocks have a control node");
-        for successor in self.nodes[control.index()].op.successors_mut() {
-            if *successor == from {
-                *successor = to;
-            }
-        }
+        let zone = self.zone;
+        self.nodes[control.index()]
+            .op
+            .map_successors(zone, |successor| if successor == from { to } else { successor });
     }
 
     /// Reorders the blocks so that `order[i]` becomes block `i`. Blocks not
     /// in `order` are dropped; nothing may refer to them.
-    pub fn reorder_blocks(&mut self, order: &[BlockId]) {
+    pub fn reorder_blocks(&mut self, order: &[BlockId], work: &Zone) {
         if order.len() == self.blocks.len() && order.iter().enumerate().all(|(index, block)| block.index() == index) {
             return;
         }
-        let mut new_index = vec![None; self.blocks.len()];
+        let mut new_index = ZoneVec::from_elem_in(None, self.blocks.len(), work);
         for (index, block) in order.iter().enumerate() {
             assert!(new_index[block.index()].is_none(), "blocks appear once in the order");
             new_index[block.index()] = Some(BlockId::from_index(index));
         }
-        let remap = |block: &mut BlockId| {
-            *block = new_index[block.index()].expect("reordering keeps every referenced block");
-        };
+        let new_id = |block: BlockId| new_index[block.index()].expect("reordering keeps every referenced block");
+        let zone = self.zone;
         for block in order {
             let block = &mut self.blocks[block.index()];
-            block.predecessors.iter_mut().for_each(remap);
+            for predecessor in &mut block.predecessors {
+                *predecessor = new_id(*predecessor);
+            }
             if let Some(control) = block.control {
-                for successor in self.nodes[control.index()].op.successors_mut() {
-                    remap(successor);
-                }
+                self.nodes[control.index()].op.map_successors(zone, new_id);
             }
         }
         for (_, block) in &mut self.osr_entries {
-            remap(block);
+            *block = new_id(*block);
         }
         // Move each retained block to its destination, carrying the displaced
         // block's destination with it. Dropped blocks end up past the new end.
@@ -1923,10 +2127,11 @@ impl Graph {
 
     /// Whether `id` always has the value of `value`, because it refines
     /// `value` or a phi whose inputs all have that value.
-    pub fn has_value_of(&self, id: NodeId, value: NodeId) -> bool {
-        let mut pending = vec![id];
-        let mut seen = Vec::new();
-        while let Some(mut node) = pending.pop() {
+    pub fn has_value_of(&self, id: NodeId, value: NodeId, work: &Zone) -> bool {
+        let mut pending = ZoneVec::new_in(work);
+        let mut seen = ZoneVec::new_in(work);
+        let mut next = Some(id);
+        while let Some(mut node) = next.take().or_else(|| pending.pop()) {
             while node != value
                 && let Some(index) = self.node(node).op.refined_input()
             {
@@ -1935,13 +2140,29 @@ impl Graph {
             if node == value || seen.contains(&node) {
                 continue;
             }
-            seen.push(node);
             if !matches!(self.node(node).op, Op::Phi) {
                 return false;
             }
+            seen.push(node);
             pending.extend(self.node(node).inputs.iter().copied());
         }
         true
+    }
+}
+
+// NB: Tests make graphs and blocks with no zone at hand. They get the zone of their thread, which lives as long as
+//     the thread.
+#[cfg(test)]
+impl Default for Graph<'static> {
+    fn default() -> Self {
+        Self::new_in(crate::test_zone())
+    }
+}
+
+#[cfg(test)]
+impl Default for Block<'static> {
+    fn default() -> Self {
+        Self::new_in(crate::test_zone())
     }
 }
 
@@ -1954,8 +2175,8 @@ mod tests {
             executable: 0,
             pc: 0,
             mode: ResumeMode::ResumeAt,
-            values,
-            in_frame: Vec::new(),
+            values: graph.list(&values),
+            in_frame: ak::ZoneVec::new_in(crate::test_zone()),
             parent,
             passed_argument_count: None,
             legacy_arguments: 0..0,
@@ -1972,13 +2193,13 @@ mod tests {
                     ..Block::default()
                 });
             }
-            let control = graph.add_node(Node::new(Op::Jump { target: BlockId(2) }, Vec::new(), None, 0));
+            let control = graph.add(Op::Jump { target: BlockId(2) }, &[], None, 0);
             graph.blocks[0].control = Some(control);
             graph.blocks[2].predecessors.push(BlockId(0));
             graph.osr_entries.push((10, BlockId(3)));
             let storage = graph.blocks.as_ptr();
             let order = order.map(BlockId);
-            graph.reorder_blocks(&order);
+            graph.reorder_blocks(&order, crate::test_zone());
             assert_eq!(graph.blocks.as_ptr(), storage);
             assert_eq!(graph.blocks.len(), 3);
             for (index, old) in order.iter().enumerate() {
@@ -1994,30 +2215,32 @@ mod tests {
     #[test]
     fn frame_state_values_keep_caller_and_nested_object_order() {
         let mut graph = Graph::default();
-        let value = graph.add_node(Node::new(Op::Constant(value::UNDEFINED), vec![], Some(Repr::Tagged), 0));
-        let inner = graph.add_node(Node::new(
+        let value = graph.add(Op::Constant(value::UNDEFINED), &[], Some(Repr::Tagged), 0);
+        let inner = graph.add(
             Op::VirtualObject {
                 kind: VirtualObjectKind::Object { shape: CellId(1) },
                 allocation: NodeId(0),
             },
-            vec![value],
+            &[value],
             Some(Repr::Tagged),
             0,
-        ));
-        let outer = graph.add_node(Node::new(
+        );
+        let outer = graph.add(
             Op::VirtualObject {
                 kind: VirtualObjectKind::Object { shape: CellId(2) },
                 allocation: NodeId(1),
             },
-            vec![inner, value],
+            &[inner, value],
             Some(Repr::Tagged),
             0,
-        ));
+        );
         let parent = state(&mut graph, vec![(0, value), (1, inner)], None);
         let current = state(&mut graph, vec![(0, outer), (1, inner)], Some(parent));
-        assert_eq!(graph.virtual_objects(current), [outer, inner]);
+        assert_eq!(graph.virtual_objects(current, crate::test_zone()), [outer, inner]);
         assert_eq!(
-            graph.frame_state_values(current).collect::<Vec<_>>(),
+            graph
+                .frame_state_values(current, crate::test_zone())
+                .collect::<Vec<_>>(),
             [
                 (0, outer),
                 (1, inner),
@@ -2029,12 +2252,12 @@ mod tests {
             ]
         );
         graph.nodes[inner.index()].inputs.push(outer);
-        assert_eq!(graph.virtual_objects(current), [outer, inner]);
+        assert_eq!(graph.virtual_objects(current, crate::test_zone()), [outer, inner]);
         assert_eq!(
-            graph.frame_state_values(current).last(),
+            graph.frame_state_values(current, crate::test_zone()).last(),
             Some((VIRTUAL_OBJECT_PROPERTY, outer))
         );
         let empty = state(&mut graph, vec![], None);
-        assert_eq!(graph.frame_state_values(empty).count(), 0);
+        assert_eq!(graph.frame_state_values(empty, crate::test_zone()).count(), 0);
     }
 }

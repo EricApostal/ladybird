@@ -56,6 +56,7 @@ use crate::ir::NodeId;
 use crate::ir::Op;
 use crate::ir::value;
 use crate::snapshot::Intrinsic;
+use ak::ZoneVec;
 
 /// Whether an instruction with `opcode` may write a binding of the function's
 /// environment (where a mapped arguments object's parameters live), or create
@@ -113,9 +114,7 @@ fn constant_index(function: &super::Function<'_>, instruction: &Instruction) -> 
     let SlotKind::Constant(constant) = function.layout.slot_kind(index) else {
         return None;
     };
-    function
-        .executable
-        .constants
+    function.snapshot[function.executable.constants]
         .get(constant as usize)
         .and_then(|bits| value::as_int32(*bits))
         .and_then(|index| u32::try_from(index).ok())
@@ -149,7 +148,7 @@ pub(super) fn uses_virtual_arguments(graph: &Graph) -> bool {
     })
 }
 
-impl GraphBuilder<'_> {
+impl<'a> GraphBuilder<'a, '_> {
     /// Whether `node` is the virtual arguments object.
     pub(super) fn is_virtual_arguments(&self, node: NodeId) -> bool {
         self.graph
@@ -227,14 +226,15 @@ impl GraphBuilder<'_> {
     /// The values the call of the inlined callee being built passed it, all
     /// of them, as arguments of a call it inlines, and their count; `None`
     /// outside inlined callees.
-    pub(super) fn inlined_call_arguments(&self) -> Option<(Vec<InlineValue>, u32)> {
+    pub(super) fn inlined_call_arguments(&self) -> Option<(ZoneVec<'a, InlineValue>, u32)> {
         let count = self.function.inline.as_ref()?.passed_argument_count;
-        let values = (0..count)
-            .map(|argument| {
+        let values = ZoneVec::from_iter_in(
+            (0..count).map(|argument| {
                 let node = self.inlined_call_argument(argument).expect("the call passed it");
                 InlineValue::Node(node)
-            })
-            .collect();
+            }),
+            self.work,
+        );
         Some((values, count))
     }
 
@@ -262,7 +262,7 @@ impl GraphBuilder<'_> {
             self.write(dst, count)?;
             return Ok(true);
         }
-        let count = self.emit(Op::ArgumentCount, Vec::new(), Some(Repr::Tagged));
+        let count = self.emit(Op::ArgumentCount, &[], Some(Repr::Tagged));
         self.write(dst, count)?;
         Ok(true)
     }
@@ -293,7 +293,7 @@ impl GraphBuilder<'_> {
         }
         let index = self.read(property)?;
         let arguments_base = self.function.layout.arguments_base();
-        let argument = self.emit_checked(Op::LoadArgument { arguments_base }, vec![index], Some(Repr::Tagged));
+        let argument = self.emit_checked(Op::LoadArgument { arguments_base }, &[index], Some(Repr::Tagged));
         self.write(dst, argument)?;
         Ok(true)
     }
@@ -326,7 +326,7 @@ impl GraphBuilder<'_> {
         }
         let index = self.read(index)?;
         let arguments_base = self.function.layout.arguments_base();
-        let argument = self.emit_checked(Op::LoadArgument { arguments_base }, vec![index], Some(Repr::Tagged));
+        let argument = self.emit_checked(Op::LoadArgument { arguments_base }, &[index], Some(Repr::Tagged));
         self.write(dst, argument)?;
         Ok(true)
     }
@@ -350,7 +350,7 @@ impl GraphBuilder<'_> {
         else {
             return Ok(None);
         };
-        let (forwarded, start) = match arguments.as_slice() {
+        let (forwarded, start) = match *arguments {
             [forwarded] => (*forwarded, None),
             [forwarded, start] => (*forwarded, Some(*start)),
             _ => return Ok(None),
@@ -388,7 +388,7 @@ impl GraphBuilder<'_> {
         if let Some(slice) = slice_check {
             self.check_callee(*this_value, slice)?;
         }
-        let array = self.emit_checked(Op::SliceArguments, vec![start], Some(Repr::Tagged));
+        let array = self.emit_checked(Op::SliceArguments, &[start], Some(Repr::Tagged));
         self.write(*dst, array)?;
         Ok(Some(super::Flow::Continue))
     }
@@ -399,7 +399,7 @@ impl GraphBuilder<'_> {
         let Instruction::Call { callee, arguments, .. } = instruction else {
             return None;
         };
-        let [_, forwarded] = arguments.as_slice() else {
+        let [_, forwarded] = *arguments else {
             return None;
         };
         // NB: CallForwardingArguments reads the running frame, which is not an
@@ -440,16 +440,20 @@ impl GraphBuilder<'_> {
             return Ok(None);
         };
         let call_pc = call.pc;
-        let call_instruction = call.instruction.clone();
+        let call_instruction = call.instruction;
         let block = self.function.cfg.block_for_pc(self.function.pc);
         let in_one_block = block.is_some()
             && block == self.function.cfg.block_for_pc(append.pc)
             && block == self.function.cfg.block_for_pc(call_pc);
-        let array_dies = self
-            .function
-            .layout
-            .tracked_index(array)
-            .is_some_and(|slot| !self.function.liveness.live_out(index + 2).contains(slot));
+        let array_dies = match self.function.layout.tracked_index(array) {
+            Some(slot) => {
+                let live = self.live_out(index + 2);
+                let dies = !live.contains(slot);
+                self.release_slot_set(live);
+                dies
+            }
+            None => false,
+        };
         if dst != array
             || self.function.is_virtual()
             || arguments != array

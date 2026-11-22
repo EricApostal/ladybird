@@ -35,7 +35,6 @@ use super::GraphBuilder;
 use super::SlotState;
 use super::arguments;
 use crate::CompileFailure;
-use crate::bitset::BitSet;
 use crate::builder::Handling;
 use crate::builder::handling;
 use crate::bytecode::Instruction;
@@ -63,15 +62,18 @@ use crate::snapshot::Forwarding;
 use crate::snapshot::Intrinsic;
 use crate::snapshot::SuperConstructTarget;
 use crate::snapshot::call_feedback_flags;
+use ak::Zone;
+use ak::ZoneBitSet;
+use ak::ZoneVec;
 
 /// How an inlined callee was called.
 #[derive(Debug, Clone)]
-pub(super) struct InlineCall {
+pub(super) struct InlineCall<'a> {
     /// The caller's frame state at the call: resuming after it, with the
     /// result in `dst`. Every frame state inside the callee chains to it.
     pub caller_frame_state: FrameStateId,
     /// The caller's abstract frame at the call.
-    pub caller_frame: AbstractFrame,
+    pub caller_frame: AbstractFrame<'a>,
     /// For a call of a closure of the callee's function: the closure, whose
     /// environments the callee's frame has, and which its materialized
     /// frames run.
@@ -87,15 +89,15 @@ pub(super) struct InlineCall {
     /// For callees with legacy `arguments`: the values the call passes beyond
     /// the arguments the callee's bytecode reads (see
     /// `legacy_argument_values()`).
-    pub untracked_arguments: Vec<NodeId>,
+    pub untracked_arguments: ZoneVec<'a, NodeId>,
     /// Where returns continue, once the first one is built.
     pub continuation: Option<BlockId>,
     /// The values returned, one per predecessor of the continuation, with
     /// what was known at each return.
-    pub returns: Vec<NodeId>,
+    pub returns: ZoneVec<'a, NodeId>,
     /// The shapes every return knew objects have (see
     /// `AbstractFrame::fresh_shapes`), once the first return is built.
-    pub return_fresh_shapes: Option<Vec<(NodeId, CellId)>>,
+    pub return_fresh_shapes: Option<ZoneVec<'a, (NodeId, CellId)>>,
     /// Interpreter stack bytes of this callee's frame and those of the
     /// inlined calls it is in.
     pub frame_bytes: u64,
@@ -139,7 +141,7 @@ fn can_inline(callee: &Function<'_>, virtual_arguments: bool, derived_construct:
         //     interpreter runs the handler in the callee's materialized frame (see `translate::leave()` in the
         //     runtime). A handler that caught before would make the code leave again and again.
         if opcode == OpCode::Catch {
-            return !super::has_run(callee.executable, instruction.pc);
+            return !super::has_run(callee.snapshot, callee.executable, instruction.pc);
         }
         // NB: An inlined callee reads what its call passed for constant indices (see `try_build_argument()`).
         if opcode == OpCode::GetArgument {
@@ -153,6 +155,7 @@ fn can_inline(callee: &Function<'_>, virtual_arguments: bool, derived_construct:
                 | OpCode::CreateVariableEnvironment
                 | OpCode::EnterObjectEnvironment
                 | OpCode::LeavePrivateEnvironment
+                | OpCode::EnterWithOwnEnvironments
                 | OpCode::CreateArguments
                 | OpCode::CreateRestParams
                 | OpCode::CallDirectEval
@@ -200,9 +203,7 @@ fn returns_no_object(callee: &Function<'_>) -> bool {
             Instruction::Return { value } => {
                 value.raw() == THIS_VALUE_REGISTER
                     || match callee.layout.slot_kind(value) {
-                        SlotKind::Constant(index) => callee
-                            .executable
-                            .constants
+                        SlotKind::Constant(index) => callee.snapshot[callee.executable.constants]
                             .get(index as usize)
                             .is_some_and(|constant| value::tag(*constant) != value::OBJECT_TAG),
                         _ => false,
@@ -227,7 +228,7 @@ fn returns_no_object(callee: &Function<'_>) -> bool {
 /// catches what super() or its arguments throw runs in the materialized
 /// frame and can return while `this` is still empty, and nothing checks the
 /// value such a frame returns.
-fn calls_super_once_before_returning(callee: &Function<'_>) -> bool {
+fn calls_super_once_before_returning(callee: &Function<'_>, work: &Zone) -> bool {
     if callee
         .instructions
         .iter()
@@ -235,7 +236,7 @@ fn calls_super_once_before_returning(callee: &Function<'_>) -> bool {
     {
         return false;
     }
-    let mut jump_targets = Vec::new();
+    let mut jump_targets = ZoneVec::new_in(work);
     for instruction in callee.instructions {
         instruction
             .instruction
@@ -283,7 +284,9 @@ fn calls_super_once_before_returning(callee: &Function<'_>) -> bool {
         }
         // NB: What super() returned is `this`.
         let returns_undefined_or_this = |value: Operand| match callee.layout.slot_kind(value) {
-            SlotKind::Constant(index) => callee.executable.constants.get(index as usize) == Some(&value::UNDEFINED),
+            SlotKind::Constant(index) => {
+                callee.snapshot[callee.executable.constants].get(index as usize) == Some(&value::UNDEFINED)
+            }
             _ => follows_bind_this && Some(value) == super_call_result,
         };
         match instruction.instruction {
@@ -337,7 +340,7 @@ struct InlinableCallee<'a> {
 }
 
 /// A call to inline.
-struct InlinedCallSite {
+struct InlinedCallSite<'a> {
     /// The snapshot index of the callee's executable.
     index: u32,
     /// The operand holding the function value checked to be the callee, or
@@ -346,7 +349,7 @@ struct InlinedCallSite {
     /// ...if it is not the inlined function itself (a bound function).
     expected_callee: Option<CellId>,
     this: InlineValue,
-    arguments: Vec<InlineValue>,
+    arguments: ZoneVec<'a, InlineValue>,
     passed_argument_count: u32,
     /// Whether the callee gets other arguments than the `Call` instruction's.
     forwarded: bool,
@@ -365,10 +368,10 @@ struct InlinedCallSite {
     callback: Option<CallbackTarget>,
 }
 
-impl InlinedCallSite {
+impl<'a> InlinedCallSite<'a> {
     /// A call of snapshot executable `index` through
-    /// `Function.prototype.call` with `arguments`, whose first is `this`.
-    fn through_call(index: u32, arguments: &[Operand], argument_count: u32, dst: Operand) -> Self {
+    /// `Function.prototype.call` with `arguments`, whose first is `this`, with its list in `work`.
+    fn through_call(index: u32, arguments: &[Operand], argument_count: u32, dst: Operand, work: &'a Zone) -> Self {
         let this = arguments
             .first()
             .map_or(InlineValue::Constant(value::UNDEFINED), |this| {
@@ -377,7 +380,7 @@ impl InlinedCallSite {
         Self::forwarded(
             index,
             this,
-            arguments.iter().skip(1).copied().map(InlineValue::Operand).collect(),
+            ZoneVec::from_iter_in(arguments.iter().skip(1).copied().map(InlineValue::Operand), work),
             argument_count.saturating_sub(1),
             dst,
         )
@@ -385,7 +388,7 @@ impl InlinedCallSite {
 
     /// A call of snapshot executable `index` that gets other arguments than
     /// the `Call` instruction's.
-    fn forwarded(index: u32, this: InlineValue, arguments: Vec<InlineValue>, count: u32, dst: Operand) -> Self {
+    fn forwarded(index: u32, this: InlineValue, arguments: ZoneVec<'a, InlineValue>, count: u32, dst: Operand) -> Self {
         Self {
             forwarded: true,
             ..Self::new(index, this, arguments, count, dst)
@@ -397,7 +400,7 @@ impl InlinedCallSite {
     fn new(
         index: u32,
         this: InlineValue,
-        arguments: Vec<InlineValue>,
+        arguments: ZoneVec<'a, InlineValue>,
         passed_argument_count: u32,
         dst: Operand,
     ) -> Self {
@@ -419,9 +422,14 @@ impl InlinedCallSite {
     }
 }
 
-impl<'a> GraphBuilder<'a> {
+impl<'a, 'z> GraphBuilder<'a, 'z> {
     pub(super) fn boxed_object(&self, cell: CellId) -> u64 {
         (u64::from(value::OBJECT_TAG) << 48) | (cell.0 & self.runtime.heap_region_offset_mask)
+    }
+
+    /// The values of `operands`, as arguments of an inlined call.
+    fn inline_operands(&self, operands: &[Operand]) -> ZoneVec<'a, InlineValue> {
+        ZoneVec::from_iter_in(operands.iter().copied().map(InlineValue::Operand), self.work)
     }
 
     /// A frame state of the function being walked at its current
@@ -430,7 +438,7 @@ impl<'a> GraphBuilder<'a> {
     /// frame memory. The destination of a `ResumeAfter` has the value it had
     /// before the instruction, which is what the frame needs if the
     /// instruction did not write it (see `ir::FrameState`).
-    pub(super) fn new_frame_state(&self, live: &BitSet, mode: ResumeMode) -> FrameState {
+    pub(super) fn new_frame_state(&self, live: &ZoneBitSet<'_>, mode: ResumeMode) -> FrameState<'z> {
         let values = self.frame_state_values(live);
         let in_frame = self.frame_state_in_frame(live);
         FrameState {
@@ -448,8 +456,9 @@ impl<'a> GraphBuilder<'a> {
     /// The frame state after the instruction being built, which wrote
     /// `dst` (`Operand::INVALID` if nothing), for the slots live after it.
     pub(super) fn resume_after_frame_state(&mut self, dst: u32) -> FrameStateId {
-        let live = self.function.liveness.live_out(self.function.instruction_index);
+        let live = self.live_out(self.function.instruction_index);
         let frame_state = self.new_frame_state(&live, ResumeMode::ResumeAfter { dst });
+        self.release_slot_set(live);
         self.graph.add_frame_state(frame_state)
     }
 
@@ -461,7 +470,7 @@ impl<'a> GraphBuilder<'a> {
         dst: u32,
         outputs: &[usize],
     ) -> FrameStateId {
-        let live = self.function.liveness.live_out(self.function.instruction_index);
+        let live = self.live_out(self.function.instruction_index);
         let mut frame_state = self.new_frame_state(&live, ResumeMode::ResumeAfter { dst });
         for slot in outputs.iter().copied().filter(|slot| live.contains(*slot)) {
             let operand = self.function.layout.operand_for_tracked_index(slot).raw();
@@ -473,6 +482,7 @@ impl<'a> GraphBuilder<'a> {
                 frame_state.in_frame.insert(position, operand);
             }
         }
+        self.release_slot_set(live);
         self.graph.add_frame_state(frame_state)
     }
 
@@ -480,17 +490,19 @@ impl<'a> GraphBuilder<'a> {
     /// state of the function being walked lists without a value: the
     /// compiled function's slots that are in sync. Reserved registers are
     /// not listed.
-    fn frame_state_in_frame(&self, live: &BitSet) -> Vec<u32> {
+    fn frame_state_in_frame(&self, live: &ZoneBitSet<'_>) -> ZoneVec<'z, u32> {
         if self.function.is_virtual() {
-            return Vec::new();
+            return ZoneVec::new_in(self.graph.zone);
         }
         // NB: Exits never clear the reserved registers, which frames keep.
-        live.iter()
-            .filter(|slot| {
-                *slot >= crate::bytecode::RESERVED_REGISTER_COUNT as usize && self.frame.slots[*slot].in_sync
-            })
-            .map(|slot| self.function.layout.operand_for_tracked_index(slot).raw())
-            .collect()
+        ZoneVec::from_iter_in(
+            live.iter()
+                .filter(|slot| {
+                    *slot >= crate::bytecode::RESERVED_REGISTER_COUNT as usize && self.frame.slots[*slot].in_sync
+                })
+                .map(|slot| self.function.layout.operand_for_tracked_index(slot).raw()),
+            self.graph.zone,
+        )
     }
 
     /// The values a frame state of the function being walked lists for the
@@ -498,7 +510,7 @@ impl<'a> GraphBuilder<'a> {
     /// virtual frames, but the exception register. Inlined callees that are
     /// not strict list all their passed arguments too, since their legacy
     /// `arguments` shows them in the frames exits and slow paths materialize.
-    fn frame_state_values(&self, live: &BitSet) -> Vec<(u32, NodeId)> {
+    fn frame_state_values(&self, live: &ZoneBitSet<'_>) -> ZoneVec<'z, (u32, NodeId)> {
         let is_virtual = self.function.is_virtual();
         // NB: Only the runtime writes the exception register (materialized frames start with it empty): when a
         //     handler of the frame catches an exception, before a leave writes the rest of the frame, which must keep
@@ -507,14 +519,15 @@ impl<'a> GraphBuilder<'a> {
             .function
             .layout
             .tracked_index(Operand::from_raw(crate::bytecode::EXCEPTION_REGISTER));
-        let mut values = live
-            .iter()
-            .filter(|slot| Some(*slot) != exception_register)
-            .filter_map(|slot| {
-                let SlotState { node, in_sync } = self.frame.slots[slot];
-                (is_virtual || !in_sync).then(|| (self.function.layout.operand_for_tracked_index(slot).raw(), node))
-            })
-            .collect::<Vec<_>>();
+        let mut values = ZoneVec::from_iter_in(
+            live.iter()
+                .filter(|slot| Some(*slot) != exception_register)
+                .filter_map(|slot| {
+                    let SlotState { node, in_sync } = self.frame.slots[slot];
+                    (is_virtual || !in_sync).then(|| (self.function.layout.operand_for_tracked_index(slot).raw(), node))
+                }),
+            self.graph.zone,
+        );
         for (operand, node) in self.legacy_argument_values() {
             if !values.iter().any(|(slot, _)| *slot == operand) {
                 values.push((operand, node));
@@ -532,21 +545,22 @@ impl<'a> GraphBuilder<'a> {
     /// all its passed arguments, which its legacy `arguments` shows. Those
     /// its bytecode reads are its frame's, the others the values the call
     /// passed.
-    fn legacy_argument_values(&self) -> Vec<(u32, NodeId)> {
+    fn legacy_argument_values(&self) -> impl Iterator<Item = (u32, NodeId)> + '_ {
         let function = &self.function;
-        let Some(call) = function.inline.as_ref().filter(|_| function.has_legacy_arguments()) else {
-            return Vec::new();
-        };
+        let call = function.inline.as_ref().filter(|_| function.has_legacy_arguments());
         let layout = function.layout;
-        let mut values = Vec::new();
-        for argument in 0..layout.number_of_arguments {
-            let slot = (layout.registers_and_locals_count + argument) as usize;
-            values.push((layout.arguments_base() + argument, self.frame.slots[slot].node));
-        }
-        for (argument, node) in (layout.number_of_arguments..).zip(&call.untracked_arguments) {
-            values.push((layout.arguments_base() + argument, *node));
-        }
-        values
+        let tracked = call
+            .map_or(0..0, |_| 0..layout.number_of_arguments)
+            .map(move |argument| {
+                let slot = (layout.registers_and_locals_count + argument) as usize;
+                (layout.arguments_base() + argument, self.frame.slots[slot].node)
+            });
+        let untracked = call.into_iter().flat_map(move |call| {
+            (layout.number_of_arguments..)
+                .zip(&call.untracked_arguments)
+                .map(move |(argument, node)| (layout.arguments_base() + argument, *node))
+        });
+        tracked.chain(untracked)
     }
 
     /// Ends the instruction at `instruction_index` just built (with the
@@ -563,36 +577,39 @@ impl<'a> GraphBuilder<'a> {
             || self
                 .graph
                 .frame_state_chain(parent)
-                .iter()
-                .any(|id| !self.graph.frame_state(*id).legacy_arguments.is_empty());
+                .any(|id| !self.graph.frame_state(id).legacy_arguments.is_empty());
         if !has_legacy_arguments {
             return;
         }
         let function_index = self.function.index;
         let graph = &self.graph;
-        let nodes = (first_node..graph.nodes.len())
-            .map(|index| NodeId(index as u32))
-            .filter(|node| {
-                let data = graph.node(*node);
-                // NB: Nodes of the calls the instruction inlined run in frames
-                //     of their own, after which those calls guard themselves.
-                data.op.properties().runs_code
-                    && data.frame_state.is_some_and(|frame_state| {
-                        let innermost = graph.frame_state(frame_state);
-                        innermost.executable == function_index && innermost.parent == Some(parent)
-                    })
-            })
-            .collect::<Vec<_>>();
+        let nodes = ZoneVec::from_iter_in(
+            (first_node..graph.nodes.len())
+                .map(|index| NodeId(index as u32))
+                .filter(|node| {
+                    let data = graph.node(*node);
+                    // NB: Nodes of the calls the instruction inlined run in frames
+                    //     of their own, after which those calls guard themselves.
+                    data.op.properties().runs_code
+                        && data.frame_state.is_some_and(|frame_state| {
+                            let innermost = graph.frame_state(frame_state);
+                            innermost.executable == function_index && innermost.parent == Some(parent)
+                        })
+                }),
+            graph.zone,
+        );
         if nodes.is_empty() {
             return;
         }
         let last = instruction_index + self.function.skipped_instructions;
+        let live = self.live_out(last);
         let frame_state = FrameState {
             pc: self.function.instructions[last].next_pc(),
-            ..self.new_frame_state(&self.function.liveness.live_out(last), ResumeMode::ResumeAt)
+            ..self.new_frame_state(&live, ResumeMode::ResumeAt)
         };
+        self.release_slot_set(live);
         let frame_state = self.graph.add_frame_state(frame_state);
-        let guard = self.emit(Op::AssumeLegacyArgumentsUnread, Vec::new(), None);
+        let guard = self.emit(Op::AssumeLegacyArgumentsUnread, &[], None);
         self.graph.nodes[guard.index()].frame_state = Some(frame_state);
         self.graph.legacy_arguments_guards.push((guard, nodes));
     }
@@ -657,10 +674,15 @@ impl<'a> GraphBuilder<'a> {
             unreachable!("calls are generic instructions");
         };
         let slots_offset = u64::from(self.runtime.offsets.execution_context_slots);
-        if let Some(native) = feedback.native_call.filter(|native| native.entry.is_some()) {
+        // NB: Calls into another realm are the runtime's (see `RuntimeOffsets::vm_current_realm`).
+        if let Some(native) = feedback
+            .native_call
+            .filter(|native| native.entry.is_some() && native.realm == self.runtime.realm)
+        {
             // NB: Native calls take the callee, the `this` value and the
             //     arguments as inputs like direct calls do.
-            let mut inputs = vec![*callee, *this_value];
+            let mut inputs = ZoneVec::with_capacity_in(arguments.len() + 2, self.work);
+            inputs.extend([*callee, *this_value]);
             inputs.extend(arguments.iter().copied());
             // NB: Calls without the frames of the inlined calls they are in check their callee (see
             //     `check_call_without_frames_target()`), and are generic where those checks exited before.
@@ -731,7 +753,12 @@ impl<'a> GraphBuilder<'a> {
         instruction: &Instruction,
         bits: u64,
     ) -> Result<Option<Flow>, CompileFailure> {
-        let Some(target) = self.direct_call_functions.get(&bits).copied() else {
+        let Some(target) = self
+            .direct_call_functions
+            .get(&bits)
+            .copied()
+            .filter(|target| target.function.realm == self.runtime.realm)
+        else {
             return Ok(None);
         };
         let index = u32::try_from(self.graph.direct_call_targets.len()).expect("target count fits in u32");
@@ -760,6 +787,10 @@ impl<'a> GraphBuilder<'a> {
         let Handling::Generic(info) = handling(OpCode::Call) else {
             unreachable!("calls are generic instructions");
         };
+        // NB: Calls into another realm are the runtime's (see `RuntimeOffsets::vm_current_realm`).
+        if target.function.realm != self.runtime.realm {
+            return Ok(None);
+        }
         // NB: Direct calls take the callee, the `this` value if the callee
         //     reads it, and the arguments as inputs (see
         //     `codegen::DIRECT_CALL_MAX_INPUTS`), and store them straight
@@ -767,7 +798,8 @@ impl<'a> GraphBuilder<'a> {
         //     are written whole, and for the virtual arguments object.
         // NB: Calls without the frames of the inlined calls they are in
         //     always take `this`, for their slow paths.
-        let mut inputs = vec![*callee, *this_value];
+        let mut inputs = ZoneVec::with_capacity_in(arguments.len() + 2, self.work);
+        inputs.extend([*callee, *this_value]);
         inputs.extend(arguments.iter().copied());
         // NB: Calls without those frames check their callee, unless it is constant (see
         //     `check_call_without_frames_target()`), and are generic where those checks exited before.
@@ -793,11 +825,12 @@ impl<'a> GraphBuilder<'a> {
             self.embed(target.function.global_this);
         }
         if let Some(index) = target.environment {
-            let Some(template) = self.function.executable.environment_templates.get(index as usize) else {
+            let snapshot = self.snapshot;
+            let Some(template) = snapshot[self.function.executable.environment_templates].get(index as usize) else {
                 return Ok(None);
             };
-            for cell in template.cells.clone() {
-                self.embed(cell);
+            for cell in &snapshot[template.cells] {
+                self.embed(*cell);
             }
         }
         if let Some(inlined_frame_bytes) = without_frames {
@@ -850,7 +883,7 @@ impl<'a> GraphBuilder<'a> {
                 Op::CheckClosure {
                     shared_data: target.function.shared_data,
                 },
-                vec![value],
+                &[value],
                 None,
             );
             return Ok(());
@@ -898,13 +931,14 @@ impl<'a> GraphBuilder<'a> {
     fn build_call_without_inlined_frames(
         &mut self,
         instruction: &Instruction,
-        op: Op,
+        op: Op<'z>,
         inputs: &[Operand],
     ) -> Result<Flow, CompileFailure> {
-        let input_nodes = inputs
-            .iter()
-            .map(|operand| self.read(*operand))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut input_nodes = ZoneVec::with_capacity_in(inputs.len(), self.work);
+        for operand in inputs {
+            let node = self.read(*operand)?;
+            input_nodes.push(node);
+        }
         let mut destination = None;
         instruction.for_each_operand(|operand, role| {
             if role.is_written() {
@@ -912,7 +946,7 @@ impl<'a> GraphBuilder<'a> {
             }
         });
         let destination = destination.expect("a call writes its destination");
-        let node = self.emit(op, input_nodes, Some(Repr::Tagged));
+        let node = self.emit(op, &input_nodes, Some(Repr::Tagged));
         // NB: Resuming after the call, the frame's destination holds the
         //     result already.
         let frame_state = self.resume_after_frame_state(destination.raw());
@@ -954,7 +988,7 @@ impl<'a> GraphBuilder<'a> {
                 ..InlinedCallSite::new(
                     index,
                     InlineValue::Operand(*this_value),
-                    arguments.iter().copied().map(InlineValue::Operand).collect(),
+                    self.inline_operands(arguments),
                     *argument_count,
                     *dst,
                 )
@@ -984,7 +1018,7 @@ impl<'a> GraphBuilder<'a> {
                 ..InlinedCallSite::new(
                     callback.index,
                     InlineValue::Operand(*this_value),
-                    arguments.iter().copied().map(InlineValue::Operand).collect(),
+                    self.inline_operands(arguments),
                     *argument_count,
                     *dst,
                 )
@@ -1005,7 +1039,7 @@ impl<'a> GraphBuilder<'a> {
                 ..InlinedCallSite::new(
                     index,
                     InlineValue::Operand(*this_value),
-                    arguments.iter().copied().map(InlineValue::Operand).collect(),
+                    self.inline_operands(arguments),
                     *argument_count,
                     *dst,
                 )
@@ -1032,11 +1066,11 @@ impl<'a> GraphBuilder<'a> {
                 }
                 InlinedCallSite {
                     callee: Some(*this_value),
-                    ..InlinedCallSite::through_call(index, arguments, *argument_count, *dst)
+                    ..InlinedCallSite::through_call(index, arguments, *argument_count, *dst, self.work)
                 }
             }
             Forwarding::Apply => {
-                let [this, forwarded_arguments] = arguments.as_slice() else {
+                let [this, forwarded_arguments] = *arguments else {
                     return Ok(None);
                 };
                 if self.constant_intrinsic(*callee) != Some(Intrinsic::FunctionPrototypeApply)
@@ -1047,7 +1081,7 @@ impl<'a> GraphBuilder<'a> {
                 let (arguments, count) = match self.inlined_call_arguments() {
                     Some(arguments) => arguments,
                     None if self.may_speculate(ExitKind::UnexpectedValue) => (
-                        (0..forwarded.argument_count).map(InlineValue::FrameArgument).collect(),
+                        ZoneVec::from_iter_in((0..forwarded.argument_count).map(InlineValue::FrameArgument), self.work),
                         forwarded.argument_count,
                     ),
                     None => return Ok(None),
@@ -1062,15 +1096,24 @@ impl<'a> GraphBuilder<'a> {
                     return Ok(None);
                 };
                 let start = forwarded.bound_arguments_start as usize;
-                let Some(bound_arguments) = self
-                    .function
-                    .executable
-                    .feedback
-                    .bound_arguments
+                let Some(bound_arguments) = self.snapshot[self.function.executable.feedback.bound_arguments]
                     .get(start..start + forwarded.bound_argument_count as usize)
                 else {
                     return Ok(None);
                 };
+                // NB: The code embeds the bound values as constants, so it lists the cells among them, which keeps them
+                //     where they are.
+                let bound_values = core::iter::once(forwarded.bound_this).chain(bound_arguments.iter().copied());
+                let (pattern, base, mask) = (
+                    self.runtime.shifted_is_cell_pattern,
+                    self.runtime.heap_region_base,
+                    self.runtime.heap_region_offset_mask,
+                );
+                for bits in bound_values.filter(|bits| bits & pattern == pattern) {
+                    if !self.graph.embedded_cells.contains(&CellId(base + (bits & mask))) {
+                        self.graph.embedded_cells.push(CellId(base + (bits & mask)));
+                    }
+                }
                 InlinedCallSite {
                     callee: Some(*callee),
                     expected_callee: Some(bound_function),
@@ -1078,12 +1121,14 @@ impl<'a> GraphBuilder<'a> {
                     ..InlinedCallSite::new(
                         index,
                         InlineValue::Constant(forwarded.bound_this),
-                        bound_arguments
-                            .iter()
-                            .copied()
-                            .map(InlineValue::Constant)
-                            .chain(arguments.iter().copied().map(InlineValue::Operand))
-                            .collect(),
+                        ZoneVec::from_iter_in(
+                            bound_arguments
+                                .iter()
+                                .copied()
+                                .map(InlineValue::Constant)
+                                .chain(arguments.iter().copied().map(InlineValue::Operand)),
+                            self.work,
+                        ),
                         forwarded.bound_argument_count + argument_count,
                         *dst,
                     )
@@ -1117,7 +1162,7 @@ impl<'a> GraphBuilder<'a> {
             let call = InlinedCallSite::new(
                 index,
                 InlineValue::Operand(*this_value),
-                arguments.iter().copied().map(InlineValue::Operand).collect(),
+                self.inline_operands(arguments),
                 *argument_count,
                 *dst,
             );
@@ -1128,7 +1173,7 @@ impl<'a> GraphBuilder<'a> {
         };
         // NB: An inlined callee forwards what its call passed it.
         if self.constant_intrinsic(*callee) == Some(Intrinsic::FunctionPrototypeApply)
-            && let [this, forwarded_arguments] = arguments.as_slice()
+            && let [this, forwarded_arguments] = *arguments
             && self.holds_virtual_arguments(*forwarded_arguments)
             && let Some((arguments, count)) = self.inlined_call_arguments()
         {
@@ -1138,21 +1183,27 @@ impl<'a> GraphBuilder<'a> {
         if self.constant_intrinsic(*callee) != Some(Intrinsic::FunctionPrototypeCall) {
             return Ok(None);
         }
-        self.inline_call(InlinedCallSite::through_call(index, arguments, *argument_count, *dst))
+        self.inline_call(InlinedCallSite::through_call(
+            index,
+            arguments,
+            *argument_count,
+            *dst,
+            self.work,
+        ))
     }
 
     /// The functions the callee of a call may be, with the snapshot
     /// executables of those whose calls may be inlined, if the callee is a
     /// phi of a few function constants in the current block, like the
     /// methods a property lookup found for the shapes it switched on.
-    fn callee_cases(&self, callee: Operand) -> Option<Vec<(u64, Option<u32>)>> {
+    fn callee_cases(&self, callee: Operand) -> Option<ZoneVec<'a, (u64, Option<u32>)>> {
         let node = self.peek(callee)?.node;
         // NB: Phis of loop headers get the inputs of their back edges later.
         let block = &self.graph.blocks[self.block.index()];
         if block.is_loop_header || !block.phis.contains(&node) {
             return None;
         }
-        let mut cases: Vec<(u64, Option<u32>)> = Vec::new();
+        let mut cases = ZoneVec::new_in(self.work);
         for input in &self.graph.node(node).inputs {
             let bits = self.graph.constant_value(*input)?;
             if value::tag(bits) != value::OBJECT_TAG {
@@ -1179,7 +1230,11 @@ impl<'a> GraphBuilder<'a> {
     /// predecessors jump to it. Each case can then start on its edges, which
     /// keep what the code knew there, like the shape of the receiver the
     /// `GetById` that found the methods switched on.
-    fn callee_case_edges(&self, callee_phi: NodeId, cases: &[(u64, Option<u32>)]) -> Option<Vec<Vec<BlockId>>> {
+    fn callee_case_edges(
+        &self,
+        callee_phi: NodeId,
+        cases: &[(u64, Option<u32>)],
+    ) -> Option<ZoneVec<'a, ZoneVec<'a, BlockId>>> {
         let block = &self.graph.blocks[self.block.index()];
         if !block.body.is_empty() || block.phis != [callee_phi] {
             return None;
@@ -1195,20 +1250,20 @@ impl<'a> GraphBuilder<'a> {
             return None;
         }
         let inputs = &self.graph.node(callee_phi).inputs;
-        Some(
-            cases
-                .iter()
-                .map(|(bits, _)| {
+        Some(ZoneVec::from_iter_in(
+            cases.iter().map(|(bits, _)| {
+                ZoneVec::from_iter_in(
                     block
                         .predecessors
                         .iter()
                         .zip(inputs)
                         .filter(|(_, input)| self.graph.constant_value(**input) == Some(*bits))
-                        .map(|(predecessor, _)| *predecessor)
-                        .collect()
-                })
-                .collect(),
-        )
+                        .map(|(predecessor, _)| *predecessor),
+                    self.work,
+                )
+            }),
+            self.work,
+        ))
     }
 
     /// Makes `edges`, edges into the current block `join` (see
@@ -1223,20 +1278,22 @@ impl<'a> GraphBuilder<'a> {
     ) -> BlockId {
         if case == 0 {
             let block = &self.graph.blocks[join.index()];
-            let kept_inputs = block
-                .predecessors
-                .iter()
-                .zip(&self.graph.node(callee_phi).inputs)
-                .filter(|(predecessor, _)| edges.contains(predecessor))
-                .map(|(_, input)| *input)
-                .collect::<Vec<_>>();
-            self.graph.nodes[callee_phi.index()].inputs = kept_inputs;
-            self.graph.blocks[join.index()].predecessors = edges.to_vec();
+            let kept_inputs = ZoneVec::from_iter_in(
+                block
+                    .predecessors
+                    .iter()
+                    .zip(&self.graph.node(callee_phi).inputs)
+                    .filter(|(predecessor, _)| edges.contains(predecessor))
+                    .map(|(_, input)| *input),
+                self.work,
+            );
+            self.graph.nodes[callee_phi.index()].inputs.assign(&kept_inputs);
+            self.graph.blocks[join.index()].predecessors.assign(edges);
             return join;
         }
         let block = self.graph.add_block(Block {
-            predecessors: edges.to_vec(),
-            ..Block::default()
+            predecessors: self.graph.list(edges),
+            ..self.graph.new_block()
         });
         self.order.push(block);
         for predecessor in edges {
@@ -1284,14 +1341,13 @@ impl<'a> GraphBuilder<'a> {
         let Some(dst_slot) = self.function.layout.tracked_index(*dst) else {
             return Ok(None);
         };
-        let operands = std::iter::once(*callee)
-            .chain(std::iter::once(*this_value))
-            .chain(arguments.iter().copied())
-            .collect::<Vec<_>>();
+        let mut operands = core::iter::once(*callee)
+            .chain(core::iter::once(*this_value))
+            .chain(arguments.iter().copied());
         if self.graph.legacy_arguments.contains(&dst.raw())
             || info.reads_whole_frame
             || crate::codegen::slow_path_call(OpCode::Call).is_none()
-            || operands.iter().any(|operand| self.holds_virtual_arguments(*operand))
+            || operands.any(|operand| self.holds_virtual_arguments(operand))
         {
             return Ok(None);
         }
@@ -1311,8 +1367,8 @@ impl<'a> GraphBuilder<'a> {
         };
         let join = self.block;
         let frame = self.frame.clone();
-        let mut results = Vec::new();
-        let mut case_shapes = Vec::new();
+        let mut results = ZoneVec::new_in(self.work);
+        let mut case_shapes = ZoneVec::new_in(self.work);
         for (case, (bits, index)) in cases.iter().enumerate() {
             let mut next_case = None;
             match (&edges, callee_value) {
@@ -1331,10 +1387,8 @@ impl<'a> GraphBuilder<'a> {
                 //     no branch.
                 (None, Some(callee_value)) if case + 1 < cases.len() => {
                     let expected = self.constant(*bits);
-                    let (if_true, if_false) = self.branch_both_ways(
-                        BranchCondition::TaggedEquals { equal: true },
-                        vec![callee_value, expected],
-                    );
+                    let (if_true, if_false) =
+                        self.branch_both_ways(BranchCondition::TaggedEquals { equal: true }, &[callee_value, expected]);
                     self.block = if_true;
                     next_case = Some(if_false);
                 }
@@ -1344,7 +1398,7 @@ impl<'a> GraphBuilder<'a> {
                 Some(index) if self.may_inline_callee_case(*index) => self.inline_call(InlinedCallSite::new(
                     *index,
                     InlineValue::Operand(*this_value),
-                    arguments.iter().copied().map(InlineValue::Operand).collect(),
+                    self.inline_operands(arguments),
                     *argument_count,
                     *dst,
                 ))?,
@@ -1369,9 +1423,9 @@ impl<'a> GraphBuilder<'a> {
                     "cases change no slot but the destination"
                 );
                 results.push((self.block, node, *bits));
-                case_shapes.push(std::mem::take(&mut self.frame.fresh_shapes));
+                case_shapes.push(self.frame.fresh_shapes.take());
             }
-            self.frame = frame.clone();
+            self.frame.clone_from(&frame);
             if let Some(next_case) = next_case {
                 self.block = next_case;
             }
@@ -1380,33 +1434,39 @@ impl<'a> GraphBuilder<'a> {
         if results.is_empty() {
             return Ok(Some(Flow::Ended));
         }
-        self.join_blocks(results.iter().map(|(block, _, _)| *block).collect());
+        self.join_blocks(&ZoneVec::from_iter_in(
+            results.iter().map(|(block, _, _)| *block),
+            self.work,
+        ));
         if edges.is_some() {
             // NB: The callee's phi no longer reaches here.
-            let functions = results
-                .iter()
-                .map(|(_, _, bits)| self.constant(*bits))
-                .collect::<Vec<_>>();
+            let mut functions = ZoneVec::with_capacity_in(results.len(), self.work);
+            for (_, _, bits) in &results {
+                let function = self.constant(*bits);
+                functions.push(function);
+            }
             let function = if functions.iter().all(|function| *function == functions[0]) {
                 functions[0]
             } else {
-                self.add_phi(functions)
+                self.add_phi(&functions)
             };
             self.frame.slots[callee_slot] = SlotState {
                 node: function,
                 in_sync: callee_in_sync,
             };
         }
-        let values = results
-            .iter()
-            .map(|(block, value, _)| self.tagged_at_end_of(*block, *value))
-            .collect::<Vec<_>>();
+        let mut values = ZoneVec::with_capacity_in(results.len(), self.work);
+        for (block, value, _) in &results {
+            let value = self.tagged_at_end_of(*block, *value);
+            values.push(value);
+        }
         let result = if values.iter().all(|value| *value == values[0]) {
             values[0]
         } else {
-            self.add_phi(values)
+            self.add_phi(&values)
         };
-        self.frame.fresh_shapes = AbstractFrame::common_fresh_shapes(case_shapes.iter().map(Vec::as_slice));
+        self.frame
+            .set_common_fresh_shapes(case_shapes.iter().map(|shapes| shapes.as_slice()));
         self.write(*dst, result)?;
         Ok(Some(Flow::Continue))
     }
@@ -1426,7 +1486,7 @@ impl<'a> GraphBuilder<'a> {
         self.inline_call(InlinedCallSite {
             closure: getter,
             check_closure: getter.is_some(),
-            ..InlinedCallSite::new(index, InlineValue::Operand(this), Vec::new(), 0, dst)
+            ..InlinedCallSite::new(index, InlineValue::Operand(this), ZoneVec::new_in(self.work), 0, dst)
         })
     }
 
@@ -1450,7 +1510,7 @@ impl<'a> GraphBuilder<'a> {
             ..InlinedCallSite::new(
                 index,
                 InlineValue::Operand(this),
-                vec![InlineValue::Operand(value)],
+                ZoneVec::from_slice_in(&[InlineValue::Operand(value)], self.work),
                 1,
                 dst,
             )
@@ -1484,8 +1544,7 @@ impl<'a> GraphBuilder<'a> {
         else {
             return Ok(None);
         };
-        let Some(index) = self.snapshot.executables[executable as usize]
-            .closure_templates
+        let Some(index) = self.snapshot[self.snapshot.executables[executable as usize].closure_templates]
             .get(shared_function_data_index as usize)
             .and_then(Option::as_ref)
             .and_then(|template| template.inline_executable)
@@ -1497,7 +1556,7 @@ impl<'a> GraphBuilder<'a> {
             ..InlinedCallSite::new(
                 index,
                 InlineValue::Operand(*this_value),
-                arguments.iter().copied().map(InlineValue::Operand).collect(),
+                self.inline_operands(arguments),
                 *argument_count,
                 *dst,
             )
@@ -1540,7 +1599,7 @@ impl<'a> GraphBuilder<'a> {
             ..InlinedCallSite::new(
                 construct.executable,
                 InlineValue::Constant(value::UNDEFINED),
-                arguments.iter().copied().map(InlineValue::Operand).collect(),
+                self.inline_operands(arguments),
                 *argument_count,
                 *dst,
             )
@@ -1563,7 +1622,7 @@ impl<'a> GraphBuilder<'a> {
             return false;
         }
         // NB: The constructors inlined above `target` by then, from the derived constructor here down.
-        let mut inlined_above = vec![constructor_executable.cell];
+        let mut inlined_above = ZoneVec::from_slice_in(&[constructor_executable.cell], self.work);
         loop {
             let kind = if target.derived {
                 InlinedCallKind::DerivedConstruct
@@ -1596,16 +1655,16 @@ impl<'a> GraphBuilder<'a> {
         let Some(executable) = self.snapshot.executables.get(index as usize) else {
             return true;
         };
-        let Ok(decoded) = super::decoded_function(executable, &self.decoded[index as usize]) else {
+        let Ok(decoded) = super::decoded_function(self.snapshot, executable, &self.decoded[index as usize], self.work)
+        else {
             return true;
         };
+        let exit_sites = &self.snapshot[executable.exit_sites];
         decoded.instructions.iter().any(|instruction| {
             matches!(
                 instruction.instruction.opcode(),
                 OpCode::SuperCall | OpCode::SuperCallWithForwardedArguments
-            ) && executable
-                .exit_sites
-                .contains(&(instruction.pc, ExitKind::BadCallTarget))
+            ) && exit_sites.contains(&(instruction.pc, ExitKind::BadCallTarget))
         })
     }
 
@@ -1679,7 +1738,7 @@ impl<'a> GraphBuilder<'a> {
             } => (
                 dst,
                 super_constructor,
-                arguments.iter().copied().map(InlineValue::Operand).collect::<Vec<_>>(),
+                self.inline_operands(arguments),
                 *argument_count,
                 false,
             ),
@@ -1694,12 +1753,12 @@ impl<'a> GraphBuilder<'a> {
                     .as_ref()
                     .expect("derived constructs are inlined calls");
                 let count = call.passed_argument_count;
-                let arguments = self
-                    .legacy_argument_values()
-                    .into_iter()
-                    .take(count as usize)
-                    .map(|(_, node)| InlineValue::Node(node))
-                    .collect::<Vec<_>>();
+                let arguments = ZoneVec::from_iter_in(
+                    self.legacy_argument_values()
+                        .take(count as usize)
+                        .map(|(_, node)| InlineValue::Node(node)),
+                    self.work,
+                );
                 if arguments.len() != count as usize {
                     return Err(CompileFailure::InvalidBytecode {
                         pc: self.function.pc,
@@ -1720,7 +1779,7 @@ impl<'a> GraphBuilder<'a> {
                     expected,
                     kind: ExitKind::UnexpectedValue,
                 },
-                vec![super_constructor_value],
+                &[super_constructor_value],
                 None,
             );
         }
@@ -1775,7 +1834,7 @@ impl<'a> GraphBuilder<'a> {
             Op::Exit {
                 kind: ExitKind::BadCallTarget,
             },
-            Vec::new(),
+            &[],
         );
         self.graph.nodes[exit.index()].frame_state = Some(frame_state);
         Ok(Some(Flow::Ended))
@@ -1798,9 +1857,11 @@ impl<'a> GraphBuilder<'a> {
         {
             return Ok(false);
         }
-        let Some(fields) = self.function.executable.derived_instance_fields.clone() else {
+        let Some(fields) = self.function.executable.derived_instance_fields else {
             return Ok(false);
         };
+        let snapshot = self.snapshot;
+        let added_fields = &snapshot[fields.fields];
         let this_register = Operand::from_raw(THIS_VALUE_REGISTER);
         let this_value = self.read(this_register)?;
         if self.graph.constant_value(this_value) != Some(value::EMPTY) {
@@ -1816,9 +1877,14 @@ impl<'a> GraphBuilder<'a> {
         else {
             return Ok(false);
         };
-        let added_count = fields.fields.iter().map(|(offset, _, _)| offset + 1).max().unwrap_or(0);
+        let added_count = added_fields.iter().map(|(offset, _, _)| offset + 1).max().unwrap_or(0);
         let reserve = reserve.max(added_count);
-        if self.runtime.object_allocation.size_class_for(reserve).is_none() {
+        if self
+            .runtime
+            .object_allocation
+            .size_class_for(snapshot, reserve)
+            .is_none()
+        {
             return Ok(false);
         }
         self.graph.nodes[allocation.index()].op = Op::AllocateObject {
@@ -1845,7 +1911,7 @@ impl<'a> GraphBuilder<'a> {
         // NB: The fields have literal values, so this cannot throw, and since `this` has the shape the fields start
         //     from (checked above), which allows extensions and has none of their names, each field adds its property
         //     or sets the value of an earlier field of the same name.
-        for (offset, value, added) in fields.fields {
+        for (offset, value, added) in added_fields.iter().copied() {
             let value = self.constant(value);
             match added {
                 Some(shape) => {
@@ -1857,7 +1923,7 @@ impl<'a> GraphBuilder<'a> {
                             shape,
                             property_count: offset + 1,
                         },
-                        vec![object, value, address],
+                        &[object, value, address],
                         None,
                     );
                 }
@@ -2030,7 +2096,7 @@ impl<'a> GraphBuilder<'a> {
                 property_count,
                 reserve: construct.reserve.max(property_count),
             },
-            Vec::new(),
+            &[],
             Some(Repr::Tagged),
         );
         // 10.2.2 [[Construct]] ( argumentsList, newTarget ), https://tc39.es/ecma262/#sec-ecmascript-function-objects-construct-argumentslist-newtarget
@@ -2038,7 +2104,7 @@ impl<'a> GraphBuilder<'a> {
         // NB: The fields have literal values, so this cannot throw, and `this` has their shape already.
         for &(offset, value) in fields {
             let value = self.constant(value);
-            self.emit(Op::InitializeNamed { offset }, vec![this, value], None);
+            self.emit(Op::InitializeNamed { offset }, &[this, value], None);
         }
         this
     }
@@ -2052,7 +2118,7 @@ impl<'a> GraphBuilder<'a> {
             InlineValue::FrameArgument(index) => {
                 let index = self.constant(value::int32(index.cast_signed()));
                 let arguments_base = self.function.layout.arguments_base();
-                Ok(self.emit_checked(Op::LoadArgument { arguments_base }, vec![index], Some(Repr::Tagged)))
+                Ok(self.emit_checked(Op::LoadArgument { arguments_base }, &[index], Some(Repr::Tagged)))
             }
         }
     }
@@ -2113,7 +2179,12 @@ impl<'a> GraphBuilder<'a> {
         if callee_executable.builtin {
             return true;
         }
-        let Ok(decoded) = super::decoded_function(callee_executable, &self.decoded[index as usize]) else {
+        let Ok(decoded) = super::decoded_function(
+            self.snapshot,
+            callee_executable,
+            &self.decoded[index as usize],
+            self.work,
+        ) else {
             return false;
         };
         self.inlined_instructions + decoded.instructions.len()
@@ -2137,7 +2208,11 @@ impl<'a> GraphBuilder<'a> {
     ) -> Option<InlinableCallee<'a>> {
         let snapshot = self.snapshot;
         let callee_executable = snapshot.executables.get(index as usize)?;
-        callee_executable.function?;
+        // NB: Calls into another realm are the runtime's, which changes the current realm (see
+        //     `RuntimeOffsets::vm_current_realm`).
+        if callee_executable.function?.realm != self.runtime.realm {
+            return None;
+        }
         let may_inline = if checks_callee {
             self.may_inline_calls_of_below(callee_executable, inlined_above)
         } else {
@@ -2146,12 +2221,13 @@ impl<'a> GraphBuilder<'a> {
         if !may_inline {
             return None;
         }
-        let decoded = super::decoded_function(callee_executable, &self.decoded[index as usize]).ok()?;
+        let decoded =
+            super::decoded_function(snapshot, callee_executable, &self.decoded[index as usize], self.work).ok()?;
         let instruction_count = decoded.instructions.len();
         let limits = snapshot.options.inlining;
         // NB: Builtins are always inlined (see the snapshot's inlining rules).
         let within_budget = callee_executable.builtin
-            || crate::bytecode::inlining_size(&decoded.instructions) <= limits.always_inlined_instructions as usize
+            || crate::bytecode::inlining_size(decoded.instructions) <= limits.always_inlined_instructions as usize
             || (kind != InlinedCallKind::Call && instruction_count <= limits.max_construct_instructions as usize)
             || (instruction_count <= limits.max_instructions as usize
                 && self.inlined_instructions + instruction_count <= limits.budget_instructions as usize);
@@ -2181,7 +2257,7 @@ impl<'a> GraphBuilder<'a> {
             || (closure && callee_executable.is_non_strict_function())
             || (virtual_arguments && uses_passed_arguments)
             || forwards_arguments_to_super;
-        let callee_function = Function::new(index, callee_executable, decoded, has_legacy_arguments).ok()?;
+        let callee_function = Function::new(snapshot, index, decoded, has_legacy_arguments, self.work).ok()?;
         if !can_inline(&callee_function, virtual_arguments, derived_construct) {
             return None;
         }
@@ -2200,7 +2276,7 @@ impl<'a> GraphBuilder<'a> {
                 returns_no_object(&callee_function)
                     && (!callee_executable.has_instance_elements || callee_executable.literal_instance_fields.is_some())
             }
-            InlinedCallKind::DerivedConstruct => calls_super_once_before_returning(&callee_function),
+            InlinedCallKind::DerivedConstruct => calls_super_once_before_returning(&callee_function, self.work),
         };
         qualifies.then_some(InlinableCallee {
             executable: callee_executable,
@@ -2210,7 +2286,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     /// Inlines the call `call` describes, if its callee qualifies.
-    fn inline_call(&mut self, call: InlinedCallSite) -> Result<Option<Flow>, CompileFailure> {
+    fn inline_call(&mut self, call: InlinedCallSite<'a>) -> Result<Option<Flow>, CompileFailure> {
         let InlinedCallSite {
             index,
             callee,
@@ -2229,7 +2305,7 @@ impl<'a> GraphBuilder<'a> {
         let derived_construct = construct.filter(|construct| construct.super_constructor.is_some());
         // NB: The callee's frame cannot hold the virtual arguments object:
         //     the callee's generic instructions could not read it.
-        if std::iter::once(&this)
+        if core::iter::once(&this)
             .chain(arguments.iter())
             .any(|value| matches!(value, InlineValue::Operand(operand) if self.holds_virtual_arguments(*operand)))
         {
@@ -2287,8 +2363,6 @@ impl<'a> GraphBuilder<'a> {
         };
 
         self.embed(function.function);
-        // NB: Materialized frames store the realm.
-        self.embed(function.realm);
         if let Some(closure) = closure
             && check_closure
         {
@@ -2297,7 +2371,7 @@ impl<'a> GraphBuilder<'a> {
                 Op::CheckClosure {
                     shared_data: function.shared_data,
                 },
-                vec![closure],
+                &[closure],
                 None,
             );
         }
@@ -2313,7 +2387,7 @@ impl<'a> GraphBuilder<'a> {
             Some(construct) if derived_construct.is_none() => self.construct_this(
                 new_target.unwrap_or(function.function),
                 construct,
-                callee_executable.literal_instance_fields.as_deref().unwrap_or_default(),
+                &self.snapshot[callee_executable.literal_instance_fields.unwrap_or_default()],
             ),
             _ => receiver,
         };
@@ -2323,25 +2397,26 @@ impl<'a> GraphBuilder<'a> {
             .iter()
             .any(|argument| matches!(argument, InlineValue::FrameArgument(_)))
         {
-            let count = self.emit(Op::ArgumentCount, Vec::new(), Some(Repr::Tagged));
+            let count = self.emit(Op::ArgumentCount, &[], Some(Repr::Tagged));
             self.emit_checked(
                 Op::CheckValue {
                     expected: value::int32(passed_argument_count.cast_signed()),
                     kind: ExitKind::UnexpectedValue,
                 },
-                vec![count],
+                &[count],
                 None,
             );
         }
-        let argument_values = arguments
-            .into_iter()
-            .map(|argument| self.inline_value(argument))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut argument_values = ZoneVec::with_capacity_in(arguments.len(), self.work);
+        for argument in arguments {
+            let value = self.inline_value(argument)?;
+            argument_values.push(value);
+        }
         let argument_count = &passed_argument_count;
         let dst = &dst;
 
         // NB: Exits in the callee resume the caller after the call.
-        let mut caller_live = self.function.liveness.live_out(self.function.instruction_index);
+        let mut caller_live = self.live_out(self.function.instruction_index);
         if let Some(slot) = self.function.layout.tracked_index(*dst) {
             caller_live.remove(slot);
         }
@@ -2349,6 +2424,7 @@ impl<'a> GraphBuilder<'a> {
             passed_argument_count: forwarded.then_some(passed_argument_count),
             ..self.new_frame_state(&caller_live, ResumeMode::ResumeAfter { dst: dst.raw() })
         };
+        self.release_slot_set(caller_live);
         let caller_frame_state = self.graph.add_frame_state(caller_frame_state);
         let frame_bytes = self.function.inline.as_ref().map_or(0, |call| call.frame_bytes)
             + callee_executable.frame_size(self.runtime.offsets.execution_context_slots, *argument_count);
@@ -2358,13 +2434,14 @@ impl<'a> GraphBuilder<'a> {
         let layout = callee_function.layout;
         let empty = self.constant(value::EMPTY);
         let undefined = self.constant(value::UNDEFINED);
-        let mut slots = vec![
+        let mut slots = ZoneVec::from_elem_in(
             SlotState {
                 node: empty,
                 in_sync: true,
-            };
-            layout.tracked_slot_count()
-        ];
+            },
+            layout.tracked_slot_count(),
+            self.work,
+        );
         slots[crate::bytecode::THIS_VALUE_REGISTER as usize] = SlotState {
             node: receiver,
             in_sync: true,
@@ -2390,15 +2467,17 @@ impl<'a> GraphBuilder<'a> {
             passed_argument_count: *argument_count,
             has_legacy_arguments,
             untracked_arguments: if has_legacy_arguments {
-                argument_values
-                    .get(layout.number_of_arguments as usize..)
-                    .unwrap_or_default()
-                    .to_vec()
+                ZoneVec::from_slice_in(
+                    argument_values
+                        .get(layout.number_of_arguments as usize..)
+                        .unwrap_or_default(),
+                    self.work,
+                )
             } else {
-                Vec::new()
+                ZoneVec::new_in(self.work)
             },
             continuation: None,
-            returns: Vec::new(),
+            returns: ZoneVec::new_in(self.work),
             return_fresh_shapes: None,
             frame_bytes,
             construct: construct.is_some(),
@@ -2407,14 +2486,15 @@ impl<'a> GraphBuilder<'a> {
         });
 
         // NB: Walk the callee's bytecode, then continue in the caller.
-        let caller = std::mem::replace(&mut self.function, callee_function);
+        callee_function.start_walk();
+        let caller = core::mem::replace(&mut self.function, callee_function);
         self.callers.push(caller);
         self.frame = callee_frame;
         let call_block = self.block;
         self.enter_function(call_block);
         let result = self.build_function();
         let caller = self.callers.pop().expect("the caller was suspended");
-        let callee_function = std::mem::replace(&mut self.function, caller);
+        let callee_function = core::mem::replace(&mut self.function, caller);
         result?;
         self.inlined_instructions += instruction_count;
 
@@ -2426,12 +2506,12 @@ impl<'a> GraphBuilder<'a> {
         self.order.push(continuation);
         self.block = continuation;
         self.frame = call.caller_frame;
-        self.frame.fresh_shapes = call.return_fresh_shapes.unwrap_or_default();
+        self.frame.fresh_shapes = call.return_fresh_shapes.unwrap_or_else(|| ZoneVec::new_in(self.work));
         let values = call.returns;
         let result = if values.iter().all(|value| *value == values[0]) {
             values[0]
         } else {
-            self.add_phi(values)
+            self.add_phi(&values)
         };
         self.write(*dst, result)?;
         Ok(Some(Flow::Continue))
@@ -2463,13 +2543,13 @@ impl<'a> GraphBuilder<'a> {
             match self.graph.constant_value(value) {
                 Some(value::EMPTY) => self.constant(value::UNDEFINED),
                 Some(_) => value,
-                None => self.emit(Op::EmptyToUndefined, vec![value], Some(Repr::Tagged)),
+                None => self.emit(Op::EmptyToUndefined, &[value], Some(Repr::Tagged)),
             }
         };
         let continuation = match self.function.inline.as_ref().and_then(|call| call.continuation) {
             Some(continuation) => continuation,
             None => {
-                let continuation = self.graph.add_block(Block::default());
+                let continuation = self.graph.add_block(self.graph.new_block());
                 self.function
                     .inline
                     .as_mut()
@@ -2485,7 +2565,7 @@ impl<'a> GraphBuilder<'a> {
             Some(shapes) => shapes.retain(|shape| fresh_shapes.contains(shape)),
             None => call.return_fresh_shapes = Some(fresh_shapes.clone()),
         }
-        self.set_control(Op::Jump { target: continuation }, Vec::new());
+        self.set_control(Op::Jump { target: continuation }, &[]);
         self.graph.blocks[continuation.index()].predecessors.push(self.block);
         Ok(Flow::Ended)
     }

@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::bytecode::instruction::OpCode;
 use core::cell::{Cell, OnceCell, RefCell};
+use core::ptr::NonNull;
 use std::collections::HashMap;
 use std::io::Write;
 use std::rc::Rc;
@@ -33,7 +35,9 @@ use crate::jit::InterpreterTier;
 use crate::jit::code::ExecutableJitState;
 use crate::layout::buffer::{BlockSlice, InterpreterBuffer, ThinSlice};
 use crate::layout::cell::{CellHeader, CellHeaderTail, Gc};
-use crate::layout::executable::ExecutableHead;
+use crate::layout::executable::{
+    CALL_CACHE_EMPTY_CALLEE, CALL_CACHE_TARGET_EXECUTABLE, CALL_CACHE_TARGET_TAG_MASK, CallCache, ExecutableHead,
+};
 use crate::layout::feedback::ExecutableFeedbackHead;
 use crate::layout::function_object::FunctionObject;
 use crate::layout::member::NullableMember;
@@ -123,13 +127,15 @@ impl PropertyLookupCacheEntryData {
     }
 
     fn has_dead_cell(&self, sweep: &Sweep<'_>) -> bool {
-        (self.key != 0 && sweep.is_dead(Value::from_bits(self.key).as_cell()))
-            || self.new_shape.is_some_and(|shape| sweep.is_dead(shape))
-            || self.shape.is_some_and(|key| sweep.is_dead(key.shape))
-            || self.prototype.is_some_and(|prototype| sweep.is_dead(prototype))
+        (self.key != 0 && sweep.is_dead_or_moving(Value::from_bits(self.key).as_cell()))
+            || self.new_shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
+            || self.shape.is_some_and(|key| sweep.is_dead_or_moving(key.shape))
+            || self
+                .prototype
+                .is_some_and(|prototype| sweep.is_dead_or_moving(prototype))
             || self
                 .prototype_chain_validity
-                .is_some_and(|validity| sweep.is_dead(validity))
+                .is_some_and(|validity| sweep.is_dead_or_moving(validity))
     }
 }
 
@@ -209,7 +215,7 @@ impl PropertyLookupCacheEntry {
         if self.get().has_dead_cell(sweep) {
             self.set(PropertyLookupCacheEntryData::default());
         }
-        if self.getter.get().is_some_and(|getter| sweep.is_dead(getter)) {
+        if self.getter.get().is_some_and(|getter| sweep.is_dead_or_moving(getter)) {
             self.getter.set(None);
         }
     }
@@ -1094,12 +1100,14 @@ impl KeyedPropertyLookupCache {
         for entry in self.entries.borrow_mut().iter_mut() {
             let lookup = &entry.lookup;
             // NB: Entries of the keyed property store cache for puts it does not make have a shape but no type.
-            if lookup.shape.is_some_and(|shape| sweep.is_dead(shape))
-                || lookup.prototype.is_some_and(|prototype| sweep.is_dead(prototype))
+            if lookup.shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
+                || lookup
+                    .prototype
+                    .is_some_and(|prototype| sweep.is_dead_or_moving(prototype))
                 || lookup
                     .prototype_chain_validity
-                    .is_some_and(|validity| sweep.is_dead(validity))
-                || lookup.new_shape.is_some_and(|shape| sweep.is_dead(shape))
+                    .is_some_and(|validity| sweep.is_dead_or_moving(validity))
+                || lookup.new_shape.is_some_and(|shape| sweep.is_dead_or_moving(shape))
             {
                 *entry = KeyedPropertyLookupCacheEntry::default();
             }
@@ -1169,7 +1177,8 @@ unsafe impl Trace for ObjectPropertyIteratorCacheData {
     fn trace(&self, visitor: &mut Visitor) {
         self.shape.trace(visitor);
         self.prototype_chain_validity.trace(visitor);
-        self.property_values.trace(visitor);
+        // SAFETY: The values are written once, when the cell is made, and only its finalizer frees them.
+        unsafe { self.property_values.trace_owned(visitor) };
         self.storage.trace(visitor);
     }
 }
@@ -1350,7 +1359,7 @@ pub struct Executable {
 }
 
 // NB: Every function that was called has these bytes.
-const _: () = assert!(size_of::<Executable>() == 184);
+const _: () = assert!(size_of::<Executable>() == 200);
 
 define_cell!(Executable, Other, external_memory_size: external_memory_size);
 
@@ -1367,7 +1376,7 @@ impl ExternalMemorySize for Executable {
         };
         let cache_data_size =
             self.head.property_lookup_caches.len().min(UNCACHED_SITE as usize) * size_of::<MonomorphicData>();
-        code_size + self.tables_memory_size() + cache_data_size
+        code_size + self.tables_memory_size() + cache_data_size + size_of_val(self.call_caches())
     }
 }
 
@@ -1384,6 +1393,29 @@ struct DebuggerBreakpointSite {
 }
 
 const _: () = assert!(core::mem::offset_of!(Executable, head) == 0);
+
+impl CallCache {
+    /// Whether the callee or the executable of the entry died in this collection, or moves in it.
+    fn has_dead_cell(&self, sweep: &Sweep<'_>) -> bool {
+        let callee = self.callee.get();
+        if callee == CALL_CACHE_EMPTY_CALLEE {
+            return false;
+        }
+        if sweep.is_dead_or_moving(Value::from_bits(callee).as_cell()) {
+            return true;
+        }
+        let target = self.target.get();
+        if target & CALL_CACHE_TARGET_TAG_MASK != CALL_CACHE_TARGET_EXECUTABLE {
+            return false;
+        }
+        let executable = NonNull::new(core::ptr::with_exposed_provenance_mut::<ExecutableHead>(
+            target as usize,
+        ))
+        .expect("a linked call cache has an executable");
+        // SAFETY: The entry was linked to a live executable, which stays intact until the sweep after it died.
+        sweep.is_dead_or_moving(Executable::from_head(unsafe { Gc::from_non_null(executable) }))
+    }
+}
 
 impl Executable {
     pub fn property_lookup_cache(&self, index: usize) -> &PropertyLookupCache {
@@ -1458,8 +1490,13 @@ impl Executable {
         {
             cache.entry.clear_if_it_has_a_dead_cell(sweep);
         }
+        for cache in self.call_caches() {
+            if cache.has_dead_cell(sweep) {
+                cache.clear();
+            }
+        }
         for cache in &self.object_shape_caches {
-            if cache.shape.get().is_some_and(|shape| sweep.is_dead(shape)) {
+            if cache.shape.get().is_some_and(|shape| sweep.is_dead_or_moving(shape)) {
                 cache.shape.set(None);
             }
         }
@@ -1510,6 +1547,8 @@ impl Executable {
             global_variable_caches,
             // The interpreter only reads the caches, which slow paths update through their cells.
             environment_coordinate_caches,
+            call_caches: Cell::new(core::ptr::null()),
+            call_metadata: Cell::new(0),
         };
         let object_shape_caches = tables.slice((0..cache_counts.object_shape).map(|_| ObjectShapeCache::default()));
         Self {
@@ -1969,6 +2008,12 @@ impl Executable {
         &self.code.bytecode
     }
 
+    /// Whether the code makes private or variable environments, so that its frames keep their own (see
+    /// `ExecutionContext::keeps_private_environment()` and `ExecutionContext::keeps_variable_environment()`).
+    pub fn keeps_own_environments(&self) -> bool {
+        self.bytecode().first() == Some(&(OpCode::EnterWithOwnEnvironments as u8))
+    }
+
     pub fn constants(&self) -> &[Value] {
         &self.head.constants
     }
@@ -1995,6 +2040,17 @@ impl Executable {
         &caches[index as usize]
     }
 
+    /// The call caches, which are empty until the executable gets its feedback.
+    pub fn call_caches(&self) -> &[CallCache] {
+        self.feedback().map_or(&[], ExecutableFeedback::call_caches)
+    }
+
+    fn clear_call_caches(&self) {
+        for cache in self.call_caches() {
+            cache.clear();
+        }
+    }
+
     pub fn interpreter_tier(&self) -> InterpreterTier {
         self.interpreter_tier.get()
     }
@@ -2006,6 +2062,9 @@ impl Executable {
             #[cfg(feature = "jit")]
             InterpreterTier::Profiling => {
                 self.ensure_feedback();
+                // NB: A call that hits its call cache records no call feedback, as the call that linked the entry did.
+                //     The calls that linked the entries in another tier did not.
+                self.clear_call_caches();
             }
             #[cfg(feature = "jit")]
             _ => {
@@ -2036,6 +2095,7 @@ impl Executable {
             unreachable!("the feedback is made once");
         }
         let feedback = self.feedback.get().expect("the feedback was just made");
+        self.head.call_caches.set(feedback.call_caches().as_ptr());
         self.point_interpreter_at_feedback(feedback);
         feedback
     }
@@ -2366,7 +2426,12 @@ fn parse_big_int_literal(literal: &str) -> SignedBigInteger {
 // alive.
 unsafe impl Trace for ExecutableHead {
     fn trace(&self, visitor: &mut Visitor) {
-        visitor.visit_values(&self.constants);
+        // NB: The constants are visited as owned values, so that a collection that moves their cells rewrites them where
+        //     they are. They are in the tables of the executable, which nothing writes once it is built, and only its
+        //     destructor frees. JIT code that embeds a constant lists its cell among the cells it embeds, which keeps
+        //     the cell where it is while the code lives.
+        // SAFETY: See above.
+        unsafe { visitor.visit_owned_values(&self.constants) };
     }
 }
 

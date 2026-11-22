@@ -32,6 +32,8 @@ set(TEST_SOURCES
     TestDownloadPresentation.cpp
     TestHiddenPageSizing.cpp
     TestJavaScriptDialog.cpp
+    TestLadybirdMenu.cpp
+    TestLocationEdit.cpp
     TestNativeTextEditingLineEdit.cpp
     TestNativeWindowContainerFocus.cpp
     TestPermissionPromptPopover.cpp
@@ -53,6 +55,16 @@ if (APPLE OR LINUX)
     list(APPEND TEST_SOURCES
         TestCrashReportReviewWidget.cpp
     )
+endif()
+
+# Only Linux reads the system's settings from the desktop's settings portal.
+if (LINUX AND NOT ANDROID)
+    list(APPEND TEST_SOURCES
+        TestSystemAppearance.cpp
+    )
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0)
+    target_link_libraries(TestUIQt PRIVATE PkgConfig::GIO)
 endif()
 
 target_sources(TestUIQt PRIVATE ${TEST_SOURCES})
@@ -95,7 +107,7 @@ endif()
 
 # The tests link Sparkle through ladybird_impl, but run from the build directory rather than from the app bundle that
 # carries Sparkle.framework, so they find it where vcpkg installed it.
-if (APPLE)
+if (APPLE AND LADYBIRD_ENABLE_SPARKLE)
     find_package(unofficial-sparkle CONFIG REQUIRED)
     get_target_property(sparkle_framework unofficial::sparkle::Sparkle IMPORTED_LOCATION)
     get_filename_component(sparkle_frameworks_directory "${sparkle_framework}" DIRECTORY)

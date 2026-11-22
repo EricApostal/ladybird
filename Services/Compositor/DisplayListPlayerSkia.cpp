@@ -128,6 +128,7 @@ struct DisplayListPlayerSkia::PainterCallbacks {
             .end_tile_raster = [](void* context) { PainterCallbacks::player(context).end_tile_raster(); },
             .begin_vector_image = [](void* context, RustFFI::VectorImagePlacement const* placement, bool requires_direct_replay) { return PainterCallbacks::player(context).begin_vector_image(*placement, requires_direct_replay); },
             .end_vector_image = [](void* context) { PainterCallbacks::player(context).end_vector_image(); },
+            .draw_surface = [](void* context, RustFFI::SurfaceDraw const* draw) { PainterCallbacks::player(context).draw_surface(*draw); },
         };
     }
 };
@@ -416,6 +417,19 @@ void DisplayListPlayerSkia::draw_composited_context(RustFFI::CompositedContextDr
     canvas.drawImageRect(image.get(), src_rect, dst_rect, to_skia_sampling_options(command.scaling_mode), &paint, SkCanvas::kStrict_SrcRectConstraint);
 }
 
+// Default sampling lands a tile's pixels unchanged where both rects have one size, as when the compositor copies them
+// outside the replay.
+void DisplayListPlayerSkia::draw_surface(RustFFI::SurfaceDraw const& draw)
+{
+    auto image = static_cast<Gfx::PaintingSurface*>(draw.surface)->sk_image_snapshot<sk_sp<SkImage>>();
+    if (!image)
+        return;
+    SkPaint paint;
+    paint.setBlendMode(SkBlendMode::kSrcOver);
+    auto sampling = draw.filtered ? SkSamplingOptions { SkFilterMode::kLinear } : SkSamplingOptions {};
+    surface().canvas().drawImageRect(image.get(), to_skia_rect(draw.source_rect), to_skia_rect(draw.target_rect), sampling, &paint, SkCanvas::kStrict_SrcRectConstraint);
+}
+
 void DisplayListPlayerSkia::play_command(DrawCanvas const& command)
 {
     auto const* surfaces = canvas_surfaces();
@@ -467,9 +481,10 @@ sk_sp<SkColorFilter> force_dark_image_color_filter()
     // be an exit-time destructor. The filter takes no uniforms, so one instance serves every draw.
     static auto* filter = [] {
         auto result = SkRuntimeEffect::MakeForColorFilter(SkString(R"(
-            const float LIGHTNESS_LIFT = 1.20;
+            const float LIGHTNESS_LIFT = 1.2264;
             const float GRAY_BRIGHTNESS_THRESHOLD = 32.0 / 255.0;
-            const float GRAY_ADJUSTED_BRIGHTNESS = 18.0 / 255.0;
+            const float GRAY_BAND_FLOOR = 18.0 / 255.0;
+            const float3 DARK_SURFACE = float3(28.0, 28.0, 30.0) / 255.0;
 
             float3 to_linear(float3 c) {
                 return mix(c / 12.92, pow((c + 0.055) / 1.055, float3(2.4)), step(float3(0.04045), c));
@@ -516,8 +531,8 @@ sk_sp<SkColorFilter> force_dark_image_color_filter()
                 // Grays landing in the band snap to one dark surface color, rather than a spread of near-blacks.
                 float epsilon = 1.0 / 255.0;
                 if (abs(inverted.r - inverted.g) <= epsilon && abs(inverted.r - inverted.b) <= epsilon
-                    && inverted.r < GRAY_BRIGHTNESS_THRESHOLD && inverted.r > GRAY_ADJUSTED_BRIGHTNESS) {
-                    inverted = float3(GRAY_ADJUSTED_BRIGHTNESS);
+                    && inverted.r < GRAY_BRIGHTNESS_THRESHOLD && inverted.r > GRAY_BAND_FLOOR) {
+                    inverted = DARK_SURFACE;
                 }
 
                 return half4(half3(inverted) * color.a, color.a);

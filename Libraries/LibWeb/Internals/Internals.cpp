@@ -405,28 +405,38 @@ u32 Internals::worker_agent_count() const
     return Bindings::worker_agent_count();
 }
 
-static void collect_garbage_from_the_outermost_event_loop_turn(GC::Root<WebIDL::Promise>);
+enum class MoveCells {
+    No,
+    Yes,
+};
 
-void Internals::gc_async(GC::Ref<WebIDL::Promise> promise)
+static void collect_garbage_from_the_outermost_event_loop_turn(MoveCells, GC::Root<WebIDL::Promise>);
+
+void Internals::gc_async(bool move_cells, GC::Ref<WebIDL::Promise> promise)
 {
-    collect_garbage_from_the_outermost_event_loop_turn(GC::make_root(promise));
+    collect_garbage_from_the_outermost_event_loop_turn(move_cells ? MoveCells::Yes : MoveCells::No, GC::make_root(promise));
 }
 
-static void collect_garbage_from_the_outermost_event_loop_turn(GC::Root<WebIDL::Promise> promise)
+static void collect_garbage_from_the_outermost_event_loop_turn(MoveCells move_cells, GC::Root<WebIDL::Promise> promise)
 {
     // Queue a LibCore event to run the collection, so that it runs outside the JS execution context. Nothing on the stack
     // of the outermost event loop turn refers to a cell that is not rooted some other way, so the collection leaves the
     // stack out. A word there that only looks like a cell pointer would otherwise keep that cell alive, and one in a
     // frame of the event loop itself would keep it alive for every later collection too.
-    Core::deferred_invoke([promise = move(promise)]() mutable {
+    Core::deferred_invoke([move_cells, promise = move(promise)]() mutable {
         // A nested event loop has script waiting further up the stack, so wait for it to finish.
         if (Core::ThreadEventQueue::current().is_processing_nested()) {
-            collect_garbage_from_the_outermost_event_loop_turn(move(promise));
+            collect_garbage_from_the_outermost_event_loop_turn(move_cells, move(promise));
             return;
         }
         auto& realm = WebIDL::promise_realm(*promise);
         HTML::TemporaryExecutionContext execution_context { realm };
-        realm.vm().heap().collect_garbage_without_scanning_the_stack();
+        auto& heap = realm.vm().heap();
+        if (move_cells == MoveCells::Yes)
+            heap.set_moves_everything_for_testing(true);
+        heap.collect_garbage_without_scanning_the_stack();
+        if (move_cells == MoveCells::Yes)
+            heap.set_moves_everything_for_testing(GC::Heap::moves_everything());
         WebIDL::resolve_promise(*promise);
     });
 }
@@ -477,6 +487,11 @@ bool Internals::has_completed_initial_paint() const
 bool Internals::initial_paint_had_pending_fonts() const
 {
     return window().associated_document().font_computer().initial_paint_had_pending_fonts();
+}
+
+bool Internals::had_user_edits() const
+{
+    return window().associated_document().had_user_edits();
 }
 
 bool Internals::has_pending_image_loads() const
@@ -1656,6 +1671,11 @@ void Internals::update_visual_contexts_for_testing()
     Layout::ForcedReadScope read { document };
     document.update_layout(DOM::UpdateLayoutReason::Debugging);
     Layout::RustFFI::render_state_prepare_paint_properties_for_testing(document.layout_node_arena().host(), read);
+}
+
+u64 Internals::describe_owners_of_visual_context_nodes()
+{
+    return Painting::describe_owners_of_visual_context_nodes(window().associated_document(), {}, {}).structural_epoch;
 }
 
 void Internals::begin_input_trace()

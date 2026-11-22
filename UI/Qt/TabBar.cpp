@@ -31,7 +31,6 @@
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/Motion.h>
 #include <UI/Qt/Popover.h>
-#include <UI/Qt/SandboxOffBar.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/SystemAppearance.h>
 #include <UI/Qt/TabBar.h>
@@ -54,7 +53,6 @@
 #include <QEasingCurve>
 #include <QEvent>
 #include <QFontMetrics>
-#include <QFrame>
 #include <QGraphicsDropShadowEffect>
 #include <QGraphicsOpacityEffect>
 #include <QGraphicsPixmapItem>
@@ -71,7 +69,6 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
-#include <QScreen>
 #include <QStaticText>
 #include <QStyle>
 #include <QStyleOptionButton>
@@ -113,6 +110,8 @@ static constexpr int HORIZONTAL_TAB_STRIP_WHEEL_SCROLL_STEP = 112;
 // After the pointer leaves the tab bar, the tabs keep their locked widths for this long.
 static constexpr int TAB_WIDTH_UNLOCK_DELAY_MS = 300;
 static constexpr qreal ATTENTION_DOT_RADIUS = 3.5;
+// A tab that hasn't loaded, such as one discarded to save memory, loads its page once it's selected.
+static constexpr qreal UNLOADED_TAB_FAVICON_OPACITY = 0.5;
 // While the strip scrolls, its ends fade into the strip over this width.
 static constexpr int HORIZONTAL_TAB_STRIP_FADE_WIDTH = 28;
 // Below this content width, a horizontal tab shows its favicon alone.
@@ -216,12 +215,6 @@ static constexpr qreal HORIZONTAL_TAB_SEPARATOR_WIDTH = 1;
 static constexpr qreal HORIZONTAL_TAB_SEPARATOR_HEIGHT = 16;
 static constexpr int TAB_CONTENT_HORIZONTAL_INSET = 8;
 static constexpr int VERTICAL_TABS_HOVER_COLLAPSE_POLL_INTERVAL_MS = 250;
-static constexpr int TAB_PREVIEW_HOVER_DELAY_MS = 350;
-static constexpr int TAB_PREVIEW_THUMBNAIL_WIDTH = 320;
-static constexpr int TAB_PREVIEW_THUMBNAIL_HEIGHT = 180;
-// NB: The shadow falls downward, so it needs less room above the card.
-static constexpr QMargins TAB_PREVIEW_SHADOW_MARGINS { 60, 36, 60, 90 };
-static constexpr int TAB_PREVIEW_CARD_GAP = 6;
 // A tab's close button is a smaller square than its speaker button, and both draw their icons at the same size. The
 // close button takes clicks from the whole height of its tab, in a slot a little wider than its square.
 static constexpr int TAB_CLOSE_BUTTON_SIZE = 18;
@@ -459,7 +452,19 @@ static bool horizontal_tab_close_button_replaces_favicon(QRectF const& content_r
     if (!is_selected || has_media_indicator)
         return false;
     auto has_room_for_both = horizontal_tab_has_room_for_favicon_before(content_rect.right() - close_button.width(), content_rect.left());
-    return !has_room_for_both && content_rect.width() >= close_button.width();
+    // NB: A tab's padding shrinks as fast as the tab does, so the width of its content can stay at the close button's
+    //     width as the tab grows. It is rounded, so that the button doesn't blink out on a frame where it is a little
+    //     less.
+    return !has_room_for_both && qRound(content_rect.width()) >= close_button.width();
+}
+
+// Where the close button that stands in for the favicon starts. It slides from the middle of the tab's content to its
+// end as the tab grows, and reaches the end as the favicon fits beside it.
+static int horizontal_tab_close_button_x_in_favicon_place(QRectF const& content_rect, QWidget const& close_button)
+{
+    auto slack = content_rect.width() - close_button.width();
+    auto slide = 0.5 + (0.5 * clamp(slack / (TAB_ICON_SIZE + HORIZONTAL_TAB_CONTENT_GAP), 0.0, 1.0));
+    return qRound(content_rect.left() + (slack * slide));
 }
 
 // The selected horizontal tab's body: the whole width of the tab, from just below its top down to the toolbar.
@@ -653,170 +658,6 @@ private:
     QSize m_size;
 };
 
-class TabPreviewThumbnail final : public QWidget {
-public:
-    AK_ALLOC_WITH_KMALLOC;
-
-    explicit TabPreviewThumbnail(QWidget* parent)
-        : QWidget(parent)
-    {
-        setFixedSize(TAB_PREVIEW_THUMBNAIL_WIDTH, TAB_PREVIEW_THUMBNAIL_HEIGHT);
-    }
-
-    void set_colors(QColor background, QColor border)
-    {
-        m_background = background;
-        m_border = border;
-        update();
-    }
-
-    void set_pixmap(QPixmap pixmap)
-    {
-        m_pixmap = AK::move(pixmap);
-        update();
-    }
-
-private:
-    virtual void paintEvent(QPaintEvent*) override
-    {
-        QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing);
-
-        auto outer_rect = rect();
-        outer_rect.adjust(0, 0, -1, -1);
-
-        QPainterPath outer_path;
-        outer_path.addRoundedRect(outer_rect, 7, 7);
-        painter.fillPath(outer_path, m_background);
-
-        if (!m_pixmap.isNull()) {
-            auto image_rect = rect().adjusted(1, 1, -1, -1);
-            QPainterPath image_path;
-            image_path.addRoundedRect(image_rect, 6, 6);
-
-            painter.save();
-            painter.setClipPath(image_path);
-
-            auto x = image_rect.x() + (image_rect.width() - m_pixmap.width()) / 2;
-            auto y = image_rect.y() + (image_rect.height() - m_pixmap.height()) / 2;
-            painter.drawPixmap(x, y, m_pixmap);
-            painter.restore();
-        }
-
-        painter.setPen(m_border);
-        painter.drawPath(outer_path);
-    }
-
-    QColor m_background;
-    QColor m_border;
-    QPixmap m_pixmap;
-};
-
-class TabPreviewPopup final : public QWidget {
-public:
-    AK_ALLOC_WITH_KMALLOC;
-
-    explicit TabPreviewPopup(QWidget* parent)
-        // NB: The preview only shows, and the room around it for its shadow lies over the tabs, so it lets the mouse
-        //     through. On X11, Qt adds the stays-on-top hint to a tooltip itself, takes that for a change of flags, and
-        //     recreates the window as it is first shown, and the new window takes the mouse again. Asking for the hint
-        //     here keeps the window from being recreated.
-        : QWidget(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint | Qt::WindowTransparentForInput | Qt::WindowStaysOnTopHint)
-    {
-        setAttribute(Qt::WA_TranslucentBackground);
-        setAttribute(Qt::WA_ShowWithoutActivating);
-        setAttribute(Qt::WA_TransparentForMouseEvents);
-
-        // NB: KDE's widget styles have the window system cast a shadow around any tooltip window. The card casts its own
-        //     within this window, so that would be a second shadow around the room left for the first.
-        setProperty("_KDE_NET_WM_SKIP_SHADOW", true);
-
-        auto* outer_layout = new QVBoxLayout(this);
-        outer_layout->setContentsMargins(TAB_PREVIEW_SHADOW_MARGINS);
-        outer_layout->setSpacing(0);
-
-        m_card = new QFrame(this);
-        m_card->setObjectName("LadybirdTabPreviewCard");
-
-        cast_popover_shadow(*m_card);
-
-        auto* card_layout = new QVBoxLayout(m_card);
-        card_layout->setContentsMargins(10, 10, 10, 10);
-        card_layout->setSpacing(8);
-
-        m_thumbnail = new TabPreviewThumbnail(m_card);
-
-        m_title_label = new QLabel(m_card);
-        m_title_label->setObjectName("LadybirdTabPreviewTitle");
-        m_title_label->setFixedWidth(TAB_PREVIEW_THUMBNAIL_WIDTH);
-        m_title_label->setTextFormat(Qt::PlainText);
-
-        m_url_label = new QLabel(m_card);
-        m_url_label->setObjectName("LadybirdTabPreviewURL");
-        m_url_label->setFixedWidth(TAB_PREVIEW_THUMBNAIL_WIDTH);
-        m_url_label->setTextFormat(Qt::PlainText);
-
-        card_layout->addWidget(m_thumbnail);
-        card_layout->addWidget(m_title_label);
-        card_layout->addWidget(m_url_label);
-        outer_layout->addWidget(m_card);
-    }
-
-    void set_preview(QPalette const& palette, QString title, QString url, Optional<QPixmap const&> thumbnail)
-    {
-        update_chrome_style(palette);
-
-        if (title.trimmed().isEmpty())
-            title = "Untitled";
-
-        QFontMetrics title_metrics(m_title_label->font());
-        QFontMetrics url_metrics(m_url_label->font());
-
-        m_thumbnail->setVisible(thumbnail.has_value());
-        if (thumbnail.has_value())
-            m_thumbnail->set_pixmap(*thumbnail);
-        m_title_label->setText(title_metrics.elidedText(title, Qt::ElideRight, TAB_PREVIEW_THUMBNAIL_WIDTH));
-        m_url_label->setText(url_metrics.elidedText(url, Qt::ElideMiddle, TAB_PREVIEW_THUMBNAIL_WIDTH));
-        adjustSize();
-    }
-
-private:
-    void update_chrome_style(QPalette const& palette)
-    {
-        auto card_background = ChromeStyle::style_sheet_color(ChromeStyle::chrome_surface(palette));
-        auto thumbnail_background = ChromeStyle::chrome_surface_recessed(palette);
-        auto border_color = ChromeStyle::chrome_control_border(palette);
-        auto border = ChromeStyle::style_sheet_color(border_color);
-        auto text = ChromeStyle::style_sheet_color(ChromeStyle::chrome_text(palette));
-        auto muted_text = ChromeStyle::style_sheet_color(ChromeStyle::chrome_muted_text(palette));
-
-        m_thumbnail->set_colors(thumbnail_background, border_color);
-
-        setStyleSheet(qformatted(R"(
-QFrame#LadybirdTabPreviewCard {{
-    background: {};
-    border: 1px solid {};
-    border-radius: 10px;
-}}
-
-QLabel#LadybirdTabPreviewTitle {{
-    color: {};
-    font-weight: 600;
-}}
-
-QLabel#LadybirdTabPreviewURL {{
-    color: {};
-}}
-)",
-            card_background, border, text, muted_text));
-    }
-
-    QFrame* m_card { nullptr };
-    TabPreviewThumbnail* m_thumbnail { nullptr };
-    QLabel* m_title_label { nullptr };
-    QLabel* m_url_label { nullptr };
-};
-
 class TabDragCancellationFilter final : public QObject {
 public:
     AK_ALLOC_WITH_KMALLOC;
@@ -898,24 +739,6 @@ TabBar::TabBar(TabWidget* tab_widget)
         QEvent font_change(QEvent::FontChange);
         changeEvent(&font_change);
         refresh_tab_layout();
-    });
-
-    m_tab_preview_timer = new QTimer(this);
-    m_tab_preview_timer->setInterval(TAB_PREVIEW_HOVER_DELAY_MS);
-    m_tab_preview_timer->setSingleShot(true);
-    connect(m_tab_preview_timer, &QTimer::timeout, this, &TabBar::show_tab_preview);
-
-    m_tab_preview_popup = new TabPreviewPopup(this);
-
-    // While the preview shows, the pointer's moves over the tab bar and out of it are followed by where it is.
-    m_tab_preview_pointer_timer = new QTimer(this);
-    m_tab_preview_pointer_timer->setInterval(50);
-    connect(m_tab_preview_pointer_timer, &QTimer::timeout, this, [this] {
-        auto position = mapFromGlobal(QCursor::pos());
-        if (rect().contains(position))
-            set_hovered_tab_index(tab_index_at(position));
-        else
-            pointer_left();
     });
 
     m_loading_ring_animation = new QVariantAnimation(this);
@@ -1003,6 +826,10 @@ TabBar::TabBar(TabWidget* tab_widget)
     });
     connect(m_layout_animation, &QVariantAnimation::finished, this, [this] {
         m_closing_tab.clear();
+        m_opening_tabs.clear();
+        // NB: A tab that opened but is still narrower than its place, as when it makes room for a dropped tab, shows its
+        //     buttons now that it is no longer opening.
+        update_tab_button_geometry();
         if (m_selection_animation->state() != QAbstractAnimation::Running)
             m_previously_selected_tab = nullptr;
         update();
@@ -1025,7 +852,6 @@ TabBar::TabBar(TabWidget* tab_widget)
     });
 
     connect(this, &QTabBar::currentChanged, this, [this](int index) {
-        hide_tab_preview();
         // NB: The selected horizontal tab has a larger minimum width (see tabSizeHint()).
         if (tab_layout() == TabLayout::Horizontal)
             refresh_tab_layout();
@@ -1085,7 +911,6 @@ void TabBar::set_vertical_tabs_position(WebView::VerticalTabsPosition position)
     m_vertical_tabs_position = position;
     if (m_tab_layout != TabLayout::Horizontal)
         setShape(vertical_tabs_are_on_right() ? QTabBar::RoundedEast : QTabBar::RoundedWest);
-    hide_tab_preview();
     refresh_tab_layout();
 }
 
@@ -1221,7 +1046,6 @@ int TabBar::horizontal_tab_share() const
 
 void TabBar::resizeEvent(QResizeEvent* event)
 {
-    hide_tab_preview();
     QTabBar::resizeEvent(event);
     set_scroll_offset(m_scroll_offset);
     ensure_tab_visible(currentIndex());
@@ -1247,21 +1071,6 @@ void TabBar::tabLayoutChange()
     update_layout_animation();
     set_scroll_offset(m_scroll_offset);
     update_tab_button_geometry();
-
-    if (m_tab_preview_index < 0)
-        return;
-
-    // NB: Title and favicon updates also change the tab layout. Keep the preview open if it still belongs
-    //     to the tab under the pointer, but dismiss it if tabs moved or were removed.
-    auto hovered_tab = tab_index_at(mapFromGlobal(QCursor::pos()));
-    if (hovered_tab != m_tab_preview_index || !m_tab_widget
-        || (m_previewed_tab && m_tab_widget->tab(hovered_tab) != m_previewed_tab)) {
-        hide_tab_preview();
-        return;
-    }
-
-    if (m_previewed_tab)
-        show_tab_preview();
 }
 
 bool TabBar::event(QEvent* event)
@@ -1285,15 +1094,11 @@ Optional<ToolTipContent> TabBar::tooltip_at(QPoint position) const
 
     auto* tab = m_tab_widget ? m_tab_widget->tab(hovered_tab) : nullptr;
 
-    // A tab that shows a preview doesn't need a tooltip as well.
-    if (tab && hovered_tab != currentIndex() && (!tab->is_loaded() || tab->view().tab_preview_pixmap({ TAB_PREVIEW_THUMBNAIL_WIDTH, TAB_PREVIEW_THUMBNAIL_HEIGHT }).has_value()))
-        return ToolTipContent {};
-
-    // The selected tab shows no preview, so a title too long for it shows in full, with the site, in a tooltip.
-    if (tab && hovered_tab == currentIndex() && m_tabs_with_cut_titles.contains(tab)) {
+    // A title too long for its tab shows in full, with the site, in a tooltip.
+    if (tab && m_tabs_with_cut_titles.contains(tab)) {
         auto text = tabText(hovered_tab);
         // A URL without a host (about:blank, e.g.) has no site to show.
-        if (auto url = tab->view().url(); url.host().has_value() && !url.serialized_host().is_empty())
+        if (auto url = tab->url(); url.host().has_value() && !url.serialized_host().is_empty())
             text = qformatted("{}\n{}", ak_string_from_qstring(text), url.serialized_host());
         return ToolTipContent { .text = AK::move(text), .rect = visual_tab_rect(hovered_tab) };
     }
@@ -1478,7 +1283,8 @@ void TabBar::paintEvent(QPaintEvent*)
         auto* tab_for_index = m_tab_widget ? m_tab_widget->tab(index) : nullptr;
         auto needs_attention = tab_for_index && tab_for_index->needs_attention() && !is_selected;
         auto favicon_shrink = tab_for_index ? tab_for_index->loading_favicon_shrink() : 0;
-        auto paint_icon = [&](QRect const& icon_rect) {
+        auto favicon_opacity = tab_for_index && !tab_for_index->is_loaded() ? UNLOADED_TAB_FAVICON_OPACITY : 1.0;
+        auto paint_icon = [&](QRect const& icon_rect, Optional<QRect> favicon_clip = {}) {
             if (ring_opacity > 0) {
                 painter.save();
                 painter.setOpacity(ring_opacity);
@@ -1490,6 +1296,10 @@ void TabBar::paintEvent(QPaintEvent*)
             auto overhang = (CHROME_ICON_CANVAS_SIZE - TAB_ICON_SIZE) / 2;
             auto const& shown_icon = icon.isNull() ? m_fallback_tab_icon : icon;
             auto shown_rect = icon.isNull() ? icon_rect.adjusted(-overhang, -overhang, overhang, overhang) : icon_rect;
+            painter.save();
+            painter.setOpacity(favicon_opacity);
+            if (favicon_clip.has_value())
+                painter.setClipRect(*favicon_clip, Qt::IntersectClip);
             if (favicon_shrink > 0) {
                 // While the tab loads, the favicon shrinks to fit inside the ring, so a square favicon never touches it.
                 auto scale = 1 - ((1 - (static_cast<qreal>(LOADING_FAVICON_SIZE) / TAB_ICON_SIZE)) * favicon_shrink);
@@ -1503,6 +1313,7 @@ void TabBar::paintEvent(QPaintEvent*)
             } else {
                 shown_icon.paint(&painter, shown_rect);
             }
+            painter.restore();
 
             // A tab with news has a dot on its favicon's corner, cut out of the strip around it.
             if (needs_attention) {
@@ -1521,6 +1332,10 @@ void TabBar::paintEvent(QPaintEvent*)
         };
 
         if (is_collapsed_vertical || is_pinned_tile) {
+            // A tab that shows only an icon has its title cut entirely.
+            if (auto* tab = m_tab_widget ? m_tab_widget->tab(index) : nullptr; tab && !tabText(index).isEmpty())
+                tabs_with_cut_titles.set(tab);
+
             // The speaker and the microphone take the favicon's place on a pinned tile.
             if (is_pinned_tile && (tabButton(index, QTabBar::LeftSide) || microphone_indicator(index)))
                 continue;
@@ -1536,8 +1351,8 @@ void TabBar::paintEvent(QPaintEvent*)
             continue;
         }
 
-        // A tab that grows, such as one opening, lays out its contents at the width it grows to, and shows as much of
-        // them as it has grown into.
+        // A tab that opens lays out its contents at the width it grows to, and shows as much of them as it has grown
+        // into.
         auto layout_rect = tab_rect;
         if (!is_vertical && is_growing_horizontal_tab(index, tab_rect)) {
             layout_rect.setWidth(visual_tab_rect(index).width());
@@ -1560,21 +1375,31 @@ void TabBar::paintEvent(QPaintEvent*)
         }
 
         if (!is_vertical && contents_rect.width() < HORIZONTAL_TAB_MIN_CONTENT_WIDTH_FOR_TITLE) {
+            // A tab too narrow for its title has it cut entirely.
+            if (auto* tab = m_tab_widget ? m_tab_widget->tab(index) : nullptr; tab && !tabText(index).isEmpty())
+                tabs_with_cut_titles.set(tab);
+            auto* close_button = tabButton(index, QTabBar::RightSide);
+            auto close_button_replaces_favicon = close_button && close_button->isVisible()
+                && horizontal_tab_close_button_replaces_favicon(horizontal_tab_contents_rect(index, layout_rect), *close_button, is_selected, tabButton(index, QTabBar::LeftSide) || microphone_indicator(index));
             // NB: A tab too narrow for its favicon next to its mute button shows the mute button alone, rather than
             //     drawing the favicon over it.
-            if (contents_rect.width() < TAB_ICON_SIZE)
+            if (contents_rect.width() < TAB_ICON_SIZE && !close_button_replaces_favicon)
                 continue;
-            if (auto* close_button = tabButton(index, QTabBar::RightSide); close_button && close_button->isVisible()
-                && horizontal_tab_close_button_replaces_favicon(horizontal_tab_contents_rect(index, layout_rect), *close_button, is_selected, tabButton(index, QTabBar::LeftSide) || microphone_indicator(index))) {
-                continue;
-            }
             QRect icon_rect {
-                contents_rect.left() + ((contents_rect.width() - TAB_ICON_SIZE) / 2),
+                contents_rect.left() + max(0, (contents_rect.width() - TAB_ICON_SIZE) / 2),
                 contents_rect.top() + ((contents_rect.height() - TAB_ICON_SIZE) / 2),
                 TAB_ICON_SIZE,
                 TAB_ICON_SIZE,
             };
-            paint_icon(icon_rect);
+            // NB: As the close button slides from the favicon's place to the end of the tab, the favicon comes into
+            //     view in the room the button leaves before it. The loading ring and the attention dot around the
+            //     favicon come into view with it, but are never drawn over the button.
+            Optional<QRect> favicon_clip;
+            if (close_button_replaces_favicon) {
+                painter.setClipRect(QRect { tab_rect.left(), tab_rect.top(), close_button->x() - tab_rect.left(), tab_rect.height() }, Qt::IntersectClip);
+                favicon_clip = contents_rect;
+            }
+            paint_icon(icon_rect, favicon_clip);
             continue;
         }
 
@@ -1725,7 +1550,6 @@ void TabBar::dragEnterEvent(QDragEnterEvent* event)
 
 void TabBar::dragLeaveEvent(QDragLeaveEvent* event)
 {
-    hide_tab_preview();
     hide_drop_preview();
     QTabBar::dragLeaveEvent(event);
 }
@@ -1745,7 +1569,6 @@ void TabBar::dragMoveEvent(QDragMoveEvent* event)
 
 void TabBar::dropEvent(QDropEvent* event)
 {
-    hide_tab_preview();
     if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
         hide_drop_preview();
         event->ignore();
@@ -1787,7 +1610,6 @@ bool TabBar::eventFilter(QObject* watched, QEvent* event)
 
 void TabBar::mousePressEvent(QMouseEvent* event)
 {
-    hide_tab_preview();
     auto pressed_tab = tab_index_at(event->pos());
     m_pressed_tab = (m_tab_widget && pressed_tab >= 0) ? m_tab_widget->tab(pressed_tab) : nullptr;
 
@@ -1852,25 +1674,11 @@ void TabBar::enterEvent(QEnterEvent* event)
 
 void TabBar::leaveEvent(QEvent* event)
 {
-    // NB: The tab preview's window reaches over the tabs, to make room for its shadow. Though it lets the mouse through,
-    //     the pointer leaves the tab bar for it while it is still over the tab bar, so where the pointer is is watched
-    //     instead while the preview shows.
-    if (m_tab_preview_popup && m_tab_preview_popup->isVisible() && rect().contains(mapFromGlobal(QCursor::pos()))) {
-        QTabBar::leaveEvent(event);
-        return;
-    }
-
-    pointer_left();
-    QTabBar::leaveEvent(event);
-}
-
-void TabBar::pointer_left()
-{
     if (m_locked_tab_width.has_value())
         m_tab_width_unlock_timer->start();
 
-    hide_tab_preview();
     set_hovered_tab_index(-1);
+    QTabBar::leaveEvent(event);
 }
 
 void TabBar::mouseReleaseEvent(QMouseEvent* event)
@@ -2194,14 +2002,19 @@ void TabBar::update_layout_animation()
     if (tabs_were_added_or_removed && can_animate) {
         HashMap<Tab const*, QRect> start_rects;
         HashMap<Tab const*, HorizontalTabEndRoom> start_end_rooms;
+        HashTable<Tab const*> opening_tabs;
         for (auto const& [tab, target] : targets) {
             // A tab starts where it is drawn now, or as nothing at its place if it is new.
             auto settled = m_settled_tab_rects.get(tab);
             if (!settled.has_value()) {
                 start_rects.set(tab, QRect { target.left(), target.top(), 0, target.height() });
                 start_end_rooms.set(tab, *target_end_rooms.get(tab));
+                opening_tabs.set(tab);
                 continue;
             }
+            // NB: A tab that was still opening keeps opening.
+            if (m_layout_animation_progress < 1.0 && m_opening_tabs.contains(tab))
+                opening_tabs.set(tab);
             // NB: A tab that becomes or stops being the first or last one gains or loses the room at the end of the strip
             //     as it moves, so what of it is drawn stays in place.
             auto settled_end_room = m_settled_tab_end_rooms.get(tab).value_or({});
@@ -2223,9 +2036,12 @@ void TabBar::update_layout_animation()
         }
         m_layout_animation_start_rects = AK::move(start_rects);
         m_layout_animation_start_end_rooms = AK::move(start_end_rooms);
+        m_opening_tabs = AK::move(opening_tabs);
         m_layout_animation_progress = 0.0;
         m_layout_animation->stop();
         m_layout_animation->start();
+    } else {
+        m_opening_tabs.remove_all_matching([&](auto* tab) { return !targets.contains(tab); });
     }
 
     m_settled_tab_rects = AK::move(targets);
@@ -2266,6 +2082,27 @@ HorizontalTabEndRoom TabBar::horizontal_tab_end_room(int index) const
     return { start->left + ((settled.left - start->left) * p), start->right + ((settled.right - start->right) * p) };
 }
 
+void TabBar::did_replace_tab(Tab const& old_tab, Tab& new_tab)
+{
+    for (auto* tab : { &m_previously_selected_tab, &m_pressed_tab }) {
+        if (*tab == &old_tab)
+            *tab = &new_tab;
+    }
+
+    // The tab that stands in for the old one is where the old one was, so the next change of the strip doesn't animate
+    // it as a new tab.
+    auto move_entry = [&](auto& map) {
+        if (auto value = map.take(&old_tab); value.has_value())
+            map.set(&new_tab, value.release_value());
+    };
+    move_entry(m_settled_tab_rects);
+    move_entry(m_settled_tab_end_rooms);
+    move_entry(m_layout_animation_start_rects);
+    move_entry(m_layout_animation_start_end_rooms);
+    if (m_opening_tabs.remove(&old_tab))
+        m_opening_tabs.set(&new_tab);
+}
+
 void TabBar::prepare_for_tab_removal(int index)
 {
     m_closing_tab.clear();
@@ -2300,8 +2137,13 @@ QRect TabBar::closing_tab_rect() const
     return rect;
 }
 
+// NB: Only a tab that opens grows in. The tabs that widen to fill the room a closing tab leaves lay out their contents
+//     at the width they have on each frame, and keep showing their buttons.
 bool TabBar::is_growing_horizontal_tab(int index, QRect const& tab_rect) const
 {
+    auto* tab = m_tab_widget ? m_tab_widget->tab(index) : nullptr;
+    if (!tab || !m_opening_tabs.contains(tab))
+        return false;
     return tab_rect.width() < visual_tab_rect(index).width();
 }
 
@@ -2442,8 +2284,6 @@ QPixmap TabBar::render_tab_drag_pixmap(int index) const
 
 void TabBar::start_tab_drag(int index)
 {
-    hide_tab_preview();
-
     if (!m_tab_widget || !m_tab_widget->tab(index))
         return;
 
@@ -2762,150 +2602,6 @@ TabMicrophoneIndicator* TabBar::microphone_indicator(int index) const
     return m_microphone_indicators.get(tab).value_or(nullptr);
 }
 
-void TabBar::schedule_tab_preview(int index)
-{
-    if (!m_tab_preview_timer || !m_tab_preview_popup)
-        return;
-
-    if (!m_tab_widget || index < 0 || index == currentIndex() || index >= count() || m_pressed_tab) {
-        hide_tab_preview();
-        return;
-    }
-
-    if (m_tab_preview_index == index && m_tab_preview_popup->isVisible())
-        return;
-
-    hide_tab_preview();
-    m_tab_preview_index = index;
-    hide_tooltip();
-    m_tab_preview_timer->start();
-}
-
-void TabBar::show_tab_preview()
-{
-    if (!m_tab_widget || !m_tab_preview_popup)
-        return;
-
-    auto index = m_tab_preview_index;
-    if (index < 0 || index != m_hovered_tab_index || index == currentIndex() || index >= count()) {
-        hide_tab_preview();
-        return;
-    }
-
-    auto* tab = m_tab_widget->tab(index);
-    if (!tab) {
-        hide_tab_preview();
-        return;
-    }
-
-    // A tab that hasn't loaded has no page to show, so its preview is its title and URL.
-    if (!tab->is_loaded()) {
-        m_tab_preview_popup->set_preview(palette(), tab->title(), qstring_from_ak_string(tab->url().serialize()), {});
-        m_tab_preview_popup->move(tab_preview_position_for(index, m_tab_preview_popup->sizeHint()));
-        m_tab_preview_popup->show();
-        m_tab_preview_popup->raise();
-        m_tab_preview_pointer_timer->start();
-        return;
-    }
-
-    if (m_previewed_tab != tab) {
-        stop_following_previewed_tab_frames();
-        m_previewed_tab = tab;
-        m_tab_preview_paint_connection = connect(&tab->view(), &WebContentView::ready_to_paint, this, &TabBar::show_tab_preview);
-        m_tab_preview_change_connection = connect(&tab->view(), &WebContentView::tab_preview_changed, this, &TabBar::show_tab_preview);
-        tab->view().add_frame_notification_interest();
-        // NB: Background tabs may never have painted. Allow rendering while their preview is requested,
-        //     without selecting the tab or showing its widget.
-        tab->view().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
-    }
-
-    auto thumbnail = tab->view().tab_preview_pixmap({ TAB_PREVIEW_THUMBNAIL_WIDTH, TAB_PREVIEW_THUMBNAIL_HEIGHT });
-    if (!thumbnail.has_value())
-        return;
-
-    m_tab_preview_popup->set_preview(palette(), tab->title(), qstring_from_ak_string(tab->view().url().serialize()), *thumbnail);
-    m_tab_preview_popup->move(tab_preview_position_for(index, m_tab_preview_popup->sizeHint()));
-    m_tab_preview_popup->show();
-    m_tab_preview_popup->raise();
-    m_tab_preview_pointer_timer->start();
-}
-
-void TabBar::stop_following_previewed_tab_frames()
-{
-    disconnect(m_tab_preview_paint_connection);
-    disconnect(m_tab_preview_change_connection);
-    if (m_previewed_tab)
-        m_previewed_tab->view().remove_frame_notification_interest();
-}
-
-void TabBar::hide_tab_preview()
-{
-    stop_following_previewed_tab_frames();
-    if (m_previewed_tab) {
-        m_previewed_tab->view().set_system_visibility_state(m_previewed_tab->view().isVisible() ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
-        m_previewed_tab = nullptr;
-    }
-
-    if (m_tab_preview_timer)
-        m_tab_preview_timer->stop();
-    if (m_tab_preview_pointer_timer)
-        m_tab_preview_pointer_timer->stop();
-
-    m_tab_preview_index = -1;
-
-    if (m_tab_preview_popup)
-        m_tab_preview_popup->hide();
-}
-
-QPoint TabBar::tab_preview_position_for(int index, QSize const& popup_size) const
-{
-    auto tab_rect = visual_tab_rect(index);
-    auto screen = QGuiApplication::screenAt(mapToGlobal(tab_rect.center()));
-    if (!screen)
-        screen = window()->screen();
-    if (!screen)
-        screen = QGuiApplication::primaryScreen();
-    auto available_geometry = screen ? screen->availableGeometry() : QRect {};
-
-    QPoint position;
-    if (tab_layout() == TabLayout::Horizontal) {
-        position = mapToGlobal(QPoint {
-            tab_rect.center().x() - popup_size.width() / 2,
-            tab_rect.bottom() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGINS.top(),
-        });
-
-        if (position.y() + popup_size.height() > available_geometry.bottom())
-            position.setY(mapToGlobal(QPoint { 0, tab_rect.top() }).y() - popup_size.height() - TAB_PREVIEW_CARD_GAP + TAB_PREVIEW_SHADOW_MARGINS.bottom());
-    } else {
-        auto place_popup_to_right = !vertical_tabs_are_on_right();
-        // The popup sits beside the tab bar rather than the tab, so it never covers the other pinned tiles in a row.
-        auto bar_rect = rect();
-        position = mapToGlobal(QPoint {
-            place_popup_to_right
-                ? bar_rect.right() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGINS.left()
-                : bar_rect.left() - popup_size.width() - TAB_PREVIEW_CARD_GAP + TAB_PREVIEW_SHADOW_MARGINS.right(),
-            tab_rect.center().y() - popup_size.height() / 2,
-        });
-
-        if (place_popup_to_right && position.x() + popup_size.width() > available_geometry.right())
-            position.setX(mapToGlobal(QPoint { bar_rect.left(), 0 }).x() - popup_size.width() - TAB_PREVIEW_CARD_GAP + TAB_PREVIEW_SHADOW_MARGINS.right());
-        else if (!place_popup_to_right && position.x() < available_geometry.left())
-            position.setX(mapToGlobal(QPoint { bar_rect.right(), 0 }).x() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGINS.left());
-    }
-
-    auto minimum_x = available_geometry.left() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGINS.left();
-    auto maximum_x = available_geometry.right() - popup_size.width() - TAB_PREVIEW_CARD_GAP + TAB_PREVIEW_SHADOW_MARGINS.right();
-    if (minimum_x <= maximum_x)
-        position.setX(clamp(position.x(), minimum_x, maximum_x));
-
-    auto minimum_y = available_geometry.top() + TAB_PREVIEW_CARD_GAP - TAB_PREVIEW_SHADOW_MARGINS.top();
-    auto maximum_y = available_geometry.bottom() - popup_size.height() - TAB_PREVIEW_CARD_GAP + TAB_PREVIEW_SHADOW_MARGINS.bottom();
-    if (minimum_y <= maximum_y)
-        position.setY(clamp(position.y(), minimum_y, maximum_y));
-
-    return position;
-}
-
 // The width of the tabs, which the bar reaches past on the page's side, where the selected tab joins the page's frame.
 int TabBar::vertical_bar_width() const
 {
@@ -3124,7 +2820,6 @@ void TabBar::set_hovered_tab_index(int index)
     update_tab_button_geometry();
     // A tab's hover fill fades in, but disappears at once when the pointer leaves.
     start_hover_animation(index, 1.0);
-    schedule_tab_preview(index);
     update();
 }
 
@@ -3211,7 +2906,7 @@ void TabBar::update_tab_button_geometry()
                 auto has_room = horizontal_tab_has_room_for_favicon_before(close_button_position.x(), content_rect.left());
                 auto replaces_favicon = horizontal_tab_close_button_replaces_favicon(content_rect, *close_button, is_selected, left_button || microphone);
                 if (replaces_favicon)
-                    close_button_position.setX(qRound(content_rect.center().x() - (close_button->width() / 2.0)));
+                    close_button_position.setX(horizontal_tab_close_button_x_in_favicon_place(content_rect, *close_button));
                 if (close_button->pos() != close_button_position)
                     close_button->move(close_button_position);
                 auto show_close_button = !is_dragged && !is_growing && (has_room || replaces_favicon) && is_in_view(close_button);
@@ -3221,7 +2916,9 @@ void TabBar::update_tab_button_geometry()
                     close_button->hide();
                 if (auto* tab_bar_button = qobject_cast<TabBarButton*>(close_button)) {
                     tab_bar_button->set_tab_emphasized(is_selected || index == m_hovered_tab_index);
-                    tab_bar_button->set_revealed(show_close_button);
+                    // NB: A close button that takes the favicon's place shows at once, rather than fading in where the
+                    //     favicon has already gone.
+                    tab_bar_button->set_revealed(show_close_button, replaces_favicon ? TabBarButton::Reveal::AtOnce : TabBarButton::Reveal::Fade);
                 } else if (close_button->isVisible() != show_close_button) {
                     close_button->setVisible(show_close_button);
                 }
@@ -3448,8 +3145,14 @@ TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
     m_page_column_layout->setContentsMargins(0, 0, 0, 0);
     m_bookmarks_bar = new BookmarksBarContainer(*m_toolbar, *m_stacked_widget, m_page_column);
     m_bookmarks_bar->bar().installEventFilter(this);
+    m_notification_bar_column = new QWidget(m_page_column);
+    m_notification_bar_column->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    m_notification_bar_column_layout = new QVBoxLayout(m_notification_bar_column);
+    m_notification_bar_column_layout->setSpacing(0);
+    m_notification_bar_column_layout->setContentsMargins(0, 0, 0, 0);
     if (Application::browser_options().disable_sandbox == WebView::DisableSandbox::Yes)
-        m_sandbox_off_bar = new SandboxOffBar(m_page_column);
+        show_notification_bar(NotificationBarSlot::SandboxOff, "The sandbox is off. Websites are less isolated from your computer.");
+    update_cpu_painting_bar();
 
     m_ladybird_button = new LadybirdButton(is_private, this);
 
@@ -3739,6 +3442,38 @@ void TabWidget::insert_tab(int index, Tab* widget, QString const& label)
     m_tab_bar->update_loading_ring_animation();
 }
 
+Tab* TabWidget::replace_tab(int index, Tab* widget)
+{
+    auto* old_widget = as_if<Tab>(m_stacked_widget->widget(index));
+    if (!old_widget)
+        return nullptr;
+
+    update_all_tabs_entries_soon();
+
+    m_stacked_widget->removeWidget(old_widget);
+    if (old_widget->is_loaded())
+        old_widget->view().removeEventFilter(this);
+    disconnect(old_widget, &Tab::loaded, this, nullptr);
+    m_toolbar->release_location_edit(*old_widget);
+
+    if (widget->is_loaded()) {
+        widget->view().installEventFilter(this);
+    } else {
+        auto did_load = [this, widget] {
+            widget->view().installEventFilter(this);
+        };
+        connect(widget, &Tab::loaded, this, did_load, Qt::SingleShotConnection);
+    }
+    m_stacked_widget->insertWidget(index, widget);
+    if (m_tab_bar->currentIndex() >= 0)
+        m_stacked_widget->setCurrentIndex(m_tab_bar->currentIndex());
+    m_tab_bar->did_replace_tab(*old_widget, *widget);
+
+    m_tab_bar->update();
+    m_tab_bar->update_loading_ring_animation();
+    return old_widget;
+}
+
 void TabWidget::remove_tab(int index)
 {
     take_tab(index);
@@ -3800,14 +3535,62 @@ void TabWidget::set_tab_bar_visible(bool visible)
 
     if (!m_tab_bar_visible)
         set_vertical_tabs_hover_expanded(false);
-    if (m_sandbox_off_bar)
-        m_sandbox_off_bar->setVisible(m_tab_bar_visible);
+    m_notification_bar_column->setVisible(m_tab_bar_visible);
 
     update_tab_chrome_visibility();
     update_tab_layout();
     // NB: The collapsed sidebar's buttons sit in the toolbar, which a layout built while the tab bar was hidden left
     //     without them.
     place_toolbar_sidebar_buttons();
+}
+
+// The notification bars stack in the order of their slots.
+void TabWidget::show_notification_bar(NotificationBarSlot slot, QString const& message, Vector<NotificationBar::Button> buttons, Function<void()> on_close)
+{
+    hide_notification_bar(slot);
+
+    int index = 0;
+    for (size_t i = 0; i < to_underlying(slot); ++i) {
+        if (m_notification_bars[i])
+            ++index;
+    }
+
+    auto* bar = new NotificationBar(*m_notification_bar_column, message, AK::move(buttons), AK::move(on_close));
+    m_notification_bar_column_layout->insertWidget(index, bar);
+    m_notification_bars[to_underlying(slot)] = bar;
+}
+
+void TabWidget::hide_notification_bar(NotificationBarSlot slot)
+{
+    auto*& bar = m_notification_bars[to_underlying(slot)];
+    if (!bar)
+        return;
+
+    m_notification_bar_column_layout->removeWidget(bar);
+    bar->hide();
+    bar->deleteLater();
+    bar = nullptr;
+}
+
+void TabWidget::update_cpu_painting_bar()
+{
+    if (!Application::the().shows_cpu_painting_bar()) {
+        hide_notification_bar(NotificationBarSlot::CpuPainting);
+        return;
+    }
+    if (m_notification_bars[to_underlying(NotificationBarSlot::CpuPainting)])
+        return;
+
+    Vector<NotificationBar::Button> buttons;
+    buttons.append({ "Report a bug", [this] {
+                        auto* browser_window = qobject_cast<BrowserWindow*>(window());
+                        if (!browser_window)
+                            return;
+                        browser_window->new_tab_from_url(Application::the().new_bug_report_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
+                    } });
+    show_notification_bar(NotificationBarSlot::CpuPainting, "Pages are painted on the CPU, which can be slow.", AK::move(buttons), [] {
+        Application::the().dismiss_cpu_painting_bar();
+    });
 }
 
 void TabWidget::set_window_controls_visible(bool visible)
@@ -5277,12 +5060,11 @@ void TabWidget::rebuild_page_column()
     add_page_to_page_column();
 }
 
-// The bar that says the sandbox is off, if it is, and then the bookmarks bar head the page, unless the bookmarks bar
-// only shows over the page while the pointer is near the toolbar. The tab performance monitor's row ends the column.
+// The notification bars and then the bookmarks bar head the page, unless the bookmarks bar only shows over the page
+// while the pointer is near the toolbar. The tab performance monitor's row ends the column.
 void TabWidget::add_page_to_page_column()
 {
-    if (m_sandbox_off_bar)
-        m_page_column_layout->addWidget(m_sandbox_off_bar);
+    m_page_column_layout->addWidget(m_notification_bar_column);
     if (!m_bookmarks_bar->shows_over_page())
         m_page_column_layout->addWidget(m_bookmarks_bar);
     m_page_column_layout->addWidget(m_stacked_widget, 1);
@@ -5777,8 +5559,20 @@ void TabBarButton::update_size()
 
 // The close button fades into the slot its tab keeps for it, and out of it, so that nothing else on the tab moves.
 // NB: Other layouts show and hide the button outright, so it is left opaque whenever it is not fading.
-void TabBarButton::set_revealed(bool revealed)
+void TabBarButton::set_revealed(bool revealed, Reveal reveal)
 {
+    if (revealed && reveal == Reveal::AtOnce) {
+        if (m_reveal_animation)
+            m_reveal_animation->stop();
+        m_revealed = true;
+        if (m_opacity != 1) {
+            m_opacity = 1;
+            update();
+        }
+        if (!isVisible())
+            show();
+        return;
+    }
     auto is_fading = m_reveal_animation && m_reveal_animation->state() == QAbstractAnimation::Running;
     if (revealed == m_revealed && (is_fading || isVisible() == revealed))
         return;

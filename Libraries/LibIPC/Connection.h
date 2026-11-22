@@ -18,6 +18,7 @@
 #include <AK/Time.h>
 #include <LibCore/EventReceiver.h>
 #include <LibIPC/Attachment.h>
+#include <LibIPC/FfiConnection.h>
 #include <LibIPC/Forward.h>
 #include <LibIPC/Message.h>
 #include <LibIPC/RawMessage.h>
@@ -93,6 +94,8 @@ public:
     // Dispatch every message the peer has already sent on this connection, without waiting for new ones.
     void dispatch_pending_messages();
 
+    FfiConnection to_ffi_with_one_reference();
+
     template<typename RequestType, typename... Args>
     NonnullOwnPtr<typename RequestType::ResponseType> send_sync(Args&&... args)
     {
@@ -156,6 +159,7 @@ protected:
     virtual OwnPtr<Message> try_parse_message(ReceivedMessageBytes const&, Queue<Attachment>&) = 0;
 
     ErrorOr<void> post_sync_request(Message const&);
+    ErrorOr<void> post_sync_request(MessageBuffer&);
     OwnPtr<IPC::Message> wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id, MayCancel = MayCancel::No, Optional<MonotonicTime> deadline = {});
     void wait_for_transport_to_become_readable(Optional<MonotonicTime> deadline = {});
     enum class PeerEOF {
@@ -165,6 +169,11 @@ protected:
     PeerEOF drain_messages_from_peer();
 
     void handle_messages();
+
+    bool send_raw_sync_request(MessageBuffer&, u32 response_endpoint_magic, i32 response_message_id, Function<void(FfiRawMessage)> const& hand_over_response);
+    static bool send_sync_request_from_rust(void* connection, ReadonlyBytes, ReadonlySpan<RawAttachment>, u32 response_endpoint_magic, i32 response_message_id, void* response_sink, void (*take_response)(void* response_sink, FfiRawMessage));
+    static void ref_from_rust(void* connection);
+    static void unref_from_rust(void* connection);
 
     AK::ThreadID m_owner_thread_id { AK::ThreadID::current() };
 
@@ -194,8 +203,13 @@ protected:
     virtual OwnPtr<Message> try_parse_message(ReceivedMessageBytes const& received_bytes, Queue<Attachment>& attachments) override
     {
         auto bytes = received_bytes.bytes();
-        if (auto header = RawMessage::read_header(bytes); header.has_value() && header->endpoint_magic == LocalEndpoint::static_magic()) {
-            if (auto message_name = LocalEndpoint::name_of_request_that_arrives_raw(header->message_id); message_name.has_value()) {
+        if (auto header = RawMessage::read_header(bytes); header.has_value()) {
+            Optional<StringView> message_name;
+            if (header->endpoint_magic == LocalEndpoint::static_magic())
+                message_name = LocalEndpoint::name_of_request_that_arrives_raw(header->message_id);
+            else if (header->endpoint_magic == PeerEndpoint::static_magic())
+                message_name = PeerEndpoint::name_of_response_that_arrives_raw(header->message_id);
+            if (message_name.has_value()) {
                 Vector<Attachment> attachments_of_message;
                 while (!attachments.is_empty())
                     attachments_of_message.append(attachments.dequeue());

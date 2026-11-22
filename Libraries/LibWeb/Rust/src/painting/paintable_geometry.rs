@@ -159,7 +159,10 @@ pub(crate) fn committed_svg_text_segments(
     arena: &impl GeometryRead,
     slot: NodeSlotId,
 ) -> Option<std::sync::Arc<Vec<crate::layout::fragment_tree::SvgTextSegment>>> {
-    if arena.node_kind_if_live(slot) != Some(crate::layout::node_data::NodeKind::SVGTextBox) {
+    if !matches!(
+        arena.node_kind_if_live(slot),
+        Some(crate::layout::node_data::NodeKind::SVGTextBox | crate::layout::node_data::NodeKind::SVGTextPathBox)
+    ) {
         return None;
     }
     arena.with_committed_fragment_link(slot, |link| {
@@ -181,6 +184,20 @@ pub(crate) fn committed_svg_text_character_cells(
     }
     arena.with_committed_fragment_link(slot, |link| {
         link.and_then(|link| link.fragment.svg()?.text_character_cells.clone())
+    })
+}
+
+/// The cells of the characters of a <text> or <tspan>'s own text nodes, as its box committed them; None for any other box,
+/// and for a text box laid along a path or not committed.
+pub(crate) fn committed_svg_text_own_character_cells(
+    arena: &impl GeometryRead,
+    slot: NodeSlotId,
+) -> Option<std::sync::Arc<Vec<svg_formatting_context::FfiSvgTextCharacterCell>>> {
+    if arena.node_kind_if_live(slot) != Some(crate::layout::node_data::NodeKind::SVGTextBox) {
+        return None;
+    }
+    arena.with_committed_fragment_link(slot, |link| {
+        link.and_then(|link| link.fragment.svg()?.text_own_character_cells.clone())
     })
 }
 

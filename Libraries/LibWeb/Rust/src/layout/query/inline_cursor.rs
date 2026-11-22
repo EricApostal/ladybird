@@ -382,7 +382,7 @@ impl<'a, A: PaintRead> InlineCursor<'a, A> {
         if node_painting::is_fragmented_inline(arena, node) {
             let mut has_content = paint_order::first_paint_child(arena, node).is_some();
             with_inline_pieces(arena, node, |piece| {
-                has_content |= !piece.is_geometry_only_placeholder;
+                has_content |= !piece.is_geometry_only_placeholder && piece.fragment_count != 0;
                 !has_content
             });
             if has_content {
@@ -475,9 +475,9 @@ impl<'a, A: PaintRead> InlineCursor<'a, A> {
         let range = side.lines().get(line.index as usize).map_or(0..0, |record| {
             record.first_fragment as usize..(record.first_fragment + record.fragment_count) as usize
         });
-        side.fragments()[range]
-            .iter()
-            .filter(move |fragment| !fragment.is_block_ellipsis && accepts(fragment))
+        side.fragments()[range].iter().filter(move |fragment| {
+            !fragment.is_block_ellipsis && !fragment.is_text_overflow_ellipsis && accepts(fragment)
+        })
     }
 
     /// The position in front of the <br> or preserved newline that ends `line`.

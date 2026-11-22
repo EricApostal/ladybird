@@ -1858,6 +1858,11 @@ void PageClient::page_did_change_needs_beforeunload_check(bool needs_beforeunloa
     client().async_did_change_needs_beforeunload_check(m_id, needs_beforeunload_check);
 }
 
+void PageClient::page_did_change_had_user_edits(bool had_user_edits)
+{
+    client().async_did_change_had_user_edits(m_id, had_user_edits);
+}
+
 void PageClient::page_did_consume_user_activation(Web::HTML::UserActivationConsumption consumption)
 {
     client().async_did_consume_user_activation(m_id, consumption);
@@ -2157,6 +2162,11 @@ void PageClient::run_webdriver_user_prompt_handling(u64 request_id)
 void PageClient::request_file(Web::FileRequest file_request)
 {
     client().request_file(m_id, move(file_request));
+}
+
+void PageClient::request_file_for_webdriver(u64 command_id, Web::FileRequest file_request)
+{
+    client().request_file_for_webdriver(m_id, command_id, move(file_request));
 }
 
 URL::BlobURLEntry::Token PageClient::page_did_add_blob_url_entry(Web::HTML::EnvironmentSettingsObject const& environment, Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const& entry)

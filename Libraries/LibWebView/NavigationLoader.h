@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
+#include <AK/Error.h>
 #include <AK/Function.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
@@ -22,7 +24,9 @@
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/LocalFileRoot.h>
 #include <LibWebView/RequestServerManager.h>
+#include <time.h>
 
 namespace WebView {
 
@@ -34,9 +38,9 @@ class WEBVIEW_API NavigationLoader final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    static NonnullRefPtr<NavigationLoader> create(Web::HTML::NavigationPopulationRequest request)
+    static NonnullRefPtr<NavigationLoader> create(Web::HTML::NavigationPopulationRequest request, LocalFileAccess local_file_access = {})
     {
-        return adopt_ref(*new NavigationLoader(move(request)));
+        return adopt_ref(*new NavigationLoader(move(request), move(local_file_access)));
     }
 
     ~NavigationLoader();
@@ -78,6 +82,7 @@ public:
     // The host's client that RequestServer was told may adopt the response body.
     Optional<int> response_body_adopter_client_id() const { return m_response_body_adopter_client_id; }
     Web::HTML::NavigationPopulationRequest const& request() const { return m_request; }
+    Optional<LocalFileRoot> const& local_file_root() const { return m_local_file_root; }
     Web::HTML::NavigationPopulationResult const& result() const;
     Web::HTML::NavigationPopulationResult take_result();
     void reclaim_response_body_after_failed_handoff();
@@ -107,10 +112,21 @@ public:
     static void discard(WebContentClient const& population_worker, Web::HTML::NavigationPopulationResult&);
 
 private:
-    explicit NavigationLoader(Web::HTML::NavigationPopulationRequest request)
+    NavigationLoader(Web::HTML::NavigationPopulationRequest request, LocalFileAccess local_file_access)
         : m_request(move(request))
+        , m_requested_url(m_request.history_entry.url)
+        , m_local_file_access(move(local_file_access))
     {
     }
+
+    struct LocalFile {
+        ByteBuffer contents;
+        time_t modified_time { 0 };
+        ByteString canonical_path;
+    };
+    void read_local_file_for_response();
+    Optional<LocalFileRoot> root_of_local_file(ByteString const& canonical_path) const;
+    void did_read_local_file_for_response(ErrorOr<LocalFile>);
 
     void determine_the_origin_of_the_response();
     bool reported_urls_match_the_response_url(URL::URL const&) const;
@@ -121,6 +137,10 @@ private:
     void release_response_body();
 
     Web::HTML::NavigationPopulationRequest m_request;
+    // The URL the request was made for, before the process that fetched the response reported where it ended up.
+    URL::URL m_requested_url;
+    LocalFileAccess m_local_file_access;
+    Optional<LocalFileRoot> m_local_file_root;
     Optional<Web::HTML::NavigationPopulationResult> m_result;
     RefPtr<Requests::Request> m_response_body_request;
     RefPtr<HTTP::HeaderList> m_response_header_list;

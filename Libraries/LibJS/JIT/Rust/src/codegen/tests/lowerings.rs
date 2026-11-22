@@ -213,11 +213,13 @@ fn argument(index: u32) -> Operand {
     Operand::from_raw(layout().arguments_base() + index)
 }
 
-fn marker_runtime() -> RuntimeInfo {
+/// Gives `snapshot` the runtime of the tests, with slow paths that leave a marker.
+fn set_marker_runtime(snapshot: &mut Snapshot) {
     use OpCode as O;
     let mut runtime = runtime();
-    let mut set =
-        |opcode: OpCode, address: u64| std::sync::Arc::make_mut(&mut runtime.slow_paths)[opcode as usize] = address;
+    runtime.object_allocation.template = snapshot.add(&[PLAIN_OBJECT_CLASS]);
+    let mut slow_paths = runtime.slow_paths.to_vec();
+    let mut set = |opcode: OpCode, address: u64| slow_paths[opcode as usize] = address;
     for opcode in [
         O::Add,
         O::AddLhsInt32,
@@ -320,12 +322,12 @@ fn marker_runtime() -> RuntimeInfo {
     runtime.object_allocation.plain_inline_storage_offset = 64;
     runtime.object_allocation.inline_capacity_offset = 40;
     runtime.offsets.shape_dictionary_generation = 84;
-    runtime.object_allocation.template = vec![PLAIN_OBJECT_CLASS];
     runtime.dynamic_calls.object_flag_is_ecmascript_function = FLAG_IS_ECMASCRIPT_FUNCTION;
     for opcode in [O::Increment, O::Decrement, O::PostfixIncrement, O::PostfixDecrement] {
         set(opcode, marker_record as *const () as u64);
     }
-    runtime
+    runtime.slow_paths = slow_paths.leak();
+    snapshot.runtime = runtime;
 }
 
 /// Compiles `program` with the marker slow paths and runs it with `arguments`.
@@ -346,10 +348,10 @@ fn run_program_with_snapshot(
 
 fn compile_program(program: &Program, prepare_snapshot: impl FnOnce(&mut Snapshot)) -> (Snapshot, CompiledCode) {
     let mut snapshot = crate::builder::tests::snapshot_for(program, layout());
-    snapshot.runtime = marker_runtime();
-    snapshot.executables[0].feedback.arith = vec![GENERAL_FEEDBACK];
+    set_marker_runtime(&mut snapshot);
+    snapshot.executables[0].feedback.arith = snapshot.add(&[GENERAL_FEEDBACK]);
     prepare_snapshot(&mut snapshot);
-    let compiled = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true)
+    let compiled = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
         .unwrap_or_else(|failure| panic!("compilation failed: {failure:?}"));
     (snapshot, compiled)
 }
@@ -373,18 +375,18 @@ fn run_compiled_program(
 }
 
 /// Runs `instruction`, which writes `r(5)` from the arguments, and returns `r(5)`.
-fn run_instruction(instruction: Instruction, arguments: &[u64]) -> u64 {
+fn run_instruction(instruction: Instruction<'static>, arguments: &[u64]) -> u64 {
     run_instruction_with(GENERAL_FEEDBACK, instruction, arguments).0
 }
 
 /// Like `run_instruction()`, with arithmetic feedback `feedback`, and
 /// `EXITED` if the code exits. Also returns the number of calls of the
 /// fake comparison and jump slow paths.
-fn run_instruction_with(feedback: u8, instruction: Instruction, arguments: &[u64]) -> (u64, u64) {
+fn run_instruction_with(feedback: u8, instruction: Instruction<'static>, arguments: &[u64]) -> (u64, u64) {
     compile_instruction(feedback, instruction)(arguments)
 }
 
-fn compile_instruction(feedback: u8, instruction: Instruction) -> impl Fn(&[u64]) -> (u64, u64) {
+fn compile_instruction(feedback: u8, instruction: Instruction<'static>) -> impl Fn(&[u64]) -> (u64, u64) {
     let program = assemble(|_| {
         vec![
             Instruction::Enter,
@@ -393,7 +395,7 @@ fn compile_instruction(feedback: u8, instruction: Instruction) -> impl Fn(&[u64]
         ]
     });
     let (snapshot, compiled) = compile_program(&program, |snapshot| {
-        snapshot.executables[0].feedback.arith = vec![feedback]
+        snapshot.executables[0].feedback.arith = snapshot.add(&[feedback]);
     });
     move |arguments| instruction_result(run_compiled_program(&snapshot, &compiled, arguments, |_| {}))
 }
@@ -584,7 +586,7 @@ fn double_operation(op: BinaryOp, lhs: f64, rhs: f64) -> f64 {
     }
 }
 
-fn binary_instruction(op: BinaryOp, lhs: OperationInput, rhs: OperationInput) -> Instruction {
+fn binary_instruction(op: BinaryOp, lhs: OperationInput, rhs: OperationInput) -> Instruction<'static> {
     use OperationInput::Int32;
     use OperationInput::Operand as Slot;
     let dst = r(5);
@@ -704,7 +706,7 @@ fn double_operations_on_values_that_die_at_them() {
         ]
     });
     let (snapshot, compiled) = compile_program(&program, |snapshot| {
-        snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::DOUBLE; 4];
+        snapshot.executables[0].feedback.arith = snapshot.add(&[crate::snapshot::arith_feedback::DOUBLE; 4]);
     });
     let numbers = [0.5, -1.25, 3.0, 1e300, -0.0, f64::INFINITY, f64::NAN, 7.75];
     for lhs in numbers {
@@ -851,7 +853,7 @@ fn updates() {
             let (result, _) = run_program_with_snapshot(
                 program,
                 &[value, value::UNDEFINED],
-                |snapshot| snapshot.executables[0].feedback.arith = vec![feedback],
+                |snapshot| snapshot.executables[0].feedback.arith = snapshot.add(&[feedback]),
                 |_| {},
             );
             if result.status == crate::code::JitStatus::Resume as u64 {
@@ -958,7 +960,7 @@ fn slow_paths_preserve_registers() {
             Instruction::NewArray {
                 dst: l(0),
                 element_count: 3,
-                elements: vec![r(5), r(6), r(7)],
+                elements: crate::test_zone().alloc_slice_copy(&[r(5), r(6), r(7)]),
             },
             Instruction::Return { value: l(0) },
         ]
@@ -1036,7 +1038,12 @@ const COMPARISONS: [Comparison; 8] = [
     Comparison::LooselyInequals,
 ];
 
-fn compare_instruction(comparison: Comparison, dst: Operand, lhs: Operand, rhs: OperationInput) -> Instruction {
+fn compare_instruction(
+    comparison: Comparison,
+    dst: Operand,
+    lhs: Operand,
+    rhs: OperationInput,
+) -> Instruction<'static> {
     use OperationInput::Int32;
     use OperationInput::Operand as Slot;
     macro_rules! pick {
@@ -1080,7 +1087,7 @@ fn compare_jump_instruction(
     is_loop: bool,
     true_target: crate::bytecode::Label,
     false_target: crate::bytecode::Label,
-) -> Instruction {
+) -> Instruction<'static> {
     use OperationInput::Int32;
     use OperationInput::Operand as Slot;
     macro_rules! pick {
@@ -1184,11 +1191,12 @@ fn boolean(result: Option<bool>) -> u64 {
 #[test]
 fn comparisons() {
     let values = values();
-    let check = |(result, slow_calls), instruction: &Instruction, lhs: u64, rhs: u64, expected: Option<bool>| {
-        let context = format!("{instruction:?} {lhs:#x} {rhs:#x}: got {result:#x}");
-        assert_eq!(result, boolean(expected), "{context}");
-        assert_eq!(slow_calls, u64::from(expected.is_none()), "{context}");
-    };
+    let check =
+        |(result, slow_calls), instruction: &Instruction<'static>, lhs: u64, rhs: u64, expected: Option<bool>| {
+            let context = format!("{instruction:?} {lhs:#x} {rhs:#x}: got {result:#x}");
+            assert_eq!(result, boolean(expected), "{context}");
+            assert_eq!(slow_calls, u64::from(expected.is_none()), "{context}");
+        };
     for comparison in COMPARISONS {
         let instruction = compare_instruction(comparison, r(5), argument(0), OperationInput::Operand(argument(1)));
         let run = compile_instruction(GENERAL_FEEDBACK, instruction.clone());
@@ -1686,12 +1694,12 @@ fn typed_array_accesses_with_constant_indices() {
                 &program,
                 &[object_value(&array), value::int32(77)],
                 |snapshot| {
-                    let executable = &mut snapshot.executables[0];
-                    executable.constants[1] = value::int32(index);
-                    executable.feedback.keyed = vec![KeyedFeedbackSnapshot {
+                    let constants = snapshot.executables[0].constants;
+                    snapshot[constants][1] = value::int32(index);
+                    snapshot.executables[0].feedback.keyed = snapshot.add(&[KeyedFeedbackSnapshot {
                         bits: keyed_feedback_bits::INT32_INDEX
                             | 1 << (keyed_feedback_bits::TYPED_ARRAY_SHIFT + u32::from(kind)),
-                    }];
+                    }]);
                 },
                 |_| {},
             );
@@ -1898,7 +1906,7 @@ fn property_iterator_next(receiver: u64, keys: u64, cursor: u64) -> (u64, u64, u
         let (result, machine) = run_program_with_snapshot(
             &program,
             &[receiver, keys, cursor],
-            |snapshot| snapshot.executables[0].exit_sites = vec![(pc, ExitKind::SlowPath)],
+            |snapshot| snapshot.executables[0].exit_sites = snapshot.add(&[(pc, ExitKind::SlowPath)]),
             |_| {},
         );
         assert_eq!(result.status, RETURNED);
@@ -2016,7 +2024,8 @@ fn property_iterator_next_reads_key_snapshots() {
 // Rare data has its binding flags at word 5. Environment shapes have their
 // flag count at word 5 and their flags at word 7. Realms have the global
 // object at word 3 and the global declarative environment at word 4. The
-// frame has the variable environment at word 12 and the realm at word 9.
+// frame has the variable environment at word 12, and the fake VM has the
+// current realm at word 7.
 
 const BINDING_MUTABLE: u8 = 2;
 
@@ -2063,7 +2072,7 @@ impl FakeEnvironment {
 /// returns the result and how often a slow path that counts ran. `exits` are
 /// the exits taken before, by the index of their instruction.
 fn run_with_environments(
-    instructions: Vec<Instruction>,
+    instructions: Vec<Instruction<'static>>,
     arguments: &[u64],
     lexical: &FakeEnvironment,
     variable: &FakeEnvironment,
@@ -2073,12 +2082,12 @@ fn run_with_environments(
     let exit_sites = exits
         .iter()
         .map(|(index, kind)| (program.offsets[*index], *kind))
-        .collect();
+        .collect::<Vec<_>>();
     let (result, machine) = run_program_with_snapshot(
         &program,
         arguments,
         |snapshot| {
-            snapshot.executables[0].exit_sites = exit_sites;
+            snapshot.executables[0].exit_sites = snapshot.add(&exit_sites);
             super::fake_heap::use_in(&mut snapshot.runtime);
         },
         |machine| {
@@ -2262,7 +2271,7 @@ fn create_variable() {
             &program,
             &[],
             |snapshot| {
-                snapshot.executables[0].identifiers = NAMES.to_vec();
+                snapshot.executables[0].identifiers = snapshot.add(&NAMES);
                 super::fake_heap::use_in(&mut snapshot.runtime);
             },
             |machine| {
@@ -2373,7 +2382,7 @@ impl FakeGlobals {
         }
     }
 
-    fn run(&self, instruction: Instruction, arguments: &[u64]) -> (JitResult, u64) {
+    fn run(&self, instruction: Instruction<'static>, arguments: &[u64]) -> (JitResult, u64) {
         let program = assemble(|_| {
             vec![
                 Instruction::Enter,
@@ -2383,7 +2392,7 @@ impl FakeGlobals {
         });
         let (result, machine) = run_program(&program, arguments, |machine| {
             machine.frame[4] = self.executable.as_ptr() as u64;
-            machine.frame[9] = self.realm.as_ptr() as u64;
+            machine.vm[VM_CURRENT_REALM_WORD] = self.realm.as_ptr() as u64;
         });
         (result, machine.vm[VM_SLOW_PUTS_WORD])
     }
@@ -2465,7 +2474,7 @@ fn global_variables() {
 /// environment has the serial number `serial`.
 fn run_with_global_cache(
     globals: &FakeGlobals,
-    instruction: &Instruction,
+    instruction: &Instruction<'static>,
     arguments: &[u64],
     cache: crate::snapshot::GlobalCacheSnapshot,
     serial: u64,
@@ -2477,18 +2486,19 @@ fn run_with_global_cache(
             Instruction::Return { value: r(5) },
         ]
     });
-    let snapshot_globals = crate::snapshot::GlobalsSnapshot {
-        object: crate::snapshot::CellId(globals.object.as_ptr() as u64),
-        declarative_environment: crate::snapshot::CellId(globals.environment.address()),
-        environment_serial: serial,
-        caches: vec![None, Some(cache)],
-    };
     // NB: The code accesses the global variables directly, without the
     //     realm or the executable's caches.
     let (result, _) = run_program_with_snapshot(
         &program,
         arguments,
-        |snapshot| snapshot.executables[0].globals = Some(snapshot_globals),
+        |snapshot| {
+            snapshot.executables[0].globals = Some(crate::snapshot::GlobalsSnapshot {
+                object: crate::snapshot::CellId(globals.object.as_ptr() as u64),
+                declarative_environment: crate::snapshot::CellId(globals.environment.address()),
+                environment_serial: serial,
+                caches: snapshot.add(&[None, Some(cache)]),
+            });
+        },
         |_| {},
     );
     result
@@ -2678,35 +2688,37 @@ fn instance_of_global_functions_walks_prototype_chains() {
     });
     let globals = FakeGlobals::new();
     let run = |value: u64, shape: u64| {
-        let snapshot_globals = crate::snapshot::GlobalsSnapshot {
-            object: CellId(globals.object.as_ptr() as u64),
-            declarative_environment: CellId(globals.environment.address()),
-            environment_serial: 99,
-            caches: vec![
-                None,
-                Some(GlobalCacheSnapshot::Binding {
-                    index: 2,
-                    mutable: false,
-                    assigned: false,
-                    value: Some(GlobalValueSnapshot {
-                        bits: function_value,
-                        inline_executable: None,
-                        cell: None,
-                        intrinsic: None,
-                        typed_array: None,
-                        has_instance: Some(OrdinaryHasInstanceSnapshot {
-                            shape: CellId(shape),
-                            dictionary_generation: None,
-                            prototype_offset: 1,
-                        }),
+        let caches = [
+            None,
+            Some(GlobalCacheSnapshot::Binding {
+                index: 2,
+                mutable: false,
+                assigned: false,
+                value: Some(GlobalValueSnapshot {
+                    bits: function_value,
+                    inline_executable: None,
+                    cell: None,
+                    intrinsic: None,
+                    typed_array: None,
+                    has_instance: Some(OrdinaryHasInstanceSnapshot {
+                        shape: CellId(shape),
+                        dictionary_generation: None,
+                        prototype_offset: 1,
                     }),
                 }),
-            ],
-        };
+            }),
+        ];
         let (result, _) = run_program_with_snapshot(
             &program,
             &[value],
-            |snapshot| snapshot.executables[0].globals = Some(snapshot_globals),
+            |snapshot| {
+                snapshot.executables[0].globals = Some(crate::snapshot::GlobalsSnapshot {
+                    object: CellId(globals.object.as_ptr() as u64),
+                    declarative_environment: CellId(globals.environment.address()),
+                    environment_serial: 99,
+                    caches: snapshot.add(&caches),
+                });
+            },
             |_| {},
         );
         result
@@ -2743,9 +2755,10 @@ fn modulo_of_random_int32_values() {
         ]
     });
     let mut snapshot = crate::builder::tests::snapshot_for(&program, layout());
-    snapshot.runtime = marker_runtime();
-    snapshot.executables[0].feedback.arith = vec![INT32_RESULTS_FEEDBACK];
-    let compiled = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    set_marker_runtime(&mut snapshot);
+    snapshot.executables[0].feedback.arith = snapshot.add(&[INT32_RESULTS_FEEDBACK]);
+    let compiled =
+        compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new()).unwrap();
     let mut random = crate::regalloc::tests::Random(0x1234_5678_9ABC_DEF1);
     for _ in 0..20000 {
         let pick = |random: &mut crate::regalloc::tests::Random| {
@@ -2782,7 +2795,7 @@ fn modulo_of_random_int32_values() {
 #[test]
 fn checks_take_the_slow_path_only_when_they_fail() {
     let object = u64::from(value::OBJECT_TAG) << 48 | 0x1000;
-    let slow_paths = |instruction: Instruction, argument: u64| {
+    let slow_paths = |instruction: Instruction<'static>, argument: u64| {
         let program = assemble(|_| {
             vec![
                 Instruction::Enter,
@@ -2791,7 +2804,9 @@ fn checks_take_the_slow_path_only_when_they_fail() {
             ]
         });
         let pc = program.offsets[1];
-        let exits = |snapshot: &mut Snapshot| snapshot.executables[0].exit_sites = vec![(pc, ExitKind::Uninitialized)];
+        let exits = |snapshot: &mut Snapshot| {
+            snapshot.executables[0].exit_sites = snapshot.add(&[(pc, ExitKind::Uninitialized)]);
+        };
         let (result, machine) = run_program_with_snapshot(&program, &[argument], exits, |machine| {
             // The this value register.
             machine.frame[FRAME_HEADER_WORDS + 2] = argument;
@@ -2980,15 +2995,21 @@ fn every_fast_path_compiles_for_both_architectures() {
         instructions
     });
     let mut snapshot = crate::builder::tests::snapshot_for(&program, layout());
-    snapshot.runtime = marker_runtime();
+    set_marker_runtime(&mut snapshot);
+    let mut slow_paths = snapshot.runtime.slow_paths.to_vec();
     for opcode in [OpCode::InitializeVariableBinding, OpCode::SetLexicalBinding] {
-        std::sync::Arc::make_mut(&mut snapshot.runtime.slow_paths)[opcode as usize] = marker_put as *const () as u64;
+        slow_paths[opcode as usize] = marker_put as *const () as u64;
     }
-    let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    snapshot.runtime.slow_paths = slow_paths.leak();
+    let compiled =
+        compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
     let text = crate::asm::disassembler::aarch64(&compiled.code[..compiled.data_offset as usize]).join("\n");
     // NB: Float32Array stores convert to single precision.
     assert!(text.contains("fcvt s31, d"), "{text}");
-    let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    let compiled =
+        compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
     let text = crate::asm::disassembler::x86_64(&compiled.code[..compiled.data_offset as usize]).join("\n");
     assert!(text.contains("cvtsd2ss"), "{text}");
 }
@@ -3068,13 +3089,13 @@ impl FakeCachedObject {
         self.entry[2] = new_shape.as_ptr() as u64;
     }
 
-    fn run(&self, instruction: Instruction, arguments: &[u64]) -> (JitResult, u64) {
+    fn run(&self, instruction: Instruction<'static>, arguments: &[u64]) -> (JitResult, u64) {
         self.run_with_prototypes(instruction, arguments, PrimitivePrototypes::default())
     }
 
     fn run_with_prototypes(
         &self,
-        instruction: Instruction,
+        instruction: Instruction<'static>,
         arguments: &[u64],
         prototypes: PrimitivePrototypes,
     ) -> (JitResult, u64) {
@@ -3091,14 +3112,19 @@ impl FakeCachedObject {
             |snapshot| {
                 snapshot.runtime.layout.keyed_lookup_cache_entries = self.keyed_lookup_cache.get();
                 snapshot.runtime.layout.keyed_store_cache_entries = self.keyed_store_cache.get();
+                if self.megamorphic_in_snapshot.get() {
+                    snapshot.executables[0].property_caches = snapshot.add(&[
+                        crate::snapshot::PropertyCacheSnapshot::default(),
+                        crate::snapshot::PropertyCacheSnapshot {
+                            kind: crate::snapshot::PropertyCacheKind::Megamorphic,
+                            ..Default::default()
+                        },
+                    ]);
+                }
                 let executable = &mut snapshot.executables[0];
                 executable.string_prototype = prototypes.string.map(crate::snapshot::CellId);
                 executable.number_prototype = prototypes.number.map(crate::snapshot::CellId);
                 executable.boolean_prototype = prototypes.boolean.map(crate::snapshot::CellId);
-                if self.megamorphic_in_snapshot.get() {
-                    executable.property_caches.resize(2, Default::default());
-                    executable.property_caches[1].kind = crate::snapshot::PropertyCacheKind::Megamorphic;
-                }
             },
             |machine| machine.frame[4] = self.executable.as_ptr() as u64,
         );
@@ -3220,7 +3246,7 @@ fn get_by_id_reads_direct_getter_wrappers_of_compressed_fields_inline() {
 }
 
 fn get_by_id_reads_direct_getter_wrappers_inline_from(compressed_field: bool) {
-    use crate::builder::tests::property_access::{cache, own};
+    use crate::builder::tests::property_access::{add_caches, cache, own};
     use crate::snapshot::{
         AccessorFunctionSnapshot, CellId, DirectGetterFields, NativeCallTarget, PropertyCacheEntryType,
     };
@@ -3248,7 +3274,7 @@ fn get_by_id_reads_direct_getter_wrappers_inline_from(compressed_field: bool) {
     fake.object[10] = implementation.as_ptr() as u64;
     let target = NativeCallTarget {
         function: CellId(function.as_ptr() as u64),
-        realm: CellId(0x7000),
+        realm: CellId(crate::builder::tests::inlining::REALM),
         entry: core::num::NonZeroU64::new(fake_native_getter as *const () as u64),
         direct_getter: Some(DirectGetterFields {
             wrapper_implementation: 80,
@@ -3283,7 +3309,10 @@ fn get_by_id_reads_direct_getter_wrappers_inline_from(compressed_field: bool) {
         let (result, _) = run_program_with_snapshot(
             &program,
             &[fake.value()],
-            |snapshot| snapshot.executables[0].property_caches = vec![cache(Vec::new()), cache(vec![entry])],
+            |snapshot| {
+                snapshot.executables[0].property_caches =
+                    add_caches(snapshot, &[cache(Vec::new()), cache(vec![entry])]);
+            },
             |machine| machine.frame[4] = fake.executable.as_ptr() as u64,
         );
         assert_eq!(result.status, RETURNED);
@@ -3333,7 +3362,7 @@ extern "C" fn fake_native_setter(vm: *mut u64) -> FakeNativeResult {
 
 #[test]
 fn put_by_id_calls_native_setters_of_prototypes() {
-    use crate::builder::tests::property_access::{cache, own};
+    use crate::builder::tests::property_access::{add_caches, cache, own};
     use crate::snapshot::{AccessorFunctionSnapshot, CellId, NativeCallTarget, PropertyCacheEntryType};
     // A prototype whose property 0 is an accessor with a native setter.
     let function = low_cell(&[0; 4]);
@@ -3345,7 +3374,7 @@ fn put_by_id_calls_native_setters_of_prototypes() {
     let fake = FakeCachedObject::new(&[value::int32(10)]);
     let target = NativeCallTarget {
         function: CellId(function.as_ptr() as u64),
-        realm: CellId(0x7000),
+        realm: CellId(crate::builder::tests::inlining::REALM),
         entry: core::num::NonZeroU64::new(fake_native_setter as *const () as u64),
         direct_getter: None,
     };
@@ -3381,7 +3410,9 @@ fn put_by_id_calls_native_setters_of_prototypes() {
     let (result, machine) = run_program_with_snapshot(
         &program,
         &[fake.value(), value::int32(42)],
-        |snapshot| snapshot.executables[0].property_caches = vec![cache(Vec::new()), cache(vec![entry])],
+        |snapshot| {
+            snapshot.executables[0].property_caches = add_caches(snapshot, &[cache(Vec::new()), cache(vec![entry])]);
+        },
         |machine| machine.frame[4] = fake.executable.as_ptr() as u64,
     );
     assert_eq!(result.status, RETURNED);
@@ -3620,24 +3651,24 @@ fn get_by_value_of_string_characters() {
 
 /// A `Call` of the callee in `argument(0)` with `this_value` and
 /// `arguments`, into `r(5)`.
-fn builtin_call(this_value: Operand, arguments: Vec<Operand>) -> Instruction {
+fn builtin_call(this_value: Operand, arguments: Vec<Operand>) -> Instruction<'static> {
     Instruction::Call {
         call_feedback: 0,
         dst: r(5),
         callee: argument(0),
         this_value,
         argument_count: arguments.len() as u32,
-        arguments,
+        arguments: crate::test_zone().alloc_slice_copy(&arguments),
     }
 }
 
 /// Makes the feedback of the `Call` of `builtin_call()` say it saw the
 /// builtin `builtin`.
 fn saw_builtin(snapshot: &mut Snapshot, builtin: u8) {
-    snapshot.executables[0].feedback.call = vec![crate::snapshot::CallFeedbackSnapshot {
+    snapshot.executables[0].feedback.call = snapshot.add(&[crate::snapshot::CallFeedbackSnapshot {
         target_builtin: Some(builtin),
         ..Default::default()
-    }];
+    }]);
 }
 
 /// Fake function memory: its flags at byte 8, and the builtin it is plus one
@@ -3738,7 +3769,8 @@ fn math_builtin_calls() {
             |snapshot| {
                 saw_builtin(snapshot, builtin);
                 if exited {
-                    snapshot.executables[0].exit_sites = vec![(pc, ExitKind::SlowPath), (pc, ExitKind::Overflow)];
+                    snapshot.executables[0].exit_sites =
+                        snapshot.add(&[(pc, ExitKind::SlowPath), (pc, ExitKind::Overflow)]);
                 }
             },
             |_| {},
@@ -3895,7 +3927,7 @@ fn math_function_calls() {
             |snapshot| {
                 saw_builtin(snapshot, builtin);
                 if exited {
-                    snapshot.executables[0].exit_sites = vec![(pc, ExitKind::SlowPath)];
+                    snapshot.executables[0].exit_sites = snapshot.add(&[(pc, ExitKind::SlowPath)]);
                 }
             },
             |_| {},
@@ -4076,7 +4108,7 @@ fn short_string_concatenations_through_the_fly_string_cache() {
                 snapshot.runtime.rope_allocation = crate::snapshot::RopeAllocationInfo {
                     allocator: 1,
                     cell_size: 64,
-                    template: vec![0; 8],
+                    template: snapshot.add(&[0; 8]),
                     lhs_offset: 32,
                     rhs_offset: 36,
                     length_offset: 16,
@@ -4093,7 +4125,7 @@ fn short_string_concatenations_through_the_fly_string_cache() {
                 snapshot.runtime.layout.large_numeric_string_cache_number = 0;
                 snapshot.runtime.layout.large_numeric_string_cache_string = 8;
                 // ArithFeedback::String and ArithFeedback::Int32.
-                snapshot.executables[0].feedback.arith = vec![1 << 3 | 1];
+                snapshot.executables[0].feedback.arith = snapshot.add(&[1 << 3 | 1]);
             },
             |_| {},
         );
@@ -4633,7 +4665,7 @@ fn rope_strings_come_from_the_runtime_without_a_local_free_cell() {
                 snapshot.runtime.rope_allocation = crate::snapshot::RopeAllocationInfo {
                     allocator: free_list.as_mut_ptr() as u64,
                     cell_size: 64,
-                    template: vec![0x1234; 8],
+                    template: snapshot.add(&[0x1234; 8]),
                     lhs_offset: 32,
                     rhs_offset: 36,
                     length_offset: 16,
@@ -4652,7 +4684,7 @@ fn rope_strings_come_from_the_runtime_without_a_local_free_cell() {
                 allocation.local_end_offset = 16;
                 allocation.local_cell_size_offset = 24;
                 // ArithFeedback::String.
-                snapshot.executables[0].feedback.arith = vec![1 << 3];
+                snapshot.executables[0].feedback.arith = snapshot.add(&[1 << 3]);
             },
             |_| {},
         );
@@ -4732,7 +4764,7 @@ fn concatenations_that_are_keys_take_the_strings_the_vm_remembers() {
                 snapshot.runtime.rope_allocation = crate::snapshot::RopeAllocationInfo {
                     allocator: free_list.as_mut_ptr() as u64,
                     cell_size: 64,
-                    template: vec![0x1234; 8],
+                    template: snapshot.add(&[0x1234; 8]),
                     lhs_offset: 32,
                     rhs_offset: 36,
                     length_offset: 16,
@@ -4757,7 +4789,7 @@ fn concatenations_that_are_keys_take_the_strings_the_vm_remembers() {
                 allocation.local_end_offset = 16;
                 allocation.local_cell_size_offset = 24;
                 // ArithFeedback::String.
-                snapshot.executables[0].feedback.arith = vec![1 << 3];
+                snapshot.executables[0].feedback.arith = snapshot.add(&[1 << 3]);
             },
             |_| {},
         );

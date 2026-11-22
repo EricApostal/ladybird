@@ -10,6 +10,7 @@
 //! entries out of line by the runtime's cache probe.
 
 use super::super::Codegen;
+use super::super::RegisterList;
 use super::super::checked_i32;
 use super::super::slow_path_calls::slow_path_saved_registers;
 use super::keyed::KeyName;
@@ -105,7 +106,7 @@ pub(super) struct AdditionEntryFields {
     pub property_offset: i32,
 }
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     fn cache_registers(&self, node: NodeId) -> CacheRegisters {
         CacheRegisters {
             object: self.temp(node, 0),
@@ -128,7 +129,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             let running = self.frame_field(self.runtime.offsets.execution_context_executable);
             self.masm.load64(dst, &running);
         } else {
-            self.masm.move_imm64(dst, self.executables[executable as usize].cell.0);
+            self.masm
+                .move_imm64(dst, self.snapshot.executables[executable as usize].cell.0);
         }
         self.masm.load64(
             dst,
@@ -163,8 +165,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.emit_load_compressed_cell(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
         self.property_cache_address(entry, executable, cache_index)?;
         self.masm.load64(entry, &Address::new(entry, 0));
-        let was_megamorphic = self.executables[executable as usize]
-            .property_caches
+        let was_megamorphic = self.snapshot[self.snapshot.executables[executable as usize].property_caches]
             .get(cache_index as usize)
             .is_some_and(|cache| cache.kind == PropertyCacheKind::Megamorphic);
         if was_megamorphic {
@@ -366,30 +367,28 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
         let base = self.input(node, 0);
         self.masm.shr64_imm(scratch, base, value::TAG_SHIFT);
-        let snapshot = &self.executables[executable as usize];
+        let snapshot = &self.snapshot.executables[executable as usize];
         let prototypes = [
             (value::STRING_TAG, snapshot.string_prototype),
             (value::INT32_TAG, snapshot.number_prototype),
             (value::BOOLEAN_TAG, snapshot.boolean_prototype),
         ]
-        .into_iter()
-        .filter_map(|(tag, prototype)| Some((tag, prototype?, self.masm.new_label())))
-        .collect::<Vec<_>>();
+        .map(|(tag, prototype)| Some((tag, prototype?, self.masm.new_label())));
         let (is_object, have_object) = (self.masm.new_label(), self.masm.new_label());
         self.masm
             .branch32_imm(Condition::Equal, scratch, i32::from(value::OBJECT_TAG), is_object);
-        for (tag, _, label) in &prototypes {
+        for (tag, _, label) in prototypes.iter().flatten() {
             self.masm
                 .branch32_imm(Condition::Equal, scratch, i32::from(*tag), *label);
         }
         // Doubles are numbers too.
-        if let Some((_, _, number)) = prototypes.iter().find(|(tag, ..)| *tag == value::INT32_TAG) {
+        if let Some((_, _, number)) = prototypes.iter().flatten().find(|(tag, ..)| *tag == value::INT32_TAG) {
             self.masm.and32_imm(scratch, scratch, u32::from(value::BASE_TAG));
             self.masm
                 .branch32_imm(Condition::NotEqual, scratch, i32::from(value::BASE_TAG), *number);
         }
         self.masm.jump(fail);
-        for (_, prototype, label) in prototypes {
+        for (_, prototype, label) in prototypes.into_iter().flatten() {
             self.masm.bind(label);
             self.masm.move_imm64(object, prototype.0);
             self.masm.jump(have_object);
@@ -467,12 +466,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// shapes than their hash tables hold, so their accesses also look in
     /// the VM's keyed caches.
     fn megamorphic_cache_name(&self, executable: u32, cache_index: u32, property: u32) -> Option<u64> {
-        let snapshot = &self.executables[executable as usize];
-        snapshot
-            .property_caches
+        let snapshot = &self.snapshot.executables[executable as usize];
+        self.snapshot[snapshot.property_caches]
             .get(cache_index as usize)
             .filter(|cache| cache.kind == PropertyCacheKind::Megamorphic)
-            .and_then(|_| snapshot.property_key_names.get(property as usize).copied())
+            .and_then(|_| {
+                self.snapshot[snapshot.property_key_names]
+                    .get(property as usize)
+                    .copied()
+            })
             .filter(|name| *name != 0)
     }
 
@@ -801,7 +803,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// The probes of the VM's keyed caches of megamorphic named accesses, out
     /// of line.
     pub(in crate::codegen) fn emit_deferred_vm_cache_probes(&mut self) -> Result<(), CompileFailure> {
-        for deferred in std::mem::take(&mut self.deferred_vm_cache_probes) {
+        for deferred in self.deferred_vm_cache_probes.take() {
             self.emitting = Some(deferred.node);
             self.masm.bind(deferred.entry);
             let registers = self.cache_registers(deferred.node);
@@ -883,7 +885,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         );
 
         let arguments = M::ARGUMENT_GPRS;
-        let saved = slow_path_saved_registers::<M>().iter().collect::<Vec<_>>();
+        let saved = slow_path_saved_registers::<M>().iter().collect::<RegisterList<_>>();
         self.emit_save_registers(&saved);
         let base = self.input(node, 0);
         if base != arguments[1] {
@@ -900,7 +902,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     /// The runtime probes of the cache probe nodes, out of line.
     pub(in crate::codegen) fn emit_deferred_cache_probes(&mut self) -> Result<(), CompileFailure> {
-        for deferred in std::mem::take(&mut self.deferred_cache_probes) {
+        for deferred in self.deferred_cache_probes.take() {
             self.emitting = Some(deferred.node);
             self.masm.bind(deferred.entry);
             let pc = self.graph.node(deferred.node).pc;
@@ -938,7 +940,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         if let Some(output) = output {
             saved = saved.without(output);
         }
-        let saved = saved.iter().collect::<Vec<_>>();
+        let saved = saved.iter().collect::<RegisterList<_>>();
         self.emit_save_registers(&saved);
 
         let hit = self.masm.new_label();
@@ -964,7 +966,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.masm.store64(&self.local_address(record + 8), source);
                 self.masm
                     .load_effective_address(arguments[3], &self.local_address(record));
-                let instruction = self.executables[executable as usize]
+                let instruction = self.snapshot.executables[executable as usize]
                     .bytecode_address
                     .checked_add(u64::from(pc))
                     .ok_or(CompileFailure::InvalidBytecode {

@@ -163,7 +163,7 @@ fn running_execution_context_environment(vm: &Vm, mode: EnvironmentMode) -> Gc<E
         .expect("bindings are created in an execution context");
     match mode {
         EnvironmentMode::Lexical => context.lexical_environment.get(),
-        EnvironmentMode::Var => context.variable_environment.get(),
+        EnvironmentMode::Var => context.variable_environment(),
     }
     .expect("the running execution context has its environments")
 }
@@ -820,7 +820,7 @@ pub fn get_import_meta(
 }
 
 pub fn get_import(vm: &Vm, pc: u32, instruction: &op::GetImport, values: &mut op::GetImportValues) -> SlowPathControl {
-    let ScriptOrModule::Module(module) = running_execution_context(vm).script_or_module.get() else {
+    let ScriptOrModule::Module(module) = running_execution_context(vm).script_or_module() else {
         unreachable!("GetImport only runs in the code of a module");
     };
     let module = module
@@ -1226,8 +1226,7 @@ pub fn set_variable_binding_of_block_function(
     let name = get_identifier(vm, &instruction.identifier);
     let context = running_execution_context(vm);
     let variable_environment = context
-        .variable_environment
-        .get()
+        .variable_environment()
         .expect("program code has a VariableEnvironment");
     let mut environment = context
         .lexical_environment
@@ -1452,7 +1451,7 @@ pub fn verify_environment_coordinate(
     let context = running_execution_context(vm);
     let mut environment = match environment_mode_of(instruction.mode) {
         EnvironmentMode::Lexical => context.lexical_environment.get(),
-        EnvironmentMode::Var => context.variable_environment.get(),
+        EnvironmentMode::Var => context.variable_environment(),
     };
 
     let mut hop = 0;
@@ -1588,10 +1587,8 @@ pub fn create_private_environment(
     _values: &mut op::CreatePrivateEnvironmentValues,
 ) -> SlowPathControl {
     let running_execution_context = running_execution_context(vm);
-    let outer_private_environment = running_execution_context.private_environment.get();
-    running_execution_context
-        .private_environment
-        .set(Some(new_private_environment(vm, outer_private_environment)));
+    let outer_private_environment = running_execution_context.private_environment();
+    running_execution_context.set_private_environment(Some(new_private_environment(vm, outer_private_environment)));
     SlowPathControl::continue_at(pc + op::CreatePrivateEnvironment::LENGTH)
 }
 
@@ -1622,9 +1619,7 @@ pub fn create_variable_environment_slow_path(
         shape_cache,
         instruction.capacity,
     );
-    running_execution_context
-        .variable_environment
-        .set(Some(var_environment.upcast()));
+    running_execution_context.set_variable_environment(Some(var_environment.upcast()));
     running_execution_context
         .lexical_environment
         .set(Some(var_environment.upcast()));

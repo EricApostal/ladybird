@@ -31,6 +31,7 @@
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
@@ -242,7 +243,9 @@ void HTMLLinkElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
 {
     Base::attribute_changed(name, old_value, value, namespace_);
     if (!namespace_.has_value() && name == AttributeNames::blocking && m_blocking)
-        m_blocking->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
+        m_blocking->associated_attribute_changed(value);
+    if (!namespace_.has_value() && name == AttributeNames::sizes && m_sizes)
+        m_sizes->associated_attribute_changed(value);
 
     // 4.6.7 Link types - https://html.spec.whatwg.org/multipage/links.html#linkTypes
     auto old_relationship = m_relationship;
@@ -280,8 +283,8 @@ void HTMLLinkElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
             start = i + 1;
         }
 
-        if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
+        if (!namespace_.has_value() && m_rel_list)
+            m_rel_list->associated_attribute_changed(value);
 
         // NB: A link that no longer represents a stylesheet will not run stylesheet completion steps.
         if ((old_relationship & Relationship::Stylesheet) && !(m_relationship & Relationship::Stylesheet))

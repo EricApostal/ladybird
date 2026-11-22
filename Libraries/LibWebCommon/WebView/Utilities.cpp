@@ -103,7 +103,12 @@ ErrorOr<Vector<ByteString>> get_paths_for_helper_process(StringView process_name
     TRY(paths.try_append(LexicalPath::join(prefix.string(), libexec_path, process_name).string()));
     TRY(paths.try_append(LexicalPath::join(prefix.string(), "bin"sv, process_name).string()));
 #endif
+#if defined(AK_OS_WINDOWS)
+    // An executable's file name on Windows ends in .exe, so a lookup by path without it finds nothing there.
+    TRY(paths.try_append(ByteString::formatted("{}/{}.exe", application_path, process_name)));
+#else
     TRY(paths.try_append(ByteString::formatted("{}/{}", application_path, process_name)));
+#endif
 #if defined(AK_OS_ANDROID)
     // Android packages the helper processes as shared libraries in the app's native library directory, named
     // lib<Name>.so; that directory is where the UI process's own executable also lives.

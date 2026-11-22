@@ -70,6 +70,7 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
+#include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/WebDriver/BiDi/BiDi.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
@@ -274,6 +275,7 @@ void HTMLParser::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_context_element);
     visitor.visit(m_root_insertion_target);
     visitor.visit(m_active_speculative_html_parser);
+    visitor.visit(m_speculative_html_parser);
     visitor.visit(m_change_encoding_callback);
     visitor.visit(m_ready_for_more_input_callback);
     visitor.visit(m_parsing_complete_callback);
@@ -646,6 +648,53 @@ void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> pa
     the_end(document, parser, document->parser_generation());
 }
 
+// Fires load at each svg element in the document's shadow-including tree, each one after the svg elements inside it,
+// until a listener replaces the document's parser.
+static void fire_load_event_at_svg_elements(DOM::Document& document, u64 parser_generation)
+{
+    // A shadow root comes first among its host's children, and is followed by the host's own children.
+    auto first_child = [](DOM::Node& node) -> DOM::Node* {
+        if (auto* element = as_if<DOM::Element>(node); element && element->shadow_root())
+            return element->shadow_root().ptr();
+        return node.first_child();
+    };
+    auto next_sibling = [](DOM::Node& node) -> DOM::Node* {
+        if (auto* shadow_root = as_if<DOM::ShadowRoot>(node))
+            return shadow_root->host()->first_child();
+        return node.next_sibling();
+    };
+    auto parent = [](DOM::Node& node) -> DOM::Node* {
+        if (auto* shadow_root = as_if<DOM::ShadowRoot>(node))
+            return shadow_root->host();
+        return node.parent();
+    };
+
+    GC::RootVector<GC::Ref<SVG::SVGSVGElement>> svg_elements;
+    DOM::Node* node = &document;
+    while (auto* child = first_child(*node))
+        node = child;
+    while (node != &document) {
+        if (auto* svg_element = as_if<SVG::SVGSVGElement>(*node))
+            svg_elements.append(*svg_element);
+        if (auto* sibling = next_sibling(*node)) {
+            node = sibling;
+            while (auto* child = first_child(*node))
+                node = child;
+        } else {
+            node = parent(*node);
+        }
+    }
+    for (auto& svg_element : svg_elements) {
+        if (document.parser_generation() != parser_generation)
+            return;
+        // A load listener can take an svg element out of the document, or the document out of its browsing context.
+        if (&svg_element->document() != &document || !svg_element->is_connected() || !document.browsing_context())
+            continue;
+        svg_element->dispatch_event(DOM::Event::create(EventNames::load,
+            HighResolutionTime::current_high_resolution_time(relevant_global_object(svg_element))));
+    }
+}
+
 static bool parser_was_replaced(DOM::Document const& document, GC::Ptr<HTMLParser> parser, u64 parser_generation)
 {
     return document.parser_generation() != parser_generation || document.parser() != parser;
@@ -764,6 +813,7 @@ void HTMLParserEndState::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_document);
     visitor.visit(m_parser);
     visitor.visit(m_timeout);
+    visitor.visit(m_fragment_target_awaiting_style_sheets);
 }
 
 void HTMLParserEndState::cancel()
@@ -805,6 +855,16 @@ void HTMLParserEndState::check_progress()
     if (!m_document->is_fully_active()) {
         complete();
         return;
+    }
+
+    if (m_fragment_target_awaiting_style_sheets && !m_document->has_a_style_sheet_that_is_blocking_scripts()) {
+        auto target = exchange(m_fragment_target_awaiting_style_sheets, nullptr);
+        auto indicated_part = m_document->determine_the_indicated_part();
+        if (indicated_part.has<DOM::Element*>() && indicated_part.get<DOM::Element*>() == target.ptr()) {
+            m_document->scroll_to_the_fragment();
+            if (m_phase == Phase::Cancelled)
+                return;
+        }
     }
 
     switch (m_phase) {
@@ -896,8 +956,12 @@ void HTMLParserEndState::advance_to_dom_content_loaded_phase()
             m_document->scroll_to_the_fragment(m_document->pending_text_directive_scroll_allowed());
         } else {
             auto indicated_part = m_document->determine_the_indicated_part();
-            if (indicated_part.has<DOM::Element*>() && indicated_part.get<DOM::Element*>() != nullptr)
-                m_document->scroll_to_the_fragment();
+            if (indicated_part.has<DOM::Element*>() && indicated_part.get<DOM::Element*>()) {
+                if (m_document->has_a_style_sheet_that_is_blocking_scripts())
+                    m_fragment_target_awaiting_style_sheets = indicated_part.get<DOM::Element*>();
+                else
+                    m_document->scroll_to_the_fragment();
+            }
         }
     }
 
@@ -1025,6 +1089,15 @@ void HTMLParserEndState::complete()
 
         // 3. Let window be the Document's relevant global object.
         auto& window = relevant_window(*document);
+
+        // AD-HOC: https://svgwg.org/svg2-draft/interact.html#LoadEvent
+        //         "Note that due to it's relationship with Window the load event on 'svg' elements is only dispatched
+        //         when all resources in the document have been completely loaded."
+        //         The HTML spec has no step for it, so fire it here, at each svg element the document has, the
+        //         innermost first, right before the window's, whose timing starts after them.
+        fire_load_event_at_svg_elements(*document, parser_generation);
+        if (document->parser_generation() != parser_generation)
+            return;
 
         // 4. Set the Document's load timing info's load event start time to the current high resolution time given window.
         document->load_timing_info().load_event_start_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(window));
@@ -2685,19 +2758,19 @@ RefPtr<CSS::StyleValue const> parse_table_child_element_align_value(Utf16View st
     // themselves, as if they had their 'text-align' property set to 'center' in a presentational hint, and to align
     // descendants to the center.
     if (string_view.equals_ignoring_ascii_case(u"center"sv) || string_view.equals_ignoring_ascii_case(u"middle"sv))
-        return CSS::KeywordStyleValue::create(CSS::Keyword::LibwebCenter);
+        return CSS::KeywordStyleValue::create(CSS::Keyword::WebkitCenter);
 
     // The thead, tbody, tfoot, tr, td, and th elements, when they have an align attribute whose value is an ASCII
     // case-insensitive match for the string "left", are expected to left-align text within themselves, as if they had
     // their 'text-align' property set to 'left' in a presentational hint, and to align descendants to the left.
     if (string_view.equals_ignoring_ascii_case(u"left"sv))
-        return CSS::KeywordStyleValue::create(CSS::Keyword::LibwebLeft);
+        return CSS::KeywordStyleValue::create(CSS::Keyword::WebkitLeft);
 
     // The thead, tbody, tfoot, tr, td, and th elements, when they have an align attribute whose value is an ASCII
     // case-insensitive match for the string "right", are expected to right-align text within themselves, as if they
     // had their 'text-align' property set to 'right' in a presentational hint, and to align descendants to the right.
     if (string_view.equals_ignoring_ascii_case(u"right"sv))
-        return CSS::KeywordStyleValue::create(CSS::Keyword::LibwebRight);
+        return CSS::KeywordStyleValue::create(CSS::Keyword::WebkitRight);
 
     // The thead, tbody, tfoot, tr, td, and th elements, when they have an align attribute whose value is an ASCII
     // case-insensitive match for the string "justify", are expected to full-justify text within themselves, as if they
@@ -2719,11 +2792,19 @@ void HTMLParser::start_the_speculative_html_parser()
         stop_the_speculative_html_parser();
 
     // 3. Let speculativeParser be a new speculative HTML parser, with the same state as parser.
+    // OPTIMIZATION: The spec says user agents can restart speculative parsing more efficiently, as long as the end
+    //               result is equivalent. So, while this parser hasn't got past where the last speculative parser
+    //               stopped, the new one goes on from there rather than scanning the input up to there again. That
+    //               keeps a document with many parser-blocking scripts from being scanned once for each of them.
+    if (!m_speculative_html_parser)
+        m_speculative_html_parser = SpeculativeHTMLParser::create(*m_document, m_scripting_mode);
+    auto speculative_parser = m_speculative_html_parser;
+    speculative_parser->take_unscanned_input(m_tokenizer.ffi_handle({}), m_document->base_url());
+
     // 4. Let speculativeDoc be a new isomorphic representation of parser's Document, where all elements are instead
     //    speculative mock elements. Let speculativeParser parse into speculativeDoc.
     // NOTE: The Rust preload scanner emits speculative fetch candidates directly, so we do not materialize a
     // speculativeDoc tree or speculative mock elements.
-    auto speculative_parser = SpeculativeHTMLParser::create(*m_document, m_tokenizer.unparsed_input(), m_document->base_url(), m_scripting_mode);
 
     // 5. Set parser's active speculative HTML parser to speculativeParser.
     m_active_speculative_html_parser = speculative_parser;

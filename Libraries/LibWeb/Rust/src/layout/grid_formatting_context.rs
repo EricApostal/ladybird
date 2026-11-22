@@ -1343,6 +1343,11 @@ pub(crate) struct SubgridParent<'pass> {
 /// (the fc-run-cache probe): a declared subgrid axis counts regardless of the
 /// parent-grid placement check only a run in progress can make.
 pub(super) fn grid_template_declares_a_subgrid_axis(pass: &LayoutPass<'_>, box_: Node) -> bool {
+    // NB: A grid fieldset lays out its grid in its anonymous fieldset content box, which isn't an item of the
+    //     fieldset's parent grid, so neither box is a subgrid.
+    if NodeFacts::new(pass, box_).is_fieldset_box() {
+        return false;
+    }
     let grid_style = pass.style_view(box_).grid_values();
     grid_style.template_columns.is_subgrid || grid_style.template_rows.is_subgrid
 }
@@ -1645,11 +1650,14 @@ impl<'pass> GridFormattingContext<'pass> {
     /// Whether a grid container with a subgrid track list is a subgrid, rather than being forced to establish an
     /// independent formatting context, which makes its track list none.
     fn can_be_subgrid(&self, node: Node) -> bool {
-        !self
-            .run
-            .pass
-            .style_view(node)
-            .is_forced_to_establish_independent_formatting_context()
+        // NB: A grid fieldset lays out its grid in its anonymous fieldset content box, which isn't an item of the
+        //     fieldset's parent grid, so neither box is a subgrid.
+        !self.facts(node).is_fieldset_box()
+            && !self
+                .run
+                .pass
+                .style_view(node)
+                .is_forced_to_establish_independent_formatting_context()
     }
 
     fn container_is_subgridded(&self, axis: Axis) -> bool {
@@ -2652,6 +2660,13 @@ impl<'pass> GridFormattingContext<'pass> {
     /// INTEROP: Like other engines, we resolve them against the item's grid area in a subgrid without the extra margins
     ///          the subgrid gives it, which is the part of the area that lies between the subgrid's own lines.
     fn percentage_basis_size(&self, item: GridItem, axis: Axis) -> CssPixels {
+        CssPixels::default()
+            .max(self.containing_block_size(item, axis) - self.subgrid_edge_extra_margins_of(item, axis))
+    }
+
+    /// The extra margins that stand in for the edges of a subgrid around `item`, which its grid area includes but its
+    /// percentage basis doesn't.
+    fn subgrid_edge_extra_margins_of(&self, item: GridItem, axis: Axis) -> CssPixels {
         let mut extra_margins = axis.select(
             item.extra_margin_left + item.extra_margin_right,
             item.extra_margin_top + item.extra_margin_bottom,
@@ -2667,7 +2682,7 @@ impl<'pass> GridFormattingContext<'pass> {
                 extra_margins += gap_extra_margin;
             }
         }
-        CssPixels::default().max(self.containing_block_size(item, axis) - extra_margins)
+        extra_margins
     }
 
     fn item_available_space(&self, item: GridItem) -> AvailableSpace {
@@ -2750,15 +2765,16 @@ impl<'pass> GridFormattingContext<'pass> {
         mut constraints: ContainingBlockConstraints,
     ) -> ContainingBlockConstraints {
         let facts = self.item_facts(item);
+        // NB: A percentage height of an item with a preferred aspect ratio, replaced or not, resolves against its grid
+        //     area, not the grid container, so its row's size is its basis here.
         if constraints.percentage_basis_block_size.is_none()
-            || (facts.has_preferred_aspect_ratio()
-                && !facts.is_replaced_box()
-                && !self.is_grid_lanes_stacking_axis(Axis::Row))
+            || (facts.has_preferred_aspect_ratio() && !self.is_grid_lanes_stacking_axis(Axis::Row))
         {
             constraints.percentage_basis_block_size = if self.use_row_sizes_for_column_percentages {
-                Some(self.containing_block_size(item, Axis::Row))
+                Some(self.percentage_basis_size(item, Axis::Row))
             } else {
                 self.fixed_track_span_size(item, Axis::Row)
+                    .map(|size| CssPixels::default().max(size - self.subgrid_edge_extra_margins_of(item, Axis::Row)))
             };
         }
         constraints.quirks_mode_percentage_basis_block_size =
@@ -3247,7 +3263,16 @@ impl<'pass> GridFormattingContext<'pass> {
         }
         let opposite = axis.opposite();
         let available = self.item_available_space(item);
-        let constraints = self.track_sizing_constraints();
+        // NB: The columns are sized before the rows, so while the rows are sized, a percentage of the item's width
+        //     resolves against its grid area, and its percentage minimum and maximum widths are definite.
+        let opposite_axis_is_sized = !axis.is_column();
+        let constraints = if opposite_axis_is_sized {
+            self.grid_area_constraints(item)
+        } else {
+            self.track_sizing_constraints()
+        };
+        let limit_is_definite =
+            |size: &ComputedSize| size.is_length() || (opposite_axis_is_sized && size.is_length_percentage());
         let inner_size = |property: SizingProperty| {
             self.sizing().calculate_inner_size_for_property(
                 sizing_context::SizedBox::new(item.box_, &self.cells_of(item)),
@@ -3258,12 +3283,12 @@ impl<'pass> GridFormattingContext<'pass> {
             )
         };
         let mut opposite_axis_size = inner_size(opposite.select(SizingProperty::Width, SizingProperty::Height));
-        if self.maximum_size(item, opposite).is_length() {
+        if limit_is_definite(self.maximum_size(item, opposite)) {
             opposite_axis_size = opposite_axis_size.min(inner_size(
                 opposite.select(SizingProperty::MaxWidth, SizingProperty::MaxHeight),
             ));
         }
-        if self.minimum_size(item, opposite).is_length() {
+        if limit_is_definite(self.minimum_size(item, opposite)) {
             opposite_axis_size = opposite_axis_size.max(inner_size(
                 opposite.select(SizingProperty::MinWidth, SizingProperty::MinHeight),
             ));
@@ -3335,8 +3360,15 @@ impl<'pass> GridFormattingContext<'pass> {
         // the size suggestion is capped by those sizes; for this purpose, any indefinite percentages in these sizes are resolved
         // against zero (and considered definite).
         // FIXME: "compressible replaced element" includes more elements than is_replaced_box().
+        // AD-HOC: Only in the inline axis. A replaced box's percentage block size with nothing to resolve against
+        //         behaves as auto instead, as it does for its min-content contribution, for web compatibility. So an
+        //         image with height: 100% in an auto row keeps its content size as its minimum, and the row grows to
+        //         fit it, as in other engines.
         let preferred_size = self.preferred_size(item, axis);
-        if self.item_facts(item).is_replaced_box() && (preferred_size.is_percentage() || maximum_size.is_percentage()) {
+        if self.item_facts(item).is_replaced_box()
+            && axis.is_column()
+            && (preferred_size.is_percentage() || maximum_size.is_percentage())
+        {
             // NOTE: Implements "for this purpose, any indefinite percentages in these sizes are resolved
             //       against zero (and considered definite)." part.
             result = CssPixels::default();
@@ -3393,11 +3425,11 @@ impl<'pass> GridFormattingContext<'pass> {
         // result from assuming the item’s used minimum size as its preferred size; else the item’s minimum
         // contribution is its min-content contribution. Because the minimum contribution often depends on
         // the size of the item’s content, it is considered a type of intrinsic size contribution.
-        // NB: The height of a non-replaced item with a preferred aspect ratio is reported as not auto because it
+        // NB: The height of an item with a preferred aspect ratio, replaced or not, is reported as not auto because it
         //     transfers from the item's width, but it still behaves as auto here.
         let facts = self.item_facts(item);
         let automatic_size_with_aspect_ratio =
-            self.preferred_size(item, axis).is_auto() && facts.has_preferred_aspect_ratio() && !facts.is_replaced_box();
+            self.preferred_size(item, axis).is_auto() && facts.has_preferred_aspect_ratio();
         if !preferred_behaves_as_auto && !automatic_size_with_aspect_ratio {
             return min_content_contribution();
         }
@@ -4676,6 +4708,18 @@ impl<'pass> GridFormattingContext<'pass> {
             return;
         }
 
+        // NB: The rows aren't sized yet when the column pass resolves the width of a replaced item, so a percentage
+        //     height resolves against the block size the column pass assumes for the item's rows, as its column
+        //     contributions did, rather than against rows that are still empty. That goes for its minimum and maximum
+        //     widths, too.
+        let replaced_column_available = AvailableSpace {
+            block_size: constraints
+                .percentage_basis_block_size
+                .map_or(AvailableSize::Indefinite, |basis| {
+                    AvailableSize::definite(clamp_to_max_dimension_value(basis))
+                }),
+            ..available
+        };
         let mut transferred_block_size = None;
         let size = if self.replaced_item_is_explicitly_stretched(item, axis) {
             containing - self.item_margin_box_start(item, axis) - self.item_margin_box_end(item, axis)
@@ -4700,7 +4744,7 @@ impl<'pass> GridFormattingContext<'pass> {
             if axis.is_column() {
                 self.sizing().compute_inline_size_for_replaced_element(
                     sizing_context::SizedBox::new(item.box_, &self.cells_of(item)),
-                    available,
+                    replaced_column_available,
                     constraints,
                 )
             } else {
@@ -4849,6 +4893,19 @@ impl<'pass> GridFormattingContext<'pass> {
         // https://drafts.csswg.org/css-grid-2/#subgrid-box-alignment
         // The subgrid is always stretched in its subgridded dimension(s): the align-self/justify-self properties on it
         // are ignored, as are any specified width/height constraints.
+        let used_limit = |property, limit: &ComputedSize| {
+            let cells = self.cells_of(item);
+            let sized = sizing_context::SizedBox::new(item.box_, &cells);
+            let sizing = self.sizing();
+            if axis.is_column()
+                && facts.is_replaced_box()
+                && let Some(size) =
+                    sizing.intrinsic_inline_limit_for_replaced_box(sized, limit, replaced_column_available, constraints)
+            {
+                return size;
+            }
+            sizing.calculate_inner_size_for_property(sized, axis.sizing_axis(), property, available, constraints)
+        };
         let is_subgridded = self.grid_item_is_subgridded(item, axis);
         let maximum_is_none = if is_subgridded {
             true
@@ -4860,12 +4917,9 @@ impl<'pass> GridFormattingContext<'pass> {
                 .should_treat_max_block_size_as_none(item.box_, available.block_size, constraints)
         };
         if !maximum_is_none {
-            let maximum = self.sizing().calculate_inner_size_for_property(
-                sizing_context::SizedBox::new(item.box_, &self.cells_of(item)),
-                axis.sizing_axis(),
+            let maximum = used_limit(
                 axis.select(SizingProperty::MaxWidth, SizingProperty::MaxHeight),
-                available,
-                constraints,
+                axis.select(style.max_width(), style.max_height()),
             );
             if resolved.size > maximum {
                 resolved = resolve_alignment(maximum, false);
@@ -4888,12 +4942,9 @@ impl<'pass> GridFormattingContext<'pass> {
         }
         let minimum = axis.select(style.min_width(), style.min_height());
         if !minimum.is_auto() && !is_subgridded {
-            let minimum = self.sizing().calculate_inner_size_for_property(
-                sizing_context::SizedBox::new(item.box_, &self.cells_of(item)),
-                axis.sizing_axis(),
+            let minimum = used_limit(
                 axis.select(SizingProperty::MinWidth, SizingProperty::MinHeight),
-                available,
-                constraints,
+                minimum,
             );
             if resolved.size < minimum {
                 resolved = resolve_alignment(minimum, false);

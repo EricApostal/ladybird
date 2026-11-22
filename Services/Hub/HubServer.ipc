@@ -23,6 +23,7 @@
 #include <LibWebCommon/Page/SpellingError.h>
 #include <LibWebCommon/Page/WritingSuggestion.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
+#include <LibWebView/DefaultBrowser.h>
 #include <LibWebView/HistoryVisitTransition.h>
 #include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/ProcessSnapshot.h>
@@ -82,6 +83,9 @@ struct WebView::ProcessPageSnapshot {
 struct WebView::ProcessTabSnapshot {
     Utf16String title;
     WebView::ProcessPageSnapshot page;
+    WebView::DiscardBlockers discard_blockers_under_memory_pressure;
+    Optional<WebView::DiscardBlockers> discard_blockers_after_inactivity;
+    Optional<i64> seconds_until_discarded_after_inactivity;
 }
 
 [ExistingCpp]
@@ -95,6 +99,7 @@ struct WebView::ProcessSnapshot {
     u64 child_id;
     i32 pid;
     WebView::ProcessType type;
+    WebView::IsPrivate is_private;
     Optional<Utf16String> title;
     Optional<URL::URL> site_url;
     Optional<u64> owner_child_id;
@@ -144,6 +149,7 @@ endpoint HubServer
     set_blocks_pop_ups(bool blocks) =|
     set_shows_line_box_borders(bool shows) =|
     set_shows_caret_hit_test_debug_overlay(bool shows) =|
+    set_shows_compositor_layers(bool shows) =|
     dump_cookies() =|
     crash_compositor_process() =|
     launch_devtools_client() =|
@@ -158,6 +164,10 @@ endpoint HubServer
     view_session_history_traversal_items(u64 view_id, i32 direction) => (Vector<WebView::ViewImplementation::SessionHistoryTraversalItem> items)
     view_session_history_snapshot(u64 view_id) => (Optional<WebView::SessionHistorySnapshot> snapshot)
     view_restore_session_history_from_snapshot(u64 view_id, WebView::SessionHistorySnapshot snapshot) => (bool restored)
+    view_keep_state_for_discarding(u64 view_id) => (Optional<u64> discarded_tab_state_id)
+    view_restore_state_of_discarded_tab(u64 view_id, u64 discarded_tab_state_id) =|
+    view_decline_discard(u64 view_id) =|
+    forget_state_of_discarded_tab(u64 discarded_tab_state_id) =|
     view_history_step_at_delta(u64 view_id, i32 delta) => (Optional<i32> step)
     view_look_up_selected_text_at(u64 view_id, Gfx::IntPoint position) => (bool looked_up)
     view_page_description(u64 view_id) => (URL::URL url, String user_agent, Gfx::IntSize viewport_size, double device_pixel_ratio, double zoom_level)
@@ -180,6 +190,12 @@ endpoint HubServer
     view_learn_misspelling(u64 view_id, Utf16String word) =|
     view_do_context_menu_media_action(u64 view_id, WebView::ContextMenuMediaAction action) =|
     view_set_reports_session_history(u64 view_id, bool reports_session_history) =|
+    view_set_compositor_layer_hidden(u64 view_id, u64 layer_id, bool hidden) =|
+    view_set_selected_compositor_layers(u64 view_id, Vector<u64> layer_ids) =|
+    view_set_hovered_compositor_layer(u64 view_id, Optional<u64> layer_id) =|
+    view_show_only_compositor_layers(u64 view_id, Vector<u64> layer_ids) =|
+    view_show_all_compositor_layers(u64 view_id) =|
+    view_reset_compositor_layer_raster_counts(u64 view_id) =|
     view_file_picker_closed(u64 view_id, Vector<Web::HTML::SelectedFile> selected_files) =|
     view_save_screenshot(u64 view_id, Gfx::ShareableBitmap bitmap) =|
     view_request_selected_text(u64 view_id, u64 request_id) =|
@@ -200,6 +216,8 @@ endpoint HubServer
     geolocation_error(u64 id, Core::GeolocationError error) =|
     geolocation_authorization_changed(Core::GeolocationAuthorization authorization) =|
     microphone_authorization_changed(WebView::MicrophoneAuthorization authorization) =|
+    default_browser_status_changed(WebView::DefaultBrowserStatus status) =|
+    default_browser_make_default_finished(bool failed, Optional<String> system_message) =|
     gamepad_connected(Web::Gamepad::GamepadDescription description, Web::Gamepad::GamepadState state) =|
     gamepad_disconnected(u32 handle) =|
     gamepad_states_changed(Vector<Web::Gamepad::GamepadState> states) =|
@@ -242,11 +260,13 @@ endpoint HubServer
     view_set_window_position(u64 view_id, Gfx::IntPoint position) =|
     view_set_window_size(u64 view_id, Gfx::IntSize size) =|
     view_set_system_visibility_state(u64 view_id, Web::HTML::VisibilityState visibility_state) =|
+    view_set_pinned(u64 view_id, bool pinned) =|
+    view_set_current_tab_of_window(u64 view_id, bool current_tab_of_window) =|
     view_set_presents_from_cpu_memory(u64 view_id, bool presents_from_cpu_memory) =|
     view_set_hosts_remote_layer(u64 view_id, bool hosts_remote_layer) =|
     // The UI hears of the first frame shown in a new remote layer, and of every frame while it wants to.
     view_set_wants_frame_notifications(u64 view_id, bool wants_frame_notifications) =|
-    view_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::IntSize> maximum_size) =|
+    view_take_frame_snapshot(u64 view_id, u64 request_id) =|
     view_begin_synchronized_resize(u64 view_id, u64 token) =|
     view_await_synchronized_resize_frame(u64 view_id, u64 token, Gfx::IntSize size) =|
     view_commit_synchronized_resize(u64 view_id, u64 token) =|

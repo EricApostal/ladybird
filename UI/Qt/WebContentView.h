@@ -28,6 +28,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/WebCompatReport.h>
 #include <UI/Qt/BackingStoreRelease.h>
+#include <UI/Qt/CompositorLayerPicker.h>
 #include <UI/Qt/RemoteView.h>
 #include <UI/Qt/ScreenshotSelectionOverlay.h>
 
@@ -189,6 +190,8 @@ public:
     void leave_report_review();
     void review_web_compat_report(WebCompatReportCapture);
     void select_web_compat_report_screenshot(Function<void(QImage)> on_selected, Function<void()> on_close = {});
+    void start_compositor_layer_picker(CompositorLayerPicker);
+    void stop_compositor_layer_picker();
 
     Function<void(WebCompatReportCapture)> on_request_web_compat_report_review;
     Function<void(Function<void(QImage)> on_selected)> on_request_web_compat_report_screenshot;
@@ -199,9 +202,6 @@ public:
         Dark,
     };
     void update_palette(PaletteMode = PaletteMode::Default);
-    // A preview of a page that the Compositor shows itself comes from it, so it can lag a frame behind the page.
-    Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size);
-
     // Frames that the Compositor shows itself are only announced while something here wants to hear of them.
     void add_frame_notification_interest();
     void remove_frame_notification_interest();
@@ -217,8 +217,6 @@ public:
     void set_follows_mouse_while_inactive(bool follows) { m_follows_mouse_while_inactive = follows; }
 
 signals:
-    void ready_to_paint();
-    void tab_preview_changed();
     void crash_overlay_changed();
     void image_overlay_unavailable();
     void urls_dropped(QList<QUrl> const&);
@@ -255,9 +253,8 @@ private:
     RefPtr<Gfx::Bitmap const> cpu_bitmap_to_paint(Paintable const&) const;
     QImage visible_snapshot() const;
     // What the view shows, which the Compositor takes where the view does not hold the frame itself.
-    void take_visible_snapshot(Optional<QSize> maximum_size, Function<void(QImage)>);
+    void take_visible_snapshot(Function<void(QImage)>);
     bool holds_displayed_frame() const;
-    void refresh_tab_preview(QSize const& maximum_size);
 
     void update_viewport_size();
     void update_cursor(Gfx::Cursor cursor);
@@ -350,11 +347,9 @@ private:
     CrashReportReviewWidget* m_crash_report_review { nullptr };
 
     QPointer<ScreenshotSelectionOverlay> m_screenshot_selection_overlay;
+    Optional<CompositorLayerPicker> m_compositor_layer_picker;
+    bool m_swallows_mouse_release_after_compositor_layer_pick { false };
     size_t m_frame_notification_interest { 0 };
-    QPixmap m_tab_preview;
-    QSize m_tab_preview_maximum_size;
-    bool m_tab_preview_is_stale { true };
-    bool m_tab_preview_request_in_flight { false };
     QPointer<ScreenshotViewer> m_screenshot_viewer;
     struct FloatingSurface {
         QPointer<QWidget> surface;
@@ -469,6 +464,7 @@ private:
     void update_vulkan_window_geometry();
     void set_vulkan_window_container_visible(bool);
     void fall_back_to_bitmap_rendering();
+    void fall_back_from_vulkan_window();
     void vulkan_window_exposure_changed();
     QRect rect_covered_by_page_window() const;
     bool vulkan_window_update_would_only_resize() const;
@@ -477,6 +473,8 @@ private:
     virtual void release_backing_store(u64 page_id, i32 bitmap_id) override;
 
 #    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    virtual void backing_stores_were_retired() override;
+
     bool create_page_surface();
     enum class PageSurfaceContent {
         Unchanged,

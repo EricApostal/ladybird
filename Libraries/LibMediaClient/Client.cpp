@@ -300,10 +300,10 @@ void Client::playback_session_clock_changed(u64 session_id, Media::MediaTimeRead
         playback_manager->clock_changed({}, move(time_reader));
 }
 
-void Client::playback_session_media_source_added(u64 session_id, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<UnixDateTime> start_time_realtime, Media::DemuxerScanState scan_state)
+void Client::playback_session_media_source_added(u64 session_id, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<UnixDateTime> start_time_realtime, AK::Duration earliest_possible_position, Media::DemuxerScanState scan_state)
 {
     if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->media_source_added({}, stream_id, move(audio_tracks), move(video_tracks), move(preferred_audio_track), move(preferred_video_track), start_time_realtime, move(scan_state));
+        playback_manager->media_source_added({}, stream_id, move(audio_tracks), move(video_tracks), move(preferred_audio_track), move(preferred_video_track), start_time_realtime, earliest_possible_position, move(scan_state));
 }
 
 void Client::playback_session_media_stream_source_failed(u64 session_id, u64 stream_id, Media::DecoderError error)
@@ -316,6 +316,12 @@ void Client::playback_session_duration_changed(u64 session_id, AK::Duration dura
 {
     if (auto* playback_manager = find_playback_manager(session_id))
         playback_manager->duration_changed({}, duration);
+}
+
+void Client::playback_session_seek_decided(u64 session_id, u64 seek_request_id, Media::SeekDecision decision)
+{
+    if (auto* playback_manager = find_playback_manager(session_id))
+        playback_manager->seek_decided({}, seek_request_id, decision);
 }
 
 void Client::playback_session_state_changed(u64 session_id, u64 applied_seek_request_id, Media::PlaybackState state, bool is_playing, Media::AvailableData available_data, bool playback_state_is_settled, AK::Duration current_time)

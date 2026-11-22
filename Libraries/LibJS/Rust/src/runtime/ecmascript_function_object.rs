@@ -840,10 +840,10 @@ impl EcmascriptFunctionObject {
 
         // 4. Let calleeRealm be F.[[Realm]].
         // 5. Set the Realm of calleeContext to calleeRealm.
-        callee_context.realm.set(self.realm());
+        // NB: The context gets its realm from its function.
 
         // 6. Set the ScriptOrModule of calleeContext to F.[[ScriptOrModule]].
-        callee_context.script_or_module.set(self.script_or_module());
+        // NB: The context gets its ScriptOrModule from its function.
 
         // NB: Frames of functions whose environment has no this binding answer for new.target themselves.
         callee_context
@@ -866,23 +866,24 @@ impl EcmascriptFunctionObject {
             callee_context.lexical_environment.set(Some(local_environment.upcast()));
 
             // 9. Set the VariableEnvironment of calleeContext to localEnv.
-            callee_context
-                .variable_environment
-                .set(Some(local_environment.upcast()));
+            callee_context.set_variable_environment(Some(local_environment.upcast()));
         } else {
+            // NB: ExecutionContext::variable_environment() reads it from the function, and the code sets it in frames
+            //     that keep their own.
             callee_context.lexical_environment.set(self.environment());
-            callee_context.variable_environment.set(self.environment());
         }
 
         // 10. Set the PrivateEnvironment of calleeContext to F.[[PrivateEnvironment]].
-        callee_context.private_environment.set(self.private_environment());
+        // NB: ExecutionContext::private_environment() reads it from F, and the code sets it in frames that keep their
+        //     own.
 
         // 11. If callerContext is not already suspended, suspend callerContext.
         // 12. Push calleeContext onto the execution context stack; calleeContext is now the running execution context.
 
         // NOTE: We don't check for stack overflow here. The bytecode interpreter will do it anyway
         //       when entering the function we're about to call.
-        vm.push_execution_context(NonNull::from(callee_context));
+        // NB: The realm of the context is F.[[Realm]] (see step 5).
+        vm.push_execution_context_in_realm(NonNull::from(callee_context), Some(self.shape().realm()));
 
         // 13. NOTE: Any exception objects produced after this point are associated with calleeRealm.
         // 14. Return calleeContext.
@@ -1000,10 +1001,12 @@ impl EcmascriptFunctionObject {
             return result.map_err(Throw::new);
         }
 
+        // NB: The context is the running one, so its realm is the current realm.
+        let realm = vm.current_realm().expect("a function runs in a realm");
         if self.kind() == FunctionKind::Async {
             return Ok(Value::from_object(AsyncFunctionDriverWrapper::start(
                 vm,
-                context.realm.get().expect("a function runs in a realm"),
+                realm,
                 GeneratingFunction::Ecmascript(self.as_ecmascript_function_gc()),
                 context,
                 result,
@@ -1011,7 +1014,6 @@ impl EcmascriptFunctionObject {
         }
         result.map_err(Throw::new)?;
 
-        let realm = context.realm.get().expect("a function runs in a realm");
         if self.kind() == FunctionKind::AsyncGenerator {
             return Ok(Value::from_object(AsyncGenerator::create(
                 vm,

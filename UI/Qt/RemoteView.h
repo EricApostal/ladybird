@@ -91,11 +91,13 @@ public:
     void set_window_position(Gfx::IntPoint position) { HubConnection::the().async_view_set_window_position(view_id(), position); }
     void set_window_size(Gfx::IntSize size) { HubConnection::the().async_view_set_window_size(view_id(), size); }
     void set_system_visibility_state(Web::HTML::VisibilityState visibility_state) { HubConnection::the().async_view_set_system_visibility_state(view_id(), move(visibility_state)); }
+    void set_pinned(bool pinned) { HubConnection::the().async_view_set_pinned(view_id(), pinned); }
+    void set_current_tab_of_window(bool current_tab_of_window) { HubConnection::the().async_view_set_current_tab_of_window(view_id(), current_tab_of_window); }
     void set_presents_from_cpu_memory(bool presents_from_cpu_memory) { HubConnection::the().async_view_set_presents_from_cpu_memory(view_id(), presents_from_cpu_memory); }
     void set_hosts_remote_layer(bool hosts_remote_layer) { HubConnection::the().async_view_set_hosts_remote_layer(view_id(), hosts_remote_layer); }
     void set_wants_frame_notifications(bool wants_frame_notifications) { HubConnection::the().async_view_set_wants_frame_notifications(view_id(), wants_frame_notifications); }
     // What the view shows, from the Compositor, scaled down to fit within the size given.
-    void take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)>);
+    void take_frame_snapshot(Function<void(Optional<Gfx::ShareableBitmap>)>);
     void begin_synchronized_resize(u64 token) { HubConnection::the().async_view_begin_synchronized_resize(view_id(), token); }
     void await_synchronized_resize_frame(u64 token, Gfx::IntSize size) { HubConnection::the().async_view_await_synchronized_resize_frame(view_id(), token, size); }
     void commit_synchronized_resize(u64 token) { HubConnection::the().async_view_commit_synchronized_resize(view_id(), token); }
@@ -217,6 +219,12 @@ public:
     void request_close_preflight(Function<void(bool)> on_complete);
     bool needs_beforeunload_check() const;
     u64 add_navigation_listener(NavigationListener);
+    void set_compositor_layer_hidden(u64 layer_id, bool hidden);
+    void set_selected_compositor_layers(Vector<u64> layer_ids);
+    void set_hovered_compositor_layer(Optional<u64> layer_id);
+    void show_only_compositor_layers(Vector<u64> layer_ids);
+    void show_all_compositor_layers();
+    void reset_compositor_layer_raster_counts();
     void remove_navigation_listener(u64 listener_id) { m_navigation_listeners.remove(listener_id); }
     Action& navigate_back_action() { return *m_navigate_back_action; }
     Action& navigate_forward_action() { return *m_navigate_forward_action; }
@@ -232,6 +240,15 @@ public:
     Vector<SessionHistoryTraversalMenuItem> session_history_traversal_menu_items(int direction) const;
     WebView::SessionHistorySnapshot session_history_snapshot() const;
     ErrorOr<void> restore_session_history_from_snapshot(WebView::SessionHistorySnapshot);
+    Optional<u64> keep_state_for_discarding();
+    void restore_state_of_discarded_tab(u64 discarded_tab_state_id);
+    void decline_discard() { HubConnection::the().async_view_decline_discard(view_id()); }
+    // NB: A tab may go away after the connection to the Hub, which takes the state along with it then.
+    static void forget_state_of_discarded_tab(u64 discarded_tab_state_id)
+    {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_forget_state_of_discarded_tab(discarded_tab_state_id);
+    }
     void exit_fullscreen() { HubConnection::the().async_view_exit_fullscreen(view_id()); }
     void deny_fullscreen_window() { HubConnection::the().async_view_deny_fullscreen_window(view_id()); }
     void set_is_fullscreen(Web::ViewportIsFullscreen is_fullscreen) { HubConnection::the().async_view_set_is_fullscreen(view_id(), is_fullscreen); }
@@ -246,7 +263,11 @@ public:
         if (auto result = m_backing_stores.add(move(bitmap_ids), move(backing_stores)); result.is_error())
             warnln("Could not add backing stores: {}", result.error());
     }
-    void did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids) { m_backing_stores.retire(bitmap_ids); }
+    void did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids)
+    {
+        m_backing_stores.retire(bitmap_ids);
+        backing_stores_were_retired();
+    }
     void did_present_backing_store(u64 page_id, i32 bitmap_id, Gfx::IntSize, double device_pixel_ratio);
     void did_accept_backing_store(i32 bitmap_id, Gfx::IntRect damage_rect);
     void did_keep_front_backing_store_as_backup() { m_backing_stores.keep_front_as_backup(); }
@@ -267,6 +288,7 @@ protected:
     // The handle's kind is None when the view has no remote layer, and goes on showing backing stores.
     virtual void remote_layer_changed(Compositing::RemoteLayerHostHandle) { }
     virtual void release_backing_store(u64 page_id, i32 bitmap_id) { release_backing_store_to_page(page_id, bitmap_id); }
+    virtual void backing_stores_were_retired() { }
 
     void set_page_background_color_to_system_canvas(bool dark) { HubConnection::the().async_view_set_page_background_color_to_system_canvas(view_id(), dark); }
     void set_device_pixel_ratio_and_viewport(double device_pixel_ratio, Web::DevicePixelSize);
@@ -342,9 +364,12 @@ public:
     Function<void()> on_load_from_user_input;
     decltype(Hub::View::on_ready_to_paint) on_ready_to_paint;
     decltype(Hub::View::on_performance_stats) on_performance_stats;
+    decltype(Hub::View::on_compositor_layers_change) on_compositor_layers_change;
     Function<void(Web::HTML::ActivateTab, Web::HTML::WebViewHints, u64 view_id)> on_open_new_view;
     decltype(Hub::View::on_activate_tab) on_activate_tab;
     decltype(Hub::View::on_close) on_close;
+    // The Hub asks to discard the tab of the view, which the tab may decline.
+    Function<void()> on_discard;
     decltype(Hub::View::on_link_hover) on_link_hover;
     decltype(Hub::View::on_link_unhover) on_link_unhover;
     decltype(Hub::View::on_title_change) on_title_change;

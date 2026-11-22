@@ -66,7 +66,6 @@ jobs:
     runs-on: ${{ fromJSON(matrix.runner_labels) }}
     container: ${{ fromJSON(matrix.container) }}
 
-    # Ladybird links Qt's private API on Linux, so each distribution version builds its packages against its own Qt.
     strategy:
       fail-fast: false
       matrix:
@@ -78,11 +77,25 @@ jobs:
             container: 'null'
             archives: true
 
+          - system: 'Ubuntu 24.04'
+            os_name: 'Linux'
+            arch: 'x86_64'
+            runner_labels: '["blacksmith-16vcpu-ubuntu-2404"]'
+            container: &noble_container '{"image":"docker.io/library/ubuntu:24.04","options":"--ulimit core=1"}'
+            packages: 'DEB'
+
+          - system: 'Ubuntu 24.04'
+            os_name: 'Linux'
+            arch: 'arm64'
+            runner_labels: '["blacksmith-16vcpu-ubuntu-2404-arm"]'
+            container: *noble_container
+            packages: 'DEB'
+
           - system: 'Ubuntu 26.04'
             os_name: 'Linux'
             arch: 'x86_64'
             runner_labels: '["blacksmith-16vcpu-ubuntu-2404"]'
-            container: &ci_container '{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.12","options":"--ulimit core=1"}'
+            container: &ci_container '{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.21","options":"--ulimit core=1"}'
             packages: 'DEB'
 
           - system: 'Ubuntu 26.04'
@@ -90,20 +103,6 @@ jobs:
             arch: 'arm64'
             runner_labels: '["blacksmith-16vcpu-ubuntu-2404-arm"]'
             container: *ci_container
-            packages: 'DEB'
-
-          - system: 'Ubuntu 26.10'
-            os_name: 'Linux'
-            arch: 'x86_64'
-            runner_labels: '["blacksmith-16vcpu-ubuntu-2404"]'
-            container: '{"image":"docker.io/library/ubuntu:26.10","options":"--ulimit core=1"}'
-            packages: 'DEB'
-
-          - system: 'Ubuntu 26.10'
-            os_name: 'Linux'
-            arch: 'arm64'
-            runner_labels: '["blacksmith-16vcpu-ubuntu-2404-arm"]'
-            container: '{"image":"docker.io/library/ubuntu:26.10","options":"--ulimit core=1"}'
             packages: 'DEB'
 
           - system: 'Fedora 44'
@@ -172,6 +171,20 @@ jobs:
           cpack -G "${{ matrix.packages }}" -B packages \
             -D CPACK_COMPONENTS_ALL="ladybird_Runtime;ladybird_SystemIntegration;ladybird_SystemSymbols"
 
+      # release-tools publishes the source archive of every LGPL port at the address that LICENSES.txt names.
+      - name: Package the source code of the LGPL libraries
+        if: ${{ inputs.version != '' }}
+        working-directory: ${{ github.workspace }}/Build
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          SYSTEM: ${{ matrix.system }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cmake --build . --target third_party_sources
+          mkdir -p packages
+          mv third-party-sources.tar "packages/ladybird-${RELEASE_VERSION}-${SYSTEM// /-}-${ARCH}-third-party-sources.tar"
+
       - name: Attest
         if: ${{ inputs.version != '' }}
         uses: actions/attest@v4
@@ -180,6 +193,7 @@ jobs:
             Build/packages/*.tar.xz
             Build/packages/*.deb
             Build/packages/*.rpm
+            Build/packages/*-third-party-sources.tar
 
       - name: Upload
         if: ${{ matrix.archives }}
@@ -233,6 +247,14 @@ jobs:
           archive: false
           if-no-files-found: error
 
+      - name: Upload the source code of the LGPL libraries
+        if: ${{ inputs.version != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: Build/packages/ladybird-*-third-party-sources.tar
+          archive: false
+          if-no-files-found: error
+
       - name: Start PulseAudio
         if: ${{ matrix.os_name == 'Linux' }}
         run: |
@@ -282,6 +304,7 @@ jobs:
     env:
       BUNDLE: ladybird-${{ inputs.version && format('{0}-', inputs.version) }}Linux-${{ matrix.arch }}.flatpak
       DEBUG_BUNDLE: ladybird-${{ inputs.version && format('{0}-', inputs.version) }}Linux-${{ matrix.arch }}-debug.flatpak
+      THIRD_PARTY_SOURCES: ladybird-${{ inputs.version }}-Flatpak-${{ matrix.arch }}-third-party-sources.tar
 
     steps:
       - name: Download the source
@@ -333,6 +356,13 @@ jobs:
           cache: false
           upload-artifact: false
 
+      # release-tools publishes the source archive of every LGPL module with the release.
+      - name: Package the source code of the LGPL libraries
+        if: ${{ inputs.version != '' }}
+        run: |
+          python3 Meta/generate-licenses.py --flatpak-manifest Meta/CMake/flatpak/org.ladybird.Ladybird.json \
+            --third-party-sources "$THIRD_PARTY_SOURCES"
+
       - name: Attest
         if: ${{ inputs.version != '' }}
         uses: actions/attest@v4
@@ -340,6 +370,7 @@ jobs:
           subject-path: |
             ${{ env.BUNDLE }}
             ${{ env.DEBUG_BUNDLE }}
+            ${{ env.THIRD_PARTY_SOURCES }}
 
       - name: Upload
         uses: actions/upload-artifact@v7
@@ -352,5 +383,13 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           path: ${{ env.DEBUG_BUNDLE }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload the source code of the LGPL libraries
+        if: ${{ inputs.version != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.THIRD_PARTY_SOURCES }}
           archive: false
           if-no-files-found: error

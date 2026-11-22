@@ -36,6 +36,8 @@ unsafe extern "C" {
         code_point: u32,
         next_code_point: u32,
         has_next_code_point: bool,
+        code_point_after_next: u32,
+        has_code_point_after_next: bool,
     ) -> u8;
 }
 
@@ -47,6 +49,7 @@ pub struct FfiFontSnapshot {
     pub descent: f32,
     pub line_gap: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
     pub pixel_size: f32,
     pub point_size: f32,
@@ -61,6 +64,7 @@ pub struct FontFacts {
     pub descent: f32,
     pub line_gap: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
     pub pixel_size: f32,
     pub point_size: f32,
@@ -145,6 +149,7 @@ impl FontHandle {
                 descent: snapshot.descent,
                 line_gap: snapshot.line_gap,
                 x_height: snapshot.x_height,
+                cap_height: snapshot.cap_height,
                 zero_advance: snapshot.zero_advance,
                 pixel_size: snapshot.pixel_size,
                 point_size: snapshot.point_size,
@@ -290,16 +295,24 @@ pub fn code_point_extends_emoji_sequence(code_point: u32) -> bool {
 /// https://www.unicode.org/reports/tr51/#def_emoji_zwj_element
 pub fn code_point_ends_emoji_zwj_element(code_point: u32) -> bool {
     matches!(code_point, 0xfe0f | 0x20e3 | 0x1f3fb..=0x1f3ff | 0xe007f)
-        || emoji_presentation_for_code_point(code_point, None).is_emoji
+        || emoji_presentation_for_code_point(code_point, None, None).is_emoji
 }
 
-pub fn emoji_presentation_for_code_point(code_point: u32, next_code_point: Option<u32>) -> EmojiPresentation {
+/// The presentation `code_point` takes, given the code point after it and the one after that, which can make it the
+/// start of an emoji sequence.
+pub fn emoji_presentation_for_code_point(
+    code_point: u32,
+    next_code_point: Option<u32>,
+    code_point_after_next: Option<u32>,
+) -> EmojiPresentation {
     // SAFETY: The lookup reads only immutable Unicode tables.
     let encoded = unsafe {
         ladybird_gfx_emoji_presentation_for_code_point(
             code_point,
             next_code_point.unwrap_or(0),
             next_code_point.is_some(),
+            code_point_after_next.unwrap_or(0),
+            code_point_after_next.is_some(),
         )
     };
     EmojiPresentation {
@@ -1411,6 +1424,23 @@ impl FrozenFontList {
             .iter()
             .position(|entry| entry.loaded.get() == Some(font))
             .map(|index| index as u32 | CACHED_FILLED_ENTRY)
+    }
+
+    /// https://drafts.csswg.org/css-values-4/#font-relative-lengths
+    /// Wants the loads of the faces still loading ahead of the first available font, as a length
+    /// relative to a metric of that font (ex, cap, ch, ic, lh) reads the first of them that covers
+    /// U+0020 once it loads. The document requests them once the pass ends, as it does those a
+    /// render pass wants.
+    pub fn want_first_available_font_loads(&self) {
+        const SPACE: u32 = 0x20;
+        for entry in self.entries.iter().filter(|entry| entry.covers(SPACE, &self.ranges)) {
+            if entry.font().is_some() {
+                return;
+            }
+            if let Some((face_id, _)) = entry.pending() {
+                self.note_wanted_pending_face(entry, face_id);
+            }
+        }
     }
 
     fn note_wanted_pending_face(&self, entry: &FrozenEntry, face_id: u64) {

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashTable.h>
 #include <AK/Math.h>
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Animations/RecordHandles.h>
@@ -134,9 +135,11 @@ bool seal_clock_plan(DOM::Document& document, bool may_plan, u64 update_serial)
         // samples where the compositor has scrolled to. The ticks go on past the events of the animations, which the
         // main thread sends as it gets to them.
         Vector<u32> elements;
+        // OPTIMIZATION: Hash sets keep a plan over thousands of animated elements from scanning lists for each one.
+        HashTable<u32> element_set;
         double last_end = -AK::Infinity<double>;
         Vector<Animations::RustFFI::TimelineCell const*> scroll_timelines;
-        Vector<u32> held_elements;
+        HashTable<u32> held_elements;
         auto plan = [&] {
             if (!document.is_fully_active() || document.hidden() || !document.window())
                 return false;
@@ -150,7 +153,7 @@ bool seal_clock_plan(DOM::Document& document, bool may_plan, u64 update_serial)
                 auto planned = Animations::RustFFI::animations_animation_clock_plan(&animation.record());
                 if (planned.kind == Animations::RustFFI::FfiClockPlanAnimationKind::Held) {
                     if (!effect.pseudo_element_type().has_value())
-                        held_elements.append(target.style_node_id().value());
+                        held_elements.set(target.style_node_id().value());
                     return true;
                 }
                 // NB: Nor does a tick move one it cannot, as one of a scroll timeline with nothing to scroll, or one that a
@@ -170,13 +173,17 @@ bool seal_clock_plan(DOM::Document& document, bool may_plan, u64 update_serial)
                 if (!scroll_timeline)
                     last_end = max(last_end, timeline_time->value + (planned.active_end.value - planned.local_time.value) / animation.playback_rate());
                 auto element = target.style_node_id().value();
-                if (!elements.contains_slow(element))
+                if (element_set.set(element) == HashSetResult::InsertedNewEntry)
                     elements.append(element);
                 return true;
             };
             for (auto const& associated_timeline : document.associated_animation_timelines()) {
                 Animations::TimelineView const* scroll_timeline = associated_timeline.is_scroll_timeline() ? &associated_timeline : nullptr;
-                for (auto const& animation : Animations::associated_animations_of(associated_timeline)) {
+                // OPTIMIZATION: Every animation the plan runs is one an update of its timeline may change.
+                auto associated_animations = Animations::associated_animations_of(associated_timeline);
+                for (auto const& animation : Animations::animations_needing_update_of(associated_timeline)) {
+                    if (!associated_animations.contains(animation))
+                        continue;
                     if (!runs_for_clock_plan(animation.play_state(), scroll_timeline != nullptr))
                         continue;
                     auto effect = animation.effect();
@@ -190,10 +197,10 @@ bool seal_clock_plan(DOM::Document& document, bool may_plan, u64 update_serial)
                     // The boxes of an element with an animation a tick cannot sample show what the host's frame shows
                     // of it, while the ticks sample the others on.
                     if (!effect->pseudo_element_type().has_value())
-                        held_elements.append(target->style_node_id().value());
+                        held_elements.set(target->style_node_id().value());
                 }
             }
-            elements.remove_all_matching([&](auto element) { return held_elements.contains_slow(element); });
+            elements.remove_all_matching([&](auto element) { return held_elements.contains(element); });
             return !elements.is_empty();
         };
         bool const animates = plan();
@@ -209,17 +216,35 @@ bool seal_clock_plan(DOM::Document& document, bool may_plan, u64 update_serial)
         if (hover_lane_is_enabled() && document.is_fully_active() && !document.hidden() && document.window()) {
             // A hover decides over the transitions the host runs as they run, where the host runs them without
             // sampling them, which leaves the timing the engine holds of them behind.
-            for (auto const& associated_timeline : document.associated_animation_timelines()) {
-                for (auto const& animation : Animations::associated_animations_of(associated_timeline)) {
-                    auto effect = animation.effect();
-                    auto* target = effect.has_value() ? effect->target() : nullptr;
-                    if (!target || effect->pseudo_element_type().has_value() || !target->style_node_id()
-                        || !effect->can_skip_per_frame_style_update())
-                        continue;
-                    // NB: The record decides the timing the hover runs the animation with.
-                    effect_timing_nodes.append(target->style_node_id().value());
-                    effect_timing_identities.append(effect->id());
-                    effect_timings.append(Animations::RustFFI::animations_animation_hover_timing(&animation.record()));
+            // OPTIMIZATION: An animation whose effect produces nothing leaves the animations associated with its
+            //               target, and one an update of its timeline may change is among those its timeline keeps,
+            //               so look only at those, not at every animation associated with a timeline. Those of
+            //               timelines the document is not associated with, or of none, are left out as before.
+            auto const associated_timelines = document.associated_animation_timelines();
+            HashTable<Animations::RustFFI::TimelineCell const*> timelines;
+            for (auto const& timeline : associated_timelines)
+                timelines.set(&timeline.record());
+            auto add_effect_timing = [&](Animations::AnimationRef const& animation) {
+                auto effect = animation.effect();
+                auto* target = effect.has_value() ? effect->target() : nullptr;
+                if (!target || effect->pseudo_element_type().has_value() || !target->style_node_id()
+                    || !effect->can_skip_per_frame_style_update()
+                    || !timelines.contains(Animations::RustFFI::animations_animation_timeline(&animation.record())))
+                    return;
+                // NB: The record decides the timing the hover runs the animation with.
+                effect_timing_nodes.append(target->style_node_id().value());
+                effect_timing_identities.append(effect->id());
+                effect_timings.append(Animations::RustFFI::animations_animation_hover_timing(&animation.record()));
+            };
+            auto target_associated_animations = Animations::associated_animations_of(document.document_animations());
+            for (auto const& animation : target_associated_animations)
+                add_effect_timing(animation);
+            // NB: A transition started provisionally runs on its timeline before its target observes it.
+            for (auto const& timeline : associated_timelines) {
+                auto associated_animations = Animations::associated_animations_of(timeline);
+                for (auto const& animation : Animations::animations_needing_update_of(timeline)) {
+                    if (associated_animations.contains(animation) && !target_associated_animations.contains(animation))
+                        add_effect_timing(animation);
                 }
             }
             Optional<Web::EventHandler::SelectionDragForLanes> selection_drag;

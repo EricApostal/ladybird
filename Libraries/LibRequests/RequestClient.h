@@ -68,7 +68,7 @@ public:
     // No other client this process creates has the same epoch, so a request is known by its id and this epoch.
     u64 transport_epoch() const { return m_transport_epoch; }
 
-    RefPtr<WebSocket> websocket_connect(URL::URL const&, Optional<HTTP::NetworkIsolationKey> const&, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers, HTTP::Cookie::SameSiteContext);
+    RefPtr<WebSocket> websocket_connect(URL::URL const&, Optional<HTTP::NetworkIsolationKey> const&, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers, u64 originating_page_id, HTTP::Cookie::SameSiteContext);
 
     // Stores the data in the HTTP cache, and returns it mapped read-only from the cache's file, or nothing when it wasn't stored.
 
@@ -90,6 +90,7 @@ private:
     virtual void websocket_connected(u64 websocket_id) override;
     virtual void websocket_received(u64 websocket_id, bool, ByteBuffer) override;
     virtual void websocket_received_shared(u64 websocket_id, bool, Core::AnonymousBuffer) override;
+    virtual void websocket_transmitted(u64 websocket_id, u64 message_byte_count) override;
     virtual void websocket_errored(u64 websocket_id, i32) override;
     virtual void websocket_closed(u64 websocket_id, u16, ByteString, bool) override;
     virtual void websocket_ready_state_changed(u64 websocket_id, u32 ready_state) override;

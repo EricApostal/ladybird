@@ -243,6 +243,26 @@ bool has_preconditions(HeaderList const& request_headers)
         || request_headers.contains("If-Range"sv);
 }
 
+// AD-HOC: The "force-cache" cache mode uses a stored response "not paying attention to staleness". But a request that
+//         carries a no-cache directive of its own asks for a response that the origin validated, so it does not get a
+//         stale one. This is checked when the cache is looked up, as only then does the request have its final headers.
+//         As RFC 7234 put it, "When the Cache-Control header field is also present and understood in a request, Pragma
+//         is ignored."
+bool request_permits_stale_responses(CacheMode cache_mode, HeaderList const& request_headers)
+{
+    if (!cache_mode_permits_stale_responses(cache_mode))
+        return false;
+    if (cache_mode != CacheMode::ForceCache)
+        return true;
+
+    if (auto cache_control = request_headers.get("Cache-Control"sv); cache_control.has_value())
+        return !contains_cache_control_directive(*cache_control, "no-cache"sv);
+    if (auto pragma = request_headers.get("Pragma"sv); pragma.has_value())
+        return !contains_cache_control_directive(*pragma, "no-cache"sv);
+
+    return true;
+}
+
 // https://datatracker.ietf.org/doc/html/rfc9110#name-overview-of-status-codes
 static bool is_heuristically_cacheable_status(u32 status_code)
 {
@@ -609,6 +629,15 @@ CacheLifetimeStatus cache_lifetime_status(HeaderList const& request_headers, Hea
     if (response_cache_control.has_value() && contains_cache_control_directive(*response_cache_control, "no-cache"sv))
         return revalidation_status(CacheLifetimeStatus::MustRevalidate);
 
+    // AD-HOC: RFC 9111 deprecates Pragma, but clients still send it. Keep the rule of RFC 7234:
+    //         https://www.rfc-editor.org/rfc/rfc7234#section-5.4
+    //         "When the Cache-Control header field is not present in a request, caches MUST consider the no-cache
+    //         request pragma-directive as having the same effect as if "Cache-Control: no-cache" were present"
+    if (!request_cache_control.has_value()) {
+        if (auto request_pragma = request_headers.get("Pragma"sv); request_pragma.has_value() && contains_cache_control_directive(*request_pragma, "no-cache"sv))
+            return revalidation_status(CacheLifetimeStatus::MustRevalidate);
+    }
+
     if (request_cache_control.has_value()) {
         // https://httpwg.org/specs/rfc9111.html#cache-request-directive.no-cache
         // The no-cache request directive indicates that the client prefers a stored response not be used to satisfy the
@@ -644,7 +673,14 @@ CacheLifetimeStatus cache_lifetime_status(HeaderList const& request_headers, Hea
     if (freshness_lifetime > current_age)
         return CacheLifetimeStatus::Fresh;
 
-    if (request_cache_control.has_value()) {
+    // https://httpwg.org/specs/rfc9111.html#cache-response-directive.must-revalidate
+    // The must-revalidate response directive indicates that once the response has become stale, a cache MUST NOT reuse
+    // that response to satisfy another request until it has been successfully validated by the origin
+    //
+    // NB: A max-stale request directive does not permit reuse of such a response either, so check this first.
+    bool has_must_revalidate = response_cache_control.has_value() && contains_cache_control_directive(*response_cache_control, "must-revalidate"sv);
+
+    if (request_cache_control.has_value() && !has_must_revalidate) {
         // https://httpwg.org/specs/rfc9111.html#cache-request-directive.max-stale
         // The max-stale request directive indicates that the client will accept a response that has exceeded its
         // freshness lifetime. If a value is present, then the client is willing to accept a response that has exceeded
@@ -662,16 +698,12 @@ CacheLifetimeStatus cache_lifetime_status(HeaderList const& request_headers, Hea
     if (!response_cache_control.has_value())
         return revalidation_status(CacheLifetimeStatus::MustRevalidate);
 
-    // https://httpwg.org/specs/rfc9111.html#cache-response-directive.must-revalidate
-    // The must-revalidate response directive indicates that once the response has become stale, a cache MUST NOT reuse
-    // that response to satisfy another request until it has been successfully validated by the origin
-    //
-    // NB: This takes precedence over stale-while-revalidate, as per
+    // NB: must-revalidate takes precedence over stale-while-revalidate, as per
     //     https://httpwg.org/specs/rfc9111.html#serving.stale.responses:
     //     A cache MUST NOT generate a stale response if it is prohibited by an explicit in-protocol directive (e.g., by
     //     a no-cache response directive, a must-revalidate response directive, or an applicable s-maxage or
     //     proxy-revalidate response directive; see Section 5.2.2).
-    if (contains_cache_control_directive(*response_cache_control, "must-revalidate"sv))
+    if (has_must_revalidate)
         return revalidation_status(CacheLifetimeStatus::MustRevalidate);
 
     // https://httpwg.org/specs/rfc5861.html#n-the-stale-while-revalidate-cache-control-extension

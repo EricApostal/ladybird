@@ -42,6 +42,21 @@ class TestIPCGenerator(unittest.TestCase):
         self.assertIn("static_assert(__is_empty(IPC::SenderClaimReceiver<u32>),", header)
         self.assertNotIn("IPC::SenderClaimReceiver<u64>)", header)
 
+    def test_responses_to_synchronous_messages_sent_from_rust_arrive_raw(self) -> None:
+        generated = generate("endpoint Test { [RustSender] query(u32 value) => (u32 answer) other() => (u32 answer) }")
+        decoder = generated.split("decode_message(")[2].split("name_of_request_that_arrives_raw")[0]
+        self.assertNotIn("MessageID::QueryResponse:", decoder)
+        self.assertIn("MessageID::OtherResponse:", decoder)
+        raw_responses = generated.split("name_of_response_that_arrives_raw(")[2]
+        self.assertIn(
+            """\
+    case (int)Messages::Test::MessageID::QueryResponse:
+        return "Test::QueryResponse"sv;""",
+            raw_responses,
+        )
+        self.assertNotIn("OtherResponse", raw_responses.split("default:")[0])
+        self.assertIn("class QueryResponse final : public IPC::Message", generated)
+
     def test_non_template_implementations_are_only_in_the_cpp_file(self) -> None:
         header, implementation = generate_files(ENDPOINT)
         self.assertIn('#include "TestEndpoint.h"', implementation)
@@ -242,6 +257,9 @@ struct Gfx::IntSize {
 """
 
 
+RUST_CODEC_DERIVES = "::libipc_rust::wire::Encode, ::libipc_rust::wire::Decode"
+
+
 def generate_rust(contents: str) -> str:
     output = io.StringIO()
     build_rust(output, parse(contents))
@@ -324,12 +342,10 @@ using Value = Variant<Test::Record, u32, IPC::File>;
 """,
             implementation,
         )
-        rust = generate_rust(DECLARATIONS)
-        self.assertIn("#[repr(u8)]\npub enum Test_Shape {\n    Circle,\n    Square,\n}", rust)
-        self.assertIn("encoder.encode(&(*self as u8))", rust)
-        self.assertIn("1 => ::std::result::Result::Ok(Self::Square),", rust)
         self.assertIn(
-            '_ => ::std::result::Result::Err(::libipc_rust::wire::DecodeError::InvalidValue("Test::Shape")),', rust
+            f"#[derive(Clone, Copy, Debug, PartialEq, Eq, {RUST_CODEC_DERIVES})]\n#[repr(u8)]\n"
+            "pub enum Test_Shape {\n    Circle,\n    Square,\n}",
+            generate_rust(DECLARATIONS),
         )
 
     def test_enums_that_give_their_values_go_as_them(self) -> None:
@@ -348,9 +364,9 @@ using Value = Variant<Test::Record, u32, IPC::File>;
             implementation,
         )
         self.assertIn("    case 27:\n        return Test::Key::Escape;\n", implementation)
-        rust = generate_rust(declaration)
-        self.assertIn("#[repr(u8)]\npub enum Test_Key {\n    Escape = 27,\n    Space = 32,\n}", rust)
-        self.assertIn("32 => ::std::result::Result::Ok(Self::Space),", rust)
+        self.assertIn(
+            "#[repr(u8)]\npub enum Test_Key {\n    Escape = 27,\n    Space = 32,\n}", generate_rust(declaration)
+        )
 
         header, _ = generate_files("enum Test::Key : u8 { Escape = 27 }")
         self.assertIn("enum class Key : u8 {\n    Escape = 27,\n};", header)
@@ -373,11 +389,11 @@ using Value = Variant<Test::Record, u32, IPC::File>;
         self.assertIn("    return static_cast<Test::Modifier>(TRY(decoder.decode<u32>()));\n", implementation)
         rust = generate_rust(declaration)
         self.assertIn(
-            "#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]\n#[repr(transparent)]\npub struct Test_Modifier(pub u32);",
+            f"#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, {RUST_CODEC_DERIVES})]\n#[repr(transparent)]\n"
+            "pub struct Test_Modifier(pub u32);",
             rust,
         )
         self.assertIn("    pub const Mask: Self = Self(0x1f);\n", rust)
-        self.assertIn("::std::result::Result::Ok(Self(decoder.decode()?))", rust)
 
         header, _ = generate_files("[Flags] enum Test::Modifier : u8 { Alt = 1 }")
         self.assertIn("#include <AK/EnumBits.h>", header)
@@ -402,24 +418,21 @@ using Value = Variant<Test::Record, u32, IPC::File>;
 """,
             implementation,
         )
-        rust = generate_rust(DECLARATIONS)
         self.assertIn(
             """\
-        let value = Self {
-            id: decoder.decode()?,
-            label: decoder.decode_with_max_size(8)?,
-            values: decoder.decode_with_max_size(3)?,
-            scale: decoder.decode()?,
-            shape: decoder.decode()?,
-        };
+#[ipc(validate = Self::validate)]
+pub struct Test_Record {
+    pub id: u64,
+    #[ipc(max_size = 8)]
+    pub label: ::libipc_rust::wire::Utf8String,
+    #[ipc(max_size = 3)]
+    pub values: ::std::vec::Vec<u16>,
+    pub scale: f64,
+    pub shape: crate::ipc_types::Test_Shape,
+}
 """,
-            rust,
+            generate_rust(DECLARATIONS),
         )
-        for condition, field in [("value.id == 0", "id"), ("!value.scale.is_finite()", "scale")]:
-            self.assertIn(
-                f'        if {condition} {{\n            return ::std::result::Result::Err(::libipc_rust::wire::DecodeError::InvalidValue("Test::Record::{field}"));',
-                rust,
-            )
 
     def test_encoders_refuse_what_decoders_refuse(self) -> None:
         _, implementation = generate_files(DECLARATIONS)
@@ -441,10 +454,9 @@ using Value = Variant<Test::Record, u32, IPC::File>;
             ("!self.scale.is_finite()", "scale"),
         ]:
             self.assertIn(
-                f'        if {condition} {{\n            return ::std::result::Result::Err(::libipc_rust::wire::EncodeError::InvalidValue("Test::Record::{field}"));',
+                f'        if {condition} {{\n            return ::std::result::Result::Err("Test::Record::{field}");',
                 rust,
             )
-        self.assertEqual(rust.count("        self.validate()?;\n"), 2)
         for cpp_type, cpp_size, rust_size in [
             ("ByteString", "length()", "0.len()"),
             ("ByteBuffer", "size()", "len()"),
@@ -495,14 +507,11 @@ using Value = Variant<Test::Record, u32, IPC::File>;
         self.assertIn(".entries = TRY((decoder.decode<HashMap<u32, u32>>())),", implementation)
 
     def test_variants_go_as_the_index_of_their_alternative(self) -> None:
-        rust = generate_rust(DECLARATIONS)
         self.assertIn(
-            "pub enum Test_Value {\n    Record(crate::ipc_types::Test_Record),\n    Number(u32),\n    File(::libipc_rust::wire::File),\n}",
-            rust,
+            f"#[derive({RUST_CODEC_DERIVES})]\npub enum Test_Value {{\n    Record(crate::ipc_types::Test_Record),\n"
+            "    Number(u32),\n    File(::libipc_rust::wire::File),\n}",
+            generate_rust(DECLARATIONS),
         )
-        self.assertIn("            Self::File(value) => {\n                encoder.encode(&2u8)?;\n", rust)
-        self.assertIn("            2 => ::std::result::Result::Ok(Self::File(decoder.decode()?)),\n", rust)
-        self.assertIn('InvalidValue("Test::Value")', rust)
 
     def test_endpoints_use_declared_types_through_the_crate(self) -> None:
         contents = DECLARATIONS + "endpoint Test { echo(Test::Value value) => (Test::Value value) }"
@@ -587,7 +596,6 @@ class TestIPCRustGenerator(unittest.TestCase):
         generated = self.generate("endpoint Test { update(Vector<Optional<i64>> values, u32 type) =| }")
         self.assertIn("pub values: ::std::vec::Vec<::std::option::Option<i64>>", generated)
         self.assertIn("pub r#type: u32", generated)
-        self.assertIn("_encoder.encode(&self.r#type)?;", generated)
 
     def test_unmapped_types_are_rejected(self) -> None:
         for cpp_type in [
@@ -666,7 +674,7 @@ class TestIPCRustGenerator(unittest.TestCase):
         generated = self.generate("endpoint Test { " + " ".join(f"{name}(String value) =|" for name in names) + " }")
         self.assertIn("pub mod messages {", generated)
         self.assertIn("Message(messages::Message)", generated)
-        self.assertIn("impl ::libipc_rust::wire::Encode for Encode", generated)
+        self.assertIn(f"#[derive({RUST_CODEC_DERIVES})]\n        pub struct Encode {{", generated)
         self.assertIn("pub value: ::libipc_rust::wire::Utf8String", generated)
         self.assertNotIn("use libipc_rust", generated)
 
@@ -703,28 +711,32 @@ class TestIPCRustGenerator(unittest.TestCase):
 
         self.assertNotIn("Stub", self.generate("endpoint Test { [RustSender] update(u32 value) =| }"))
 
-    def test_owned_encoding_moves_every_field(self) -> None:
-        generated = self.generate("endpoint Test { send(Vector<IPC::File> files) =| }")
-        self.assertIn("fn encode_owned(self,", generated)
-        self.assertIn("_encoder.encode_owned(self.files)?;", generated)
+    def test_synchronous_messages_sent_from_rust_name_their_response(self) -> None:
+        generated = self.generate("endpoint Test { [RustSender] query(u32 value) => (u32 answer) other() =| }")
+        self.assertIn(
+            """\
+        impl ::libipc_rust::wire::SyncMessage for Query {
+            type Response = QueryResponse;
+        }
+""",
+            generated,
+        )
+        self.assertEqual(generated.count("SyncMessage"), 1)
 
     def test_utf8_is_validated_on_requests_and_responses(self) -> None:
         for cpp_type, expression in [
-            ("ByteString", "&value.0"),
-            ("ByteBuffer", "&value"),
+            ("ByteString", "&self.text.0"),
+            ("ByteBuffer", "&self.text"),
         ]:
             with self.subTest(cpp_type=cpp_type):
                 generated = self.generate(
                     f"endpoint Test {{ echo([UTF8] {cpp_type} text) => ([UTF8] {cpp_type} text) }}"
                 )
-                self.assertEqual(generated.count(f"::libipc_rust::wire::validate_utf8({expression})?;"), 2)
-                encode_expression = expression.replace("value", "self.text")
                 self.assertEqual(
-                    generated.count(f"::libipc_rust::wire::validate_utf8({encode_expression}).map_err("), 2
+                    generated.count(f'::libipc_rust::wire::validate_utf8({expression}).map_err(|_| "UTF-8")?;'), 2
                 )
-                self.assertEqual(generated.count('EncodeError::InvalidValue("UTF-8")'), 2)
-                self.assertEqual(generated.count("fn validate_utf8(&self)"), 2)
-                self.assertEqual(generated.count("self.validate_utf8()?;"), 4)
+                self.assertEqual(generated.count("#[ipc(validate = Self::validate)]"), 2)
+                self.assertEqual(generated.count("fn validate(&self)"), 2)
                 self.assertEqual(
                     generate(f"endpoint Test {{ echo([UTF8] {cpp_type} text) => ([UTF8] {cpp_type} text) }}").count(
                         "Utf8View(text).validate()"

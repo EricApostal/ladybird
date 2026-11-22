@@ -765,6 +765,10 @@ pub struct Stream {
 }
 
 impl Stream {
+    pub(super) fn bytecode_capacity(&self) -> usize {
+        self.current.bytes.capacity() + self.head.bytes.capacity() + self.body_head.bytes.capacity()
+    }
+
     pub(super) fn clear(&mut self) {
         if !self.is_active {
             return;
@@ -1459,6 +1463,11 @@ impl Generator<'_> {
         } else {
             self.put(op::Return { value });
         }
+    }
+
+    /// Makes room for `count` more values, which are about to come.
+    pub(super) fn reserve_values(&mut self, count: usize) {
+        self.context.stream.values.reserve(count);
     }
 
     #[inline(always)]
@@ -3566,6 +3575,7 @@ impl Generator<'_> {
         use crate::bytecode::constant_fold::*;
         let mut values = std::mem::take(&mut self.context.primitive_values);
         values.clear();
+        values.reserve(elements.len());
         for &element in elements {
             let value = match self.context.constants.get(element) {
                 Some(ConstantValue::Number(number)) => nanboxed_number(*number),
@@ -4212,6 +4222,22 @@ impl Generator<'_> {
     /// Assembles what was emitted into a new block, which has `other_tables_size` bytes left: the operands that come
     /// after the registers get their place in the frame, and labels their offsets.
     pub(super) fn finish_stream(&mut self, other_tables_size: usize) -> (AssembledBytecode, SliceBlockBuilder) {
+        // NB: Only code that runs in frames without a function starts without Enter, and those frames keep their
+        //     private environment anyway.
+        // NB: EnterWithOwnEnvironments binds the this value of sloppy functions too.
+        debug_assert!(
+            !self.coerces_this || self.context.stream.head.bytes.first() == Some(&(OpCode::Enter as u8)),
+            "code that binds its this value runs in frames of a function"
+        );
+        if let Some(enter) = self.context.stream.head.bytes.first_mut()
+            && *enter == OpCode::Enter as u8
+        {
+            if self.keeps_own_environments {
+                *enter = OpCode::EnterWithOwnEnvironments as u8;
+            } else if self.coerces_this {
+                *enter = OpCode::EnterCoercingThis as u8;
+            }
+        }
         // NB: Folding leaves constants that nothing uses, and they would take up slots in every frame.
         let mut constant_uses = vec![0u32; self.context.constants.values.len()];
         let stream = &self.context.stream;

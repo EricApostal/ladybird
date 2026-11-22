@@ -47,6 +47,7 @@ set(SOURCES
     Infra/Strings.cpp
     Loader/ContentBlocking.cpp
     Loader/DownloadFilename.cpp
+    Loader/FileResponseHeaders.cpp
     Loader/LoaderConfigSnapshot.cpp
     Loader/SiteCompatibility.cpp
     MediaSession/MediaSessionState.cpp
@@ -86,7 +87,6 @@ set(SOURCES
     WebView/DOMNodeProperties.cpp
     WebView/Geolocation.cpp
     WebView/Mutation.cpp
-    WebView/SiteIsolation.cpp
     WebView/Utilities.cpp
 )
 

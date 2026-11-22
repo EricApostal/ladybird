@@ -16,6 +16,8 @@
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/DocumentObserver.h>
+#include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactions.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
@@ -89,8 +91,7 @@ void web_bindings_set_rust_wrapper(void* realm, void* cell, JSObject* wrapper);
 void web_bindings_queue_a_microtask(void* realm, JSObject* function);
 void web_bindings_deferred_invoke(void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, void*));
-void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
-void web_bindings_queue_a_task_without_execution_context(u8 task_source, void* cell, void (*steps)(JSVM*, void*));
+void web_bindings_queue_a_task(u8 task_source, void* cell, void (*steps)(JSVM*, void*));
 u64 web_bindings_queue_a_global_task(JSObject* global_object, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_remove_tasks(void* realm, ReadonlySpan<u64> task_ids);
 u64 web_bindings_currently_running_task(void* realm);
@@ -121,6 +122,8 @@ bool web_bindings_document_is_allowed_to_use_feature(DOM::Document*, u8 feature)
 u8 web_bindings_document_visibility_state(DOM::Document*);
 void web_bindings_document_origin(DOM::Document*, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
 bool web_bindings_document_has_focus(DOM::Document*);
+bool web_bindings_document_is_fully_active_descendant_of_a_top_level_traversable_with_user_attention(DOM::Document*);
+DOM::DocumentObserver* web_bindings_document_observe_visibility_state(DOM::Document*, GC::Cell*, void (*steps)(JSVM*, GC::Cell*, bool visible));
 bool web_bindings_document_has_been_destroyed(DOM::Document*);
 URL::FFI::RustUrl web_bindings_document_url(DOM::Document*);
 void web_bindings_document_load_timing_info(DOM::Document const*, DOM::DocumentLoadTimingInfo*);
@@ -146,6 +149,8 @@ double web_bindings_environment_settings_object_current_wall_time(HTML::Environm
 void web_bindings_environment_settings_object_encoding_parse_url(HTML::EnvironmentSettingsObject*, FlatPtr url, void* parsed_url, void (*on_url)(void*, URL::FFI::RustUrl const*));
 void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*));
 bool web_bindings_object_implements_interface(JSObject* object, u16 interface_name);
+bool web_bindings_object_is_window_proxy(JSObject* object);
+JSObject* web_bindings_window_proxy_object_in_realm(JSObject* object, void* realm);
 JSObject* web_bindings_create_dom_exception(void* realm, ReadonlyBytes name, FlatPtr message);
 JSCompletion web_bindings_perform_a_security_check(void* realm, JSValue platform_object, ReadonlyBytes identifier, u8 type);
 bool web_bindings_extract_an_origin(JSObject* object, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
@@ -276,6 +281,7 @@ bool web_bindings_document_is_fully_active(DOM::Document* document)
     return document->is_fully_active();
 }
 
+static_assert(to_underlying(DOM::PolicyControlledFeature::EncryptedMedia) == 3);
 static_assert(to_underlying(DOM::PolicyControlledFeature::Geolocation) == 7);
 
 bool web_bindings_document_is_allowed_to_use_feature(DOM::Document* document, u8 feature)
@@ -301,6 +307,20 @@ void web_bindings_document_origin(DOM::Document* document, void* origin, void (*
 bool web_bindings_document_has_focus(DOM::Document* document)
 {
     return document->has_focus();
+}
+
+bool web_bindings_document_is_fully_active_descendant_of_a_top_level_traversable_with_user_attention(DOM::Document* document)
+{
+    return document->is_fully_active_descendant_of_a_top_level_traversable_with_user_attention();
+}
+
+DOM::DocumentObserver* web_bindings_document_observe_visibility_state(DOM::Document* document, GC::Cell* cell, void (*steps)(JSVM*, GC::Cell*, bool visible))
+{
+    auto observer = DOM::DocumentObserver::create(*document);
+    observer->set_document_visibility_state_observer(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *cell }, steps), [](auto& cell, auto& steps, HTML::VisibilityState state) {
+        steps(JS::HostABI::vm_to_abi(JS::VM::the()), cell.ptr(), state == HTML::VisibilityState::Visible);
+    }));
+    return observer.ptr();
 }
 
 bool web_bindings_document_has_been_destroyed(DOM::Document* document)
@@ -443,6 +463,20 @@ bool web_bindings_object_implements_interface(JSObject* object, u16 interface_na
     return wrappable && wrappable->implements_interface(static_cast<InterfaceName>(interface_name));
 }
 
+bool web_bindings_object_is_window_proxy(JSObject* object)
+{
+    return HTML::WindowProxy::from_object(*JS::HostABI::object_from_abi(object));
+}
+
+JSObject* web_bindings_window_proxy_object_in_realm(JSObject* object, void* realm)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto& window_proxy = *HTML::WindowProxy::from_object(*JS::HostABI::object_from_abi(object));
+    if (auto browsing_context = window_proxy.associated_browsing_context())
+        return JS::HostABI::object_to_abi(&browsing_context->window_proxy_for(host_defined_wrapper_world(js_realm), js_realm)->object());
+    return object;
+}
+
 JSObject* web_bindings_create_dom_exception(void* realm, ReadonlyBytes name, FlatPtr message)
 {
     auto& js_realm = *static_cast<JS::Realm*>(realm);
@@ -530,20 +564,12 @@ static_assert(to_underlying(HTML::Task::Source::FileReading) == 13);
 static_assert(to_underlying(HTML::Task::Source::PerformanceTimeline) == 15);
 static_assert(to_underlying(HTML::Task::Source::Clipboard) == 17);
 static_assert(to_underlying(HTML::Task::Source::Permissions) == 18);
+static_assert(to_underlying(HTML::Task::Source::RemoteEvent) == 20);
+static_assert(to_underlying(HTML::Task::Source::WebGL) == 26);
 static_assert(to_underlying(HTML::Task::Source::Crypto) == 27);
 static_assert(to_underlying(HTML::Task::Source::Storage) == 29);
 
-void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
-{
-    GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
-    // NB: The task's captures, which the collector traces, keep the cell alive until the steps run.
-    HTML::queue_a_task(static_cast<HTML::Task::Source>(task_source), nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(js_realm, GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& js_realm, auto& cell, auto& steps) {
-        HTML::TemporaryExecutionContext execution_context { js_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell.ptr());
-    }));
-}
-
-void web_bindings_queue_a_task_without_execution_context(u8 task_source, void* cell, void (*steps)(JSVM*, void*))
+void web_bindings_queue_a_task(u8 task_source, void* cell, void (*steps)(JSVM*, void*))
 {
     // NB: The task's captures, which the collector traces, keep the cell alive until the steps run.
     HTML::queue_a_task(static_cast<HTML::Task::Source>(task_source), nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& cell, auto& steps) {

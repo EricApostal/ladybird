@@ -99,6 +99,7 @@ View::View(InitialState initial_state)
     , m_system_theme(move(initial_state.system_theme))
     , m_screen_rects(move(initial_state.screen_rects))
     , m_websites_prefer_dark(initial_state.websites_prefer_dark)
+    , m_is_tab(initial_state.is_tab)
 {
     m_device_pixel_ratio = initial_state.device_pixel_ratio;
     m_maximum_frames_per_second = initial_state.maximum_frames_per_second;
@@ -172,6 +173,13 @@ void View::did_get_permission_answer(u64 answer_id, Web::Permissions::PromptOutc
 {
     if (auto on_answer = m_pending_permission_answers.take(answer_id); on_answer.has_value())
         (*on_answer)(outcome);
+}
+
+// NB: The UI may keep the tab, such as when the user sees it after all. It then stays as it is.
+void View::did_request_discard()
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_discard(view_id());
 }
 
 void View::forward_callbacks_to_ui(bool is_tab)
@@ -260,30 +268,34 @@ void View::forward_callbacks_to_ui(bool is_tab)
 
     on_finish_handling_key_event = [this](Web::KeyEvent const& event) {
         // NB: Input that the Hub came up with itself, such as WebDriver's, is nothing the UI knows about.
-        if (!event.browser_data)
+        auto input_id = ConnectionFromUI::input_id_of(event.browser_data.ptr());
+        if (!input_id.has_value())
             return;
         if (auto* ui = ConnectionFromUI::the()) {
             push_state_to_ui();
-            ui->async_view_finish_handling_key_event(view_id(), ConnectionFromUI::input_id_of(*event.browser_data), event.clone_without_browser_data());
+            ui->async_view_finish_handling_key_event(view_id(), *input_id, event.clone_without_browser_data());
         }
     };
 
     on_finish_handling_mouse_event = [this](Web::MouseEvent const& event, Web::EventResult result) {
-        if (!event.browser_data)
+        // NB: Input that the Hub came up with itself, such as WebDriver's, is nothing the UI knows about.
+        auto input_id = ConnectionFromUI::input_id_of(event.browser_data.ptr());
+        if (!input_id.has_value())
             return;
         if (auto* ui = ConnectionFromUI::the()) {
             push_state_to_ui();
-            ui->async_view_finish_handling_mouse_event(view_id(), ConnectionFromUI::input_id_of(*event.browser_data), event.clone_without_browser_data(), result);
+            ui->async_view_finish_handling_mouse_event(view_id(), *input_id, event.clone_without_browser_data(), result);
         }
     };
 
     on_finish_handling_drag_event = [this](Web::DragEvent const& event) {
         // NB: Input that the Hub came up with itself, such as WebDriver's, is nothing the UI knows about.
-        if (!event.browser_data)
+        auto input_id = ConnectionFromUI::input_id_of(event.browser_data.ptr());
+        if (!input_id.has_value())
             return;
         if (auto* ui = ConnectionFromUI::the()) {
             push_state_to_ui();
-            ui->async_view_finish_handling_drag_event(view_id(), ConnectionFromUI::input_id_of(*event.browser_data), event.clone_without_browser_data());
+            ui->async_view_finish_handling_drag_event(view_id(), *input_id, event.clone_without_browser_data());
         }
     };
 
@@ -621,6 +633,11 @@ void View::forward_callbacks_to_ui(bool is_tab)
             push_state_to_ui();
             ui->async_view_performance_stats(view_id(), arguments...);
         }
+    };
+
+    on_compositor_layers_change = [this](auto const&... arguments) {
+        if (auto* ui = ConnectionFromUI::the())
+            ui->async_view_compositor_layers_change(view_id(), arguments...);
     };
 }
 

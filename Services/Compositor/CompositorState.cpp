@@ -8,9 +8,14 @@
 #include <AK/Random.h>
 #include <AK/StdLibExtras.h>
 #include <AK/TemporaryChange.h>
+#include <Compositor/BackingStoreFactory.h>
+#include <Compositor/Canvas2DCommandPlayer.h>
 #include <Compositor/CanvasHost.h>
 #include <Compositor/CompositorState.h>
+#include <Compositor/OpenGLContext.h>
 #include <Compositor/SkiaUtils.h>
+#include <Compositor/VideoFrameSkia.h>
+#include <LibCompositing/CanvasColorSpace.h>
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibCompositing/DisplayList/RegisteredImageFrames.h>
 #include <LibCore/AnonymousBuffer.h>
@@ -18,7 +23,9 @@
 #include <LibCore/StatsLog.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
+#include <LibGfx/ExportFormat.h>
 #include <LibMedia/Sinks/DisplayingVideoSink.h>
+#include <LibMediaCodecs/VideoFrame.h>
 #include <LibMediaCodecs/VideoSurface.h>
 #include <core/SkCanvas.h>
 #include <core/SkImage.h>
@@ -61,6 +68,11 @@ IPC::RawMessage::OutcomeInRust CompositorState::handle_message_from_web_content(
 IPC::RawMessage::OutcomeInRust CompositorState::handle_message_from_presentation(PresentationId presentation_id, IPC::RawMessage& message)
 {
     return m_core.handle_message_from_presentation(presentation_id, message);
+}
+
+IPC::RawMessage::OutcomeInRust CompositorState::handle_message_from_control(IPC::RawMessage& message)
+{
+    return m_core.handle_message_from_control(message);
 }
 
 CompositorState::PresentedContext::PresentedContext(CompositorStateWebContentClient& web_content_client, OwnedCanvasSurfaces canvas_surfaces)
@@ -112,38 +124,36 @@ CompositorStateClient* CompositorState::presentation_if_present(PresentationId p
     return m_presentations_by_id.get(presentation_id).value_or(nullptr);
 }
 
-void CompositorState::set_timer(Web::CompositorContextId context_id, ContextTimer timer, AK::Duration delay)
+void CompositorState::set_timer(u64 timer_number, AK::Duration delay)
 {
-    auto& context_timer = m_context_timers.ensure(context_id).ensure(timer, [&] {
-        return Core::Timer::create_single_shot(delay, [this, context_id, timer] {
-            context_timer_fired(context_id, timer);
+    auto& timer = m_timers.ensure(timer_number, [&] {
+        return Core::Timer::create_single_shot(delay, [this, timer_number] {
+            m_core.timer_fired(timer_number);
         });
     });
-    context_timer->restart(delay);
+    timer->restart(delay);
 }
 
-void CompositorState::cancel_timer(Web::CompositorContextId context_id, ContextTimer timer)
+void CompositorState::cancel_timer(u64 timer_number)
 {
-    auto timers = m_context_timers.find(context_id);
-    if (timers == m_context_timers.end())
-        return;
-    if (auto context_timer = timers->value.get(timer); context_timer.has_value())
-        (*context_timer)->stop();
+    if (auto timer = m_timers.get(timer_number); timer.has_value())
+        (*timer)->stop();
 }
 
-void CompositorState::context_timer_fired(Web::CompositorContextId context_id, ContextTimer timer)
+void CompositorState::destroy_timer(u64 timer_number)
 {
-    if (!presented_context_if_present(context_id))
+    auto timer = m_timers.take(timer_number);
+    if (!timer.has_value())
         return;
-    m_core.timer_fired(context_id, timer);
+    (*timer)->stop();
+    // NB: The timer may be the one whose callback is running.
+    Core::deferred_invoke([timer = timer.release_value()] { });
 }
 
 PresentationId CompositorState::register_presentation(CompositorStateClient& presentation, PresentationCapabilities capabilities)
 {
     PresentationId presentation_id { m_next_presentation_id++ };
     m_presentations_by_id.set(presentation_id, &presentation);
-    if (auto window_server = WindowServer::try_create_for_presentation())
-        m_window_servers.set(&presentation, window_server.release_nonnull());
     m_core.register_presentation(presentation_id,
         {
             .synthesizes_scroll_momentum = capabilities.synthesizes_scroll_momentum,
@@ -158,18 +168,6 @@ PresentationId CompositorState::register_presentation(CompositorStateClient& pre
 
 void CompositorState::unregister_presentation(CompositorStateClient& presentation)
 {
-    Vector<u64> remote_layer_ids;
-    for (auto const& [remote_layer_id, remote_layer] : m_remote_layers) {
-        if (remote_layer.presentation == &presentation)
-            remote_layer_ids.append(remote_layer_id);
-    }
-    for (auto remote_layer_id : remote_layer_ids)
-        destroy_remote_layer(remote_layer_id);
-    if (auto window_server = m_window_servers.take(&presentation); window_server.has_value()) {
-        if (m_window_servers_holding_changes.remove_first_matching([&](auto const& holding) { return holding.ptr() == window_server->ptr(); }))
-            (*window_server)->release_changes_held_off_screen();
-    }
-
     m_core.unregister_presentation(presentation.presentation_id());
     m_presentations_by_id.remove(presentation.presentation_id());
 }
@@ -180,146 +178,6 @@ void CompositorState::bind_presentation(Web::CompositorContextId context_id, Com
     if (!presented_context_if_present(context_id))
         return;
     m_core.bind_presentation(context_id, presentation.presentation_id());
-}
-
-Compositing::RemoteLayerHostHandle CompositorState::create_remote_layer(CompositorStateClient& presentation, u64 remote_layer_id)
-{
-    VERIFY(presentation_if_present(presentation.presentation_id()) == &presentation);
-    if (auto existing = m_remote_layers.find(remote_layer_id); existing != m_remote_layers.end()) {
-        dbgln("Compositor: Ignoring creation of remote layer {}, which already exists", remote_layer_id);
-        return {};
-    }
-    auto window_server = m_window_servers.get(&presentation);
-    if (!window_server.has_value())
-        return {};
-    auto layer = (*window_server)->try_create_remote_layer(remote_layer_id);
-    if (!layer)
-        return {};
-    auto host_handle = layer->host_handle();
-    m_remote_layers.set(remote_layer_id, { .presentation = &presentation, .window_server = **window_server, .layer = move(layer), .shown_context_id = {}, .fit_within = {}, .size_of_shown_frame_laid_out_by_page = {} });
-    return host_handle;
-}
-
-void CompositorState::destroy_remote_layer(u64 remote_layer_id)
-{
-    show_context_in_remote_layer(remote_layer_id, {});
-    m_remote_layers.remove(remote_layer_id);
-    auto had_synchronized_resizes = !m_synchronized_resizes.is_empty();
-    m_synchronized_resizes.remove_all_matching([&](auto const& resize) { return resize.remote_layer_id == remote_layer_id; });
-    if (had_synchronized_resizes && m_synchronized_resizes.is_empty())
-        release_synchronized_resize_hold();
-}
-
-void CompositorState::show_context_in_remote_layer(u64 remote_layer_id, Optional<Web::CompositorContextId> context_id)
-{
-    auto remote_layer = m_remote_layers.find(remote_layer_id);
-    if (remote_layer == m_remote_layers.end())
-        return;
-    if (remote_layer->value.shown_context_id == context_id)
-        return;
-
-    remote_layer->value.size_of_shown_frame_laid_out_by_page = {};
-    if (auto shown_context_id = exchange(remote_layer->value.shown_context_id, {}); shown_context_id.has_value()) {
-        if (auto* shown_context = presented_context_if_present(*shown_context_id)) {
-            shown_context->remote_layer_id = {};
-            m_core.set_shown_in_remote_layer(*shown_context_id, false);
-        }
-    }
-    if (!context_id.has_value())
-        return;
-
-    auto* context = presented_context_if_present(*context_id);
-    if (!context || !m_core.presents_to_client(*context_id)) {
-        dbgln("Compositor: Ignoring context {} for remote layer {}, as it is not a root context", *context_id, remote_layer_id);
-        return;
-    }
-    if (context->remote_layer_id.has_value()) {
-        if (auto other_remote_layer = m_remote_layers.find(*context->remote_layer_id); other_remote_layer != m_remote_layers.end()) {
-            other_remote_layer->value.shown_context_id = {};
-            other_remote_layer->value.size_of_shown_frame_laid_out_by_page = {};
-        }
-    }
-
-    remote_layer->value.shown_context_id = context_id;
-    context->remote_layer_id = remote_layer_id;
-    m_core.set_shown_in_remote_layer(*context_id, true);
-}
-
-void CompositorState::set_remote_layer_fit(u64 remote_layer_id, Optional<Gfx::IntSize> fit_within)
-{
-    auto remote_layer = m_remote_layers.find(remote_layer_id);
-    if (remote_layer == m_remote_layers.end() || remote_layer->value.fit_within == fit_within)
-        return;
-    remote_layer->value.fit_within = fit_within;
-    remote_layer->value.layer->place_frame(fit_within);
-}
-
-// A UI that never commits its resize, as one that crashed, would otherwise freeze every window of the browser.
-static constexpr auto SYNCHRONIZED_RESIZE_HOLD_LIMIT = AK::Duration::from_seconds(1);
-
-void CompositorState::begin_synchronized_resize(u64 remote_layer_id, u64 token)
-{
-    auto remote_layer = m_remote_layers.find(remote_layer_id);
-    if (remote_layer == m_remote_layers.end())
-        return;
-    auto& window_server = remote_layer->value.window_server;
-    if (!m_window_servers_holding_changes.contains_slow(window_server)) {
-        if (m_window_servers_holding_changes.is_empty()) {
-            if (!m_synchronized_resize_hold_timeout) {
-                m_synchronized_resize_hold_timeout = Core::Timer::create_single_shot(SYNCHRONIZED_RESIZE_HOLD_LIMIT, [this] {
-                    dbgln("Compositor: Releasing the window resize that was never committed");
-                    release_synchronized_resize_hold();
-                });
-            }
-            m_synchronized_resize_hold_timeout->start();
-        }
-        m_window_servers_holding_changes.append(window_server);
-        window_server->hold_changes_on_screen();
-    }
-    m_synchronized_resizes.append({ .remote_layer_id = remote_layer_id, .token = token, .awaited_size = {}, .frame_is_held = false });
-}
-
-void CompositorState::await_synchronized_resize_frame(u64 remote_layer_id, u64 token, Gfx::IntSize size)
-{
-    for (auto& resize : m_synchronized_resizes) {
-        if (resize.remote_layer_id == remote_layer_id && resize.token == token)
-            resize.awaited_size = size;
-    }
-    report_held_synchronized_resize_frames(remote_layer_id);
-}
-
-void CompositorState::report_held_synchronized_resize_frames(u64 remote_layer_id)
-{
-    auto remote_layer = m_remote_layers.find(remote_layer_id);
-    if (remote_layer == m_remote_layers.end())
-        return;
-    auto shown_size = remote_layer->value.size_of_shown_frame_laid_out_by_page;
-    for (auto& resize : m_synchronized_resizes) {
-        if (resize.remote_layer_id != remote_layer_id || resize.frame_is_held || !resize.awaited_size.has_value() || resize.awaited_size != shown_size)
-            continue;
-        resize.frame_is_held = true;
-        remote_layer->value.presentation->did_hold_synchronized_resize_frame(remote_layer_id, resize.token);
-    }
-}
-
-void CompositorState::commit_synchronized_resize(u64 remote_layer_id, u64 token)
-{
-    m_synchronized_resizes.remove_all_matching([&](auto const& resize) {
-        return resize.remote_layer_id == remote_layer_id && resize.token == token;
-    });
-    if (m_synchronized_resizes.is_empty())
-        release_synchronized_resize_hold();
-    if (auto remote_layer = m_remote_layers.find(remote_layer_id); remote_layer != m_remote_layers.end())
-        remote_layer->value.presentation->did_commit_synchronized_resize(remote_layer_id, token);
-}
-
-void CompositorState::release_synchronized_resize_hold()
-{
-    if (m_synchronized_resize_hold_timeout)
-        m_synchronized_resize_hold_timeout->stop();
-    m_synchronized_resizes.clear();
-    for (auto& window_server : exchange(m_window_servers_holding_changes, {}))
-        window_server->release_changes_held_off_screen();
 }
 
 CompositorStateClient* CompositorState::presentation_for_context(Web::CompositorContextId context_id) const
@@ -345,6 +203,7 @@ CompositorState::ContextOwnerCheckResult CompositorState::check_context_owner(We
 
 void CompositorState::destroy_contexts_for_web_content_client(CompositorStateWebContentClient& client)
 {
+    m_core.forget_web_content_client(client.web_content_client_id());
     Vector<Web::CompositorContextId> context_ids;
     for (auto& context : m_presented_contexts) {
         if (context.value->web_content_client.web_content_client_id() == client.web_content_client_id())
@@ -448,20 +307,8 @@ void CompositorState::create_context(Web::CompositorContextId context_id, Option
 
 void CompositorState::destroy_context(Web::CompositorContextId context_id)
 {
-    auto& context = presented_context(context_id);
+    VERIFY(presented_context_if_present(context_id));
     m_core.destroy_context(context_id);
-    if (context.remote_layer_id.has_value()) {
-        // The layer keeps the context's last frame until another context is shown in it.
-        if (auto remote_layer = m_remote_layers.find(*context.remote_layer_id); remote_layer != m_remote_layers.end())
-            remote_layer->value.shown_context_id = {};
-    }
-    if (auto timers = m_context_timers.find(context_id); timers != m_context_timers.end()) {
-        for (auto& [_, timer] : timers->value) {
-            timer->on_timeout = {};
-            timer->stop();
-        }
-        m_context_timers.remove(timers);
-    }
     m_presented_contexts.remove(context_id);
     update_unpainted_video_update_scheduling();
 }
@@ -835,12 +682,12 @@ void CompositorState::viewport_size_updated(Web::CompositorContextId context_id,
     m_core.viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
 }
 
-Optional<OverlayLabel> CompositorState::shape_overlay_label(Web::CompositorContextId context_id, Optional<StringView> font_family, double device_pixel_ratio, StringView text)
+Optional<OverlayLabel> CompositorState::shape_overlay_label(Web::CompositorContextId context_id, Optional<StringView> font_family, float font_size_in_points, double device_pixel_ratio, StringView text)
 {
     auto* context = presented_context_if_present(context_id);
     if (!context)
         return {};
-    return context->raster_targets.shape_overlay_label(font_family, device_pixel_ratio, text);
+    return context->raster_targets.shape_overlay_label(font_family, font_size_in_points, device_pixel_ratio, text);
 }
 
 void CompositorState::set_ui_overlays(Web::CompositorContextId context_id, Compositing::UIOverlays overlays)
@@ -1011,62 +858,19 @@ void CompositorState::finish_screenshot_preparation(u64 preparation_id)
         requester->tell_remote_descendants_prepared_for_screenshot(finished->request_id);
 }
 
-static Gfx::IntSize size_fitting_within(Gfx::IntSize size, Gfx::IntSize maximum_size)
-{
-    if (size.width() <= maximum_size.width() && size.height() <= maximum_size.height())
-        return size;
-    auto scale = min(static_cast<double>(maximum_size.width()) / size.width(), static_cast<double>(maximum_size.height()) / size.height());
-    return { max(1, static_cast<int>(round(size.width() * scale))), max(1, static_cast<int>(round(size.height() * scale))) };
-}
-
-Optional<Gfx::ShareableBitmap> CompositorState::take_frame_snapshot(Web::CompositorContextId context_id, Optional<Gfx::IntSize> maximum_size)
+Optional<Gfx::ShareableBitmap> CompositorState::take_frame_snapshot(Web::CompositorContextId context_id)
 {
     if (!presented_context_if_present(context_id))
         return {};
     auto presented_frame = m_core.presented_frame_for_snapshot(context_id);
     if (!presented_frame.has_value())
         return {};
-    auto const& source = *presented_frame->surface;
-    auto frame_size = presented_frame->frame_size;
-    auto snapshot_size = frame_size;
-    if (maximum_size.has_value() && !maximum_size->is_empty())
-        snapshot_size = size_fitting_within(frame_size, *maximum_size);
 
-    auto bitmap_or_error = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, snapshot_size);
+    auto bitmap_or_error = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, presented_frame->frame_size);
     if (bitmap_or_error.is_error())
         return {};
     auto bitmap = bitmap_or_error.release_value();
-
-    if (snapshot_size == frame_size) {
-        source.read_into_bitmap(*bitmap);
-        return Gfx::ShareableBitmap { move(bitmap), Gfx::ShareableBitmap::ConstructWithKnownGoodBitmap };
-    }
-
-    // A linear filter reads only the pixels around each one it writes, so a frame scaled down to a fraction of its size
-    // in one step would skip most of them. Halving it first lets every pixel count.
-    auto image = source.sk_image_snapshot<sk_sp<SkImage>>();
-    auto image_size = frame_size;
-    SkSamplingOptions const sampling { SkFilterMode::kLinear };
-    auto draw_scaled = [&](Gfx::IntSize size) -> RefPtr<Gfx::PaintingSurface> {
-        auto surface_or_error = Gfx::PaintingSurface::try_create_with_size(size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, source.skia_backend_context());
-        if (surface_or_error.is_error())
-            return nullptr;
-        auto surface = surface_or_error.release_value();
-        surface->canvas().drawImageRect(image.get(), SkRect::MakeIWH(image_size.width(), image_size.height()), SkRect::MakeIWH(size.width(), size.height()), sampling, nullptr, SkCanvas::kStrict_SrcRectConstraint);
-        return surface;
-    };
-    while (image_size.width() / 2 >= snapshot_size.width() && image_size.height() / 2 >= snapshot_size.height()) {
-        Gfx::IntSize half_size { image_size.width() / 2, image_size.height() / 2 };
-        auto half = draw_scaled(half_size);
-        if (!half)
-            return {};
-        image = half->sk_image_snapshot<sk_sp<SkImage>>();
-        image_size = half_size;
-    }
-    auto snapshot_surface = draw_scaled(snapshot_size);
-    if (!snapshot_surface)
-        return {};
-    snapshot_surface->read_into_bitmap(*bitmap);
+    presented_frame->surface->read_into_bitmap(*bitmap);
     return Gfx::ShareableBitmap { move(bitmap), Gfx::ShareableBitmap::ConstructWithKnownGoodBitmap };
 }
 
@@ -1132,72 +936,63 @@ void CompositorState::end_painting()
     m_display_list_players[--m_painting_depth]->end_painting();
 }
 
-static BackingStoreManager::PublicationMode publication_mode_of(RustFFI::StorePublication publication)
-{
-    switch (publication) {
-    case RustFFI::StorePublication::Unpublished:
-        return BackingStoreManager::PublicationMode::Unpublished;
-    case RustFFI::StorePublication::Published:
-        return BackingStoreManager::PublicationMode::Published;
-    case RustFFI::StorePublication::ShownInRemoteLayer:
-        return BackingStoreManager::PublicationMode::ShownInRemoteLayer;
-    }
-    VERIFY_NOT_REACHED();
+namespace {
+
+// An image of a store that the Rust core holds until it publishes the store.
+struct SharedImageToPublish {
+    AK_ALLOC_WITH_KMALLOC;
+
+    Gfx::SharedImage image;
+};
+
 }
 
-RustFFI::StoreResizeOutcome CompositorState::resize_stores(Web::CompositorContextId context_id, RustFFI::FfiStoreResize const& resize)
+bool CompositorState::create_store(Web::CompositorContextId context_id, RustFFI::StoreKind kind, Gfx::IntSize size, WindowServer* window_server_showing_stores, RustFFI::FfiNewStore& new_store)
 {
-    auto& backing_stores = presented_context(context_id).raster_targets.backing_stores();
-    auto publication_mode = publication_mode_of(resize.publication);
-    auto window_resize_in_progress = resize.window_resize_in_progress ? Compositing::WindowResizingInProgress::Yes : Compositing::WindowResizingInProgress::No;
-    auto allocation = backing_stores.resize_backing_stores_if_needed(resize.raster_size, window_resize_in_progress, publication_mode);
-    if (!allocation.has_value())
-        return RustFFI::StoreResizeOutcome::Unchanged;
-
-    RefPtr<WindowServer> window_server_showing_stores;
-    if (publication_mode == BackingStoreManager::PublicationMode::ShownInRemoteLayer) {
-        auto* remote_layer = remote_layer_showing(context_id);
-        VERIFY(remote_layer);
-        window_server_showing_stores = remote_layer->window_server;
-    }
-    auto gpu_sharing = resize.gpu_sharing_allowed ? BackingStoreManager::GpuSharing::Allowed : BackingStoreManager::GpuSharing::Disallowed;
-    auto publication = backing_stores.allocate_backing_stores(*allocation, m_skia_backend_context, publication_mode, gpu_sharing, move(window_server_showing_stores));
-    if (publication.is_error()) {
-        dbgln("Compositor: Failed to allocate the stores of context {} that a remote layer shows, which its presentation shows again: {}", context_id, publication.error());
-        return RustFFI::StoreResizeOutcome::Failed;
-    }
-    if (!publication.value().has_value())
-        return RustFFI::StoreResizeOutcome::ReallocatedOffscreen;
-    if (publication_mode == BackingStoreManager::PublicationMode::Published) {
-        auto* presentation = resize.has_presentation ? presentation_if_present(PresentationId { resize.presentation_id }) : nullptr;
-        VERIFY(presentation);
-        auto stores = publication.release_value().release_value();
-        presentation->did_allocate_backing_stores(context_id, move(stores.bitmap_ids), move(stores.shared_images));
-    }
-    return RustFFI::StoreResizeOutcome::ReallocatedForViewer;
-}
-
-bool CompositorState::add_store_if_window_server_reads_every_released_store(Web::CompositorContextId context_id, Optional<PresentationId> publishing_presentation)
-{
-    auto& backing_stores = presented_context(context_id).raster_targets.backing_stores();
-    auto publication = backing_stores.add_backing_store_if_window_server_still_reads_every_released_store(m_skia_backend_context);
-    if (!publication.has_value())
+    auto store_or_error = create_backing_store(kind, size, m_skia_backend_context, window_server_showing_stores);
+    if (store_or_error.is_error()) {
+        if (kind == RustFFI::StoreKind::ShownByWindowServer)
+            dbgln("Compositor: Failed to allocate a store of context {} that a remote layer shows, which its presentation shows again: {}", context_id, store_or_error.error());
         return false;
-    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Context {} gained backing store {}, as the window server still reads every released one", context_id, publication->bitmap_ids);
-    if (auto* presentation = publishing_presentation.has_value() ? presentation_if_present(*publishing_presentation) : nullptr)
-        presentation->did_add_backing_stores(context_id, move(publication->bitmap_ids), move(publication->shared_images));
+    }
+    auto store = store_or_error.release_value();
+    new_store.surface = &store.surface.leak_ref();
+    if (store.window_server_surface)
+        new_store.window_server_surface = &store.window_server_surface.release_nonnull().leak_ref();
+    if (store.shared_image_buffer) {
+        new_store.shared_image_buffer = store.shared_image_buffer.leak_ptr();
+        new_store.shared_image_buffer_is_in_use = [](void* buffer) { return shared_image_buffer_is_in_use(*static_cast<Gfx::SharedImageBuffer const*>(buffer)); };
+        new_store.destroy_shared_image_buffer = [](void* buffer) { (void)adopt_own(*static_cast<Gfx::SharedImageBuffer*>(buffer)); };
+    }
+    if (store.shared_image.has_value()) {
+        new_store.shared_image = make<SharedImageToPublish>(store.shared_image.release_value()).leak_ptr();
+        new_store.destroy_shared_image = [](void* image) { (void)adopt_own(*static_cast<SharedImageToPublish*>(image)); };
+    }
     return true;
 }
 
-bool CompositorState::retire_idle_surplus_stores(Web::CompositorContextId context_id, Optional<PresentationId> publishing_presentation)
+void CompositorState::publish_stores(PresentationId presentation_id, Web::CompositorContextId context_id, bool added, ReadonlySpan<i32> bitmap_ids, ReadonlySpan<void*> images)
 {
-    auto& backing_stores = presented_context(context_id).raster_targets.backing_stores();
-    auto retired_bitmap_ids = backing_stores.retire_idle_surplus_backing_stores();
-    if (auto* presentation = publishing_presentation.has_value() ? presentation_if_present(*publishing_presentation) : nullptr; presentation && !retired_bitmap_ids.is_empty()) {
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Context {} retired idle backing stores {}", context_id, retired_bitmap_ids);
-        presentation->did_retire_backing_stores(context_id, move(retired_bitmap_ids));
+    Vector<Gfx::SharedImage> shared_images;
+    shared_images.ensure_capacity(images.size());
+    for (auto* image : images) {
+        auto owned_image = adopt_own(*static_cast<SharedImageToPublish*>(image));
+        shared_images.unchecked_append(move(owned_image->image));
     }
-    return backing_stores.has_surplus_backing_stores();
+    auto* presentation = presentation_if_present(presentation_id);
+    if (!presentation)
+        return;
+    Vector<i32> ids { bitmap_ids };
+    if (added)
+        presentation->did_add_backing_stores(context_id, move(ids), move(shared_images));
+    else
+        presentation->did_allocate_backing_stores(context_id, move(ids), move(shared_images));
+}
+
+void CompositorState::retire_published_stores(PresentationId presentation_id, Web::CompositorContextId context_id, ReadonlySpan<i32> bitmap_ids)
+{
+    if (auto* presentation = presentation_if_present(presentation_id))
+        presentation->did_retire_backing_stores(context_id, Vector<i32> { bitmap_ids });
 }
 
 bool CompositorState::take_registered_image_frames(Web::CompositorContextId context_id, ReadonlySpan<u64> image_frame_ids)
@@ -1293,6 +1088,31 @@ bool CompositorState::staged_rasterization_has_resources(WebContentClientId clie
 // The largest frame WebContent rasterizes for an SVG image.
 static constexpr int max_rasterization_target_dimension = 16384;
 
+CanvasHost& CompositorState::canvas_host_of(WebContentClientId client_id)
+{
+    auto* client = web_content_client_if_present(client_id);
+    VERIFY(client);
+    return client->canvas_host();
+}
+
+void CompositorState::begin_canvas_2d_painting(WebContentClientId client_id, Compositing::CanvasId canvas_id, RustFFI::FfiCanvas2DPainter& painter)
+{
+    auto* client = web_content_client_if_present(client_id);
+    VERIFY(client);
+    VERIFY(!m_canvas_host_painting_2d_context);
+    m_canvas_host_painting_2d_context = &client->canvas_host();
+    auto& player = m_canvas_host_painting_2d_context->begin_2d_painting(canvas_id, client->registered_image_frames());
+    painter = {
+        .player = &player,
+        .play_command = [](void* player, Compositing::DisplayListCommandType command_type, ReadonlyBytes payload) { static_cast<Canvas2DCommandPlayer*>(player)->play_command(command_type, payload); },
+    };
+}
+
+bool CompositorState::end_canvas_2d_painting_reporting_whether_video_frames_were_sampled_on_gpu()
+{
+    return exchange(m_canvas_host_painting_2d_context, nullptr)->end_2d_painting_reporting_whether_video_frames_were_sampled_on_gpu();
+}
+
 bool CompositorState::begin_staged_rasterization(WebContentClientId client, u64 token, Compositing::RustFFI::FfiRasterPainter& painter)
 {
     auto* rasterization = staged_rasterization(client, token);
@@ -1375,17 +1195,6 @@ void CompositorState::report_live_content(Web::CompositorContextId context_id, R
     receive(receiver, &content);
 }
 
-CompositorState::RemoteLayerState* CompositorState::remote_layer_showing(Web::CompositorContextId context_id)
-{
-    auto* context = presented_context_if_present(context_id);
-    if (!context || !context->remote_layer_id.has_value())
-        return nullptr;
-    auto remote_layer = m_remote_layers.find(*context->remote_layer_id);
-    if (remote_layer == m_remote_layers.end())
-        return nullptr;
-    return &remote_layer->value;
-}
-
 Optional<RemoteLayer::Content> CompositorState::remote_layer_content(PresentedContext& context, RustFFI::MediaKind kind, u64 media_id)
 {
     switch (kind) {
@@ -1421,11 +1230,24 @@ static Gfx::AffineTransform content_to_frame_of(RustFFI::FfiSublayerPlacement co
     return { transform[0], transform[1], transform[2], transform[3], transform[4], transform[5] };
 }
 
-bool CompositorState::remote_layer_can_show(Web::CompositorContextId context_id, RustFFI::MediaKind kind, u64 media_id, RustFFI::FfiSublayerPlacement const& placement, double device_pixel_ratio)
+static Optional<RemoteSublayer::PathClip> path_clip_of(RustFFI::FfiSublayerPlacement const& placement)
 {
-    auto* remote_layer = remote_layer_showing(context_id);
-    if (!remote_layer)
-        return false;
+    if (!placement.is_clipped_by_path)
+        return {};
+    auto contours = Gfx::PathData::from_ffi(placement.clip_path_contours);
+    auto const* path_to_frame = placement.clip_path_to_frame;
+    RemoteSublayer::PathClip path_clip;
+    path_clip.path_identity = placement.clip_path_identity;
+    path_clip.verbs.append(contours.verbs.data(), contours.verbs.size());
+    path_clip.points.append(contours.points.data(), contours.points.size());
+    path_clip.conic_weights.append(contours.conic_weights.data(), contours.conic_weights.size());
+    path_clip.winding_rule = placement.clip_path_fill_rule;
+    path_clip.path_to_frame = { path_to_frame[0], path_to_frame[1], path_to_frame[2], path_to_frame[3], path_to_frame[4], path_to_frame[5] };
+    return path_clip;
+}
+
+bool CompositorState::remote_layer_can_show(RemoteLayer& remote_layer, Web::CompositorContextId context_id, RustFFI::MediaKind kind, u64 media_id, RustFFI::FfiSublayerPlacement const& placement, double device_pixel_ratio)
+{
     auto content = remote_layer_content(presented_context(context_id), kind, media_id);
     if (!content.has_value())
         return false;
@@ -1434,9 +1256,10 @@ bool CompositorState::remote_layer_can_show(Web::CompositorContextId context_id,
         .content_to_viewport = content_to_frame_of(placement),
         .clip_rect = placement.clip_rect,
         .rounded_clip = rounded_clip_of(placement),
+        .is_clipped_by_path = placement.is_clipped_by_path,
         .scaling_mode = placement.scaling_mode,
     };
-    return remote_layer->layer->can_show(window_server_placement, *content, device_pixel_ratio);
+    return remote_layer.can_show(window_server_placement, *content, device_pixel_ratio);
 }
 
 Vector<RemoteSublayer>* CompositorState::build_sublayers(Web::CompositorContextId context_id, ReadonlySpan<RustFFI::FfiSublayer> sublayers_to_build)
@@ -1444,42 +1267,93 @@ Vector<RemoteSublayer>* CompositorState::build_sublayers(Web::CompositorContextI
     auto sublayers = make<Vector<RemoteSublayer>>();
     auto& context = presented_context(context_id);
     auto& raster_targets = context.raster_targets;
+    // A sublayer without content is left out, and so are the sublayers of a group that is.
+    Vector<Optional<size_t>> index_of_built_sublayer;
+    index_of_built_sublayer.ensure_capacity(sublayers_to_build.size());
     for (auto const& sublayer : sublayers_to_build) {
-        Optional<Variant<NonnullRefPtr<Media::VideoFrame>, PresentableSurface::Lease>> content;
-        switch (sublayer.content_kind) {
-        case RustFFI::SublayerContentKind::Canvas:
-            if (auto surface = raster_targets.canvas_surfaces().presentable_canvas_surface(Compositing::CanvasId { sublayer.media_id }))
-                content = surface->lease();
-            break;
-        case RustFFI::SublayerContentKind::Video:
-            if (auto frame = current_video_frame(context.web_content_client, Media::VideoSinkHandle { sublayer.media_id }); frame && frame->surface())
-                content = frame.release_nonnull();
-            break;
-        case RustFFI::SublayerContentKind::PresentableSurface:
-            content = static_cast<PresentableSurface*>(sublayer.presentable_surface)->lease();
-            break;
+        Optional<size_t> group_index;
+        bool is_in_group = sublayer.group_index >= 0;
+        if (is_in_group && static_cast<size_t>(sublayer.group_index) < index_of_built_sublayer.size())
+            group_index = index_of_built_sublayer[sublayer.group_index];
+        Optional<decltype(RemoteSublayer::content)> content;
+        if (!is_in_group || group_index.has_value()) {
+            switch (sublayer.content_kind) {
+            case RustFFI::SublayerContentKind::Canvas:
+                if (auto surface = raster_targets.canvas_surfaces().presentable_canvas_surface(Compositing::CanvasId { sublayer.media_id }))
+                    content = surface->lease();
+                break;
+            case RustFFI::SublayerContentKind::Video:
+                if (auto frame = current_video_frame(context.web_content_client, Media::VideoSinkHandle { sublayer.media_id }); frame && frame->surface())
+                    content = frame.release_nonnull();
+                break;
+            case RustFFI::SublayerContentKind::PresentableSurface:
+                content = const_cast<PresentableSurface*>(sublayer.presentable_surface)->lease();
+                break;
+            case RustFFI::SublayerContentKind::Group: {
+                auto const* to_parent = sublayer.group.to_parent;
+                content = RemoteSublayer::Group {
+                    .to_parent = { to_parent[0], to_parent[1], to_parent[2], to_parent[3], to_parent[4], to_parent[5] },
+                    .clip_rect = sublayer.group.clips ? Optional<Gfx::FloatRect> { sublayer.group.clip_rect } : OptionalNone {},
+                    .corner_radii = sublayer.group.corner_radii,
+                    .opacity = sublayer.group.opacity,
+                };
+                break;
+            }
+            case RustFFI::SublayerContentKind::Tile:
+                content = RemoteSublayer::Tile {
+                    .surface = const_cast<PresentableSurface*>(sublayer.presentable_surface)->lease(),
+                    .every_pixel_is_opaque = sublayer.every_pixel_is_opaque,
+                };
+                break;
+            case RustFFI::SublayerContentKind::Color:
+                content = sublayer.color;
+                break;
+            case RustFFI::SublayerContentKind::Backdrop: {
+                auto const& backdrop = sublayer.backdrop;
+                RemoteSublayer::Backdrop built_backdrop;
+                built_backdrop.region = backdrop.region;
+                auto append_color_matrix = [&](float const* color_matrix) {
+                    RemoteSublayer::Backdrop::Filter filter;
+                    filter.kind = RemoteSublayer::Backdrop::Filter::Kind::ColorMatrix;
+                    for (size_t index = 0; index < filter.color_matrix.size(); ++index)
+                        filter.color_matrix[index] = color_matrix[index];
+                    built_backdrop.filters.append(filter);
+                };
+                if (backdrop.has_color_matrix_before_blur)
+                    append_color_matrix(backdrop.color_matrix_before_blur);
+                if (backdrop.has_blur) {
+                    RemoteSublayer::Backdrop::Filter blur;
+                    blur.kind = RemoteSublayer::Backdrop::Filter::Kind::Blur;
+                    blur.blur_standard_deviation = backdrop.blur_standard_deviation;
+                    built_backdrop.filters.append(blur);
+                }
+                if (backdrop.has_color_matrix_after_blur)
+                    append_color_matrix(backdrop.color_matrix_after_blur);
+                content = move(built_backdrop);
+                break;
+            }
+            }
         }
-        if (!content.has_value())
+        if (!content.has_value()) {
+            index_of_built_sublayer.unchecked_append({});
             continue;
+        }
+        index_of_built_sublayer.unchecked_append(sublayers->size());
         auto const& placement = sublayer.placement;
+        bool is_placed_by_group = content->has<RemoteSublayer::Tile>() || content->has<Gfx::Color>();
         sublayers->append({
             .identity = sublayer.identity,
+            .group_index = group_index,
             .content = content.release_value(),
-            .content_rect = placement.content_rect,
+            .content_rect = is_placed_by_group ? sublayer.rect : placement.content_rect,
             .content_to_frame = content_to_frame_of(placement),
             .clip_rect = placement.clip_rect,
             .rounded_clip = rounded_clip_of(placement),
+            .path_clip = path_clip_of(placement),
             .scaling_mode = placement.scaling_mode,
         });
     }
     return sublayers.leak_ptr();
-}
-
-WindowServer::FrameHandOff CompositorState::frame_hand_off(Web::CompositorContextId context_id)
-{
-    if (auto* remote_layer = remote_layer_showing(context_id))
-        return remote_layer->window_server->frame_hand_off();
-    return WindowServer::frame_hand_off_through_presentation();
 }
 
 u64 CompositorState::submit_frame(Gfx::PaintingSurface* surface)
@@ -1528,45 +1402,6 @@ void CompositorState::hand_off_once_gpu_work_is_scheduled([[maybe_unused]] u64 t
 #else
     VERIFY_NOT_REACHED();
 #endif
-}
-
-Optional<PresentationId> CompositorState::show_frame_in_remote_layer(Web::CompositorContextId context_id, RustFFI::FfiRemoteLayerFrame const& frame, NonnullOwnPtr<Vector<RemoteSublayer>> sublayers)
-{
-    auto* remote_layer = remote_layer_showing(context_id);
-    if (!remote_layer)
-        return {};
-    auto& context = presented_context(context_id);
-    auto* store = frame.uses_store ? context.raster_targets.backing_stores().window_server_surface_of_latest_rendered_store() : nullptr;
-    VERIFY(store || !frame.uses_store);
-
-    auto remote_layer_id = *context.remote_layer_id;
-    auto shown = remote_layer->layer->show_frame({
-        .store = store ? Optional<PresentableSurface::Lease> { store->lease() } : OptionalNone {},
-        .painted_size = frame.painted_size,
-        .device_pixel_ratio = frame.device_pixel_ratio,
-        .fit_within = remote_layer->fit_within,
-        .sublayers = move(*sublayers),
-    });
-    if (!shown) {
-        dbgln("Compositor: Remote layer {} failed to show a frame of context {}, which its presentation shows again", remote_layer_id, context_id);
-        stop_showing_in_remote_layer(context_id);
-        return {};
-    }
-    remote_layer->size_of_shown_frame_laid_out_by_page = frame.laid_out_by_page ? Optional<Gfx::IntSize> { frame.painted_size } : OptionalNone {};
-    report_held_synchronized_resize_frames(remote_layer_id);
-    return remote_layer->presentation->presentation_id();
-}
-
-void CompositorState::stop_showing_in_remote_layer(Web::CompositorContextId context_id)
-{
-    auto& context = presented_context(context_id);
-    auto remote_layer_id = exchange(context.remote_layer_id, {});
-    if (!remote_layer_id.has_value())
-        return;
-    if (auto remote_layer = m_remote_layers.find(*remote_layer_id); remote_layer != m_remote_layers.end()) {
-        remote_layer->value.shown_context_id = {};
-        remote_layer->value.size_of_shown_frame_laid_out_by_page = {};
-    }
 }
 
 void CompositorState::release_store_later(Web::CompositorContextId context_id, i32 bitmap_id)
@@ -1630,6 +1465,28 @@ VSyncScheduler& CompositorState::vsync_scheduler_for_display(Optional<u64> displ
 
 namespace {
 
+struct VideoFrameForRust {
+    AK_ALLOC_WITH_KMALLOC;
+
+    NonnullRefPtr<Media::VideoFrame> frame;
+};
+
+struct VideoFrameImageForRust {
+    AK_ALLOC_WITH_KMALLOC;
+
+    sk_sp<SkImage> image;
+};
+
+struct ConvertedPixelsForRust {
+    AK_ALLOC_WITH_KMALLOC;
+
+    ByteBuffer buffer;
+};
+
+// NB: `ExportFormat` of libcompositing_rust lists the formats in this order.
+static_assert(to_underlying(Gfx::ExportFormat::Luminance8) == 0);
+static_assert(to_underlying(Gfx::ExportFormat::RGBA8888) == 7);
+
 struct SharedMemoryMapping {
     AK_ALLOC_WITH_KMALLOC;
 
@@ -1648,14 +1505,14 @@ static CompositorState& state_of(void* host)
     return *static_cast<CompositorState*>(host);
 }
 
-static Gfx::PaintingSurface& painting_surface_of(void* surface)
+static SkCanvas& canvas_of(Gfx::PaintingSurface const* surface)
 {
-    return *static_cast<Gfx::PaintingSurface*>(surface);
+    return surface->canvas();
 }
 
-static SkCanvas& canvas_of(void* surface)
+static Gfx::PaintingSurface& mutable_surface(Gfx::PaintingSurface const* surface)
 {
-    return painting_surface_of(surface).canvas();
+    return const_cast<Gfx::PaintingSurface&>(*surface);
 }
 
 static Optional<u64> display_of(bool has_display_id, u64 display_id)
@@ -1663,13 +1520,6 @@ static Optional<u64> display_of(bool has_display_id, u64 display_id)
     if (!has_display_id)
         return {};
     return display_id;
-}
-
-static Optional<PresentationId> presentation_of(bool has_presentation, u64 presentation_id)
-{
-    if (!has_presentation)
-        return {};
-    return PresentationId { presentation_id };
 }
 
 static MonotonicTime time_of(i64 nanoseconds)
@@ -1682,11 +1532,8 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
     using Context = Web::CompositorContextId;
     return {
         .host = &state,
-        .surface_retain = [](void* surface) { painting_surface_of(surface).ref(); },
-        .surface_release = [](void* surface) { painting_surface_of(surface).unref(); },
-        .surface_size = [](void* surface, Gfx::IntSize* size) { *size = painting_surface_of(surface).size(); },
-        .create_surface = [](void* host, Gfx::IntSize size, void* like, bool inherits_lcd_text) -> void* {
-            auto skia_backend_context = like ? painting_surface_of(like).skia_backend_context() : state_of(host).m_skia_backend_context;
+        .create_surface = [](void* host, Gfx::IntSize size, Gfx::PaintingSurface const* like, bool inherits_lcd_text) -> Gfx::PaintingSurface const* {
+            auto skia_backend_context = like ? like->skia_backend_context() : state_of(host).m_skia_backend_context;
             auto text_antialiasing = Gfx::PaintingSurface::TextAntialiasing::Grayscale;
             if (inherits_lcd_text && like && canvas_of(like).getBaseProps().pixelGeometry() != kUnknown_SkPixelGeometry)
                 text_antialiasing = Gfx::PaintingSurface::TextAntialiasing::LCD;
@@ -1695,72 +1542,82 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
                 return nullptr;
             return &surface.release_value().leak_ref();
         },
-        .surfaces_share_backend = [](void* a, void* b) { return painting_surface_of(a).skia_backend_context() == painting_surface_of(b).skia_backend_context(); },
-        .surface_uses_gpu = [](void* surface) { return painting_surface_of(surface).skia_backend_context() != nullptr; },
-        .surface_save = [](void* surface) { return canvas_of(surface).save(); },
-        .surface_restore_to_count = [](void* surface, i32 count) { canvas_of(surface).restoreToCount(count); },
-        .surface_translate = [](void* surface, float x, float y) { canvas_of(surface).translate(x, y); },
-        .surface_scale = [](void* surface, float x, float y) { canvas_of(surface).scale(x, y); },
-        .surface_clip_rect = [](void* surface, Gfx::IntRect rect) { canvas_of(surface).clipIRect(SkIRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height())); },
-        .surface_clear = [](void* surface, Gfx::Color color) { canvas_of(surface).clear(Gfx::to_skia_color(color)); },
-        .surface_draw_surface = [](void* target, void* source, Gfx::IntRect source_rect, Gfx::IntRect target_rect, RustFFI::SurfaceBlend blend) {
-            auto image = painting_surface_of(source).sk_image_snapshot<sk_sp<SkImage>>();
+        .surface_save = [](Gfx::PaintingSurface const* surface) { return canvas_of(surface).save(); },
+        .surface_restore_to_count = [](Gfx::PaintingSurface const* surface, i32 count) { canvas_of(surface).restoreToCount(count); },
+        .surface_translate = [](Gfx::PaintingSurface const* surface, float x, float y) { canvas_of(surface).translate(x, y); },
+        .surface_scale = [](Gfx::PaintingSurface const* surface, float x, float y) { canvas_of(surface).scale(x, y); },
+        .surface_clip_rect = [](Gfx::PaintingSurface const* surface, Gfx::IntRect rect) { canvas_of(surface).clipIRect(SkIRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height())); },
+        .surface_clear = [](Gfx::PaintingSurface const* surface, Gfx::Color color) { canvas_of(surface).clear(Gfx::to_skia_color(color)); },
+        .surface_draw_surface = [](Gfx::PaintingSurface const* target, Gfx::PaintingSurface const* source, Gfx::IntRect source_rect, Gfx::IntRect target_rect, RustFFI::SurfaceBlend blend) {
+            auto image = source->sk_image_snapshot<sk_sp<SkImage>>();
             SkPaint paint;
             paint.setBlendMode(blend == RustFFI::SurfaceBlend::Source ? SkBlendMode::kSrc : SkBlendMode::kSrcOver);
             canvas_of(target).drawImageRect(image.get(), Gfx::to_skia_rect(source_rect), Gfx::to_skia_rect(target_rect), SkSamplingOptions {}, &paint, SkCanvas::kStrict_SrcRectConstraint); },
-        .flush_surface = [](void*, void* surface) { DisplayListPlayerSkia::flush(painting_surface_of(surface)); },
-        .begin_painting = [](void* host, u64 context_id, void* surface, RustFFI::PaintingResources resources, bool allows_lcd_text, Compositing::RustFFI::FfiRasterPainter* painter) { *painter = state_of(host).begin_painting(Context { context_id }, painting_surface_of(surface), resources, allows_lcd_text); },
+        .flush_surface = [](Gfx::PaintingSurface const* surface) { DisplayListPlayerSkia::flush(mutable_surface(surface)); },
+        .begin_painting = [](void* host, u64 context_id, Gfx::PaintingSurface const* surface, RustFFI::PaintingResources resources, bool allows_lcd_text, Compositing::RustFFI::FfiRasterPainter* painter) { *painter = state_of(host).begin_painting(Context { context_id }, mutable_surface(surface), resources, allows_lcd_text); },
         .end_painting = [](void* host) { state_of(host).end_painting(); },
         .start_raster_cache_frame = [](void* host, u64 context_id) { state_of(host).presented_context(Context { context_id }).raster_targets.raster_cache().drop_what_was_not_used_since_last_frame(); },
-        .store_state = [](void* host, u64 context_id) -> RustFFI::FfiStoreState {
-            auto const& backing_stores = state_of(host).presented_context(Context { context_id }).raster_targets.backing_stores();
-            return { .is_valid = backing_stores.is_valid(), .is_rendering = backing_stores.is_rendering(), .has_available_store = backing_stores.has_available_buffer() };
-        },
-        .resize_stores = [](void* host, u64 context_id, RustFFI::FfiStoreResize const* resize) { return state_of(host).resize_stores(Context { context_id }, *resize); },
-        .invalidate_stores = [](void* host, u64 context_id) { state_of(host).presented_context(Context { context_id }).raster_targets.backing_stores().invalidate(); },
-        .acquire_store = [](void* host, u64 context_id, RustFFI::FfiAcquiredStore* acquired) {
-            auto render_target = state_of(host).presented_context(Context { context_id }).raster_targets.backing_stores().acquire_render_target();
-            if (!render_target.has_value())
-                return false;
-            acquired->bitmap_id = render_target->bitmap_id;
-            acquired->surface = &render_target->surface;
-            return true; },
-        .complete_rendering = [](void* host, u64 context_id, i32 bitmap_id) { state_of(host).presented_context(Context { context_id }).raster_targets.backing_stores().complete_rendering(bitmap_id); },
-        .release_store = [](void* host, u64 context_id, i32 bitmap_id) { return state_of(host).presented_context(Context { context_id }).raster_targets.backing_stores().release_buffer(bitmap_id); },
-        .release_all_presented_stores = [](void* host, u64 context_id) { state_of(host).presented_context(Context { context_id }).raster_targets.backing_stores().release_all_presented_buffers(); },
-        .latest_rendered_store_surface = [](void* host, u64 context_id) -> void* { return state_of(host).presented_context(Context { context_id }).raster_targets.backing_stores().latest_rendered_surface().ptr(); },
-        .add_store_if_window_server_reads_every_released_store = [](void* host, u64 context_id, bool has_presentation, u64 presentation_id) { return state_of(host).add_store_if_window_server_reads_every_released_store(Context { context_id }, presentation_of(has_presentation, presentation_id)); },
-        .retire_idle_surplus_stores = [](void* host, u64 context_id, bool has_presentation, u64 presentation_id) { return state_of(host).retire_idle_surplus_stores(Context { context_id }, presentation_of(has_presentation, presentation_id)); },
-        .next_presentable_surface = [](void* host, u64 context_id, u32 pool, Gfx::IntSize size, void* like) -> void* {
-            auto& state = state_of(host);
-            auto skia_backend_context = like ? painting_surface_of(like).skia_backend_context() : state.m_skia_backend_context;
-            auto surface = state.presented_context(Context { context_id }).raster_targets.next_presentable_surface(pool, size, skia_backend_context);
-            if (!surface)
+        .create_store = [](void* host, u64 context_id, RustFFI::StoreKind kind, Gfx::IntSize size, void* window_server, RustFFI::FfiNewStore* new_store) { return state_of(host).create_store(Context { context_id }, kind, size, static_cast<WindowServer*>(window_server), *new_store); },
+        .publish_stores = [](void* host, u64 presentation_id, u64 context_id, bool added, ReadonlySpan<i32> bitmap_ids, ReadonlySpan<void*> images) { state_of(host).publish_stores(PresentationId { presentation_id }, Context { context_id }, added, bitmap_ids, images); },
+        .retire_published_stores = [](void* host, u64 presentation_id, u64 context_id, ReadonlySpan<i32> bitmap_ids) { state_of(host).retire_published_stores(PresentationId { presentation_id }, Context { context_id }, bitmap_ids); },
+        .create_presentable_surface = [](void*, Gfx::IntSize size, Gfx::PaintingSurface const* like) -> PresentableSurface const* {
+            auto surface = PresentableSurfacePool::create_surface(size, like->skia_backend_context());
+            if (surface.is_error())
                 return nullptr;
-            return surface.leak_ref();
+            return &surface.release_value().leak_ref();
         },
-        .drop_presentable_surface_pool = [](void* host, u64 context_id, u32 pool) { state_of(host).presented_context(Context { context_id }).raster_targets.drop_presentable_surface_pool(pool); },
-        .presentable_surface_retain = [](void* surface) { static_cast<PresentableSurface*>(surface)->ref(); },
-        .presentable_surface_release = [](void* surface) { static_cast<PresentableSurface*>(surface)->unref(); },
-        .presentable_surface_painting_surface = [](void* surface) -> void* { return &static_cast<PresentableSurface*>(surface)->painting_surface(); },
+        .window_server_compositing = [](void* window_server) -> RustFFI::FfiWindowServerCompositing {
+            auto const& compositing_window_server = *static_cast<WindowServer*>(window_server);
+            return {
+                .shows_tiles_of_painted_layers = compositing_window_server.shows_tiles_of_painted_layers(),
+                .filters_what_is_below_layers = compositing_window_server.filters_what_is_below_layers(),
+            };
+        },
         .live_content = [](void* host, u64 context_id, ReadonlySpan<u64> canvas_ids, void* receiver, void (*receive)(void*, RustFFI::FfiLiveContent const*)) { state_of(host).report_live_content(Context { context_id }, canvas_ids, receiver, receive); },
-        .remote_layer_can_show = [](void* host, u64 context_id, RustFFI::MediaKind kind, u64 media_id, RustFFI::FfiSublayerPlacement const* placement, double device_pixel_ratio) { return state_of(host).remote_layer_can_show(Context { context_id }, kind, media_id, *placement, device_pixel_ratio); },
+        .remote_layer_can_show = [](void* host, void* remote_layer, u64 context_id, RustFFI::MediaKind kind, u64 media_id, RustFFI::FfiSublayerPlacement const* placement, double device_pixel_ratio) { return state_of(host).remote_layer_can_show(*static_cast<RemoteLayer*>(remote_layer), Context { context_id }, kind, media_id, *placement, device_pixel_ratio); },
         .build_sublayers = [](void* host, u64 context_id, ReadonlySpan<RustFFI::FfiSublayer> sublayers) -> void* {
             return state_of(host).build_sublayers(Context { context_id }, sublayers);
         },
         .destroy_sublayers = [](void* sublayers) { delete static_cast<Vector<RemoteSublayer>*>(sublayers); },
-        .frame_hand_off = [](void* host, u64 context_id) { return state_of(host).frame_hand_off(Context { context_id }) == WindowServer::FrameHandOff::OnceGpuWorkIsScheduled
-                                                               ? RustFFI::FrameHandOff::OnceGpuWorkIsScheduled
-                                                               : RustFFI::FrameHandOff::OnceGpuWorkIsFinished; },
-        .submit_frame = [](void* host, u64, void* surface) { return state_of(host).submit_frame(static_cast<Gfx::PaintingSurface*>(surface)); },
+        .submit_frame = [](void* host, u64, Gfx::PaintingSurface const* surface) { return state_of(host).submit_frame(const_cast<Gfx::PaintingSurface*>(surface)); },
         .hand_off_once_gpu_work_is_scheduled = [](void* host, u64 token) { state_of(host).hand_off_once_gpu_work_is_scheduled(token); },
-        .show_frame_in_remote_layer = [](void* host, u64 context_id, RustFFI::FfiRemoteLayerFrame const* frame, void* sublayers, u64* presentation_id) {
-            auto shown_in = state_of(host).show_frame_in_remote_layer(Context { context_id }, *frame, adopt_own(*static_cast<Vector<RemoteSublayer>*>(sublayers)));
-            if (!shown_in.has_value())
+        .create_window_server = [](void*, RustFFI::FfiCppObject* window_server) {
+            auto created = WindowServer::try_create_for_presentation();
+            if (!created)
                 return false;
-            *presentation_id = shown_in->value();
+            window_server->object = &created.release_nonnull().leak_ref();
+            window_server->destroy = [](void* object) { static_cast<WindowServer*>(object)->unref(); };
             return true; },
-        .stop_showing_in_remote_layer = [](void* host, u64 context_id) { state_of(host).stop_showing_in_remote_layer(Context { context_id }); },
+        .window_server_frame_hand_off = [](void* window_server) { return static_cast<WindowServer*>(window_server)->frame_hand_off() == WindowServer::FrameHandOff::OnceGpuWorkIsScheduled
+                                                                      ? RustFFI::FrameHandOff::OnceGpuWorkIsScheduled
+                                                                      : RustFFI::FrameHandOff::OnceGpuWorkIsFinished; },
+        .window_server_hold_changes_on_screen = [](void* window_server) { static_cast<WindowServer*>(window_server)->hold_changes_on_screen(); },
+        .window_server_release_changes_held_off_screen = [](void* window_server) { static_cast<WindowServer*>(window_server)->release_changes_held_off_screen(); },
+        .create_remote_layer = [](void* window_server, u64 remote_layer_id, RustFFI::FfiCppObject* remote_layer, RustFFI::FfiRemoteLayerHostHandle* host_handle) {
+            auto layer = static_cast<WindowServer*>(window_server)->try_create_remote_layer(remote_layer_id);
+            if (!layer)
+                return false;
+            auto handle = layer->host_handle();
+            host_handle->kind = to_underlying(handle.kind);
+            host_handle->id = handle.id;
+            remote_layer->object = layer.leak_ptr();
+            remote_layer->destroy = [](void* object) { (void)adopt_own(*static_cast<RemoteLayer*>(object)); };
+            return true; },
+        .remote_layer_place_frame = [](void* remote_layer, bool has_fit_within, Gfx::IntSize fit_within) { static_cast<RemoteLayer*>(remote_layer)->place_frame(has_fit_within ? Optional<Gfx::IntSize> { fit_within } : OptionalNone {}); },
+        .remote_layer_show_frame = [](void* remote_layer, RustFFI::FfiRemoteLayerFrame const* frame, void* sublayers) {
+            auto owned_sublayers = adopt_own(*static_cast<Vector<RemoteSublayer>*>(sublayers));
+            auto* store = const_cast<PresentableSurface*>(frame->store);
+            auto shown = static_cast<RemoteLayer*>(remote_layer)->show_frame({
+                .store = store ? Optional<PresentableSurface::Lease> { store->lease() } : OptionalNone {},
+                .shows_no_store = frame->shows_no_store,
+                .painted_size = frame->painted_size,
+                .device_pixel_ratio = frame->device_pixel_ratio,
+                .fit_within = frame->has_fit_within ? Optional<Gfx::IntSize> { frame->fit_within } : OptionalNone {},
+                .sublayers = move(*owned_sublayers),
+            });
+            if (!shown)
+                dbgln("Compositor: A remote layer failed to show a frame, which its presentation shows again");
+            return shown; },
         .log_presented_frame = [](void*, u64 page_id, Gfx::IntRect damage_rect) { log_presented_frame(page_id, damage_rect); },
         .release_store_later = [](void* host, u64 context_id, i32 bitmap_id) { state_of(host).release_store_later(Context { context_id }, bitmap_id); },
         .request_vsync = [](void* host, bool has_display_id, u64 display_id, double refresh_rate) { state_of(host).vsync_scheduler_for_display(display_of(has_display_id, display_id)).schedule(refresh_rate); },
@@ -1780,7 +1637,7 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
             receive(receiver, contexts_with_new_video_frames.span()); },
         .context_video_sinks_require_updates = [](void* host, u64 context_id) { return state_of(host).context_video_sinks_require_updates(Context { context_id }); },
         .set_maximum_display_refresh_rate = [](void* host, double refresh_rate) { state_of(host).set_maximum_display_refresh_rate(refresh_rate); },
-        .map_shared_memory = [](void*, i32 descriptor, u64 size, u8 const** data, size_t* data_size) -> void* {
+        .map_shared_memory = [](void*, i32 descriptor, u64 size, u8** data, size_t* data_size) -> void* {
             auto buffer = Core::AnonymousBuffer::create_from_anon_fd(descriptor, size);
             if (buffer.is_error()) {
                 dbgln("Compositor: Could not map shared memory from WebContent: {}", buffer.error());
@@ -1791,7 +1648,7 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
                 return nullptr;
             }
             auto mapping = make<SharedMemoryMapping>(buffer.release_value());
-            *data = mapping->buffer.bytes().data();
+            *data = mapping->buffer.data<u8>();
             *data_size = mapping->buffer.bytes().size();
             return mapping.leak_ptr();
         },
@@ -1805,6 +1662,98 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
         .staged_rasterization_has_resources = [](void* host, u64 client, u64 token, ReadonlySpan<u64> font_ids, ReadonlySpan<u64> image_frame_ids) { return state_of(host).staged_rasterization_has_resources(WebContentClientId { client }, token, font_ids, image_frame_ids); },
         .begin_staged_rasterization = [](void* host, u64 client, u64 token, Compositing::RustFFI::FfiRasterPainter* painter) { return state_of(host).begin_staged_rasterization(WebContentClientId { client }, token, *painter); },
         .finish_staged_rasterization = [](void* host, u64 client, u64 token) { state_of(host).finish_staged_rasterization(WebContentClientId { client }, token); },
+        .reserve_canvas_ids = [](void* host, u64 count) { return state_of(host).m_canvas_surface_registry.reserve_canvas_ids(count).value(); },
+        .create_canvas_2d_context = [](void* host, u64 client, Compositing::CanvasId canvas_id, Gfx::IntSize size, bool alpha, bool will_read_frequently, Web::Bindings::PredefinedColorSpace color_space) { return state_of(host).canvas_host_of(WebContentClientId { client }).create_2d_context(canvas_id, size, alpha, will_read_frequently, Compositing::gfx_color_space_for(color_space)); },
+        .destroy_canvas_2d_context = [](void* host, u64 client, Compositing::CanvasId canvas_id) { state_of(host).canvas_host_of(WebContentClientId { client }).destroy_2d_context(canvas_id); },
+        .read_back_canvas_2d_pixels = [](void* host, u64 client, Compositing::CanvasId canvas_id, Gfx::IntRect rect, u8 alpha_type, Web::Bindings::PredefinedColorSpace color_space, u8* pixels, size_t pixels_size, Gfx::IntSize* size) {
+            VERIFY(Gfx::is_valid_alpha_type(alpha_type));
+            auto read_size = state_of(host).canvas_host_of(WebContentClientId { client }).read_back_canvas_2d_pixels(canvas_id, rect, static_cast<Gfx::AlphaType>(alpha_type), Compositing::gfx_color_space_for(color_space), { pixels, pixels_size });
+            if (!read_size.has_value())
+                return false;
+            *size = *read_size;
+            return true; },
+        .begin_canvas_2d_painting = [](void* host, u64 client, Compositing::CanvasId canvas_id, RustFFI::FfiCanvas2DPainter* painter) { state_of(host).begin_canvas_2d_painting(WebContentClientId { client }, canvas_id, *painter); },
+        .end_canvas_2d_painting = [](void* host) { return state_of(host).end_canvas_2d_painting_reporting_whether_video_frames_were_sampled_on_gpu(); },
+        .present_canvas_2d_context = [](void* host, u64 client, Compositing::CanvasId canvas_id) { return state_of(host).canvas_host_of(WebContentClientId { client }).try_present_2d_context(canvas_id); },
+        .flush_canvas_2d_contexts = [](void* host, u64 client, ReadonlySpan<Compositing::CanvasId> canvas_ids) { state_of(host).canvas_host_of(WebContentClientId { client }).flush_2d_contexts(canvas_ids); },
+        .gl_proc_address = [](void*, char const* name) { return OpenGLContext::address_of_function(name); },
+        .create_webgl_context = [](void* host, u64 client, Compositing::CanvasId canvas_id, RustFFI::ContextOptions options) {
+            auto version = options.webgl2 ? Compositing::WebGL::WebGLVersion::WebGL2 : Compositing::WebGL::WebGLVersion::WebGL1;
+            return state_of(host).canvas_host_of(WebContentClientId { client }).create_webgl_context(canvas_id, version, { .depth = options.depth, .stencil = options.stencil, .antialias = options.antialias }, options.size); },
+        .destroy_webgl_context = [](void* host, u64 client, Compositing::CanvasId canvas_id) { state_of(host).canvas_host_of(WebContentClientId { client }).destroy_webgl_context(canvas_id); },
+        .make_webgl_context_current = [](void* host, u64 client, Compositing::CanvasId canvas_id, RustFFI::DefaultBuffers* defaults) {
+            auto& gl_context = state_of(host).canvas_host_of(WebContentClientId { client }).webgl_context(canvas_id);
+            gl_context.make_current();
+            *defaults = { .framebuffer = gl_context.default_framebuffer(), .renderbuffer = gl_context.default_renderbuffer() }; },
+        .set_webgl_drawing_buffer_size = [](void* host, u64 client, Compositing::CanvasId canvas_id, Gfx::IntSize size) { state_of(host).canvas_host_of(WebContentClientId { client }).webgl_context(canvas_id).set_size(size); },
+        .present_webgl_context = [](void* host, u64 client, Compositing::CanvasId canvas_id, bool preserve_drawing_buffer, bool show_presented_frame) {
+            switch (state_of(host).canvas_host_of(WebContentClientId { client }).present_webgl_context(canvas_id, preserve_drawing_buffer, show_presented_frame)) {
+            case CanvasHost::WebGLPresentOutcome::Presented:
+                return RustFFI::PresentOutcome::Presented;
+            case CanvasHost::WebGLPresentOutcome::ShowedPresentedFrame:
+                return RustFFI::PresentOutcome::ShowedPresentedFrame;
+            case CanvasHost::WebGLPresentOutcome::NoDrawingBuffer:
+                return RustFFI::PresentOutcome::NoDrawingBuffer;
+            }
+            VERIFY_NOT_REACHED(); },
+        .read_back_webgl_drawing_buffer = [](void* host, u64 client, Compositing::CanvasId canvas_id, bool from_presented_frame, Gfx::IntRect rect, u8* pixels, size_t pixels_size, Gfx::IntSize* size) {
+            auto read_size = state_of(host).canvas_host_of(WebContentClientId { client }).read_back_webgl_drawing_buffer(canvas_id, from_presented_frame, rect, { pixels, pixels_size });
+            if (!read_size.has_value())
+                return false;
+            *size = *read_size;
+            return true; },
+        .webgl_can_copy_images_into_textures = [](void* host, u64 client, Compositing::CanvasId canvas_id) { return state_of(host).canvas_host_of(WebContentClientId { client }).webgl_context(canvas_id).can_copy_images_into_textures(); },
+        .held_video_frame = [](void* host, u64 client, u64 sink_handle, u64 generation, RustFFI::FfiCppObject* frame, Gfx::IntSize* size) {
+            auto held_frame = state_of(host).canvas_host_of(WebContentClientId { client }).held_video_frame(Media::VideoSinkHandle { sink_handle }, generation);
+            if (!held_frame)
+                return false;
+            *size = held_frame->size().to_type<int>();
+            frame->object = make<VideoFrameForRust>(held_frame.release_nonnull()).leak_ptr();
+            frame->destroy = [](void* object) { delete static_cast<VideoFrameForRust*>(object); };
+            return true; },
+        .video_frame_image = [](void* host, void* frame, RustFFI::FfiCppObject* image) {
+            auto sk_image = sk_image_from_video_frame(*static_cast<VideoFrameForRust*>(frame)->frame, state_of(host).m_skia_backend_context);
+            if (!sk_image)
+                return;
+            image->object = make<VideoFrameImageForRust>(move(sk_image)).leak_ptr();
+            image->destroy = [](void* object) { delete static_cast<VideoFrameImageForRust*>(object); }; },
+        .copy_video_frame_image_into_bound_texture = [](void* host, u64 client, Compositing::CanvasId canvas_id, void* image, RustFFI::VideoFrameCopy copy) {
+            auto& gl_context = state_of(host).canvas_host_of(WebContentClientId { client }).webgl_context(canvas_id);
+            return gl_context.copy_image_into_bound_texture(*static_cast<VideoFrameImageForRust*>(image)->image, copy.source_size, copy.size, copy.target, copy.level, copy.xoffset, copy.yoffset, copy.flip_y, copy.premultiply_alpha); },
+        .convert_image_source_for_webgl = [](void* host, u64 client_id, RustFFI::FfiImageSource source, RustFFI::FfiImageConversion conversion, RustFFI::FfiConvertedPixels* converted) {
+            auto* client = state_of(host).web_content_client_if_present(WebContentClientId { client_id });
+            VERIFY(client);
+            VERIFY(conversion.export_format <= to_underlying(Gfx::ExportFormat::RGBA8888));
+            auto image_source = source.is_held_video_frame
+                ? CanvasHost::WebGLImageSource { CanvasHost::HeldVideoFrame { Media::VideoSinkHandle { source.id }, source.generation } }
+                : CanvasHost::WebGLImageSource { Compositing::ImageFrameResourceId { source.id } };
+            int export_flags = 0;
+            if (conversion.flip_y)
+                export_flags |= Gfx::ExportFlags::FlipY;
+            if (conversion.premultiply_alpha)
+                export_flags |= Gfx::ExportFlags::PremultiplyAlpha;
+            Optional<Gfx::IntSize> target_size;
+            if (conversion.has_target_size)
+                target_size = conversion.target_size;
+            Gfx::BitmapExportResult pixels;
+            switch (client->canvas_host().convert_image_for_webgl_upload(image_source, client->registered_image_frames(), static_cast<Gfx::ExportFormat>(conversion.export_format), export_flags, target_size, pixels)) {
+            case CanvasHost::WebGLImageConversion::UnknownImageFrame:
+                return RustFFI::FfiImageConversionOutcome::UnknownImageFrame;
+            case CanvasHost::WebGLImageConversion::Failed:
+                return RustFFI::FfiImageConversionOutcome::Failed;
+            case CanvasHost::WebGLImageConversion::Converted:
+                break;
+            }
+            auto owned_pixels = make<ConvertedPixelsForRust>(move(pixels.buffer));
+            *converted = {
+                .pixels = { .object = owned_pixels.ptr(), .destroy = [](void* object) { delete static_cast<ConvertedPixelsForRust*>(object); } },
+                .data = owned_pixels->buffer.data(),
+                .size = owned_pixels->buffer.size(),
+                .width = pixels.width,
+                .height = pixels.height,
+            };
+            (void)owned_pixels.leak_ptr();
+            return RustFFI::FfiImageConversionOutcome::Converted; },
     };
 }
 

@@ -112,6 +112,8 @@ public:
     GC::Ptr<DOM::Node> target_node_for_mouse_position(CSSPixelPoint);
 
     EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false);
+    // Whether a key the user pressed or a paste is being handled, along with what the page does in response to it.
+    static bool is_handling_user_key_press_or_paste();
     EventResult handle_text_editing_command(TextEditingCommand const&);
     struct KeyboardScrollSnapshot {
         Compositing::KeyboardScrollState state;
@@ -140,7 +142,7 @@ public:
     void handle_gamepad_updated(Gamepad::GamepadState const&);
     void handle_gamepad_disconnected(Gamepad::GamepadHandle);
 
-    void process_auto_scroll();
+    void process_auto_scroll(double frame_timestamp);
 
     enum class SelectionMode : u8 {
         None,

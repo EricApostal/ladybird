@@ -35,6 +35,8 @@ pub enum ReplacedContentInput {
         is_text_entry: bool,
         include_number_stepper: bool,
     },
+    /// An `<input>` in the Range state, a slider.
+    RangeInput,
     /// A `<canvas>`'s `width` and `height`, its natural size in CSS pixels.
     Canvas { width: u32, height: u32 },
     /// The natural size of what an element has loaded, such as a video's or an image's.
@@ -75,6 +77,7 @@ impl ReplacedContentInput {
                 is_text_entry: kind == Kind::TextEntryInput as u8,
                 include_number_stepper: values[1] != 0,
             },
+            kind if kind == Kind::RangeInput as u8 => Self::RangeInput,
             kind if kind == Kind::Canvas as u8 => Self::Canvas {
                 width: values[0],
                 height: values[1],
@@ -591,6 +594,47 @@ impl RetainedState {
             };
         }
         self.projection.construction_facts(node)
+    }
+
+    /// https://drafts.csswg.org/css-values-4/#font-relative-lengths
+    /// Wants the loads of the faces still loading ahead of the first available fonts that `reads`
+    /// names for `node`, or for its pseudo-element `pseudo`, as the lengths that read their metrics
+    /// would once they load: the element's or pseudo-element's own, its parent's, and the document
+    /// element's.
+    pub(crate) fn want_first_available_font_loads_for(
+        &self,
+        node: StyleNodeID,
+        pseudo: Option<u8>,
+        reads: crate::css::animation::FontMetricReads,
+    ) {
+        let want = |record: Option<u64>| {
+            let font = record
+                .and_then(|record| self.published_record_view(record))
+                .map(|view| view.font());
+            if let Some(list) = font.and_then(|font| font.frozen_font_list.list()) {
+                list.want_first_available_font_loads();
+            }
+        };
+        let element_record =
+            |node: Option<StyleNodeID>| node.and_then(|node| self.element_published_style_record(node));
+        if reads.own {
+            want(match pseudo {
+                Some(kind) => self.published_pseudo_record(node, kind).map(|record| record.raw()),
+                None => element_record(Some(node)),
+            });
+        }
+        // NB: A pseudo-element inherits from its originating element.
+        if reads.parent {
+            want(element_record(match pseudo {
+                Some(_) => Some(node),
+                None => self.inheritance_parent(node),
+            }));
+        }
+        if reads.root {
+            want(element_record(
+                std::iter::successors(Some(node), |&ancestor| self.inheritance_parent(ancestor)).last(),
+            ));
+        }
     }
 
     /// The record the element published, which its box is built from: the one a clock frame shows in its place, the
@@ -1633,15 +1677,6 @@ impl StyleEngine {
                 document_media: Default::default(),
                 document_functions: Default::default(),
                 custom_property_registry: None,
-                monospace_font_family: RetainedStyleValueData::from_owned(
-                    crate::css::parser::value_parser::value_list(
-                        vec![StyleValueData::Keyword {
-                            keyword: crate::css::style_compute::keyword::MONOSPACE,
-                        }],
-                        1,
-                        true,
-                    ),
-                ),
                 font_resolution: None,
                 pass_fonts: None,
                 computed_group_sets: Default::default(),
@@ -2541,7 +2576,6 @@ impl RetainedState {
             custom_property_registry: _,
             font_resolution: _,
             pass_fonts: _,
-            monospace_font_family: _,
             computed_group_sets,
             style_record_view_epoch_depth: _,
             custom_property_environments: _,

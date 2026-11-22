@@ -15,6 +15,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
@@ -66,6 +67,13 @@
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
 #include <LibWebCommon/Loader/ContentBlocking.h>
+
+extern "C" {
+
+// Defined in Bindings/Rust/src/web_gl/exports.rs.
+void web_webgl_lose_contexts_of_this_thread(JSVM*);
+void web_webgl_restore_contexts_of_this_thread(JSVM*);
+}
 
 namespace Web {
 
@@ -803,6 +811,25 @@ void Page::update_needs_beforeunload_check()
     client().page_did_change_needs_beforeunload_check(m_needs_beforeunload_check);
 }
 
+// Whether the user edited a document this page hosts, so that they would lose what they typed if the page went away.
+void Page::update_had_user_edits()
+{
+    auto had_user_edits = false;
+    for (auto const& navigable : hosted_navigables()) {
+        // NB: A document that is leaving its navigable, such as that of a removed iframe, is still its active document.
+        if (auto document = navigable->active_document(); document && document->navigable().ptr() == navigable.ptr() && document->had_user_edits()) {
+            had_user_edits = true;
+            break;
+        }
+    }
+
+    if (m_had_user_edits == had_user_edits)
+        return;
+
+    m_had_user_edits = had_user_edits;
+    client().page_did_change_had_user_edits(m_had_user_edits);
+}
+
 void Page::set_top_level_traversable(GC::Ref<HTML::Navigable> navigable)
 {
     VERIFY(!m_top_level_traversable); // Replacement is not allowed!
@@ -957,6 +984,7 @@ void Page::discard_provisional_navigable_of(HTML::RemoteNavigable& remote_naviga
     if (m_top_level_traversable.ptr() == navigable.ptr()) {
         m_top_level_traversable = remote_navigable;
         update_needs_beforeunload_check();
+        update_had_user_edits();
         retire_page_compositor_context(navigable->take_compositor_context());
     }
     navigable->set_has_been_destroyed();
@@ -992,6 +1020,7 @@ GC::Ref<HTML::LocalNavigable> Page::begin_hosting(HTML::CrossProcessId id, HTML:
         VERIFY(m_top_level_traversable.ptr() == navigable.ptr());
         m_top_level_traversable = stand_in;
         update_needs_beforeunload_check();
+        update_had_user_edits();
         return stand_in;
     }
     return HTML::LocalNavigable::create_stand_in({}, *navigable, current_history_entry);
@@ -2010,6 +2039,7 @@ void Page::prepare_canvas_contexts_for_compositing()
 
 void Page::notify_all_canvas_elements_of_lost_backing_storage()
 {
+    web_webgl_restore_contexts_of_this_thread(JS::HostABI::vm_to_abi(JS::VM::the()));
     for_each_canvas_element([](auto& canvas_element) {
         canvas_element.notify_compositor_backing_storage_lost();
     });
@@ -2017,9 +2047,7 @@ void Page::notify_all_canvas_elements_of_lost_backing_storage()
 
 void Page::notify_all_webgl_contexts_lost()
 {
-    for_each_canvas_element([](auto& canvas_element) {
-        canvas_element.notify_compositor_connection_lost();
-    });
+    web_webgl_lose_contexts_of_this_thread(JS::HostABI::vm_to_abi(JS::VM::the()));
 }
 
 void Page::record_context_menu_request(Badge<EventHandler>, ContextMenuRequest request)

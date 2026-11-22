@@ -30,8 +30,9 @@ public:
 
     static Vector<DownloadState> downloads();
 
-    // The ID that the UI gave an input event, from the browser data of the event.
-    static u64 input_id_of(Web::BrowserInputData const&);
+    // The ID that the UI gave an input event, from the browser data of the event. Input the UI didn't send has none,
+    // whether it carries no browser data or someone else's (WebDriver's, e.g.).
+    static Optional<u64> input_id_of(Web::BrowserInputData const*);
 
     virtual void die() override;
 
@@ -78,6 +79,7 @@ private:
     virtual void set_blocks_pop_ups(bool blocks) override;
     virtual void set_shows_line_box_borders(bool shows) override;
     virtual void set_shows_caret_hit_test_debug_overlay(bool shows) override;
+    virtual void set_shows_compositor_layers(bool shows) override;
     virtual void dump_cookies() override;
     virtual void crash_compositor_process() override;
     virtual void launch_devtools_client() override;
@@ -90,6 +92,10 @@ private:
     virtual Messages::HubServer::ViewSessionHistoryTraversalItemsResponse view_session_history_traversal_items(u64 view_id, i32 direction) override;
     virtual Messages::HubServer::ViewSessionHistorySnapshotResponse view_session_history_snapshot(u64 view_id) override;
     virtual Messages::HubServer::ViewRestoreSessionHistoryFromSnapshotResponse view_restore_session_history_from_snapshot(u64 view_id, WebView::SessionHistorySnapshot snapshot) override;
+    virtual Messages::HubServer::ViewKeepStateForDiscardingResponse view_keep_state_for_discarding(u64 view_id) override;
+    virtual void view_restore_state_of_discarded_tab(u64 view_id, u64 discarded_tab_state_id) override;
+    virtual void view_decline_discard(u64 view_id) override;
+    virtual void forget_state_of_discarded_tab(u64 discarded_tab_state_id) override;
     virtual Messages::HubServer::ViewHistoryStepAtDeltaResponse view_history_step_at_delta(u64 view_id, i32 delta) override;
     virtual Messages::HubServer::ViewLookUpSelectedTextAtResponse view_look_up_selected_text_at(u64 view_id, Gfx::IntPoint position) override;
     virtual Messages::HubServer::ViewPageDescriptionResponse view_page_description(u64 view_id) override;
@@ -100,6 +106,12 @@ private:
     virtual void view_open_navigation_in_new_window(u64 view_id, Web::HTML::PreparedNavigationDescriptor navigation, WebView::IsPrivate is_private) override;
     virtual void view_traverse_the_history_to_step(u64 view_id, i32 step) override;
     virtual void view_set_reports_session_history(u64 view_id, bool reports_session_history) override;
+    virtual void view_set_compositor_layer_hidden(u64 view_id, u64 layer_id, bool hidden) override;
+    virtual void view_set_selected_compositor_layers(u64 view_id, Vector<u64> layer_ids) override;
+    virtual void view_set_hovered_compositor_layer(u64 view_id, Optional<u64> layer_id) override;
+    virtual void view_show_only_compositor_layers(u64 view_id, Vector<u64> layer_ids) override;
+    virtual void view_show_all_compositor_layers(u64 view_id) override;
+    virtual void view_reset_compositor_layer_raster_counts(u64 view_id) override;
     virtual void view_file_picker_closed(u64 view_id, Vector<Web::HTML::SelectedFile> selected_files) override;
     virtual void view_save_screenshot(u64 view_id, Gfx::ShareableBitmap bitmap) override;
     virtual void view_request_selected_text(u64 view_id, u64 request_id) override;
@@ -120,6 +132,8 @@ private:
     virtual void geolocation_error(u64 id, Core::GeolocationError error) override;
     virtual void geolocation_authorization_changed(Core::GeolocationAuthorization authorization) override;
     virtual void microphone_authorization_changed(WebView::MicrophoneAuthorization authorization) override;
+    virtual void default_browser_status_changed(WebView::DefaultBrowserStatus status) override;
+    virtual void default_browser_make_default_finished(bool failed, Optional<String> system_message) override;
     virtual void gamepad_connected(Web::Gamepad::GamepadDescription description, Web::Gamepad::GamepadState state) override;
     virtual void gamepad_disconnected(u32 handle) override;
     virtual void gamepad_states_changed(Vector<Web::Gamepad::GamepadState> states) override;
@@ -162,10 +176,12 @@ private:
     virtual void view_set_window_position(u64 view_id, Gfx::IntPoint position) override;
     virtual void view_set_window_size(u64 view_id, Gfx::IntSize size) override;
     virtual void view_set_system_visibility_state(u64 view_id, Web::HTML::VisibilityState visibility_state) override;
+    virtual void view_set_pinned(u64 view_id, bool pinned) override;
+    virtual void view_set_current_tab_of_window(u64 view_id, bool current_tab_of_window) override;
     virtual void view_set_presents_from_cpu_memory(u64 view_id, bool presents_from_cpu_memory) override;
     virtual void view_set_hosts_remote_layer(u64 view_id, bool hosts_remote_layer) override;
     virtual void view_set_wants_frame_notifications(u64 view_id, bool wants_frame_notifications) override;
-    virtual void view_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::IntSize> maximum_size) override;
+    virtual void view_take_frame_snapshot(u64 view_id, u64 request_id) override;
     virtual void view_begin_synchronized_resize(u64 view_id, u64 token) override;
     virtual void view_await_synchronized_resize_frame(u64 view_id, u64 token, Gfx::IntSize size) override;
     virtual void view_commit_synchronized_resize(u64 view_id, u64 token) override;

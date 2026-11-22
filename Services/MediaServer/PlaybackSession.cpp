@@ -37,6 +37,9 @@ PlaybackSession::PlaybackSession(ConnectionFromClient& connection, u64 id, Audio
     m_manager->on_buffered_ranges_change = [this] {
         report_media_stream_scan_states();
     };
+    m_manager->on_seek_decided = [this](Media::SeekDecision decision) {
+        m_connection.async_playback_session_seek_decided(m_id, m_applied_seek_request_id, decision);
+    };
     m_manager->on_error = [this](Media::DecoderError&& error) {
         m_connection.async_playback_session_error(m_id, move(error));
     };
@@ -73,11 +76,18 @@ void PlaybackSession::add_media_stream_source(u64 stream_id, NonnullRefPtr<Media
         ->when_resolved([this, stream_id](Media::PlaybackManager::AddedTracks& added_tracks) {
             auto scan_state = added_tracks.demuxer->scan_state();
             m_media_stream_sources.set(stream_id, { added_tracks.demuxer, scan_state });
-            m_connection.async_playback_session_media_source_added(m_id, stream_id, move(added_tracks.audio_tracks), move(added_tracks.video_tracks), m_manager->preferred_audio_track(), m_manager->preferred_video_track(), m_manager->start_time_realtime(), move(scan_state));
+            m_connection.async_playback_session_media_source_added(m_id, stream_id, move(added_tracks.audio_tracks), move(added_tracks.video_tracks), m_manager->preferred_audio_track(), m_manager->preferred_video_track(), m_manager->start_time_realtime(), m_manager->earliest_possible_position(), move(scan_state));
         })
         .when_rejected([this, stream_id](Media::DecoderError& error) {
             m_connection.async_playback_session_media_stream_source_failed(m_id, stream_id, move(error));
         });
+}
+
+void PlaybackSession::start(u64 seek_request_id)
+{
+    m_applied_seek_request_id = seek_request_id;
+    m_manager->start();
+    report_playback_state();
 }
 
 void PlaybackSession::seek(u64 seek_request_id, AK::Duration timestamp, Media::SeekMode mode)
@@ -126,7 +136,7 @@ void PlaybackSession::add_source_buffer_demuxer(u64 source_buffer_id, NonnullRef
     m_manager->add_media_source(demuxer)
         ->when_resolved([this, source_buffer_id](Media::PlaybackManager::AddedTracks& added_tracks) {
             // A source buffer's ranges reach the renderer with each append or removal that it completes.
-            m_connection.async_playback_session_media_source_added(m_id, {}, move(added_tracks.audio_tracks), move(added_tracks.video_tracks), m_manager->preferred_audio_track(), m_manager->preferred_video_track(), m_manager->start_time_realtime(), {});
+            m_connection.async_playback_session_media_source_added(m_id, {}, move(added_tracks.audio_tracks), move(added_tracks.video_tracks), m_manager->preferred_audio_track(), m_manager->preferred_video_track(), m_manager->start_time_realtime(), m_manager->earliest_possible_position(), {});
             finish_source_buffer_track_addition(source_buffer_id, TrackAdditionOutcome::Added);
         })
         .when_rejected([this, source_buffer_id](Media::DecoderError& error) {

@@ -34,6 +34,8 @@ bool code_point_has_property(u32 code_point, Property property, CaseSensitivity 
 
 bool code_point_has_emoji_property(u32 code_point);
 bool code_point_has_emoji_presentation_property(u32 code_point);
+bool code_point_has_emoji_modifier_base_property(u32 code_point);
+bool code_point_has_extended_pictographic_property(u32 code_point);
 bool code_point_has_default_ignorable_code_point_property(u32 code_point);
 bool code_point_has_identifier_start_property(u32 code_point);
 bool code_point_has_identifier_continue_property(u32 code_point);
@@ -46,6 +48,9 @@ Vector<String> get_property_strings(Property);
 Optional<Script> script_from_string(StringView);
 bool code_point_has_script(u32 code_point, Script script);
 bool code_point_has_script_extension(u32 code_point, Script script);
+// The language most likely written in the script of a code point, such as "th" for Thai. There's none for a script that
+// many languages share (Latin, Han), or for a code point that has no script of its own.
+Optional<String> likely_language_for_script_of(u32 code_point);
 
 enum class BidiClass {
     ArabicNumber,             // AN

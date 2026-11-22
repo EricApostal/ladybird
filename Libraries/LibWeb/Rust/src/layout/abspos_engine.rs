@@ -1924,10 +1924,16 @@ impl AbsposEngine<'_> {
     }
 
     // https://drafts.csswg.org/css-position-3/#abspos-auto-size
-    // Resizable form controls use non-replaced sizing here, so their intrinsic dimensions don't prevent stretching.
+    // Form controls use non-replaced sizing here, so their intrinsic dimensions don't prevent stretching. That covers
+    // checkboxes and radio buttons too, which pages lay over a styled box between zero insets to make it clickable,
+    // and text inputs and sliders without their native appearance, which have a default preferred size instead.
     fn form_control_stretches(&self, sized: OutOfFlowBox<'_>, equation: AxisEquation, axis: SizingAxis) -> bool {
         let style = self.style_of(sized);
-        self.facts(sized.node).is_native_form_control_box()
+        let facts = self.facts(sized.node);
+        (facts.is_native_form_control_box()
+            || facts.is_non_devolvable_widget()
+            || facts.is_text_input()
+            || facts.is_slider())
             && axis.select(style.width(), style.height()).is_auto()
             && !self.sizes_to_fit_content(sized, equation, matches!(axis, SizingAxis::Inline))
     }
@@ -2369,19 +2375,14 @@ impl AbsposEngine<'_> {
         let sizing = self.sizing();
         let is_replaced = sizing.box_is_sized_as_replaced_element(sized.sized_box(), available_space, constraints);
         let containing_block_block_size = available_space.block_size.to_px_or_zero();
-        // NB: The margins of a non-replaced box resolve against the inline size of its containing block, and those of a
-        //     replaced box against its block size.
-        let margin_basis = if is_replaced && !self.facts(sized.node).is_native_form_control_box() {
-            containing_block_block_size
-        } else {
-            available_space.inline_size.to_px_or_zero()
-        };
+        // https://drafts.csswg.org/css-box-4/#margin-physical
+        // Percentages refer to the logical width of the containing block.
         let equation = self.axis_equation(
             sized,
             inputs,
             SizingAxis::Block,
             containing_block_block_size,
-            margin_basis,
+            available_space.inline_size.to_px_or_zero(),
             auto_margin_overflow,
         );
         let is_replaced = is_replaced && !self.form_control_stretches(sized, equation, SizingAxis::Block);

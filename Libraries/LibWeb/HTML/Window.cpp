@@ -689,7 +689,8 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         case CSS::PreferredContrast::Auto:
         default:
-            // FIXME: Fallback to system settings
+            // The browser resolves Auto from the platform's settings before a page sees it, so Auto only remains where
+            // nothing reads them.
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         }
     case CSS::MediaFeatureID::PrefersReducedData:
@@ -703,7 +704,8 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
             return ident_media_feature_value(CSS::Keyword::Reduce);
         case CSS::PreferredMotion::Auto:
         default:
-            // FIXME: Fallback to system settings
+            // The browser resolves Auto from the platform's settings before a page sees it, so Auto only remains where
+            // nothing reads them.
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         }
     case CSS::MediaFeatureID::PrefersReducedTransparency:
@@ -726,6 +728,8 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
         return ident_media_feature_value(CSS::Keyword::Srgb);
     case CSS::MediaFeatureID::VideoDynamicRange:
         return ident_media_feature_value(page().client().screen_shows_high_dynamic_range() ? CSS::Keyword::High : CSS::Keyword::Standard);
+    case CSS::MediaFeatureID::WebkitDevicePixelRatio:
+        return { .kind = CSS::Parser::ValueParserFFI::FfiMediaFeatureValueKind::Number, .keyword = 0, .value = device_pixel_ratio(), .second_value = 0 };
     case CSS::MediaFeatureID::WebkitTransform3d:
         // https://compat.spec.whatwg.org/#css-media-queries-webkit-transform-3d
         // If the user agent supports 3D transforms, the value will be 1. Otherwise the value is 0.
@@ -1674,6 +1678,7 @@ void web_window_queue_posted_message(JSVM*, Window*, SerializedTransferRecord*, 
 EnvironmentSettingsObject* web_window_post_message_incumbent_settings();
 void web_window_post_message_settings_origin(EnvironmentSettingsObject*, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
 WindowProxy* web_window_post_message_source(EnvironmentSettingsObject*);
+JSObject* web_window_post_message_source_object(WindowProxy*);
 void web_window_post_message_parse_target_origin(FlatPtr, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
 void* web_window_post_message_realm(Window*);
 void web_window_post_message_document_origin(Window*, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
@@ -1692,6 +1697,11 @@ void web_window_post_message_settings_origin(EnvironmentSettingsObject* settings
 WindowProxy* web_window_post_message_source(EnvironmentSettingsObject* settings)
 {
     return window_proxy_from_global_this_value(settings->realm().global_environment().global_this_value()).ptr();
+}
+
+JSObject* web_window_post_message_source_object(WindowProxy* source)
+{
+    return JS::HostABI::object_to_abi(&source->object());
 }
 
 void web_window_post_message_parse_target_origin(FlatPtr raw_target_origin, void* context, void (*receive)(void*, URL::FFI::FfiOrigin const*))

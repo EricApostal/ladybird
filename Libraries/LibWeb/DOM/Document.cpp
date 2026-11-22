@@ -466,7 +466,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         auto realm_execution_context = HTML::create_window_realm(window, *browsing_context, agent_cluster_cross_origin_isolation_mode);
 
         // 6. Set window to the global object of realmExecutionContext's Realm component.
-        window = HTML::window_from_global_object(realm_execution_context->realm->global_object());
+        window = HTML::window_from_global_object(realm_execution_context->realm()->global_object());
         VERIFY(window);
 
         // 7. Let topLevelCreationURL be creationURL.
@@ -632,7 +632,12 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
             || navigation_params.request->text_directive_user_activation();
         navigation_params.request->set_text_directive_user_activation(false);
         document->m_browsing_context_group_has_remote_contexts = navigation_params.request->browsing_context_group_has_multiple_contexts();
-        document->m_navigation_bypassed_cache = navigation_params.request->cache_mode() == HTTP::CacheMode::Reload;
+        if (auto cache_mode = navigation_params.request->cache_mode(); cache_mode == HTTP::CacheMode::Reload || cache_mode == HTTP::CacheMode::ForceCache)
+            document->m_navigation_cache_mode = cache_mode;
+    } else if (navigation_params.navigable->parent()) {
+        // AD-HOC: A document that is not fetched, such as the one of a srcdoc iframe, loads the way its container
+        //         document does. Its requests use the same cache mode while it loads.
+        document->m_navigation_cache_mode = navigation_params.navigable->container_state().document_cache_mode_while_loading;
     }
 
     // NOTE: Step 16 is treated as the else branch of step 15. Otherwise, redirectCount is undefined when the fetch
@@ -902,6 +907,7 @@ Layout::NodeArena& Document::layout_node_arena()
             switch (kind) {
             case Layout::RustFFI::NodeKind::InlineNode:
             case Layout::RustFFI::NodeKind::BreakNode:
+            case Layout::RustFFI::NodeKind::WordBreakOpportunityNode:
                 Layout::allocate_layout_node<Layout::NodeWithStyle>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
                 return;
             case Layout::RustFFI::NodeKind::TextNode:
@@ -3045,7 +3051,8 @@ Layout::RustFFI::FfiPaintPreparationHostCallbacks Document::paint_preparation_ho
         .viewport = [](void* context, Layout::RustFFI::FfiPaintPreparationViewport* viewport) {
             auto& document = *static_cast<Document*>(context);
             viewport->visual_context_tree_inputs = Painting::visual_context_tree_inputs(document);
-            viewport->device_viewport_size = document.page().css_to_device_rect(document.viewport_rect()).size().to_type<int>(); },
+            auto navigable = document.navigable();
+            viewport->device_viewport_size = navigable ? navigable->viewport_size_in_device_pixels() : Gfx::IntSize {}; },
         .resolve_svg_filter = [](void* context, Layout::BegunRead const* read, Compositing::RustFFI::NodeSlotId slot, void const* url_value, void* sink) { return Painting::push_svg_filter_reference(*read, *static_cast<Document*>(context), slot, url_value, sink); },
         .resolve_svg_paint_server = [](void* context, Layout::BegunRead const* read, Compositing::RustFFI::NodeSlotId slot, bool is_stroke, void* sink) { Painting::push_svg_paint_server_description(*read, *static_cast<Document*>(context), slot, is_stroke, sink); },
         .require_display_list_recording = [](void* context, bool request_frame) {
@@ -3921,7 +3928,7 @@ WebIDL::ExceptionOr<GC::Ref<Event>> Document::create_event(Utf16FlyString const&
     } else if (interface.equals_ignoring_ascii_case("keyboardevent"sv)) {
         event = UIEvents::KeyboardEvent::create(Utf16FlyString {}, {}, time_stamp);
     } else if (interface.equals_ignoring_ascii_case("messageevent"sv)) {
-        event = HTML::MessageEvent::create(FlyString {}, time_stamp);
+        event = HTML::create_message_event(realm);
     } else if (interface.equals_ignoring_ascii_case("mouseevent"sv)
         || interface.equals_ignoring_ascii_case("mouseevents"sv)) {
         event = UIEvents::MouseEvent::create(FlyString {}, UIEvents::MouseEventOptions {}, 0, 0, 0, 0, time_stamp);
@@ -5072,9 +5079,9 @@ void Document::queue_navigation_timing_entry()
 
 void Document::begin_smil_time_container_once_loaded(SVG::SMILTimeContainer& time_container)
 {
-    // The timeline of an SVG document fragment should begin when the load event for its outermost svg element is
-    // triggered, but that event is not fired. Like Blink, begin the timeline once the document has completely loaded
-    // instead, or right away for a fragment that is inserted after that.
+    // AD-HOC: The timeline of an SVG document fragment should begin when the load event for its outermost svg element
+    //         is triggered. Begin it once the document has completely loaded instead, which comes after that event,
+    //         or right away for a fragment that is inserted after that.
     if (is_completely_loaded()) {
         time_container.begin();
         return;
@@ -5102,8 +5109,14 @@ void Document::completely_finish_loading()
     //         loading before they are activated. The timestamp must still be recorded so
     //         that activate_history_entry can detect this and re-trigger the container
     //         notification steps.
-    if (!m_completely_loaded_time.has_value())
+    if (!m_completely_loaded_time.has_value()) {
         m_completely_loaded_time = AK::UnixDateTime::now();
+
+        // NB: The requests of this document no longer use the cache mode of its navigation, and neither do the
+        //     navigations of its child navigables, which a process that hosts one reads from its container's state.
+        if (m_navigation_cache_mode != HTTP::CacheMode::Default)
+            report_container_state_of_child_navigables();
+    }
 
     GC::RootVector time_containers_to_begin { exchange(m_smil_time_containers_to_begin, {}) };
     for (auto& time_container : time_containers_to_begin)
@@ -5507,12 +5520,12 @@ void Document::release_video_frames_held_for_callbacks()
         video_element->release_presented_video_frame_held_for_callbacks();
 }
 
-void Document::run_the_scroll_steps()
+void Document::run_the_scroll_steps(double frame_timestamp)
 {
     // AD-HOC: Process auto-scroll ticks before dispatching scroll events. This is tied to the rendering update to
     //         ensure exactly one auto-scroll tick per frame.
     if (auto navigable = this->navigable())
-        navigable->event_handler().process_auto_scroll();
+        navigable->event_handler().process_auto_scroll(frame_timestamp);
 
     // FIXME: 1. For each scrolling box box that was scrolled:
     //        ...
@@ -6584,6 +6597,16 @@ void Document::destroy_a_document_and_its_descendants(GC::Ptr<GC::Function<void(
     // NB: This is handled by destruction_state.
 }
 
+void Document::report_container_state_of_child_navigables()
+{
+    // NB: Navigable containers in shadow trees have child navigables too.
+    for_each_shadow_including_descendant([&](Node& node) {
+        if (auto* container = as_if<HTML::NavigableContainer>(node); container && container->content_navigable())
+            page().client().page_did_change_navigable_container_state(container->content_navigable()->id(), container->replicated_container_state());
+        return TraversalDecision::Continue;
+    });
+}
+
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#abort-a-document
 void Document::abort()
 {
@@ -6596,6 +6619,11 @@ void Document::abort()
     //    then make document unsalvageable given document and "fetch".
     bool canceled_fetch = HTML::stop_body_delivery(m_ongoing_navigation_fetch);
     m_ongoing_navigation_fetch = Empty {};
+
+    // NB: An aborted document may never become completely loaded. Its load is over, so the requests it makes from now
+    //     on must not use the cache mode of its navigation anymore.
+    if (exchange(m_navigation_cache_mode, HTTP::CacheMode::Default) != HTTP::CacheMode::Default && !is_completely_loaded())
+        report_container_state_of_child_navigables();
 
     auto cancel_fetch = [&](GC::Ptr<Fetch::Infrastructure::FetchController> controller) {
         if (!controller || controller->state() != Fetch::Infrastructure::FetchController::State::Ongoing)
@@ -7640,28 +7668,29 @@ void Document::queue_an_intersection_observer_entry(IntersectionObserver::Inters
     queue_intersection_observer_task();
 }
 
+static CSSPixelRect apply_observer_scroll_margin(void const* context, CSSPixelRect clip_rect)
+{
+    auto const& scroll_margin = static_cast<IntersectionObserver::IntersectionObserver const*>(context)->scroll_margin_values();
+    if (scroll_margin.is_empty())
+        return clip_rect;
+    clip_rect.inflate(
+        scroll_margin[0].to_px(clip_rect.height()),
+        scroll_margin[1].to_px(clip_rect.width()),
+        scroll_margin[2].to_px(clip_rect.height()),
+        scroll_margin[3].to_px(clip_rect.width()));
+    return clip_rect;
+}
+
 // https://www.w3.org/TR/intersection-observer/#compute-the-intersection
 static Optional<CSSPixelRect> compute_intersection(Layout::BegunRead const& read, GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, Layout::Box const* root_layout_box, CSSPixelRect const& root_bounds, MonotonicTime visual_animation_sample_time)
 {
     auto& document = target->document();
-    auto const& scroll_margin = observer.scroll_margin_values();
-    auto inflate_scroll_container_clip_rect_by_scroll_margin = [](void* context, CSSPixelRect clip_rect) -> CSSPixelRect {
-        auto const& scroll_margin = *static_cast<Vector<CSS::LengthPercentage> const*>(context);
-        if (scroll_margin.is_empty())
-            return clip_rect;
-        clip_rect.inflate(
-            scroll_margin[0].to_px(clip_rect.height()),
-            scroll_margin[1].to_px(clip_rect.width()),
-            scroll_margin[2].to_px(clip_rect.height()),
-            scroll_margin[3].to_px(clip_rect.width()));
-        return clip_rect;
-    };
     CSSPixelRect rect;
     auto intersects = Layout::RustFFI::layout_script_intersection_observer_intersection_rect(
         document.layout_node_arena().host(), Layout::Node::slot_id(target->layout_node(read)), target_rect,
         Layout::Node::slot_id(root_layout_box), root_bounds,
         Painting::viewport_mapping_with_visual_animations_sampled_at(document, visual_animation_sample_time),
-        const_cast<Vector<CSS::LengthPercentage>*>(&scroll_margin), inflate_scroll_container_clip_rect_by_scroll_margin, &rect);
+        &observer, apply_observer_scroll_margin, &rect);
     if (!intersects)
         return {};
     return rect;
@@ -7857,10 +7886,7 @@ void Document::start_intersection_observing_a_lazy_loading_element(Element& elem
     // 2. If doc's lazy load intersection observer is null, set it to a new IntersectionObserver instance, initialized as follows:
     if (!m_lazy_load_intersection_observer) {
         auto options = IntersectionObserver::IntersectionObserverOptions {};
-        // The HTML lazy-loading algorithm uses a generous implicit root margin so that resources are fetched
-        // before they enter the viewport.  In particular, this also handles elements whose box is initially empty
-        // while their intrinsic dimensions are waiting on the fetch itself.
-        options.root_margin = "1250px"_utf16;
+        options.scroll_margin = "1250px 625px"_utf16;
 
         // The callback is these steps, with arguments entries and observer:
         auto wrapped_callback = IntersectionObserver::create_lazy_load_intersection_observer_callback(*this);
@@ -8658,6 +8684,12 @@ struct CompositorAnimationUpdatePass {
     GC::RootHashTable<GC::Ref<Element>> elements_with_visibility_observation_descendants;
     Vector<Compositing::RustFFI::NodeSlotId> layout_nodes_with_stale_forced_effects_layer;
     Vector<Compositing::RustFFI::NodeSlotId> layout_nodes_with_stale_forced_background_color_frame;
+    // OPTIMIZATION: The slot indices of the stale lists above, and of the frames this pass kept, so that keeping a
+    //               frame does not scan the lists. A stale frame that this pass kept is no longer stale.
+    HashTable<u32> stale_forced_effects_layer_slots;
+    HashTable<u32> stale_forced_background_color_frame_slots;
+    HashTable<u32> kept_effects_layer_slots;
+    HashTable<u32> kept_background_color_frame_slots;
     // The target the keyframes of the compositor animation being built resolve their values against.
     Optional<AbstractElement> keyframe_target;
 
@@ -8678,19 +8710,34 @@ struct CompositorAnimationUpdatePass {
         return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? document->m_layout_nodes_with_forced_compositor_effects_layer : document->m_layout_nodes_with_forced_compositor_background_color_frame;
     }
 
-    Vector<Compositing::RustFFI::NodeSlotId>& stale_forced_frames(Animations::RustFFI::FfiCompositorFrameKind kind)
+    HashTable<u32>& stale_forced_frame_slots(Animations::RustFFI::FfiCompositorFrameKind kind)
     {
-        return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? layout_nodes_with_stale_forced_effects_layer : layout_nodes_with_stale_forced_background_color_frame;
+        return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? stale_forced_effects_layer_slots : stale_forced_background_color_frame_slots;
     }
 
-    bool transform_subtree_is_clipped_outside(Element const& animated_target, CSSPixelRect const& root_bounds) const
+    HashTable<u32>& kept_frame_slots(Animations::RustFFI::FfiCompositorFrameKind kind)
+    {
+        return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? kept_effects_layer_slots : kept_background_color_frame_slots;
+    }
+
+    void take_forced_frames_as_stale()
+    {
+        layout_nodes_with_stale_forced_effects_layer = move(document->m_layout_nodes_with_forced_compositor_effects_layer);
+        layout_nodes_with_stale_forced_background_color_frame = move(document->m_layout_nodes_with_forced_compositor_background_color_frame);
+        for (auto slot : layout_nodes_with_stale_forced_effects_layer)
+            stale_forced_effects_layer_slots.set(slot.index);
+        for (auto slot : layout_nodes_with_stale_forced_background_color_frame)
+            stale_forced_background_color_frame_slots.set(slot.index);
+    }
+
+    bool transform_subtree_is_clipped_outside(Element const& animated_target, CSSPixelRect const& root_bounds, IntersectionObserver::IntersectionObserver const* observer = nullptr, Layout::Node const* intersection_root = nullptr) const
     {
         auto const* layout_node = animated_target.unsafe_layout_node(read);
         if (!layout_node)
             return false;
         return Layout::RustFFI::layout_script_transform_subtree_is_clipped_outside(
-            layout_node->document_host(), Layout::Node::slot_id(layout_node), root_bounds,
-            viewport_mapping);
+            layout_node->document_host(), Layout::Node::slot_id(layout_node), Layout::Node::slot_id(intersection_root), root_bounds,
+            viewport_mapping, observer, observer ? apply_observer_scroll_margin : nullptr);
     }
 
     static Compositing::RustFFI::NodeSlotId layout_node(void* context, Animations::RustFFI::FfiCompositorTarget target)
@@ -8760,19 +8807,14 @@ struct CompositorAnimationUpdatePass {
     static void keep_frame(void* context, Compositing::RustFFI::NodeSlotId slot, Animations::RustFFI::FfiCompositorFrameKind kind)
     {
         auto& pass = of(context);
-        auto& forced = pass.forced_frames(kind);
-        if (!any_of(forced, [&](auto forced_slot) { return forced_slot.index == slot.index; }))
-            forced.append(slot);
-        pass.stale_forced_frames(kind).remove_first_matching([&](auto stale_slot) {
-            return stale_slot.index == slot.index;
-        });
+        if (pass.kept_frame_slots(kind).set(slot.index) == HashSetResult::InsertedNewEntry)
+            pass.forced_frames(kind).append(slot);
     }
 
     static bool frame_was_kept(void* context, Compositing::RustFFI::NodeSlotId slot, Animations::RustFFI::FfiCompositorFrameKind kind)
     {
-        return any_of(of(context).stale_forced_frames(kind), [&](auto stale_slot) {
-            return stale_slot.index == slot.index;
-        });
+        auto& pass = of(context);
+        return pass.stale_forced_frame_slots(kind).contains(slot.index) && !pass.kept_frame_slots(kind).contains(slot.index);
     }
 
     static void refresh_viewport_mapping(void* context)
@@ -9057,7 +9099,10 @@ bool CompositorAnimationUpdatePass::transform_affects_intersection_observation(v
         auto root = observer.intersection_root_node();
         if (root->is_element() && animated_target.is_shadow_including_inclusive_ancestor_of(*root))
             return true;
-        bool subtree_is_clipped_outside_root = pass.transform_subtree_is_clipped_outside(animated_target, observer.root_intersection_rectangle(pass.read));
+        auto const* root_layout_node = !observer.is_implicit_root() && &root->document() == &animated_target.document()
+            ? root->unsafe_layout_node(pass.read)
+            : nullptr;
+        bool subtree_is_clipped_outside_root = pass.transform_subtree_is_clipped_outside(animated_target, observer.root_intersection_rectangle(pass.read), &observer, root_layout_node);
         for (auto const& observation : observer.observation_targets()) {
             auto target = observation.target.ptr();
             if (!target)
@@ -9139,8 +9184,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
     CompositorAnimationUpdatePass pass { *this, read };
     pass.viewport_mapping = Painting::viewport_mapping(*this);
     paint_state().begin_compositor_animation_update();
-    pass.layout_nodes_with_stale_forced_effects_layer = move(m_layout_nodes_with_forced_compositor_effects_layer);
-    pass.layout_nodes_with_stale_forced_background_color_frame = move(m_layout_nodes_with_forced_compositor_background_color_frame);
+    pass.take_forced_frames_as_stale();
 
     auto index_shadow_including_element_ancestors = [](Node& node, GC::RootHashTable<GC::Ref<Element>>& index) {
         for (auto* ancestor = &node; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
@@ -9208,6 +9252,8 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
     }
 
     for (auto stale_slot : pass.layout_nodes_with_stale_forced_effects_layer) {
+        if (pass.kept_effects_layer_slots.contains(stale_slot.index))
+            continue;
         auto* layout_node = layout_node_arena().node_if_live(read, stale_slot);
         if (!layout_node)
             continue;
@@ -9218,6 +9264,8 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         Painting::repaint_after_style_change(*layout_node, invalidation);
     }
     for (auto stale_slot : pass.layout_nodes_with_stale_forced_background_color_frame) {
+        if (pass.kept_background_color_frame_slots.contains(stale_slot.index))
+            continue;
         auto* layout_node = layout_node_arena().node_if_live(read, stale_slot);
         if (!layout_node)
             continue;
@@ -11000,10 +11048,17 @@ void Document::set_navigable(GC::Ptr<HTML::LocalNavigable> navigable)
     rendering_pending_document_changed(*this);
     rendering_pending_document_changed(*this);
 
-    if (previous_page)
+    // NB: A page without user edits keeps none as a document without any comes or goes.
+    if (previous_page) {
         previous_page->update_needs_beforeunload_check();
-    if (navigable && &navigable->page() != previous_page.ptr())
+        if (m_had_user_edits || previous_page->had_user_edits())
+            previous_page->update_had_user_edits();
+    }
+    if (navigable && &navigable->page() != previous_page.ptr()) {
         navigable->page().update_needs_beforeunload_check();
+        if (m_had_user_edits || navigable->page().had_user_edits())
+            navigable->page().update_had_user_edits();
+    }
 }
 
 void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
@@ -12034,12 +12089,12 @@ GC::Ref<HTML::DOMStringList> Document::ancestor_origins_list_creation_steps() co
     VERIFY(ancestor_origins.has_value());
 
     // 3. Let output be « ».
-    Vector<String> output;
+    Vector<Utf16String> output;
 
     // 4. For each origin of ancestorOrigins:
     for (auto const& origin : ancestor_origins.value()) {
         // 1. Append the serialization of origin to output.
-        output.append(origin.serialize());
+        output.append(Utf16String::from_utf8(origin.serialize()));
     }
 
     // 5. Return a new DOMStringList object whose associated list is output.

@@ -498,7 +498,7 @@ impl Drop for IcuSegmenterHandle {
 }
 
 pub(crate) enum GraphemeSegmenter {
-    Ascii {
+    SingleCodeUnits {
         length_in_code_units: usize,
     },
     /// Text of code points below U+0300 only, where every code unit is a grapheme cluster except for CR LF.
@@ -522,12 +522,13 @@ fn is_latin_code_unit_outside_clusters(code_unit: u16) -> bool {
 
 impl GraphemeSegmenter {
     pub(crate) fn new(text: &[u16]) -> Self {
-        let Some(first_non_ascii) = text.iter().position(|unit| *unit > 0x7f) else {
-            return Self::Ascii {
+        let Some(first_cluster_candidate) = text.iter().position(|&unit| !is_latin_code_unit_outside_clusters(unit))
+        else {
+            return Self::SingleCodeUnits {
                 length_in_code_units: text.len(),
             };
         };
-        if text[first_non_ascii..].iter().all(|unit| *unit < 0x300) {
+        if text[first_cluster_candidate..].iter().all(|unit| *unit < 0x300) {
             let line_feeds_after_carriage_returns = text
                 .windows(2)
                 .enumerate()
@@ -556,11 +557,9 @@ impl GraphemeSegmenter {
         }
     }
 
-    /// Mirrors Unicode::AsciiGraphemeSegmenter for the ASCII case: every code
-    /// unit index is a boundary.
     pub(crate) fn next_boundary(&self, index: usize, inclusive: bool) -> Option<usize> {
         match self {
-            Self::Ascii { length_in_code_units } => {
+            Self::SingleCodeUnits { length_in_code_units } => {
                 if inclusive && index <= *length_in_code_units {
                     return Some(index);
                 }
@@ -1135,7 +1134,6 @@ struct TextChunker<'text> {
     current_index: usize,
     /// The fonts of the chunks, each once, which the chunks name by index.
     fonts: Vec<FontHandle>,
-    last_non_whitespace_font: Option<u16>,
     first_font_and_ascii_code_points_it_resolves: Option<(&'text FontHandle, u128)>,
     font_for_every_space: Option<&'text FontHandle>,
 }
@@ -1180,7 +1178,6 @@ impl<'text> TextChunker<'text> {
             splits_at_orientation_changes: inputs.splits_at_orientation_changes,
             current_index: 0,
             fonts: Vec::new(),
-            last_non_whitespace_font: None,
             first_font_and_ascii_code_points_it_resolves,
             font_for_every_space,
         }
@@ -1201,14 +1198,22 @@ impl<'text> TextChunker<'text> {
         self.splits_at_orientation_changes && code_point_is_upright_in_mixed_orientation(self.current_code_point())
     }
 
-    fn next_grapheme_boundary(&self) -> usize {
+    fn next_chunk_boundary(&self) -> usize {
+        // CRLF is one grapheme, but the line feed must start its own chunk when CSS preserves line breaks.
+        if self.should_respect_linebreaks && self.text.get(self.current_index) == Some(&u16::from(b'\r')) {
+            return self.current_index + 1;
+        }
         self.grapheme_segmenter
             .next_boundary(self.current_index, false)
             .unwrap_or(self.text.len())
     }
 
     fn is_collapsible(&self, code_point: u32) -> bool {
-        self.should_collapse_whitespace && code_point_is_ascii_space(code_point)
+        // NB: A line feed that white-space-collapse: preserve-breaks keeps is a forced line break, not white space that
+        //     collapses with the white space around it.
+        self.should_collapse_whitespace
+            && code_point_is_ascii_space(code_point)
+            && !(self.should_respect_linebreaks && code_point == '\n' as u32)
     }
 
     fn is_at_line_break_opportunity(&self) -> bool {
@@ -1218,15 +1223,19 @@ impl<'text> TextChunker<'text> {
     fn emoji_presentation_at(&self, code_unit_offset: usize, code_point: u32) -> EmojiPresentation {
         let next_offset = code_unit_offset + code_unit_length_for_code_point(code_point);
         let next_code_point = (next_offset < self.text.len()).then(|| code_point_at(self.text, next_offset));
+        let code_point_after_next = next_code_point.and_then(|next_code_point| {
+            let offset_after_next = next_offset + code_unit_length_for_code_point(next_code_point);
+            (offset_after_next < self.text.len()).then(|| code_point_at(self.text, offset_after_next))
+        });
         // OPTIMIZATION: No code point below U+0300 has the Emoji_Presentation property, so only a variation selector
-        //               can give one of them anything but the default text presentation.
-        let default_presentation = if code_point < 0x300 && !matches!(next_code_point, Some(0xfe0e | 0xfe0f)) {
+        //               or a zero width joiner can give one of them anything but the default text presentation.
+        let default_presentation = if code_point < 0x300 && !matches!(next_code_point, Some(0xfe0e | 0xfe0f | 0x200d)) {
             EmojiPresentation {
                 is_emoji: false,
                 forced: false,
             }
         } else {
-            emoji_presentation_for_code_point(code_point, next_code_point)
+            emoji_presentation_for_code_point(code_point, next_code_point, code_point_after_next)
         };
         // OPTIMIZATION: Below U+0300, only '#', '*', the ASCII digits, U+00A9 and U+00AE have the Emoji property.
         let has_emoji_property = if code_point < 0x300 {
@@ -1236,7 +1245,8 @@ impl<'text> TextChunker<'text> {
         };
         debug_assert!(
             code_point >= 0x300 || {
-                let presentation = emoji_presentation_for_code_point(code_point, next_code_point);
+                let presentation =
+                    emoji_presentation_for_code_point(code_point, next_code_point, code_point_after_next);
                 let has_property = unicode_layout_code_point_has_emoji_property(code_point);
                 presentation.is_emoji == default_presentation.is_emoji
                     && presentation.forced == default_presentation.forced
@@ -1276,69 +1286,52 @@ impl<'text> TextChunker<'text> {
             .font_for_code_point_borrowed(code_point, self.emoji_presentation_at(code_unit_offset, code_point))
     }
 
-    fn font_for_space(&self, at_index: usize, space_code_point: u32) -> ChunkFont<'text> {
+    fn font_for_space(&self, space_code_point: u32) -> Cow<'text, FontHandle> {
         if let Some(font) = self.font_for_every_space {
-            return ChunkFont::FromCascade(Cow::Borrowed(font));
+            return Cow::Borrowed(font);
         }
 
-        let has_glyph = |font: &FontHandle| font.contains_glyph(space_code_point);
-
-        // 1. Prefer the last non-whitespace font in this node/run.
-        if let Some(last_font_index) = self.last_non_whitespace_font {
-            let last_font = &self.fonts[usize::from(last_font_index)];
-            if !last_font.is_emoji_font() && has_glyph(last_font) {
-                return ChunkFont::InTable(last_font_index);
-            }
-        }
-
-        // 2. Look ahead to the next non-space to infer the base font of this run.
-        let mut i = at_index;
-        while i < self.text.len() {
-            let code_point = code_point_at(self.text, i);
-            if !is_interword_space(code_point) && code_point != '\t' as u32 && code_point != '\n' as u32 {
-                let font = self.font_for_code_point_at(i, code_point);
-                if !font.is_emoji_font() && has_glyph(&font) {
-                    return ChunkFont::FromCascade(font);
-                }
-                // Text is coming from an emoji face; we'll fall back to (3).
-                break;
-            }
-            i = self
-                .grapheme_segmenter
-                .next_boundary(i, false)
-                .unwrap_or(self.text.len());
-        }
-
-        // 3. No text around (leading/trailing/all spaces) — pick a font with the glyph from the cascade.
-        ChunkFont::FromCascade(self.frozen_font_list.font_for_code_point_borrowed(
+        // https://drafts.csswg.org/css-fonts-4/#font-matching-algorithm
+        // NB: A space is matched like any other character: It takes the first font in the list whose unicode-range
+        //     covers it and that has a glyph for it, rather than the font of the text next to it.
+        let font = self.frozen_font_list.font_for_code_point_borrowed(
             space_code_point,
             EmojiPresentation {
                 is_emoji: false,
                 forced: false,
             },
-        ))
+        );
+        if !font.is_emoji_font() {
+            return font;
+        }
+        // AD-HOC: An emoji font listed ahead of a text font would give spaces its width, so a space skips it for the
+        //         first text font with a glyph for it.
+        self.frozen_font_list.font_for_code_point_borrowed(
+            space_code_point,
+            EmojiPresentation {
+                is_emoji: false,
+                forced: true,
+            },
+        )
     }
 
-    fn expected_font_for(&self, code_point: u32) -> ChunkFont<'text> {
+    fn expected_font_for(&self, code_point: u32) -> Cow<'text, FontHandle> {
         if is_interword_space(code_point) {
-            self.font_for_space(self.current_index, code_point)
+            self.font_for_space(code_point)
+        } else if code_point == '\t' as u32 {
+            // NB: A tab is drawn as a shift to a tab stop rather than as a glyph, so it takes the font that a space in
+            //     its place would take, not a fallback font that happens to have a glyph for it.
+            self.font_for_space(' ' as u32)
         } else {
-            ChunkFont::FromCascade(self.font_for_code_point_at(self.current_index, code_point))
+            self.font_for_code_point_at(self.current_index, code_point)
         }
     }
 
-    fn is_font_at_index(&self, font: &ChunkFont<'_>, font_index: u16) -> bool {
-        match font {
-            ChunkFont::InTable(index) => *index == font_index,
-            ChunkFont::FromCascade(font) => **font == self.fonts[usize::from(font_index)],
-        }
+    fn is_font_at_index(&self, font: &FontHandle, font_index: u16) -> bool {
+        *font == self.fonts[usize::from(font_index)]
     }
 
-    fn index_of_font(&mut self, font: ChunkFont<'text>) -> u16 {
-        let font = match font {
-            ChunkFont::InTable(index) => return index,
-            ChunkFont::FromCascade(font) => font,
-        };
+    fn index_of_font(&mut self, font: Cow<'text, FontHandle>) -> u16 {
         let index = match self.fonts.iter().rposition(|kept| *kept == *font) {
             Some(index) => index,
             None => {
@@ -1364,9 +1357,6 @@ impl<'text> TextChunker<'text> {
         let is_all_whitespace = self.text[start..end]
             .iter()
             .all(|unit| *unit <= 0x7f && code_point_is_ascii_space(u32::from(*unit)));
-        if !is_all_whitespace {
-            self.last_non_whitespace_font = Some(font_index);
-        }
         Some(TextChunk {
             start,
             length: length_in_code_units,
@@ -1426,7 +1416,7 @@ impl<'text> TextChunker<'text> {
                     }
 
                     // Otherwise, commit the newline!
-                    self.current_index = self.next_grapheme_boundary();
+                    self.current_index = self.next_chunk_boundary();
                     let chunk = self.try_commit_chunk(
                         pending.start,
                         self.current_index,
@@ -1450,7 +1440,7 @@ impl<'text> TextChunker<'text> {
                     let chunk = self.try_commit_chunk_at_cursor(&pending, false);
 
                     while self.current_index < self.text.len() && self.is_collapsible(self.current_code_point()) {
-                        self.current_index = self.next_grapheme_boundary();
+                        self.current_index = self.next_chunk_boundary();
                     }
 
                     if let Some(chunk) = chunk {
@@ -1488,9 +1478,9 @@ impl<'text> TextChunker<'text> {
                         }
 
                         // Otherwise, commit the whitespace!
-                        self.current_index = self.next_grapheme_boundary();
+                        self.current_index = self.next_chunk_boundary();
                         can_break_at_current_position = self.is_at_line_break_opportunity();
-                        let space_font = self.font_for_space(self.current_index, code_point);
+                        let space_font = self.font_for_space(code_point);
                         let space_font_index = self.index_of_font(space_font);
                         if let Some(chunk) = self.try_commit_chunk(
                             pending.start,
@@ -1515,7 +1505,7 @@ impl<'text> TextChunker<'text> {
                     }
                 }
 
-                self.current_index = self.next_grapheme_boundary();
+                self.current_index = self.next_chunk_boundary();
                 can_break_at_current_position = self.is_at_line_break_opportunity();
             }
 
@@ -1557,12 +1547,6 @@ impl<'text> TextChunker<'text> {
             pending.text_type,
         )
     }
-}
-
-/// A font the chunker picked: one of the fonts of its chunks, or one the cascade answered with.
-enum ChunkFont<'text> {
-    InTable(u16),
-    FromCascade(Cow<'text, FontHandle>),
 }
 
 pub(crate) fn text_chunks(

@@ -44,6 +44,62 @@ pub struct FfiSvgTextCharacterCell {
     pub starts_typographic_character: bool,
 }
 
+/// Appends the cell of each character the edits map the given cells back to: Where an edit turned characters into
+/// others, the characters it took share the cell of those it made.
+fn append_svg_text_cells_through_edits<'a>(
+    cells: &[FfiSvgTextCharacterCell],
+    edits: impl IntoIterator<Item = &'a super::rendered_text::RenderedTextEdit>,
+    out: &mut Vec<FfiSvgTextCharacterCell>,
+) {
+    let mut cursor = 0;
+    for edit in edits {
+        let start = edit.rendered_start_offset;
+        let end = start + edit.rendered_length_in_code_units;
+        out.extend_from_slice(&cells[cursor..start]);
+        cursor = end;
+        if edit.dom_length_in_code_units == 0 {
+            continue;
+        }
+        let mut cell = svg_text_cell_for_source_span(cells, start, end);
+        out.push(cell);
+        cell.starts_typographic_character = false;
+        out.extend(std::iter::repeat_n(cell, edit.dom_length_in_code_units - 1));
+    }
+    out.extend_from_slice(&cells[cursor..]);
+}
+
+fn svg_text_cell_for_source_span(
+    cells: &[FfiSvgTextCharacterCell],
+    start: usize,
+    end: usize,
+) -> FfiSvgTextCharacterCell {
+    if let Some((&first, others)) = cells[start..end].split_first() {
+        let mut bounds = FloatRect::new(first.x, first.y, first.width, first.height);
+        for other in others {
+            bounds = united_even_if_empty(
+                Some(bounds),
+                FloatRect::new(other.x, other.y, other.width, other.height),
+            );
+        }
+        return FfiSvgTextCharacterCell {
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+            ..first
+        };
+    }
+    // A source character removed by casing has an empty cell at its position between the surrounding glyphs.
+    let mut cell = cells.get(start).copied().unwrap_or_else(|| {
+        let mut last = cells.last().copied().unwrap_or_default();
+        last.x += last.width;
+        last
+    });
+    cell.width = 0.0;
+    cell.starts_typographic_character = false;
+    cell
+}
+
 /// What shaping one SVG text run yields: its glyphs, its total advance, the union of its glyph
 /// cells, and the glyph cell of every one of its code units.
 struct ShapedSvgText {
@@ -556,6 +612,8 @@ struct SvgTextBoxContents {
     glyph_cells: SvgCssPixelRect,
     /// The glyph cell of each character in the element's subtree, in document order.
     character_cells: Vec<FfiSvgTextCharacterCell>,
+    /// The glyph cell of each character of the element's own text nodes, in document order.
+    own_character_cells: Vec<FfiSvgTextCharacterCell>,
     /// The union of the boxes of the element's text content child elements.
     children_bounding_box: SvgCssPixelRect,
 }
@@ -854,6 +912,13 @@ pub(super) struct SvgFormattingContext<'pass> {
     text_length_adjustment: SvgTextLengthAdjustment,
     /// The characters each text node of the text content elements laid out so far renders.
     processed_svg_text: RefCell<std::collections::HashMap<Node, std::sync::Arc<[u16]>>>,
+    /// Where text-transform changed the characters of a text node in `processed_svg_text`, how its characters map to
+    /// those it had before the transform.
+    svg_text_transform_edits: RefCell<std::collections::HashMap<Node, Vec<super::rendered_text::RenderedTextEdit>>>,
+    /// The glyph outlines, laid along the path, and the character cells of each text content element inside the
+    /// <textPath> laid out last, which that element paints in its own style.
+    text_on_path_glyphs:
+        RefCell<std::collections::HashMap<Node, (libgfx_rust::path::Path, Vec<FfiSvgTextCharacterCell>)>>,
     /// The glyph cells of the text content element laid out last: those of its whole subtree, in document order.
     last_text_subtree_cells: Option<std::sync::Arc<Vec<FfiSvgTextCharacterCell>>>,
     /// The stretches of text in the subtree of the <text>, <tspan>, or <a> laid out last, in document order.
@@ -897,6 +962,8 @@ impl<'pass> SvgFormattingContext<'pass> {
             current_text_position: FfiFloatPoint::default(),
             text_length_adjustment: SvgTextLengthAdjustment::None,
             processed_svg_text: RefCell::new(std::collections::HashMap::new()),
+            svg_text_transform_edits: RefCell::new(std::collections::HashMap::new()),
+            text_on_path_glyphs: RefCell::new(std::collections::HashMap::new()),
             last_text_subtree_cells: None,
             last_text_subtree_spans: Vec::new(),
             root_payload: RefCell::new(fragment_tree::PendingPayload::default()),
@@ -1634,12 +1701,51 @@ impl<'pass> SvgFormattingContext<'pass> {
             .collect();
         let mut processed_text = self.processed_svg_text.borrow_mut();
         for (node, text) in text_nodes.iter().zip(process_svg_text_white_space(&borrowed_sources)) {
+            let text = self.apply_svg_text_transform(*node, text);
             processed_text.insert(*node, std::sync::Arc::from(text));
         }
         processed_text
             .get(&text_node)
             .cloned()
             .unwrap_or_else(|| std::sync::Arc::from(Vec::new()))
+    }
+
+    /// The characters of a text node once its white space is processed, with its text-transform applied. The transform
+    /// comes after the white space processing, so that the characters it changes map to those SVG addresses.
+    /// NB: Masked text was transformed before it was masked, and has no white space left to process.
+    fn apply_svg_text_transform(&self, text_node: Node, text: Vec<u16>) -> Vec<u16> {
+        let inherited_text = self.style(self.parent(text_node)).inherited_text();
+        if inherited_text.text_transform == crate::css::css_enums::text_transform::NONE
+            || inherited_text.text_security != crate::css::css_enums::text_security::NONE
+        {
+            return text;
+        }
+        let uses_locale = super::rendered_text::transform_uses_locale(inherited_text.text_transform);
+        let locale = self
+            .run
+            .pass
+            .arena()
+            .published_text_source(text_node, uses_locale)
+            .locale;
+        let length = text.len();
+        let transformed = super::text_transform::render_text(
+            text,
+            locale.as_deref(),
+            super::text_transform::TextRenderingOptions {
+                text_transform: inherited_text.text_transform,
+                text_security: crate::css::css_enums::text_security::NONE,
+                white_space_collapse: crate::css::css_enums::white_space_collapse::PRESERVE,
+                is_password_input: false,
+                dom_start_offset: 0,
+                dom_length_in_code_units: length,
+            },
+        );
+        if !transformed.edits.is_empty() {
+            self.svg_text_transform_edits
+                .borrow_mut()
+                .insert(text_node, transformed.edits);
+        }
+        transformed.text
     }
 
     /// The characters of the run of adjacent text nodes that starts at `text_node`: its own, and those of the text
@@ -1661,6 +1767,44 @@ impl<'pass> SvgFormattingContext<'pass> {
             next = self.next_sibling(next);
         }
         Some(std::sync::Arc::from(run))
+    }
+
+    // SVG DOM indices address UTF-16 code units before text transformation. Keep the painted glyphs and their
+    // spacing, and publish the cell occupied by each source code unit of a masked or transformed run.
+    // https://svgwg.org/svg2-draft/text.html#TermAddressableCharacter
+    fn append_svg_run_dom_cells(
+        &self,
+        mut node: Node,
+        cells: Vec<FfiSvgTextCharacterCell>,
+        out: &mut Vec<FfiSvgTextCharacterCell>,
+    ) {
+        let inherited_text = self.style(self.parent(node)).inherited_text();
+        let is_masked = inherited_text.text_security != crate::css::css_enums::text_security::NONE;
+        if !is_masked && inherited_text.text_transform == crate::css::css_enums::text_transform::NONE {
+            out.extend(cells);
+            return;
+        }
+        let mut cells = cells.as_slice();
+        while !node.is_invalid() && node_facts::kind_is_text(self.node_kind(node)) {
+            let current = node;
+            node = self.next_sibling(node);
+            if is_masked {
+                let content = self.run.pass.text_content(current);
+                let Some(masked_text) = &content.svg_source_text else {
+                    continue;
+                };
+                let (node_cells, rest) = cells.split_at(masked_text.len());
+                append_svg_text_cells_through_edits(node_cells, content.rendered_text_edits(), out);
+                cells = rest;
+                continue;
+            }
+            let (node_cells, rest) = cells.split_at(self.processed_svg_text(current).len());
+            match self.svg_text_transform_edits.borrow().get(&current) {
+                Some(edits) => append_svg_text_cells_through_edits(node_cells, edits, out),
+                None => out.extend_from_slice(node_cells),
+            }
+            cells = rest;
+        }
     }
 
     fn append_svg_source_text(&self, text_node: Node, out: &mut Vec<u16>) {
@@ -1828,9 +1972,15 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     /// https://drafts.csswg.org/css-inline/#dominant-baseline-property
+    /// https://drafts.csswg.org/css-inline/#alignment-baseline-property
+    /// NB: The text of an element sits on the baseline its alignment-baseline names, where that's other than 'baseline',
+    ///     and on its dominant baseline otherwise.
     fn svg_dominant_baseline_offset(&self, style: StyleValues<'_>) -> f32 {
         let svg = style.inherited_svg();
-        let metric = if svg.has_dominant_baseline {
+        let svg_reset = style.svg_reset();
+        let metric = if svg_reset.has_alignment_baseline {
+            svg_reset.alignment_baseline
+        } else if svg.has_dominant_baseline {
             svg.dominant_baseline
         } else {
             // https://drafts.csswg.org/css-inline/#valdef-dominant-baseline-auto
@@ -1883,7 +2033,11 @@ impl<'pass> SvgFormattingContext<'pass> {
             let code_point = code_point_at(text, offset);
             let next_offset = offset + code_point_length_at(text, offset);
             let next_code_point = (next_offset < text.len()).then(|| code_point_at(text, next_offset));
-            libgfx_rust::font::emoji_presentation_for_code_point(code_point, next_code_point)
+            let offset_after_next =
+                next_offset + next_code_point.map_or(0, |_| code_point_length_at(text, next_offset));
+            let code_point_after_next = (next_code_point.is_some() && offset_after_next < text.len())
+                .then(|| code_point_at(text, offset_after_next));
+            libgfx_rust::font::emoji_presentation_for_code_point(code_point, next_code_point, code_point_after_next)
         };
         let font_for =
             |offset: usize| frozen_font_list.font_for_code_point(code_point_at(text, offset), presentation_at(offset));
@@ -1900,7 +2054,17 @@ impl<'pass> SvgFormattingContext<'pass> {
             //     and neither does one before a character with a variation selector that asks for its text
             //     presentation: Those are no part of an emoji sequence.
             if code_point == ZERO_WIDTH_JOINER {
-                joiner_joins_emoji = libgfx_rust::font::code_point_ends_emoji_zwj_element(previous_code_point);
+                // NB: A pictograph that defaults to text presentation ends an emoji ZWJ element too, when the joiner
+                //     joins it to another pictograph.
+                let joined_offset = offset + code_point_length_at(text, offset);
+                let joined_code_point = (joined_offset < text.len()).then(|| code_point_at(text, joined_offset));
+                joiner_joins_emoji = libgfx_rust::font::code_point_ends_emoji_zwj_element(previous_code_point)
+                    || libgfx_rust::font::emoji_presentation_for_code_point(
+                        previous_code_point,
+                        Some(code_point),
+                        joined_code_point,
+                    )
+                    .is_emoji;
             }
             let presentation = presentation_at(offset);
             let is_joined = previous_code_point == ZERO_WIDTH_JOINER
@@ -2287,7 +2451,11 @@ impl<'pass> SvgFormattingContext<'pass> {
                 paint_parts.add_decoration_lines(after_child, lines_over);
 
                 contents.glyph_cells.unite(shaped.glyph_cells);
-                contents.character_cells.extend(shaped.character_cells);
+                let first_own_cell = contents.character_cells.len();
+                self.append_svg_run_dom_cells(child, shaped.character_cells, &mut contents.character_cells);
+                contents
+                    .own_character_cells
+                    .extend_from_slice(&contents.character_cells[first_own_cell..]);
             } else if matches!(kind, NodeKind::SVGTextBox | NodeKind::SVGTextPathBox) {
                 // <text> and <tspan> elements can contain more text elements, whose glyph cells count toward this
                 // box too.
@@ -2467,31 +2635,117 @@ impl<'pass> SvgFormattingContext<'pass> {
     /// https://svgwg.org/svg2-draft/text.html#TextPathElement
     /// FIXME: The character cells are those of the text shaped from the origin; they aren't moved
     ///        onto the path or rotated along it, so only their advances are meaningful.
-    fn svg_text_path_box_path(&self, text_path_box: Node) -> (libgfx_rust::path::Path, Vec<FfiSvgTextCharacterCell>) {
+    /// Where some of its own text follows a child element, also returns the parts its path paints in.
+    fn svg_text_path_box_path(
+        &self,
+        text_path_box: Node,
+    ) -> (
+        libgfx_rust::path::Path,
+        Vec<FfiSvgTextCharacterCell>,
+        Option<Vec<fragment_tree::SvgTextSegment>>,
+    ) {
         let empty = || libgfx_rust::path::Path::new();
         let Some(shape_path) = self.svg_referenced_shape_path(text_path_box) else {
-            return (empty(), Vec::new());
+            self.text_on_path_glyphs.borrow_mut().clear();
+            return (empty(), Vec::new(), None);
         };
 
         let style = self.style(text_path_box);
-        let mut runs = Vec::new();
+        // The runs of the <textPath>'s own text, each with the child element it follows, or the invalid node for the
+        // text that comes before every child element: Text that follows a child paints after it.
+        let mut runs: Vec<(Node, Vec<libgfx_rust::path::GlyphRun>)> = Vec::new();
+        let mut after_child = Node::INVALID;
         let mut character_cells = Vec::new();
+        // NB: Each text content element inside the <textPath> paints its own text, in its own style.
+        let mut runs_of_elements: Vec<(Node, Vec<libgfx_rust::path::GlyphRun>)> = Vec::new();
+        let mut cells_of_elements: std::collections::HashMap<Node, Vec<FfiSvgTextCharacterCell>> =
+            std::collections::HashMap::new();
         let mut advance = 0.0f32;
+        // https://svgwg.org/svg2-draft/text.html#TextLayoutPath
+        // Align the glyph vertically relative to the midpoint-on-the-path based on property alignment-baseline and any
+        // specified values for attribute 'dy' on a 'tspan' element.
+        // NB: A 'dx' moves the text along the path, and a 'dy' moves it off the path. Each is the shift of the first
+        //     character of the element that has it, and stays for the characters after it.
+        let mut shift_off_path = 0.0f32;
+        // NB: A 'dx' on the first character moves the text along the path once it's anchored, so it's no part of the
+        //     extent the anchoring takes.
+        let mut leading_dx = None;
+        // The span the characters cover, which text-anchor places, as for ordinary text: A 'dx' can move a character
+        // back past the ones before it.
+        let (mut extent_start, mut extent_end) = (f32::INFINITY, f32::NEG_INFINITY);
+        // OPTIMIZATION: Which text node is the first that the <textPath> and its <text> render is the same for every text
+        //               node, so it's found once.
+        let first_on_path = self.first_rendered_svg_text_node(text_path_box);
+        let first_of_text = self.first_rendered_svg_text_node(self.parent(text_path_box));
         self.for_each_svg_text_node(text_path_box, |node| {
+            // NB: A text node right after another one is shaped as part of the run that one starts, so the run takes the
+            //     shift of its first character: that of the first of its text nodes that has text left once white space
+            //     is processed.
             let Some(text) = self.svg_text_run_starting_at(node) else {
                 return;
             };
+            let mut first_rendered = node;
+            while self.processed_svg_text(first_rendered).is_empty() {
+                let next = self.next_sibling(first_rendered);
+                if next.is_invalid() || !node_facts::kind_is_text(self.node_kind(next)) {
+                    first_rendered = node;
+                    break;
+                }
+                first_rendered = next;
+            }
+            let (dx, dy) = self.svg_text_on_path_shift_at(first_rendered, text_path_box, first_on_path, first_of_text);
+            advance += dx;
+            shift_off_path += dy;
+            if leading_dx.is_none() && !text.is_empty() {
+                leading_dx = Some(advance);
+            }
+            let run_style = self.style(self.parent(node));
             // AD-HOC: Text on a path is laid out independently, so the 'textLength' of the <text> it's in doesn't
             //         adjust it.
             let shaped = self.shape_svg_text(
-                self.style(self.parent(node)),
+                run_style,
                 &text,
-                FfiFloatPoint { x: advance, y: 0.0 },
+                FfiFloatPoint {
+                    x: advance,
+                    y: self.svg_dominant_baseline_offset(run_style) + shift_off_path,
+                },
                 0.0,
             );
+            let run_start = advance;
             advance += shaped.advance;
-            runs.extend(shaped.runs);
-            character_cells.extend(shaped.character_cells);
+            // NB: A run that white space processing left empty, such as a line break before a <tspan>, covers nothing.
+            if !text.is_empty() {
+                extent_start = extent_start.min(run_start).min(advance);
+                extent_end = extent_end.max(run_start).max(advance);
+            }
+            let first_cell = character_cells.len();
+            self.append_svg_run_dom_cells(node, shaped.character_cells, &mut character_cells);
+            let owner = self.parent(node);
+            if owner == text_path_box || self.node_kind(owner) != NodeKind::SVGTextBox {
+                match runs.last_mut() {
+                    Some((child, own_runs)) if *child == after_child => own_runs.extend(shaped.runs),
+                    _ => runs.push((after_child, shaped.runs)),
+                }
+                return;
+            }
+            let mut child = owner;
+            while self.parent(child) != text_path_box {
+                child = self.parent(child);
+            }
+            after_child = child;
+            match runs_of_elements.iter_mut().find(|(element, _)| *element == owner) {
+                Some((_, element_runs)) => element_runs.extend(shaped.runs),
+                None => runs_of_elements.push((owner, shaped.runs)),
+            }
+            // The cells of an element's characters count toward each element it's in, as they do in a <text>.
+            let mut element = owner;
+            while element != text_path_box && self.node_kind(element) == NodeKind::SVGTextBox {
+                cells_of_elements
+                    .entry(element)
+                    .or_default()
+                    .extend_from_slice(&character_cells[first_cell..]);
+                element = self.parent(element);
+            }
         });
 
         // https://svgwg.org/svg2-draft/text.html#TextPathElementStartOffsetAttribute
@@ -2500,14 +2754,88 @@ impl<'pass> SvgFormattingContext<'pass> {
             .text_path_start_offset
             .resolve_relative_to(shape_path.length());
         // FIXME: Take writing mode and text direction into account.
-        match style.inherited_svg().text_anchor {
-            text_anchor::START => {}
-            text_anchor::MIDDLE => start_offset -= advance / 2.0,
-            text_anchor::END => start_offset -= advance,
-            _ => unreachable!("invalid text-anchor value"),
+        if extent_start <= extent_end {
+            let leading_dx = leading_dx.unwrap_or(0.0);
+            match style.inherited_svg().text_anchor {
+                text_anchor::START => start_offset -= extent_start - leading_dx,
+                text_anchor::MIDDLE => start_offset -= (extent_start + extent_end) / 2.0 - leading_dx,
+                text_anchor::END => start_offset -= extent_end - leading_dx,
+                _ => unreachable!("invalid text-anchor value"),
+            }
         }
 
-        (shape_path.place_glyph_runs_along(&runs, start_offset), character_cells)
+        let mut text_on_path_glyphs = self.text_on_path_glyphs.borrow_mut();
+        text_on_path_glyphs.clear();
+        for (element, element_runs) in runs_of_elements {
+            let cells = cells_of_elements.remove(&element).unwrap_or_default();
+            text_on_path_glyphs.insert(
+                element,
+                (shape_path.place_glyph_runs_along(&element_runs, start_offset), cells),
+            );
+        }
+        for (element, cells) in cells_of_elements {
+            text_on_path_glyphs.insert(element, (libgfx_rust::path::Path::new(), cells));
+        }
+        let mut path = empty();
+        let mut segments = Vec::new();
+        let paints_as_one_path = runs.iter().all(|(after_child, _)| after_child.is_invalid());
+        for (after_child, own_runs) in runs {
+            let part = shape_path.place_glyph_runs_along(&own_runs, start_offset);
+            path.append_path(&part);
+            if !paints_as_one_path {
+                segments.push(fragment_tree::SvgTextSegment {
+                    after_child,
+                    path: part,
+                    color_glyph_runs: Vec::new(),
+                });
+            }
+        }
+        (path, character_cells, (!paints_as_one_path).then_some(segments))
+    }
+
+    /// The 'dx' and 'dy' that shift the first character of a text node in a <textPath>: those of the innermost element
+    /// that has each, of the elements whose first character it is. That takes in the <text>, where the <textPath>'s
+    /// characters are the first it renders.
+    fn svg_text_on_path_shift_at(
+        &self,
+        text_node: Node,
+        text_path_box: Node,
+        first_on_path: Option<Node>,
+        first_of_text: Option<Node>,
+    ) -> (f32, f32) {
+        let (mut dx, mut dy) = (None, None);
+        let mut element = self.parent(text_node);
+        loop {
+            let first = if element == text_path_box {
+                first_on_path
+            } else if element == self.parent(text_path_box) {
+                first_of_text
+            } else {
+                self.first_rendered_svg_text_node(element)
+            };
+            if first != Some(text_node) {
+                break;
+            }
+            if element == text_path_box {
+                element = self.parent(element);
+                continue;
+            }
+            if self.node_kind(element) != NodeKind::SVGTextBox {
+                break;
+            }
+            let attributes = self.svg_attributes(element);
+            if dx.is_none() && attributes.text_dx.kind != SVG_LENGTH_KIND_NONE {
+                dx = Some(self.resolve_svg_text_length(element, attributes.text_dx, self.viewport_width));
+            }
+            if dy.is_none() && attributes.text_dy.kind != SVG_LENGTH_KIND_NONE {
+                dy = Some(self.resolve_svg_text_length(element, attributes.text_dy, self.viewport_height));
+            }
+            if attributes.is_text_element {
+                break;
+            }
+            element = self.parent(element);
+        }
+        (dx.unwrap_or(0.0), dy.unwrap_or(0.0))
     }
 
     /// The geometry of the shape element an SVG reference names, read from what that element
@@ -3095,12 +3423,23 @@ impl<'pass> SvgFormattingContext<'pass> {
         let kind = self.node_kind(graphics_box);
         let mut text_segments = None;
         let mut text_children_bounding_box = SvgCssPixelRect::default();
+        let mut own_character_cells = None;
         let (path, glyph_cells, character_cells) = match kind {
             NodeKind::SVGGeometryBox => (self.svg_geometry_path(graphics_box), None, None),
+            NodeKind::SVGTextBox if self.text_on_path_glyphs.borrow().contains_key(&graphics_box) => {
+                let (path, cells) = self
+                    .text_on_path_glyphs
+                    .borrow_mut()
+                    .remove(&graphics_box)
+                    .expect("the element's glyphs on the path");
+                text_children_bounding_box = self.layout_text_content_children_on_path(run, graphics_box);
+                (path, None, Some(cells))
+            }
             NodeKind::SVGTextBox => {
                 let contents = self.layout_svg_text_box_contents(run, graphics_box);
                 text_segments = contents.segments;
                 text_children_bounding_box = contents.children_bounding_box;
+                own_character_cells = Some(std::sync::Arc::new(contents.own_character_cells));
                 (
                     contents.path,
                     Some(contents.glyph_cells),
@@ -3108,7 +3447,9 @@ impl<'pass> SvgFormattingContext<'pass> {
                 )
             }
             NodeKind::SVGTextPathBox => {
-                let (path, character_cells) = self.svg_text_path_box_path(graphics_box);
+                let (path, character_cells, segments) = self.svg_text_path_box_path(graphics_box);
+                text_segments = segments;
+                text_children_bounding_box = self.layout_text_content_children_on_path(run, graphics_box);
                 (path, None, Some(character_cells))
             }
             _ => (libgfx_rust::path::Path::new(), None, None),
@@ -3141,6 +3482,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             svg.path = Some(std::sync::Arc::new(fragment_tree::CommittedSvgPath::new(path)));
             svg.text_segments = text_segments.map(std::sync::Arc::new);
             svg.text_character_cells = character_cells;
+            svg.text_own_character_cells = own_character_cells;
         });
         let object_bounding_box = if is_text_content_box {
             bounding_box.to_float_rect()
@@ -3148,6 +3490,31 @@ impl<'pass> SvgFormattingContext<'pass> {
             path_bounding_box
         };
         self.set_content_rect(graphics_box, cells, bounding_box, object_bounding_box)
+    }
+
+    /// Lays out the text content elements inside a <textPath>, or inside one of those, each with the glyphs its own text
+    /// has on the path, and returns the box they cover.
+    fn layout_text_content_children_on_path(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        element: Node,
+    ) -> SvgCssPixelRect {
+        let mut bounding_box = SvgCssPixelRect::default();
+        let children: Vec<Node> = self.run.pass.children(element).collect();
+        for child in children {
+            if self.node_kind(child) != NodeKind::SVGTextBox {
+                continue;
+            }
+            // NB: An element with no text on the path, such as one in a <textPath> whose path doesn't resolve, renders
+            //     nothing, rather than its text laid out as if it weren't on a path.
+            self.text_on_path_glyphs
+                .borrow_mut()
+                .entry(child)
+                .or_insert_with(|| (libgfx_rust::path::Path::new(), Vec::new()));
+            let geometry = self.layout_graphics_element(run, child);
+            bounding_box.unite(float_rect_to_css_pixels(geometry.stroke_bounding_box));
+        }
+        bounding_box
     }
 
     // https://w3c.github.io/svgwg/svg2-draft/embedded.html#Placement
@@ -3307,10 +3674,9 @@ impl<'pass> SvgFormattingContext<'pass> {
 fn font_metrics_for_length_resolution(style: StyleValues<'_>) -> crate::css::style_compute::FfiFontMetrics {
     let font = style.font().first_available_font_metrics();
     crate::css::style_compute::FfiFontMetrics {
-        font_size: style.font_size().to_double(),
+        font_size: style.font().font_size_for_lengths(),
         x_height: CssPixels::nearest_value_for_f32(font.x_height).to_double(),
-        // FIXME: This is only approximately the cap height, exactly as Length::FontMetrics has it.
-        cap_height: CssPixels::nearest_value_for_f32(font.ascent).to_double(),
+        cap_height: CssPixels::nearest_value_for_f32(font.cap_height).to_double(),
         zero_advance: CssPixels::nearest_value_for_f32(font.zero_advance).to_double(),
         line_height: style.line_height().to_double(),
     }

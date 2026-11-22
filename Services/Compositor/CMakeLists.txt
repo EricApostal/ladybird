@@ -1,6 +1,6 @@
 set(SOURCES
     AnimatedImage.cpp
-    BackingStoreManager.cpp
+    BackingStoreFactory.cpp
     BitmapExport.cpp
     Canvas2DCommandPlayer.cpp
     CanvasHost.cpp
@@ -15,7 +15,6 @@ set(SOURCES
     ConnectionFromClient.cpp
     ConnectionFromPresentation.cpp
     ConnectionFromWebContent.cpp
-    HostWebGLContext.cpp
     OpenGLContext.cpp
     PaintingSurface.cpp
     PresentableSurface.cpp
@@ -25,18 +24,7 @@ set(SOURCES
     VideoFrameHolds.cpp
     VideoFrameSkia.cpp
     VSyncScheduler.cpp
-    WebGLObjectMap.cpp
     WindowServer.cpp
-)
-
-invoke_py_generator(
-    "WebGLCommandReplayer.cpp"
-    "generate_compositor_webgl_replayer.py"
-    "${LADYBIRD_SOURCE_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.json"
-    "WebGLCommandReplayer.h"
-    "WebGLCommandReplayer.cpp"
-    arguments -j "${LADYBIRD_SOURCE_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.json"
-    dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_webgl.py"
 )
 
 set(GENERATED_SOURCES
@@ -48,8 +36,6 @@ set(GENERATED_SOURCES
     CompositorWebContentServerEndpoint.h
     RenderClockClientEndpoint.h
     RenderClockServerEndpoint.h
-    ${CMAKE_CURRENT_BINARY_DIR}/../../Libraries/LibCompositing/WebGL/GLFunctions.cpp
-    WebGLCommandReplayer.cpp
 )
 
 import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME compositor_core FEATURES allocator FFI_HEADER CompositorCoreRustFFI.h)
@@ -102,7 +88,9 @@ endif()
 
 if (WIN32 AND HAS_DIRECTX)
     target_sources(compositorservice PRIVATE DirectCompositionWindowServer.cpp)
-    target_link_libraries(compositorservice PRIVATE LibThreading dcomp)
+    # dcomp.h declares composition textures only from NTDDI_WIN10_NI on.
+    set_source_files_properties(DirectCompositionWindowServer.cpp PROPERTIES COMPILE_DEFINITIONS NTDDI_VERSION=0x0A00000C)
+    target_link_libraries(compositorservice PRIVATE LibThreading d3d11 dcomp)
 endif()
 
 if (WIN32)

@@ -37,9 +37,11 @@
 #include <UI/Qt/Popover.h>
 #include <UI/Qt/SiteSettingsPopover.h>
 #include <UI/Qt/StringUtils.h>
+#include <UI/Qt/SuggestionProvider.h>
 #include <UI/Qt/SystemAppearance.h>
 #include <UI/Qt/Theme.h>
 
+#include <QAction>
 #include <QApplication>
 #include <QCalendarWidget>
 #include <QClipboard>
@@ -107,16 +109,16 @@ class ZoomPopover final : public Popover {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    explicit ZoomPopover(QWidget* parent)
+    ZoomPopover(QWidget* parent, QAction& zoom_level)
         : Popover(parent)
     {
         setAccessibleName("Page zoom");
         card().setObjectName("LadybirdZoomPopover");
-        card().setFixedWidth(232);
+        card().setFixedWidth(148);
 
         auto* layout = new QVBoxLayout(&card());
-        layout->setContentsMargins(14, 14, 14, 14);
-        layout->setSpacing(10);
+        layout->setContentsMargins(10, 10, 10, 8);
+        layout->setSpacing(4);
 
         auto* controls = new QHBoxLayout;
         controls->setSpacing(6);
@@ -125,20 +127,26 @@ public:
             button->setObjectName("LadybirdZoomButton");
             button->setIcon(create_chrome_icon(icon, Theme::panel().body));
             button->setIconSize({ 16, 16 });
-            button->setFixedSize(30, 28);
+            button->setFixedSize(26, 24);
             button->setAccessibleName(name);
             button->setToolTip(name);
             QObject::connect(button, &QPushButton::clicked, this, [this, callback] {
                 callback(*this);
-                update_level();
             });
             return button;
         };
         controls->addWidget(make_button(ChromeIcon::ZoomOut, "Zoom out", [](ZoomPopover& popover) { if (popover.on_zoom_out) popover.on_zoom_out(); }));
-        m_level = new QLabel(&card());
-        m_level->setObjectName("LadybirdZoomLevel");
-        m_level->setAlignment(Qt::AlignCenter);
-        controls->addWidget(m_level, 1);
+
+        auto* level = new QLabel(&card());
+        level->setObjectName("LadybirdZoomLevel");
+        level->setAlignment(Qt::AlignCenter);
+        controls->addWidget(level, 1);
+        auto update_level = [&zoom_level, level]() {
+            level->setText(zoom_level.isVisible() && !zoom_level.text().isEmpty() ? zoom_level.text() : QStringLiteral("100%"));
+        };
+        QObject::connect(&zoom_level, &QAction::changed, level, update_level);
+        update_level();
+
         controls->addWidget(make_button(ChromeIcon::NewTab, "Zoom in", [](ZoomPopover& popover) { if (popover.on_zoom_in) popover.on_zoom_in(); }));
         layout->addLayout(controls);
 
@@ -150,26 +158,15 @@ public:
         QObject::connect(reset, &QPushButton::clicked, this, [this] {
             if (on_reset)
                 on_reset();
-            update_level();
         });
         footer->addWidget(reset);
         footer->addStretch(1);
         layout->addLayout(footer);
     }
 
-    void update_level()
-    {
-        if (current_level)
-            m_level->setText(qformatted("{}%", round_to<int>(current_level() * 100)));
-    }
-
     Function<void()> on_zoom_in;
     Function<void()> on_zoom_out;
     Function<void()> on_reset;
-    Function<double()> current_level;
-
-private:
-    QLabel* m_level { nullptr };
 };
 
 Tab::Tab(BrowserWindow* window, Optional<u64> hub_view_id)
@@ -227,7 +224,7 @@ void Tab::initialize(Optional<u64> hub_view_id)
     m_find_in_page->setVisible(false);
 
     // The window's toolbar holds the address field while it shows this tab.
-    m_location_edit = new LocationEdit(this, m_window->is_private());
+    m_location_edit = new LocationEdit(this, Application::settings(), make<SuggestionProvider>(m_window->is_private()));
     m_location_edit->hide();
     m_location_edit->installEventFilter(this);
 
@@ -260,7 +257,10 @@ void Tab::initialize(Optional<u64> hub_view_id)
     QObject::disconnect(bookmark_action, &QAction::triggered, nullptr, nullptr);
     QObject::connect(bookmark_action, &QAction::triggered, this, [this] { show_bookmark_popover(); });
     m_location_edit->set_trailing_action(bookmark_action);
-    m_location_edit->set_zoom_action(create_application_action(*m_location_edit, view().reset_zoom_action(), IncludeActionIcon::No));
+
+    auto* zoom_level = create_application_action(*m_location_edit, view().reset_zoom_action(), IncludeActionIcon::No);
+    m_location_edit->set_zoom_action(zoom_level);
+
     // The translate button shows the page's translation menu, rather than translating the page at once.
     m_translate_action = create_application_action(*m_location_edit, view().translate_action());
     m_location_edit->set_translate_action(m_translate_action);
@@ -269,6 +269,9 @@ void Tab::initialize(Optional<u64> hub_view_id)
         m_performance_stats = stats;
         emit performance_stats_changed();
     };
+    view().on_compositor_layers_change = [this](Compositing::CompositorLayersDescription const& layers) {
+        m_compositor_layers = layers;
+    };
 
     recreate_location_edit_icons();
     update_chrome_style();
@@ -276,8 +279,8 @@ void Tab::initialize(Optional<u64> hub_view_id)
     m_location_edit->on_site_settings_requested = [this] {
         show_site_settings_popover();
     };
-    m_location_edit->on_zoom_requested = [this] {
-        show_zoom_popover();
+    m_location_edit->on_zoom_requested = [this, zoom_level] {
+        show_zoom_popover(*zoom_level);
     };
     m_location_edit->on_translate_requested = [this] {
         show_translation_menu();
@@ -287,12 +290,23 @@ void Tab::initialize(Optional<u64> hub_view_id)
         update_tab_icon();
     });
 
+    // NB: A tab that was discarded keeps its view until the event loop deletes it, and messages from the view that were
+    //     on their way still arrive, but the tab is no longer one of the window's tabs.
     view().on_activate_tab = [this] {
-        m_window->activate_tab(tab_index());
+        if (auto index = tab_index(); index >= 0)
+            m_window->activate_tab(index);
     };
+
+    view().on_discard = [this] {
+        m_window->discard_tab(*this);
+    };
+    view().set_pinned(m_is_pinned);
+    view().set_current_tab_of_window(m_window->current_tab() == this);
 
     view().on_close = [this] {
         auto index = tab_index();
+        if (index < 0)
+            return;
         if (m_tab_to_activate_on_close) {
             if (auto index_to_activate = m_window->tab_index(m_tab_to_activate_on_close); index_to_activate >= 0)
                 m_window->activate_tab(index_to_activate);
@@ -975,6 +989,8 @@ void Tab::create_tab_context_menu()
 // The window's toolbar can hold the address field while the tab goes away with the window.
 Tab::~Tab()
 {
+    if (m_deferred_tab.has_value() && m_deferred_tab->discarded_tab_state_id.has_value())
+        WebContentView::forget_state_of_discarded_tab(*m_deferred_tab->discarded_tab_state_id);
     delete m_location_edit;
 }
 
@@ -993,15 +1009,19 @@ void Tab::ensure_loaded()
 
     // Until initialize() has built the view, url() reads the deferred tab's URL, so the deferred tab stays until then.
     auto deferred_url = m_deferred_tab->url;
+    auto history = AK::move(m_deferred_tab->history);
+    auto discarded_tab_state_id = m_deferred_tab->discarded_tab_state_id;
     initialize({});
     m_deferred_tab.clear();
+
+    if (discarded_tab_state_id.has_value())
+        view().restore_state_of_discarded_tab(*discarded_tab_state_id);
 
     if (m_session_tab_id.has_value())
         view().set_session_tab_id(*m_session_tab_id);
     emit loaded();
 
-    Optional<WebView::SessionHistorySnapshot> history;
-    if (m_session_tab_id.has_value())
+    if (!history.has_value() && m_session_tab_id.has_value())
         history = m_window->session().load_tab_history(*m_session_tab_id);
     if (!history.has_value() || view().restore_session_history_from_snapshot(history.release_value()).is_error())
         navigate(deferred_url);
@@ -1073,6 +1093,8 @@ void Tab::set_pinned(bool pinned)
 {
     m_is_pinned = pinned;
     m_pin_tab_action->setText(pinned ? "Un&pin Tab" : "&Pin Tab");
+    if (is_loaded())
+        view().set_pinned(pinned);
 }
 
 void Tab::navigate(URL::URL const& url)
@@ -1146,6 +1168,12 @@ void Tab::enter_report_review(Tab* tab_to_activate_on_close, Optional<QString> t
     };
     listener.on_load_finish = [this](URL::URL const&) { m_has_loaded_report_review_page = true; };
     m_report_review_navigation_listener = view().add_navigation_listener(AK::move(listener));
+}
+
+void Tab::did_replace_tab(Tab const& old_tab, Tab& new_tab)
+{
+    if (m_tab_to_activate_on_close == &old_tab)
+        m_tab_to_activate_on_close = &new_tab;
 }
 
 // A report on its way keeps being sent, as it does when the tab closes.
@@ -1457,23 +1485,21 @@ void Tab::show_translation_menu()
     m_translation_menu->popup(button.mapToGlobal(QPoint { 0, button.height() }));
 }
 
-void Tab::show_zoom_popover()
+void Tab::show_zoom_popover(QAction& zoom_level)
 {
     if (!m_zoom_popover) {
-        auto* popover = new ZoomPopover(this);
+        auto* popover = new ZoomPopover(this, zoom_level);
         popover->on_zoom_in = [this] { view().zoom_in(); };
         popover->on_zoom_out = [this] { view().zoom_out(); };
         popover->on_reset = [this] {
             view().reset_zoom();
             m_zoom_popover->close();
         };
-        popover->current_level = [this] { return view().zoom_level(); };
         m_zoom_popover = popover;
     }
 
-    auto& popover = static_cast<ZoomPopover&>(*m_zoom_popover);
+    auto& popover = *m_zoom_popover;
     popover.setStyleSheet(ChromeStyle::zoom_popover_style_sheet(Theme::chrome_palette(*this)));
-    popover.update_level();
     popover.adjustSize();
     // The panel hangs from the address field, lined up with its right edge.
     move_popover_below(popover, *m_location_edit);

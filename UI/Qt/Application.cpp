@@ -52,11 +52,13 @@
 #include <LibWebView/Translator.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
+#include <LibWebView/WebCompatReport.h>
 #include <LibWebView/WebContentPage.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/BookmarkDialog.h>
 #include <UI/Qt/Bookmarks.h>
 #include <UI/Qt/ChromeLayout.h>
+#include <UI/Qt/CompositorLayersWindow.h>
 #include <UI/Qt/DownloadsPage.h>
 #include <UI/Qt/EventLoopImplementationQt.h>
 #include <UI/Qt/ExternalURLHandler.h>
@@ -77,12 +79,16 @@
 
 #if defined(AK_OS_MACOS)
 #    include <UI/Qt/ApplicationIcon.h>
+#    include <UI/Qt/DefaultBrowserMacOS.h>
 #    include <UI/Qt/LaunchURLsMacOS.h>
 #    include <UI/Qt/MacWindow.h>
 #    include <UI/Qt/MicrophoneAuthorizerMacOS.h>
 #    include <UI/Qt/ScrollbarPreferencesMac.h>
-#    include <UI/Qt/SoftwareUpdaterMac.h>
 #    include <UI/Qt/SpellCheckerMac.h>
+#endif
+
+#if defined(LADYBIRD_HAS_SPARKLE)
+#    include <UI/Qt/SoftwareUpdaterMac.h>
 #endif
 
 #if defined(LADYBIRD_HAS_TRANSLATOR)
@@ -90,6 +96,7 @@
 #endif
 
 #if defined(AK_OS_LINUX)
+#    include <UI/Qt/DefaultBrowserLinux.h>
 #    include <UI/Qt/X11Window.h>
 #endif
 
@@ -546,6 +553,7 @@ public:
         m_help_menu->addSeparator();
         m_help_menu->addAction(create_application_action(*m_application_widget, application.open_about_page_action(), IncludeActionIcon::No));
 
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
         auto* check_for_updates_action = make_action("Check for Updates…");
         // NB: On macOS, this moves the item into the application menu, below About Ladybird.
         check_for_updates_action->setMenuRole(QAction::ApplicationSpecificRole);
@@ -553,13 +561,18 @@ public:
             HubConnection::the().async_check_for_updates(WebView::UpdateCheckTrigger::UserInitiated);
         });
         m_help_menu->addAction(check_for_updates_action);
+#endif
 
+#if defined(LADYBIRD_HAS_UPDATE_CHECK) || defined(AK_OS_LINUX)
+        m_debug_menu->addSeparator();
+#endif
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
         auto* simulate_update_action = make_action("Simulate Available Update");
         QObject::connect(simulate_update_action, &QAction::triggered, this, [] {
             HubConnection::the().async_check_for_updates(WebView::UpdateCheckTrigger::Debug);
         });
-        m_debug_menu->addSeparator();
         m_debug_menu->addAction(simulate_update_action);
+#endif
 #if defined(AK_OS_LINUX)
         auto* simulate_replaced_installation_action = make_action("Simulate Replaced Installation");
         QObject::connect(simulate_replaced_installation_action, &QAction::triggered, this, [] {
@@ -667,6 +680,8 @@ private:
 // come from a page.
 class PNGMimeConverter final : public QUtiMimeConverter {
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     virtual QString utiForMime(QString const& mime) const override
     {
         return mime == "image/png" ? QStringLiteral("public.png") : QString {};
@@ -719,6 +734,15 @@ ErrorOr<NonnullOwnPtr<Application>> Application::create(Main::Arguments const& a
     auto transports = TRY(IPC::TransportHandle::create_pair());
     application->m_connection_from_ui = Hub::ConnectionFromUI::construct(TRY(transports.first.create_transport()));
     application->m_hub_connection = adopt_ref(*new HubConnection(TRY(transports.second.create_transport())));
+
+    // The Hub reads the platform's preferences from us when it needs them, but open pages only learn of a change once
+    // the Hub sends the preference again.
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::reduced_motion_changed, [] {
+        hub().platform_motion_preference_changed();
+    });
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::contrast_changed, [] {
+        hub().platform_contrast_preference_changed();
+    });
 #endif
     return application;
 }
@@ -767,6 +791,8 @@ Hub::UIInfo Application::current_ui_info() const
     info.reports_scroll_momentum = platform_reports_scroll_momentum();
     info.scrolls_elastically = platform_scrolls_elastically();
     info.scrollbar_track_press_jumps = platform_scrollbar_track_press_jumps();
+    info.prefers_reduced_motion = platform_prefers_reduced_motion();
+    info.prefers_more_contrast = platform_prefers_more_contrast();
     info.preferred_languages = platform_preferred_languages();
     info.presentation_gpu_device = platform_presentation_gpu_device();
     info.presentation_drm_format_modifiers = platform_presentation_drm_format_modifiers();
@@ -809,6 +835,10 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
 #    if defined(AK_OS_MACOS)
     m_spell_checker = create_platform_spell_checker();
     m_microphone_authorizer = make<MicrophoneAuthorizerMacOS>();
+    m_default_browser = make<DefaultBrowserMacOS>();
+#    elif defined(AK_OS_LINUX)
+    auto desktop_id = ByteString::formatted("{}.desktop", ak_byte_string_from_qstring(QGuiApplication::desktopFileName()));
+    m_default_browser = make<DefaultBrowserLinux>(move(desktop_id));
 #    endif
 
     IPC::MessageBuffer ui_info_buffer;
@@ -941,6 +971,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     m_browser_options.devtools_port = state.devtools_port;
     if (state.devtools_enabled)
         m_devtools_port = state.devtools_port;
+    m_gpu_painting_enabled = state.gpu_painting_enabled;
     m_profile_is_temporary = state.profile_is_temporary;
 #    if defined(AK_OS_MACOS)
     set_profile_application_icon(state.profile_identifier, state.profile_identity, state.profile_is_temporary);
@@ -988,6 +1019,20 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
         });
     }
 
+    // The user can choose another default browser in the system settings at any time, and comes back to the browser
+    // after doing it.
+    if (m_default_browser) {
+        m_default_browser->on_status_change = [this] {
+            if (auto* hub = HubConnection::the_if_connected())
+                hub->async_default_browser_status_changed(m_default_browser->status());
+        };
+        QObject::connect(qGuiApp, &QGuiApplication::applicationStateChanged, [this](Qt::ApplicationState state) {
+            if (state == Qt::ApplicationActive)
+                m_default_browser->refresh();
+        });
+        m_default_browser->refresh();
+    }
+
     // NB: The UI info holds the interface color scheme, which changes with the interface theme as well as with the
     //     system's appearance. The views take it from the Hub only after this, as they update their palettes later.
     auto send_ui_info = [this] {
@@ -996,6 +1041,10 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     };
     QObject::connect(&SystemAppearance::the(), &SystemAppearance::changed, send_ui_info);
     QObject::connect(&SystemAppearance::the(), &SystemAppearance::interface_appearance_changed, send_ui_info);
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::reduced_motion_changed, send_ui_info);
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::contrast_changed, send_ui_info);
+    // The Hub may have started with what we told it before a change that came in the meantime.
+    send_ui_info();
     s_browser_has_started = true;
     return {};
 }
@@ -1119,6 +1168,74 @@ Application::~Application()
     m_picture_in_picture_windows.clear();
 }
 
+static void place_beside_browser_window_or_over_its_top_right_corner(QWidget& window, QWidget const& browser_window)
+{
+    constexpr int GAP = 12;
+    auto browser_frame = browser_window.frameGeometry();
+    auto window_size = window.size();
+    auto screen = browser_window.screen()->availableGeometry();
+    auto x = browser_frame.right() + GAP;
+    if (x + window_size.width() > screen.right())
+        x = browser_frame.right() - window_size.width() - GAP;
+    window.move(x, browser_frame.top() + GAP);
+}
+
+void Application::set_shows_compositor_layers(bool shows)
+{
+    HubConnection::the().async_set_shows_compositor_layers(shows);
+    if (!shows) {
+        if (m_compositor_layers_window)
+            m_compositor_layers_window->hide();
+        return;
+    }
+    if (!m_compositor_layers_window) {
+        m_compositor_layers_window = make<CompositorLayersWindow>(CompositorLayersWindow::Source {
+            .layers_of_active_tab = [this]() -> Optional<Compositing::CompositorLayersDescription> {
+                if (auto* tab = active_tab())
+                    return tab->compositor_layers();
+                return {};
+            },
+            .set_layer_hidden_in_active_tab = [this](u64 layer_id, bool hidden) {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().set_compositor_layer_hidden(layer_id, hidden); },
+            .set_selected_layers_in_active_tab = [this](Vector<u64> layer_ids) {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().set_selected_compositor_layers(AK::move(layer_ids)); },
+            .set_hovered_layer_in_active_tab = [this](Optional<u64> layer_id) {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().set_hovered_compositor_layer(layer_id); },
+            .show_only_layers_in_active_tab = [this](Vector<u64> layer_ids) {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().show_only_compositor_layers(AK::move(layer_ids)); },
+            .show_all_layers_in_active_tab = [this] {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().show_all_compositor_layers(); },
+            .reset_raster_counts_in_active_tab = [this] {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().reset_compositor_layer_raster_counts(); },
+            .start_picking_layer_in_active_tab = [this](CompositorLayerPicker picker) {
+                auto* tab = active_tab();
+                if (!tab || !tab->is_loaded())
+                    return false;
+                m_view_picking_compositor_layer = &tab->view();
+                tab->view().start_compositor_layer_picker(AK::move(picker));
+                return true; },
+            .stop_picking_layer_in_active_tab = [this] {
+                if (m_view_picking_compositor_layer)
+                    m_view_picking_compositor_layer->stop_compositor_layer_picker();
+                m_view_picking_compositor_layer = nullptr; },
+        });
+        m_compositor_layers_window->on_close = [] {
+            ApplicationActions::the().show_compositor_layers_action().set_checked(false);
+            HubConnection::the().async_set_shows_compositor_layers(false);
+        };
+        if (auto* browser_window = active_window_if_any())
+            place_beside_browser_window_or_over_its_top_right_corner(*m_compositor_layers_window, *browser_window);
+    }
+    m_compositor_layers_window->show();
+    m_compositor_layers_window->raise();
+}
+
 void Application::show_process_manager()
 {
     if (!m_process_manager_window) {
@@ -1177,6 +1294,7 @@ void Application::create_platform_actions()
     });
     if (hub.devtools_enabled())
         m_devtools_port = WebView::Application::browser_options().devtools_port;
+    m_gpu_painting_enabled = hub.compositor_gpu_painting_enabled();
 
     RemoteDownloads::the().set_downloads(Hub::ConnectionFromUI::downloads());
 #endif
@@ -1186,7 +1304,7 @@ void Application::create_platform_actions()
         if (auto* hub = HubConnection::the_if_connected())
             hub->send_settings_changes(settings);
     };
-#if defined(AK_OS_MACOS)
+#if defined(LADYBIRD_HAS_SPARKLE)
     m_software_updater = SoftwareUpdater::create();
     m_software_updater->on_will_relaunch = [this] {
         m_restart = Restart::ByUpdater;
@@ -1309,6 +1427,16 @@ bool Application::platform_scrollbar_track_press_jumps() const
 #else
     return false;
 #endif
+}
+
+bool Application::platform_prefers_reduced_motion() const
+{
+    return SystemAppearance::prefers_reduced_motion();
+}
+
+bool Application::platform_prefers_more_contrast() const
+{
+    return Theme::has_increased_contrast();
 }
 
 Vector<String> Application::platform_preferred_languages() const
@@ -1573,12 +1701,8 @@ static WindowConfiguration window_configuration_for(SessionWindowGeometry const&
     auto* screen = QGuiApplication::screenAt(rect.center());
     if (!screen)
         screen = QGuiApplication::primaryScreen();
-    if (screen) {
-        auto available = screen->availableGeometry();
-        rect.setSize(rect.size().boundedTo(available.size()));
-        rect.moveLeft(clamp(rect.left(), available.left(), available.right() - rect.width() + 1));
-        rect.moveTop(clamp(rect.top(), available.top(), available.bottom() - rect.height() + 1));
-    }
+    if (screen)
+        rect = BrowserWindow::rect_fitted_into(rect, screen->availableGeometry());
 
     return {
         .x = Web::DevicePixels { rect.x() },
@@ -2393,6 +2517,7 @@ void Application::display_error_dialog(StringView error_message) const
     create_message_box(QMessageBox::Warning, error_message, active_window_if_any())->open();
 }
 
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
 void Application::display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> const& version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger)
 {
     static constexpr auto current_version = BROWSER_VERSION ""sv;
@@ -2440,9 +2565,9 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
     if (first_is_one_of(install_method, WebView::InstallMethod::DEB, WebView::InstallMethod::RPM, WebView::InstallMethod::Flatpak)) {
         text = qformatted("You have Ladybird {}. Update it with your system's software updater.", current_version);
         buttons.append({ "Remind me later", PageCard::ButtonRole::Primary, {} });
+#    if defined(LADYBIRD_HAS_SPARKLE)
     } else if (install_method == WebView::InstallMethod::MacOSApp) {
         buttons.append({ "Remind me later", PageCard::ButtonRole::Secondary, {} });
-#if defined(AK_OS_MACOS)
         buttons.append({ "Install update", PageCard::ButtonRole::Primary, [trigger] {
                             auto* software_updater = Application::the().software_updater();
                             if (!software_updater)
@@ -2452,7 +2577,7 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
                             else
                                 software_updater->install_update();
                         } });
-#endif
+#    endif
     } else {
         buttons.append({ "Remind me later", PageCard::ButtonRole::Secondary, {} });
         buttons.append({ "View release", PageCard::ButtonRole::Primary, [url = WebView::release_page_url(*version)] {
@@ -2463,6 +2588,7 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
 
     window->show_page_card(BrowserWindow::PageCardSlot::Update, qformatted("Ladybird {} is available", *version), text, move(buttons));
 }
+#endif
 
 #if defined(AK_OS_LINUX)
 // The system replaces the files of a package that it updates while Ladybird runs from the ones that it started with. The
@@ -2924,6 +3050,34 @@ void Application::did_disable_devtools()
     for (auto* widget : QApplication::topLevelWidgets()) {
         if (auto* window = as_if<BrowserWindow>(widget))
             window->on_devtools_disabled();
+    }
+}
+
+URL::URL Application::new_bug_report_url() const
+{
+    return WebView::new_bug_report_url({
+        .disable_sandbox = browser_options().disable_sandbox,
+        .gpu_painting_enabled = m_gpu_painting_enabled,
+    });
+}
+
+void Application::did_change_gpu_painting(bool enabled)
+{
+    m_gpu_painting_enabled = enabled;
+    update_cpu_painting_bars();
+}
+
+void Application::dismiss_cpu_painting_bar()
+{
+    m_cpu_painting_bar_dismissed = true;
+    update_cpu_painting_bars();
+}
+
+void Application::update_cpu_painting_bars() const
+{
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget))
+            window->tab_widget().update_cpu_painting_bar();
     }
 }
 

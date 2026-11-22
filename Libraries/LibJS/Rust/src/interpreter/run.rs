@@ -89,7 +89,13 @@ impl Vm {
 
         // NOTE: This is how we "push" a new execution context onto the VM's
         //       execution context stack.
-        let previous_running_execution_context = self.head.running_execution_context.replace(context.as_ptr());
+        // NB: The context is mostly the running one already, whose realm is current. The realm of a context does not
+        //     change while it runs, so the realm current now is that of the context running now, when this returns.
+        let previous_running_execution_context = self.head.running_execution_context.get();
+        let previous_realm = self.head.current_realm.get();
+        if context.as_ptr() != previous_running_execution_context {
+            self.set_running_execution_context(context.as_ptr());
+        }
         context_ref.executable.set(Some(Executable::head(executable)));
 
         assert!(
@@ -148,6 +154,7 @@ impl Vm {
         self.head
             .running_execution_context
             .set(previous_running_execution_context);
+        self.head.current_realm.set(previous_realm);
         self.run_executable_depth().set(run_executable_depth);
         if exception != Value::EMPTY {
             return Err(exception);
@@ -218,7 +225,7 @@ impl Vm {
         let caller = unsafe { &*caller_frame };
         caller.program_counter.set(frame.caller_return_pc.get());
         caller.slots()[frame.caller_dst_raw.get() as usize].set(return_value);
-        self.head.running_execution_context.set(caller_frame);
+        self.set_running_frame_in_current_realm(caller_frame);
         self.interpreter_stack().deallocate(frame_pointer.as_ptr().cast());
         self.head.finish_execution_generation();
     }
@@ -295,17 +302,13 @@ impl Vm {
         // NOTE: This was done during execution context construction.
 
         // 4. Set the Realm of scriptContext to scriptRecord.[[Realm]].
-        script_context_ref.realm.set(Some(script_record.realm()));
+        script_context_ref.set_realm(Some(script_record.realm()));
 
         // 5. Set the ScriptOrModule of scriptContext to scriptRecord.
-        script_context_ref
-            .script_or_module
-            .set(ScriptOrModule::Script(script_record));
+        script_context_ref.set_script_or_module(ScriptOrModule::Script(script_record));
 
         // 6. Set the VariableEnvironment of scriptContext to globalEnv.
-        script_context_ref
-            .variable_environment
-            .set(Some(global_environment.upcast()));
+        script_context_ref.set_variable_environment(Some(global_environment.upcast()));
 
         // 7. Set the LexicalEnvironment of scriptContext to globalEnv.
         script_context_ref
@@ -433,6 +436,7 @@ impl Vm {
         new_target: Option<Gc<Object>>,
         is_construct: bool,
     ) -> Option<NonNull<ExecutionContext>> {
+        debug_assert!(self.is_in_current_realm(callee_function.as_function_object_gc()));
         let callee_context = self.allocate_inline_frame(
             callee_executable,
             arguments,
@@ -448,17 +452,15 @@ impl Vm {
         callee_context
             .function
             .set(Some(callee_function.as_function_object_gc()));
-        callee_context.realm.set(callee_function.realm());
-        callee_context.script_or_module.set(callee_function.script_or_module());
+        // NB: The context gets its realm and its ScriptOrModule from its function.
         callee_context
             .new_target
             .set(new_target.map_or(Value::UNDEFINED, Value::from_object));
         let environment = callee_function.inline_call_environment(self, new_target);
         callee_context.lexical_environment.set(environment);
-        callee_context.variable_environment.set(environment);
-        callee_context
-            .private_environment
-            .set(callee_function.private_environment());
+        // NB: Only the frame of a function that needs a function environment keeps the field, but a store costs less
+        //     than asking.
+        callee_context.variable_environment_in_frame.set(environment);
 
         Some(self.enter_inline_frame(callee_context, callee_executable))
     }
@@ -478,6 +480,7 @@ impl Vm {
         this_value: Value,
     ) -> Option<NonNull<ExecutionContext>> {
         assert!(!callee_function.function_environment_needed());
+        debug_assert!(self.is_in_current_realm(callee_function.as_function_object_gc()));
         let caller_context = self.running_execution_context_ref();
         let callee_context = self.allocate_inline_frame(
             callee_executable,
@@ -496,10 +499,10 @@ impl Vm {
 
         // 5. Let calleeRealm be F.[[Realm]].
         // 6. Set the Realm of calleeContext to calleeRealm.
-        callee_context.realm.set(Some(callee_function.realm()));
+        // NB: The context gets its realm from its function.
 
         // 7. Set the ScriptOrModule of calleeContext to null.
-        callee_context.script_or_module.set(ScriptOrModule::Empty);
+        // NB: The ScriptOrModule of a context with a native function is null.
 
         // 8. Perform any necessary implementation-defined initialization of calleeContext.
         // NB: Like NativeFunction's [[Call]], which runs these builtins otherwise.
@@ -508,12 +511,6 @@ impl Vm {
         callee_context
             .lexical_environment
             .set(caller_context.lexical_environment.get());
-        callee_context
-            .variable_environment
-            .set(caller_context.variable_environment.get());
-        callee_context
-            .private_environment
-            .set(caller_context.private_environment.get());
 
         Some(self.enter_inline_frame(callee_context, callee_executable))
     }
@@ -571,12 +568,9 @@ impl Vm {
 
         // Inline JS-to-JS frames stay out of the VM execution context stack and
         // are tracked through caller_frame instead.
-        self.head.running_execution_context.set(callee_context_pointer.as_ptr());
+        self.set_running_frame_in_current_realm(callee_context_pointer.as_ptr());
 
         // Set up execution context fields that run_executable normally does.
-        // NB: We must use the callee's realm (not the caller's) for global_object
-        //     and global_declarative_environment, since the caller's realm may differ
-        //     in cross-realm calls (e.g. iframe <-> parent).
         callee_context.executable.set(Some(Executable::head(callee_executable)));
 
         callee_context_pointer
@@ -591,7 +585,7 @@ impl Vm {
         assert!(!caller_frame.is_null());
 
         self.interpreter_stack().deallocate(callee_frame.as_ptr().cast());
-        self.head.running_execution_context.set(caller_frame);
+        self.set_running_frame_in_current_realm(caller_frame);
     }
 
     /// Unwinds to the innermost handler of an exception thrown at `program_counter` in the running frame, leaving
@@ -685,7 +679,7 @@ impl Vm {
             if !caller_frame.is_null() {
                 let caller_pc = context.caller_return_pc.get();
                 self.interpreter_stack().deallocate(context_pointer.as_ptr().cast());
-                self.head.running_execution_context.set(caller_frame);
+                self.set_running_frame_in_current_realm(caller_frame);
 
                 // The caller's return address is one past the Call instruction, and handler ranges exclude their end
                 // offset, so look up the handler for an offset inside the Call.
@@ -721,7 +715,7 @@ impl Vm {
                 return HandleExceptionResponse::ExitFromExecutable;
             }
             self.interpreter_stack().deallocate(context_pointer.as_ptr().cast());
-            self.head.running_execution_context.set(caller_frame);
+            self.set_running_frame_in_current_realm(caller_frame);
         }
     }
 }

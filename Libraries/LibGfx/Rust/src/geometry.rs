@@ -4,16 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use libipc_rust::wire::{Decode, Encode};
 use std::ops::{Add, Mul, Neg, Sub};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode)]
 #[repr(C)]
 pub struct IntPoint {
     pub x: i32,
     pub y: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Encode, Decode)]
 #[repr(C)]
 pub struct FloatPoint {
     pub x: f32,
@@ -28,7 +29,7 @@ pub struct FloatVector3 {
     pub z: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode)]
 #[repr(C)]
 pub struct IntSize {
     pub width: i32,
@@ -41,7 +42,7 @@ impl IntSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Encode, Decode)]
 #[repr(C)]
 pub struct FloatSize {
     pub width: f32,
@@ -54,7 +55,7 @@ impl FloatSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode)]
 #[repr(C)]
 pub struct IntRect {
     pub x: i32,
@@ -63,7 +64,7 @@ pub struct IntRect {
     pub height: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Encode, Decode)]
 #[repr(C)]
 pub struct FloatRect {
     pub x: f32,
@@ -257,6 +258,9 @@ impl IntRect {
     }
     pub const fn inflated(self, w: i32, h: i32) -> Self {
         Self::new(self.x - w / 2, self.y - h / 2, self.width + w, self.height + h)
+    }
+    pub const fn translated(self, dx: i32, dy: i32) -> Self {
+        Self::new(self.x + dx, self.y + dy, self.width, self.height)
     }
     pub const fn inflated_edges(self, top: i32, right: i32, bottom: i32, left: i32) -> Self {
         Self::new(

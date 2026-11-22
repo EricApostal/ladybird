@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/Optional.h>
@@ -17,6 +18,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Settings.h>
 #include <UI/Qt/BookmarksBar.h>
+#include <UI/Qt/NotificationBar.h>
 #include <UI/Qt/PlainText.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/WindowToolbar.h>
@@ -56,10 +58,8 @@ namespace Ladybird {
 class AllTabsPopover;
 class ChromeHeaderButton;
 class LadybirdButton;
-class SandboxOffBar;
 
 class TabMicrophoneIndicator;
-class TabPreviewPopup;
 class TabWidget;
 class WindowControlsReveal;
 
@@ -98,6 +98,7 @@ public:
     void set_pinned_tabs_in_rows(bool);
     void set_vertical_tabs_position(WebView::VerticalTabsPosition);
     void refresh_tab_layout();
+    void did_replace_tab(Tab const& old_tab, Tab& new_tab);
     // After a tab is closed with a click, the tabs keep their width until the pointer leaves the tab bar, so the next
     // close button lands under the pointer.
     void lock_tab_widths();
@@ -176,7 +177,6 @@ private:
     bool start_window_move();
     void start_tab_drag(int index);
     QPoint tab_drag_hot_spot() const;
-    void pointer_left();
     void start_strip_drag(int index);
     void update_strip_drag(QPoint position);
     void end_strip_drag();
@@ -186,11 +186,6 @@ private:
     void update_layout_animation();
     QRect animated_tab_rect(int index, QRect const& target) const;
     HorizontalTabEndRoom horizontal_tab_end_room(int index) const;
-    void schedule_tab_preview(int index);
-    void show_tab_preview();
-    void hide_tab_preview();
-    void stop_following_previewed_tab_frames();
-    QPoint tab_preview_position_for(int index, QSize const& popup_size) const;
 
     // Where the pinned tabs sit in vertical tabs: a grid of tiles when expanded, one icon column when collapsed, and a
     // separator below. Its height is 0 when there's no pinned tab.
@@ -272,6 +267,8 @@ private:
     QRect closing_tab_rect() const;
     HashMap<Tab const*, QRect> m_layout_animation_start_rects;
     HashMap<Tab const*, HorizontalTabEndRoom> m_layout_animation_start_end_rooms;
+    // The tabs that open, and grow in from nothing, while the tabs move.
+    HashTable<Tab const*> m_opening_tabs;
     HashMap<Tab const*, QRect> m_settled_tab_rects;
     HashMap<Tab const*, HorizontalTabEndRoom> m_settled_tab_end_rooms;
     int m_settled_tab_count { 0 };
@@ -295,13 +292,6 @@ private:
     // Where the card a dragged tab is drawn as sits in the tab.
     QPoint m_tab_drag_card_offset;
     QObject* m_strip_drag_cancellation_filter { nullptr };
-    QTimer* m_tab_preview_timer { nullptr };
-    QTimer* m_tab_preview_pointer_timer { nullptr };
-    TabPreviewPopup* m_tab_preview_popup { nullptr };
-    int m_tab_preview_index { -1 };
-    QPointer<Tab> m_previewed_tab;
-    QMetaObject::Connection m_tab_preview_paint_connection;
-    QMetaObject::Connection m_tab_preview_change_connection;
 };
 
 class TabWidget final : public QWidget {
@@ -323,6 +313,8 @@ public:
     void insert_tab(int index, Tab* widget, QString const& label);
     void remove_tab(int index);
     Tab* take_tab(int index);
+    // Another tab stands in for the one at the index, which keeps its place in the tab bar rather than closing.
+    Tab* replace_tab(int index, Tab* widget);
 
     int count() const { return m_tab_bar->count(); }
 
@@ -343,6 +335,15 @@ public:
     void set_tab_icon(int index, QIcon const& icon);
 
     void set_tab_bar_visible(bool visible);
+
+    enum class NotificationBarSlot : u8 {
+        SandboxOff,
+        CpuPainting,
+    };
+    void show_notification_bar(NotificationBarSlot, QString const& message, Vector<NotificationBar::Button> = {}, Function<void()> on_close = {});
+    void hide_notification_bar(NotificationBarSlot);
+    void update_cpu_painting_bar();
+
     void set_new_tab_action(QAction* action);
     void set_window_controls_visible(bool);
     void window_control_buttons_changed();
@@ -469,7 +470,9 @@ private:
     WindowControlsReveal* m_window_controls_reveal { nullptr };
     WindowToolbar* m_toolbar { nullptr };
     BookmarksBarContainer* m_bookmarks_bar { nullptr };
-    SandboxOffBar* m_sandbox_off_bar { nullptr };
+    QWidget* m_notification_bar_column { nullptr };
+    QBoxLayout* m_notification_bar_column_layout { nullptr };
+    Array<NotificationBar*, 2> m_notification_bars {};
     QWidget* m_page_column { nullptr };
     QWidget* m_toolbar_placeholder { nullptr };
     bool m_toolbar_follows_page_column { false };
@@ -538,10 +541,16 @@ public:
         RailBadge,
     };
 
+    // How the button shows: by fading in, or at once and fully opaque, cutting short a fade in progress.
+    enum class Reveal : u8 {
+        Fade,
+        AtOnce,
+    };
+
     TabBarButton(QIcon const& icon, Role, QWidget* parent = nullptr);
     void set_placement(Placement);
     // Shows the button by fading it in, or fades it out and hides it.
-    void set_revealed(bool);
+    void set_revealed(bool, Reveal = Reveal::Fade);
     // A close button is dimmed, but on the hovered and the selected tabs.
     void set_tab_emphasized(bool);
 

@@ -41,7 +41,7 @@ DecoderErrorOr<Reader> Reader::from_stream(NonnullRefPtr<MediaStreamCursor> cons
 }
 
 // Returns the position of the first element that is read from this master element.
-DecoderErrorOr<size_t> Reader::parse_master_element(Streamer& streamer, [[maybe_unused]] StringView element_name, Function<DecoderErrorOr<ElementIterationDecision>(u64)> element_consumer)
+DecoderErrorOr<size_t> Reader::parse_master_element(Streamer& streamer, StringView element_name, Function<DecoderErrorOr<ElementIterationDecision>(u64)> element_consumer)
 {
     auto element_data_size = TRY(streamer.read_element_size());
     dbgln_if(MATROSKA_DEBUG, "{} has {} octets of data.", element_name, element_data_size);
@@ -52,7 +52,13 @@ DecoderErrorOr<size_t> Reader::parse_master_element(Streamer& streamer, [[maybe_
     if (element_data_size.has_value())
         element_data_end = first_element_position + element_data_size.value();
 
-    while (!element_data_end.has_value() || streamer.position() < element_data_end.value()) {
+    while (true) {
+        if (element_data_end.has_value()) {
+            if (streamer.position() > element_data_end.value())
+                return DecoderError::format(DecoderErrorCategory::Corrupted, "Read past the end of the {}", element_name);
+            if (streamer.position() == element_data_end.value())
+                break;
+        }
         dbgln_if(MATROSKA_TRACE_DEBUG, "====== Reading  element ======");
         auto element_position = streamer.position();
         auto element_id = TRY(streamer.read_element_id());
@@ -470,6 +476,19 @@ static DecoderErrorOr<Optional<MasteringDisplayColorVolume>> parse_mastering_met
     return volume;
 }
 
+static DecoderErrorOr<Optional<u16>> read_light_level_or_skip_if_malformed(Streamer& streamer)
+{
+    auto value_position = streamer.position();
+    auto value_or_error = streamer.read_u64();
+    if (!value_or_error.is_error())
+        return AK::clamp_to<u16>(value_or_error.release_value());
+    if (value_or_error.error().category() != DecoderErrorCategory::Corrupted)
+        return value_or_error.release_error();
+    TRY(streamer.seek_to_position(value_position));
+    TRY(streamer.read_unknown_element());
+    return OptionalNone {};
+}
+
 static DecoderErrorOr<TrackEntry::ColorFormat> parse_video_color_information(Streamer& streamer)
 {
     TrackEntry::ColorFormat color_format {};
@@ -500,12 +519,16 @@ static DecoderErrorOr<TrackEntry::ColorFormat> parse_video_color_information(Str
             dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's BitsPerChannel attribute: {}", color_format.bits_per_channel);
             break;
         case MAX_CLL_ID:
-            content_light_level_information().maximum_content_light_level = AK::clamp_to<u16>(TRY(streamer.read_u64()));
-            dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's MaxCLL attribute: {}", content_light_level_information().maximum_content_light_level);
+            if (auto level = TRY(read_light_level_or_skip_if_malformed(streamer)); level.has_value()) {
+                content_light_level_information().maximum_content_light_level = level.value();
+                dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's MaxCLL attribute: {}", level.value());
+            }
             break;
         case MAX_FALL_ID:
-            content_light_level_information().maximum_frame_average_light_level = AK::clamp_to<u16>(TRY(streamer.read_u64()));
-            dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's MaxFALL attribute: {}", content_light_level_information().maximum_frame_average_light_level);
+            if (auto level = TRY(read_light_level_or_skip_if_malformed(streamer)); level.has_value()) {
+                content_light_level_information().maximum_frame_average_light_level = level.value();
+                dbgln_if(MATROSKA_TRACE_DEBUG, "Read Colour's MaxFALL attribute: {}", level.value());
+            }
             break;
         case MASTERING_METADATA_ID:
             color_format.mastering_display_color_volume = TRY(parse_mastering_metadata(streamer));
@@ -1356,12 +1379,12 @@ DecoderErrorOr<void> Reader::seek_to_cue_for_timestamp(SampleIterator& iterator,
     return {};
 }
 
-static DecoderErrorOr<void> search_clusters_for_keyframe_before_timestamp(SampleIterator& iterator, AK::Duration const& timestamp)
+static DecoderErrorOr<Optional<SampleIterator>> search_clusters_for_keyframe_before_timestamp(SampleIterator iterator, AK::Duration const& timestamp)
 {
 #if MATROSKA_DEBUG
     size_t inter_frames_count;
 #endif
-    SampleIterator last_keyframe = iterator;
+    Optional<SampleIterator> last_keyframe;
 
     while (true) {
         SampleIterator rewind_iterator = iterator;
@@ -1377,7 +1400,7 @@ static DecoderErrorOr<void> search_clusters_for_keyframe_before_timestamp(Sample
             break;
 
         if (block.only_keyframes()) {
-            last_keyframe = rewind_iterator;
+            last_keyframe = move(rewind_iterator);
 #if MATROSKA_DEBUG
             inter_frames_count = 0;
 #endif
@@ -1391,9 +1414,7 @@ static DecoderErrorOr<void> search_clusters_for_keyframe_before_timestamp(Sample
 #if MATROSKA_DEBUG
     dbgln("Seeked to a keyframe with {} inter frames to skip", inter_frames_count);
 #endif
-    iterator = move(last_keyframe);
-
-    return {};
+    return last_keyframe;
 }
 
 DecoderErrorOr<SampleIterator> Reader::seek_to_random_access_point(SampleIterator iterator, AK::Duration timestamp) const
@@ -1418,22 +1439,53 @@ DecoderErrorOr<SampleIterator> Reader::seek_to_random_access_point(SampleIterato
         VERIFY(iterator.last_timestamp().has_value());
     }
 
-    if (!iterator.last_timestamp().has_value() || timestamp < iterator.last_timestamp().value()) {
-        // If the timestamp is before the iterator's current position, then we need to start from the beginning of the Segment.
-        if (timestamp > AK::Duration::zero())
-            warnln("Seeking track {} to {}s required restarting the sample iterator from the start, streaming may be broken for this file.", timestamp, iterator.m_track_number);
-        iterator = TRY(create_sample_iterator(iterator.m_stream_cursor, iterator.m_track_number));
-        TRY(search_clusters_for_keyframe_before_timestamp(iterator, timestamp));
-        return iterator;
+    if (iterator.last_timestamp().has_value() && timestamp >= iterator.last_timestamp().value()) {
+        auto keyframe = TRY(search_clusters_for_keyframe_before_timestamp(iterator, timestamp));
+        if (keyframe.has_value())
+            return keyframe.release_value();
     }
 
-    TRY(search_clusters_for_keyframe_before_timestamp(iterator, timestamp));
-    return iterator;
+    // If the timestamp is before the iterator's current position, or no keyframe lies between that position and the
+    // timestamp, then the keyframe is behind us, so we need to start from the beginning of the Segment.
+    if (timestamp > AK::Duration::zero())
+        warnln("Seeking track {} to {}s required restarting the sample iterator from the start, streaming may be broken for this file.", timestamp, iterator.m_track_number);
+    iterator = TRY(create_sample_iterator(iterator.m_stream_cursor, iterator.m_track_number));
+    auto keyframe = TRY(search_clusters_for_keyframe_before_timestamp(iterator, timestamp));
+    // The first block is the random access point even if it isn't marked as a keyframe.
+    return keyframe.value_or(move(iterator));
 }
 
 Optional<Vector<TrackCuePoint> const&> Reader::cue_points_for_track(u64 track_number) const
 {
     return m_cues.get(track_number);
+}
+
+AK::Duration Reader::earliest_possible_position(NonnullRefPtr<MediaStreamCursor> const& cursor) const
+{
+    HashTable<u64> tracks_without_blocks;
+    for (auto const& [track_number, track] : m_tracks) {
+        if (first_is_one_of(track->track_type(), TrackEntry::TrackType::Video, TrackEntry::TrackType::Audio))
+            tracks_without_blocks.set(track_number);
+    }
+
+    auto iterator_or_error = create_sample_iterator(cursor);
+    if (iterator_or_error.is_error())
+        return AK::Duration::zero();
+    auto iterator = iterator_or_error.release_value();
+
+    Optional<AK::Duration> earliest;
+    while (!tracks_without_blocks.is_empty()) {
+        auto block_or_error = iterator.next_block();
+        if (block_or_error.is_error())
+            break;
+
+        auto const& block = block_or_error.value();
+        if (!block.timestamp().has_value() || !tracks_without_blocks.remove(block.track_number()))
+            continue;
+        earliest = min(earliest.value_or(AK::Duration::max()), block.timestamp().value());
+    }
+
+    return max(earliest.value_or(AK::Duration::zero()), AK::Duration::zero());
 }
 
 Vector<BufferedRangesScan> Reader::buffered_time_ranges_by_track(NonnullRefPtr<MediaStreamCursor> const& cursor, Vector<MediaStream::ByteRange> const& byte_ranges) const
@@ -1585,8 +1637,14 @@ Vector<BufferedRangesScan> Reader::buffered_time_ranges_by_track(NonnullRefPtr<M
         BufferedRangesScan scan;
         scan.track_identifier = track_number;
         for (auto const& cached_range : m_buffered_ranges) {
-            if (auto interval = cached_range.track_intervals.get(track_number); interval.has_value())
-                scan.time_ranges.add_range(max(AK::Duration::zero(), interval.value().start), interval.value().end);
+            auto interval = cached_range.track_intervals.get(track_number);
+            if (!interval.has_value())
+                continue;
+            // Data from the first cluster onward is playable from the start of the timeline.
+            auto start = max(AK::Duration::zero(), interval.value().start);
+            if (cached_range.start <= m_first_cluster_position)
+                start = AK::Duration::zero();
+            scan.time_ranges.add_range(start, interval.value().end);
         }
         scan.last_byte_range_has_samples = !m_buffered_ranges.is_empty() && m_buffered_ranges.last().track_intervals.contains(track_number);
         scans.append(move(scan));

@@ -9,7 +9,6 @@
 #include <AK/LexicalPath.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
@@ -55,7 +54,7 @@ TEST_CASE(a_tab_opened_before_the_compositor_launches_paints_once_it_does)
 
     bool painted = false;
     view->on_ready_to_paint = [&] { painted = true; };
-    view->load(URL::Parser::basic_parse("data:text/html,<p>painted"sv).release_value());
+    view->load_from_browser_ui(URL::Parser::basic_parse("data:text/html,<p>painted"sv).release_value());
     Core::EventLoop::current().spin_until([&] { return painted; });
     view->on_ready_to_paint = nullptr;
 
@@ -68,8 +67,12 @@ TEST_CASE(a_video_that_starts_before_the_compositor_launches_plays_once_it_does)
     Array arguments { "--temporary-profile"sv, "--enable-autoplay"sv };
     auto app = TRY_OR_FAIL(environment.create_application<TestApplication>(arguments));
 
-    // The tests run from this directory.
-    auto video_path = TRY_OR_FAIL(FileSystem::real_path("../LibWeb/Assets/blue-with-second-in-gray-64x36.webm"sv));
+    // The tests run from this directory. A page reads only the files in its own folder, so the video is put beside it.
+    auto video = TRY_OR_FAIL(Core::File::open("../LibWeb/Assets/blue-with-second-in-gray-64x36.webm"sv, Core::File::OpenMode::Read));
+    auto video_path = LexicalPath::join(environment.directory(), "video.webm"sv).string();
+    auto video_copy = TRY_OR_FAIL(Core::File::open(video_path, Core::File::OpenMode::Write));
+    TRY_OR_FAIL(video_copy->write_until_depleted(TRY_OR_FAIL(video->read_until_eof())));
+    video_copy->close();
     auto page_path = LexicalPath::join(environment.directory(), "video.html"sv).string();
     auto page = TRY_OR_FAIL(Core::File::open(page_path, Core::File::OpenMode::Write));
     TRY_OR_FAIL(page->write_formatted("<video autoplay muted src=\"{}\" oncanplay=\"document.title = 'canplay'\"></video>", URL::create_with_file_scheme(video_path)->serialize()));
@@ -81,7 +84,7 @@ TEST_CASE(a_video_that_starts_before_the_compositor_launches_plays_once_it_does)
 
     bool can_play = false;
     view->on_title_change = [&](auto const& title) { can_play = title == "canplay"sv; };
-    view->load(URL::create_with_file_scheme(page_path).release_value());
+    view->load_from_browser_ui(URL::create_with_file_scheme(page_path).release_value());
     EXPECT(!app->has_compositor_process());
     Core::EventLoop::current().spin_until([&] { return can_play; });
     view->on_title_change = nullptr;

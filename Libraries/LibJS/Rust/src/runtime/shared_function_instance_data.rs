@@ -219,7 +219,8 @@ const MAX_CONSTRUCT_RESERVE_UPDATES: u32 = 1024;
 const _: () = assert!(MAX_CONSTRUCT_RESERVE <= u8::MAX as u32);
 const _: () = assert!(MAX_CONSTRUCT_RESERVE_UPDATES as u64 <= asm_call_metadata::CONSTRUCT_COUNT_MASK);
 
-define_cell!(SharedFunctionInstanceData, Other);
+// NB: Tracing considers the bytecode for flushing, with state of the thread that owns the heap.
+define_cell!(SharedFunctionInstanceData, Other, traced_on: owner_thread_only);
 
 // SAFETY: Visits the executable, the call environment template and every cell the storage holds. While a collection
 //         flushes code, an executable that idled long enough is left to what else holds it, and the cells that outlive
@@ -383,6 +384,9 @@ impl SharedFunctionInstanceData {
             metadata |= asm_call_metadata::NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION;
         }
         self.asm_call_metadata.set(metadata);
+        if let Some(executable) = self.executable() {
+            executable.head.call_metadata.set(metadata);
+        }
     }
 
     /// Creates the shared data of a function the frontend described, which is strict if `strict`.
@@ -532,6 +536,7 @@ impl SharedFunctionInstanceData {
         self.executable.get().map(Executable::from_head)
     }
 
+    /// Also gives `executable` the function's metadata, which calls of it read from the executable.
     pub fn set_executable(&self, executable: Option<Gc<Executable>>) {
         self.executable.set(executable.map(Executable::head));
         self.update_can_inline_call();

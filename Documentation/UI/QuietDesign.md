@@ -543,7 +543,7 @@ settings.
   1. Report a problem with this site (the site report flow, prefilled with the address):
      only on a website
   2. Report a bug: opens GitHub's new-issue page in a new tab, prefilled with version, OS
-     and build where possible
+     and build where possible, and with whether the sandbox or GPU painting is off
   3. Crash reports, "2 to review": only while reports are waiting; opens the review page.
      The same amber dot as on the button sits just before "2 to review", so the label
      stays aligned with the rows above it
@@ -590,21 +590,38 @@ settings.
   - Sent or deleted rows disappear. An empty list says "No crash reports waiting".
   - A "Crash report settings" link at the bottom goes to Settings → Feedback.
 
-### Sandbox off
+### Notification bars
 
-When Ladybird runs with `--disable-sandbox`, every window shows a bar directly below the
-toolbar (or at the top of the page area in the sidebar layouts):
+Every window shows its notification bars directly below the toolbar (or at the top of the
+page area in the sidebar layouts), one below the other in a fixed order:
 
 - 32 px plus a `divider` line below, in the `toolbar` color, so it reads as part of the
   chrome, not as a page banner. The page starts below it.
-- The `warning` icon (16 px) and one sentence in `text`: "The sandbox is off. Websites are
-  less isolated from your computer."
-- No close button, no action button, no amber fill. It can't be dismissed, because the state
-  can't be changed from inside the browser, and it should be in every screenshot that ends
-  up in a bug report.
+- The `warning` icon (16 px) and one sentence in `text`, cut short with an ellipsis when the
+  window is too narrow for it. Then any text buttons, and a close button if the bar can be
+  closed. No amber fill.
+
+### Sandbox off
+
+When Ladybird runs with `--disable-sandbox`, every window shows a notification bar: "The
+sandbox is off. Websites are less isolated from your computer."
+
+- No close button and no action button. It can't be dismissed, because the state can't be
+  changed from inside the browser, and it should be in every screenshot that ends up in a
+  bug report.
 - Bug reports and crash reports include "sandbox: off" in their prefilled details.
 - Nothing else changes: no badge on the Ladybird button, no tint, nothing in the address
   field (which describes the site, not the browser).
+
+### Painting on the CPU
+
+When GPU painting is off, whether because of `--force-cpu-painting`, because no GPU could be
+used or because painting on it failed, every window shows a notification bar, below the
+sandbox one when both show: "Pages are painted on the CPU, which can be slow."
+
+- A "Report a bug" text button, which opens a new bug report, and a close button.
+- Closing it in one window closes it in every window until the browser is started again.
+  Nothing remembers it, so a browser that keeps painting on the CPU keeps saying so.
 
 ### Ladybird menu
 

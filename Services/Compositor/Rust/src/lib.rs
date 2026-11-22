@@ -16,9 +16,12 @@ mod rust_demangle;
 mod rust_panic;
 
 pub mod async_scroll_update_outbox;
+pub mod backing_stores;
+pub mod canvas_2d_contexts;
 pub mod context_scene;
 pub mod context_state;
 pub mod core;
+pub mod cpp_object;
 pub mod display_list_chunk_stores;
 pub mod display_list_coverage_watch;
 pub mod elastic_overscroll_controller;
@@ -30,9 +33,12 @@ pub mod keyboard_scroll_controller;
 pub mod overlays;
 pub mod presenting;
 pub mod raster_host;
+pub mod remote_layers;
 pub mod scroll_fling_controller;
 pub mod scroll_snap_controller;
 pub mod scrollbar_controller;
+pub mod surfaces;
+pub mod webgl;
 pub mod wheel_gesture_routing;
 
 #[cfg(test)]

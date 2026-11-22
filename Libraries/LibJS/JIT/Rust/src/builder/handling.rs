@@ -90,6 +90,7 @@ pub fn handling(opcode: OpCode) -> Handling {
     match opcode {
         // Control flow, moves and frame setup.
         O::Enter
+        | O::EnterCoercingThis
         | O::Mov
         | O::MovWide
         | O::WideNameIndices
@@ -117,6 +118,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         O::GetLexicalEnvironment
         | O::SetLexicalEnvironment
         | O::LeavePrivateEnvironment
+        | O::EnterWithOwnEnvironments
         | O::IsCallable
         | O::GetArgumentCount => Handling::Native,
 

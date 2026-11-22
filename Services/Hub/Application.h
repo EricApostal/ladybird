@@ -10,6 +10,7 @@
 #include <LibCore/Promise.h>
 #include <LibMain/Main.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/DefaultBrowser.h>
 #include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/NotificationBackend.h>
 #include <LibWebView/PictureInPictureWindow.h>
@@ -37,6 +38,8 @@ public:
     virtual bool platform_reports_scroll_momentum() const = 0;
     virtual bool platform_scrolls_elastically() const = 0;
     virtual bool platform_scrollbar_track_press_jumps() const = 0;
+    virtual bool platform_prefers_reduced_motion() const = 0;
+    virtual bool platform_prefers_more_contrast() const = 0;
     virtual Vector<String> platform_preferred_languages() const = 0;
     virtual Optional<Gfx::GpuDeviceIdentity> platform_presentation_gpu_device() const = 0;
     virtual Vector<u64> platform_presentation_drm_format_modifiers() const = 0;
@@ -89,7 +92,9 @@ private:
     virtual NonnullRefPtr<Core::Promise<ByteString>> ask_user_for_download_path(ByteString const& file) const override;
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const override;
     virtual void display_error_dialog(StringView error_message) const override;
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     virtual void display_update_check_result(WebView::UpdateCheckResult const&, WebView::UpdateCheckTrigger) override;
+#endif
     virtual void set_clipboard_text(String, ClipboardType) override;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem) override;
     virtual void read_clipboard_text(ClipboardType, Function<void(Utf16String)>) const override;
@@ -97,12 +102,14 @@ private:
     virtual void update_tabs_display() const override;
     virtual void did_clear_history_since(UnixDateTime) const override;
     virtual void quit_for_signal() override;
+    virtual NonnullOwnPtr<WebView::DefaultBrowser> create_default_browser() override;
     virtual NonnullOwnPtr<WebView::MicrophoneAuthorizer> create_microphone_authorizer() override;
     virtual NonnullOwnPtr<WebView::NotificationBackend> create_notification_backend() override;
     virtual OwnPtr<WebView::MediaSessionPlatformBackend> create_media_session_platform_backend() override;
     virtual bool captures_browser_crashes() const override { return true; }
     virtual void on_devtools_enabled() const override;
     virtual void on_devtools_disabled() const override;
+    virtual void on_compositor_gpu_painting_changed() const override;
     virtual void create_platform_actions() override;
     virtual Optional<String> ui_font_family() const override;
     virtual Web::CSS::PreferredColorScheme interface_color_scheme() const override;
@@ -120,6 +127,8 @@ private:
     virtual bool platform_reports_scroll_momentum() const override;
     virtual bool platform_scrolls_elastically() const override;
     virtual bool platform_scrollbar_track_press_jumps() const override;
+    virtual bool platform_prefers_reduced_motion() const override;
+    virtual bool platform_prefers_more_contrast() const override;
     virtual Vector<String> platform_preferred_languages() const override;
     virtual Optional<Gfx::GpuDeviceIdentity> platform_presentation_gpu_device() const override;
     virtual Vector<u64> platform_presentation_drm_format_modifiers() const override;

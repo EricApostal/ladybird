@@ -33,6 +33,7 @@
 #include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
+#include <LibWeb/HTML/HTMLEmbedElement.h>
 #include <LibWeb/HTML/HTMLFrameSetElement.h>
 #include <LibWeb/HTML/HTMLHeadingElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
@@ -1517,6 +1518,10 @@ enum ElementConstructionFact : u32 {
     IsSvgGeometryElement = 1 << 8,
     IsHtmlSelectElement = 1 << 9,
     IsHtmlProgressOrMeterElement = 1 << 10,
+    // The element's default block-start or block-end margin is one a quirks-mode body or table cell ignores where it
+    // collapses into the cell's or the body's own start or end.
+    HasQuirkyBlockStartMargin = 1 << 11,
+    HasQuirkyBlockEndMargin = 1 << 12,
     // The layout algorithm a MathML element's tag name selects, as a MathMLLayoutKind in these bits.
     MathMLLayoutKindShift = 16,
     MathMLLayoutKindMask = 0x1f << MathMLLayoutKindShift,
@@ -1612,7 +1617,7 @@ static ElementOpenFacts element_open_facts(DOM::Element const& element)
     set(is<SVG::SVGElement>(element), ElementOpenFacts::SvgElement);
     set(is_body || is<HTML::HTMLFrameSetElement>(element), ElementOpenFacts::Body);
     set(is<HTML::HTMLHeadingElement>(element), ElementOpenFacts::Heading);
-    set(is_input || is<HTML::HTMLTextAreaElement>(element) || is<HTML::HTMLImageElement>(element) || is<HTML::HTMLObjectElement>(element) || is<HTML::HTMLVideoElement>(element)
+    set(is_input || is<HTML::HTMLTextAreaElement>(element) || is<HTML::HTMLImageElement>(element) || is<HTML::HTMLObjectElement>(element) || is<HTML::HTMLEmbedElement>(element) || is<HTML::HTMLVideoElement>(element)
             || is<SVG::SVGImageElement>(element) || is<HTML::HTMLCanvasElement>(element),
         ElementOpenFacts::ReplacedContent);
     set(is_input || local_name == HTML::TagNames::bdi, ElementOpenFacts::OwnDirectionality);
@@ -1661,7 +1666,7 @@ static u32 kind_box_type_adjustment_facts(DOM::Element const& element)
     set(is_html_element && local_name == HTML::TagNames::table, ElementStyleAdjustmentFact::IsTable);
     set(is_svg_element && local_name != "svg"sv, ElementStyleAdjustmentFact::ForcePositionStatic);
     set(is_mathml_element, ElementStyleAdjustmentFact::IsMathML);
-    set(local_name.equals_ignoring_ascii_case("mtable"sv), ElementStyleAdjustmentFact::IsMathMLMtable);
+    set(is_mathml_element && local_name == MathML::TagNames::mtable, ElementStyleAdjustmentFact::IsMathMLMtable);
     set(local_name.equals_ignoring_ascii_case("mtr"sv), ElementStyleAdjustmentFact::IsMathMLMtr);
     set(local_name.equals_ignoring_ascii_case("mtd"sv), ElementStyleAdjustmentFact::IsMathMLMtd);
     set(is_html_element && local_name.equals_ignoring_ascii_case(HTML::TagNames::th), ElementStyleAdjustmentFact::IsTh);
@@ -1745,6 +1750,18 @@ static u32 kind_construction_facts(DOM::Element const& element)
     set(element.is_svg_geometry_element(), ElementConstructionFact::IsSvgGeometryElement);
     set(is<HTML::HTMLSelectElement>(element), ElementConstructionFact::IsHtmlSelectElement);
     set(is<HTML::HTMLProgressElement>(element) || is<HTML::HTMLMeterElement>(element), ElementConstructionFact::IsHtmlProgressOrMeterElement);
+    // https://html.spec.whatwg.org/multipage/rendering.html#concept-rendering-elements-with-margins
+    // The elements with default margins are the following elements: blockquote, dir, dl, h1, h2, h3, h4, h5, h6,
+    // listing, menu, ol, p, plaintext, pre, ul, xmp.
+    // AD-HOC: Only the block-end margins of p, and of the elements laid out as preformatted text, are quirky. See
+    //         https://github.com/whatwg/html/issues/10296.
+    if (html_element) {
+        auto const& local_name = element.local_name();
+        set(first_is_one_of(local_name, HTML::TagNames::blockquote, HTML::TagNames::dir, HTML::TagNames::dl, HTML::TagNames::h1, HTML::TagNames::h2, HTML::TagNames::h3, HTML::TagNames::h4, HTML::TagNames::h5, HTML::TagNames::h6, HTML::TagNames::listing, HTML::TagNames::menu, HTML::TagNames::ol, HTML::TagNames::p, HTML::TagNames::plaintext, HTML::TagNames::pre, HTML::TagNames::ul, HTML::TagNames::xmp),
+            ElementConstructionFact::HasQuirkyBlockStartMargin);
+        set(first_is_one_of(local_name, HTML::TagNames::listing, HTML::TagNames::p, HTML::TagNames::plaintext, HTML::TagNames::pre, HTML::TagNames::xmp),
+            ElementConstructionFact::HasQuirkyBlockEndMargin);
+    }
     facts |= to_underlying(mathml_layout_kind(element)) << ElementConstructionFact::MathMLLayoutKindShift;
     return facts;
 }
@@ -1902,6 +1919,13 @@ static void publish_element_replaced_content_input(DOM::Element& element, StyleE
         set_image_natural_size_input(style_engine, node, *image);
         return;
     }
+    if (auto const* embed = as_if<HTML::HTMLEmbedElement>(element)) {
+        if (embed->content_navigable())
+            set_natural_size_input(style_engine, node, embed->natural_size_of_content_document());
+        else
+            set_image_natural_size_input(style_engine, node, *embed);
+        return;
+    }
     if (auto const* object = as_if<HTML::HTMLObjectElement>(element)) {
         // An object representing its content navigable is sized from the SVG document it shows.
         if (object->represents_its_content_navigable())
@@ -1914,6 +1938,10 @@ static void publish_element_replaced_content_input(DOM::Element& element, StyleE
         // An image button's box is an image box, which no size attribute sizes.
         if (input->type_state() == HTML::HTMLInputElement::TypeAttributeState::ImageButton) {
             set_image_natural_size_input(style_engine, node, *input);
+            return;
+        }
+        if (input->type_state() == HTML::HTMLInputElement::TypeAttributeState::Range) {
+            set_replaced_content_input(style_engine, node, Kind::RangeInput, 0, 0);
             return;
         }
         auto kind = Kind::Input;

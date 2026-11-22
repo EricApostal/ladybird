@@ -47,6 +47,7 @@
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/BrowsingContext.h>
@@ -1608,11 +1609,21 @@ ReplicatedContainerState LocalNavigable::container_state() const
     return container->replicated_container_state();
 }
 
+bool LocalNavigable::container_suppresses_viewport_scrolling() const
+{
+    if (auto container = this->container())
+        return container->suppresses_viewport_scrolling();
+    return m_root_container_state.suppresses_viewport_scrolling;
+}
+
 void LocalNavigable::set_root_container_state(ReplicatedContainerState state)
 {
     VERIFY(is_local_root() && parent());
     auto used_color_scheme_changed = m_root_container_state.used_color_scheme != state.used_color_scheme;
+    bool scroll_mode_changed = m_root_container_state.suppresses_viewport_scrolling != state.suppresses_viewport_scrolling;
     m_root_container_state = move(state);
+    if (scroll_mode_changed && m_active_document)
+        m_active_document->set_needs_layout_update(DOM::SetNeedsLayoutReason::FrameScrollingAttributeChange);
 
     // The container's used color scheme decides whether the canvas is opaque.
     if (used_color_scheme_changed && m_active_document) {
@@ -1898,7 +1909,7 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
         //     and returns windowType. The renderer runs it too, for its page of the traversable.
         auto request_new_web_view = [&] {
             TokenizedFeature::Map empty_window_features;
-            auto hints = web_view_hints_from_tokenised_features(window_features.has_value() ? *window_features : empty_window_features, page());
+            auto hints = web_view_hints_from_tokenised_features(window_features.has_value() ? *window_features : empty_window_features);
             return page().client().page_did_request_new_web_view(activate_tab, hints, id(), Utf16String::from_utf16(name), no_opener, active_document()->base_url());
         };
 
@@ -2723,13 +2734,27 @@ static void create_navigation_params_by_fetching(
     }
 
     // 8. Otherwise, if entry's document state's ever populated is true, then set request's history-navigation flag.
-    else if (document_state.ever_populated)
+    else if (document_state.ever_populated) {
         request->set_history_navigation(true);
 
-    // AD-HOC: While a document loads bypassing the HTTP cache, so do the documents of its child navigables.
-    if (request->cache_mode() == HTTP::CacheMode::Default) {
-        if (auto container_document = navigable->container_document(); container_document && container_document->is_loading_bypassing_cache())
-            request->set_cache_mode(HTTP::CacheMode::Reload);
+        // INTEROP: The specs don't define HTTP cache behavior for history traversals. But RFC 9111 says that a history
+        //          mechanism shows the representation as it was when it was retrieved, and that freshness doesn't apply
+        //          to it, and every major engine uses a stored response here without revalidating it. Use the
+        //          "force-cache" cache mode, with which Fetch "uses any response in the HTTP cache matching the
+        //          request, not paying attention to staleness. If there was no response, it creates a normal request
+        //          and updates the HTTP cache with the response."
+        //          https://httpwg.org/specs/rfc9111.html#history.lists
+        request->set_cache_mode(HTTP::CacheMode::ForceCache);
+    }
+
+    // AD-HOC: While a document loads bypassing the HTTP cache, or using it without revalidation, so do the documents
+    //         of its child navigables. Bypassing the cache wins over a history traversal of the child navigable too.
+    //         The container state carries the mode when the container document is in another process.
+    if (navigable->parent()) {
+        auto container_cache_mode = navigable->container_state().document_cache_mode_while_loading;
+        if (request->cache_mode() == HTTP::CacheMode::Default
+            || (request->cache_mode() == HTTP::CacheMode::ForceCache && container_cache_mode == HTTP::CacheMode::Reload))
+            request->set_cache_mode(container_cache_mode);
     }
 
     // 9. If sourceSnapshotParams's has transient activation is true, then set request's user-activation to true.
@@ -2767,9 +2792,10 @@ static void create_navigation_params_by_fetching(
         //        The referenced issue suggests that it is a no-op to retrieve the browsing context scope origin.
 
         // 2. Set request's destination to navigable's container's local name.
-        // FIXME: Are there other container types? If so, we need a helper here
+        auto container_is_embed = *container_local_name == HTML::TagNames::embed;
         auto container_is_iframe = *container_local_name == HTML::TagNames::iframe;
         request->set_destination(container_is_iframe ? Web::Fetch::Infrastructure::Request::Destination::IFrame
+                : container_is_embed                 ? Web::Fetch::Infrastructure::Request::Destination::Embed
                                                      : Web::Fetch::Infrastructure::Request::Destination::Object);
 
         // 3. If sourceSnapshotParams's fetch client is navigable's container document's relevant settings object,
@@ -2779,8 +2805,8 @@ static void create_navigation_params_by_fetching(
         //        is that process's, so its resource timing is not told of the navigation.
         auto fetch_client = settings_object_of_fetch_client(source_snapshot_params->fetch_client);
         if (auto container_document = navigable->container_document(); container_document && fetch_client.ptr() == &container_document->relevant_settings_object()) {
-            // FIXME: Are there other container types? If so, we need a helper here
             request->set_initiator_type(container_is_iframe ? Web::Fetch::Infrastructure::Request::InitiatorType::IFrame
+                    : container_is_embed                    ? Web::Fetch::Infrastructure::Request::InitiatorType::Embed
                                                             : Web::Fetch::Infrastructure::Request::InitiatorType::Object);
         }
 
@@ -3094,9 +3120,11 @@ GC_DEFINE_ALLOCATOR(DocumentToCreate);
 DocumentToCreate::DocumentToCreate(GC::Ref<NavigationParams> navigation_params, GC::Ref<LoadSteps> load_steps, Optional<URL::Origin> origin)
     : m_navigation_params(navigation_params)
     , m_load_steps(load_steps)
-    , m_origin(move(origin))
+    , m_replaces_response_origin(origin.has_value())
     , m_environment_id(navigation_params->reserved_environment ? navigation_params->reserved_environment->id : *navigation_params->environment_id)
 {
+    if (origin.has_value())
+        m_navigation_params->origin = origin.release_value();
 }
 
 void DocumentToCreate::visit_edges(Cell::Visitor& visitor)
@@ -3108,7 +3136,7 @@ void DocumentToCreate::visit_edges(Cell::Visitor& visitor)
 
 URL::Origin DocumentToCreate::origin() const
 {
-    return m_origin.value_or(m_navigation_params->origin);
+    return m_navigation_params->origin;
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
@@ -3148,8 +3176,6 @@ bool DocumentToCreate::takes_over_window_of(DOM::Document const& document) const
 GC::Ref<DOM::Document> DocumentToCreate::create_document()
 {
     auto document = m_load_steps->function()(*m_navigation_params);
-    if (m_origin.has_value())
-        document->set_origin(*m_origin);
     if (m_navigation_params->response->network_transport().has_value())
         m_navigation_params->response->resume_body_delivery(*surrounding_agent().fetch_executor);
     m_navigation_params = nullptr;
@@ -3166,13 +3192,14 @@ void DocumentToCreate::discard()
     m_load_steps = nullptr;
 }
 
-// NB: A document created in place of the response, or the PDF viewer, has an origin other than its navigation params'.
-//     The process reports which of the two it created, and the UI process takes up that origin for the document it
-//     holds.
+// NB: A document created in place of the response, or the PDF viewer, has an origin other than its response's. The
+//     process reports which of the two it created, and the UI process takes up that origin for the document it holds.
 static void report_a_document_with_an_origin_of_its_own(LocalNavigable& navigable, PopulateSessionHistoryEntryDocumentOutput const& output)
 {
     auto const* navigation_params = output.navigation_params.get_pointer<GC::Ref<NavigationParams>>();
-    if (!output.document_to_create || !navigation_params || output.document_to_create->origin().is_same_origin((*navigation_params)->origin))
+    if (!output.document_to_create || !navigation_params)
+        return;
+    if (!output.document_to_create->replaces_response_origin() && output.document_to_create->origin().is_same_origin((*navigation_params)->origin))
         return;
     auto origin = output.inline_content_origin.has_value() && output.document_to_create->origin().is_same_origin(*output.inline_content_origin)
         ? PopulatedDocumentOrigin::InlineContent
@@ -4923,7 +4950,7 @@ void LocalNavigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList 
 
     if (has_compositor_context()) {
         compositor_context().viewport_size_updated(
-            page().css_to_device_rect(viewport_rect()).size().to_type<int>(),
+            viewport_size_in_device_pixels(),
             page().client().device_pixel_ratio(),
             Compositing::WindowResizingInProgress::Yes);
     }
@@ -6242,9 +6269,25 @@ void LocalNavigable::schedule_hover_update_after_async_scroll()
     m_async_scroll_hover_update_timer->restart(AK::Duration::from_milliseconds(hover_update_after_async_scroll_delay_ms));
 }
 
+static bool async_scroll_node_is_in_document(DOM::Document& document, Web::AsyncScrollNodeStableID const& stable_id)
+{
+    if (stable_id.kind == Web::AsyncScrollNodeKind::Viewport || stable_id.kind == Web::AsyncScrollNodeKind::VisualViewport)
+        return stable_id.node_id == document.unique_id();
+    return element_for_async_scroll_node_stable_id(document, stable_id) != nullptr;
+}
+
 bool LocalNavigable::leave_hover_update_to_end_of_user_scroll()
 {
-    if (!any_of(m_pending_async_scroll_operations, [](auto const& pending) { return pending.trigger == ScrollTrigger::UserInput; }))
+    // A user's scroll of a document this navigable no longer shows may never be reported as ended, since its scroll
+    // node is gone: It holds back no hover of the active document.
+    auto document = active_document();
+    if (!document)
+        return false;
+    if (!any_of(m_pending_async_scroll_operations, [&](auto const& pending) {
+            if (pending.trigger != ScrollTrigger::UserInput)
+                return false;
+            return !pending.stable_node_id.has_value() || async_scroll_node_is_in_document(*document, *pending.stable_node_id);
+        }))
         return false;
     schedule_hover_update_after_async_scroll();
     return true;
@@ -6975,7 +7018,7 @@ void LocalNavigable::repaint_after_compositor_process_reconnect()
             }
         }
         compositor_context().viewport_size_updated(
-            page().css_to_device_rect(viewport_rect()).size().to_type<int>(),
+            viewport_size_in_device_pixels(),
             page().client().device_pixel_ratio(),
             Compositing::WindowResizingInProgress::No);
 
@@ -7135,7 +7178,7 @@ bool LocalNavigable::commit_frame(PaintConfig paint_config)
     // NB: Only the top-level traversable fills its canvas. A local root under a remote parent is an iframe in another
     //     process, and its canvas stays transparent like that of a same-process iframe.
     if (is_top_level_traversable() && !paint_config.canvas_fill_rect.has_value())
-        paint_config.canvas_fill_rect = Gfx::IntRect { {}, page().css_to_device_rect(viewport_rect()).size().to_type<int>() };
+        paint_config.canvas_fill_rect = Gfx::IntRect { {}, viewport_size_in_device_pixels() };
 
     // A frame is left to the next rendering update while the compositor cannot be reached.
     if (!compositor_context().ready_for_frame())
@@ -7379,7 +7422,19 @@ void LocalNavigable::paint_next_frame()
 
 Gfx::IntRect LocalNavigable::present_viewport_rect() const
 {
-    return page().css_to_device_rect(viewport_rect()).to_type<int>();
+    return { page().css_to_device_rect(viewport_rect()).location().to_type<int>(), viewport_size_in_device_pixels() };
+}
+
+// A viewport size in device pixels becomes one in CSS pixels floored to a fraction of a CSS pixel, so its product with
+// the scale lies just below the device size. Rounding gives the device size back, which the UI process gives the
+// compositor too.
+Gfx::IntSize LocalNavigable::viewport_size_in_device_pixels() const
+{
+    auto scale = page().client().device_pixels_per_css_pixel();
+    return {
+        static_cast<int>(round(m_viewport_size.width().to_double() * scale)),
+        static_cast<int>(round(m_viewport_size.height().to_double() * scale)),
+    };
 }
 
 bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_reason, LayOutFirst lay_out_first)

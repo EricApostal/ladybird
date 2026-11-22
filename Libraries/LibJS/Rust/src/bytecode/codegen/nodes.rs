@@ -18,15 +18,15 @@ use crate::ast::Name;
 use crate::ast::SyntaxTree;
 use crate::ast::UnaryOp;
 use crate::ast::UpdateOp;
-use crate::parser::columns::NONE;
-use crate::parser::columns::tag;
 use crate::parser::literals;
 pub(super) use crate::parser::literals::EscapeMode;
 pub(super) use crate::parser::literals::StringLiteralText;
 use crate::parser::literals::has_escape_sequence;
-use crate::parser::token::T;
 use crate::utf16::Utf16View;
 use ak::Utf16String;
+use libjs_parser::columns::NONE;
+use libjs_parser::columns::tag;
+use libjs_parser::token::T;
 
 /// A node of the tree. Zero stands for no node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,7 +153,7 @@ pub(super) struct TryData {
     pub(super) finalizer: Option<NodeId>,
 }
 
-impl SyntaxTree {
+impl SyntaxTree<'_> {
     #[inline(always)]
     pub(super) fn node_tag(&self, node: NodeId) -> u8 {
         self.ast.tag[node.index()]

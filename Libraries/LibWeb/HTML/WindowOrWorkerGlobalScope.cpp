@@ -14,6 +14,7 @@
 #include <AK/StringBuilder.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
+#include <LibCompositing/CanvasColorSpace.h>
 #include <LibCore/Timer.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
@@ -36,10 +37,8 @@
 #include <LibWeb/EventTiming/PerformanceEventTiming.h>
 #include <LibWeb/Fetch/BindingsGlue.h>
 #include <LibWeb/Fetch/FetchMethod.h>
-#include <LibWeb/HTML/Canvas/PredefinedColorSpace.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
-#include <LibWeb/HTML/EventSource.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -109,7 +108,6 @@ void WindowOrWorkerGlobalScopeMixin::visit_edges(JS::Cell::Visitor& visitor)
 {
     visitor.visit(m_timers);
     visitor.visit(m_indexed_db);
-    visitor.visit(m_registered_event_sources);
     visitor.visit(m_strongly_referenced_broadcast_channels);
     visitor.visit(m_objects_with_pending_activity);
 
@@ -123,7 +121,6 @@ void WindowOrWorkerGlobalScopeMixin::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_crypto);
     visitor.visit(m_cache_storage);
     visitor.visit(m_trusted_type_policy_factory);
-    visitor.ignore(m_outstanding_rejected_promises_weak_set);
     visitor.visit(m_about_to_be_notified_rejected_promises_list);
 }
 
@@ -225,6 +222,7 @@ extern "C" {
 // Defined in Bindings/Rust/src/canvas_2d/exports.rs.
 bool web_canvas_2d_read_back_video_frame(void* video_wrapper, Optional<Gfx::DecodedImageFrame>* out_frame);
 // Defined in Bindings/Rust/src/html/exports.rs.
+void web_rust_event_source_forcibly_close_all(JSVM*, void* realm);
 JSCompletion web_rust_structured_clone(JSVM*, void* realm, JSValue, JSObject* const* transfer, size_t count);
 // Defined in Bindings/Rust/src/performance_timeline/exports.rs.
 HighResolutionTime::Performance* web_rust_performance_timeline_performance(JSVM*, void* realm);
@@ -638,7 +636,7 @@ void WindowOrWorkerGlobalScopeMixin::create_image_bitmap_impl(JS::Realm& realm, 
             }
 
             // 3. Set imageBitmap's bitmap data to image's image data, cropped to the source rectangle with formatting.
-            auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *bitmap_or_error.release_value(), gfx_color_space_for(image_data->color_space()), sx, sy, sw, sh, options);
+            auto cropped_bitmap_or_error = crop_to_the_source_rectangle_with_formatting(compositor_host_for(realm.global_object()), *bitmap_or_error.release_value(), Compositing::gfx_color_space_for(image_data->color_space()), sx, sy, sw, sh, options);
             // AD-HOC: Reject promise with an "InvalidStateError" DOMException on allocation failure
             // Spec issue: https://github.com/whatwg/html/issues/3323
             if (cropped_bitmap_or_error.is_error()) {
@@ -1072,20 +1070,10 @@ void WindowOrWorkerGlobalScopeMixin::add_performance_entry(GC::Ref<PerformanceTi
     web_rust_performance_timeline_add_performance_entry(JS::HostABI::vm_to_abi(realm.vm()), &realm, new_entry.ptr(), check_if_performance_buffer_is_full == CheckIfPerformanceBufferIsFull::Yes);
 }
 
-void WindowOrWorkerGlobalScopeMixin::register_event_source(Badge<EventSource>, GC::Ref<EventSource> event_source)
-{
-    m_registered_event_sources.set(event_source);
-}
-
-void WindowOrWorkerGlobalScopeMixin::unregister_event_source(Badge<EventSource>, GC::Ref<EventSource> event_source)
-{
-    m_registered_event_sources.remove(event_source);
-}
-
 void WindowOrWorkerGlobalScopeMixin::forcibly_close_all_event_sources()
 {
-    for (auto event_source : m_registered_event_sources)
-        event_source->forcibly_close();
+    auto& realm = relevant_realm(*this);
+    web_rust_event_source_forcibly_close_all(JS::HostABI::vm_to_abi(realm.vm()), &realm);
 }
 
 void WindowOrWorkerGlobalScopeMixin::add_strong_reference_to_broadcast_channel(GC::Ref<DOM::EventTarget> channel)
@@ -1387,8 +1375,8 @@ void WindowOrWorkerGlobalScopeMixin::push_onto_outstanding_rejected_promises_wea
 
 bool WindowOrWorkerGlobalScopeMixin::remove_from_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise> promise)
 {
-    return m_outstanding_rejected_promises_weak_set.remove_first_matching([&](GC::Ptr<JS::Promise> promise_in_set) {
-        return promise == promise_in_set;
+    return m_outstanding_rejected_promises_weak_set.remove_first_matching([&](auto const& promise_in_set) {
+        return promise == promise_in_set.ptr();
     });
 }
 
@@ -1430,6 +1418,9 @@ void WindowOrWorkerGlobalScopeMixin::notify_about_rejected_promises(Badge<EventL
         auto& self = as<WindowOrWorkerGlobalScopeMixin>(global);
         auto& realm = relevant_realm(self);
 
+        // NB: The weak set drops the promises that died once here, rather than each time a promise is added to it.
+        self.m_outstanding_rejected_promises_weak_set.remove_all_matching([](auto const& promise_in_set) { return !promise_in_set; });
+
         // 1. For each promise p in list:
         for (auto const& promise : list->elements()) {
 
@@ -1458,7 +1449,7 @@ void WindowOrWorkerGlobalScopeMixin::notify_about_rejected_promises(Badge<EventL
 
             // 4. If p's [[PromiseIsHandled]] internal slot is false, add p to settings object's outstanding rejected promises weak set.
             if (!promise->is_handled())
-                self.m_outstanding_rejected_promises_weak_set.append(*promise);
+                self.push_onto_outstanding_rejected_promises_weak_set(promise);
 
             // This algorithm results in promise rejections being marked as handled or not handled. These concepts parallel handled and not handled script errors.
             // If a rejection is still not handled after this, then the rejection may be reported to a developer console.

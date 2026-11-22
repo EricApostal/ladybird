@@ -11,6 +11,7 @@
 #include <AK/Base64.h>
 #include <AK/Debug.h>
 #include <AK/Math.h>
+#include <AK/TemporaryChange.h>
 #include <LibCompositing/DisplayList/DisplayListResources.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootHashTable.h>
@@ -1540,11 +1541,28 @@ bool EventHandler::update_hover_where_the_pointer_rests(HTML::HoverUpdatePoint h
     auto target = target_for_mouse_position(*m_last_known_mouse_visual_viewport_position, visual_animation_sample_time_nanoseconds);
     auto node = target.has_value() ? target->dom_node() : nullptr;
     auto* target_layout_node = target.has_value() ? target->layout_node(read) : nullptr;
-    if (node && target_layout_node && node.ptr() == document->hovered_node() && !Painting::is_navigable_container_viewport_paintable(*target_layout_node)) {
+    if (node && target_layout_node && !Painting::is_navigable_container_viewport_paintable(*target_layout_node)) {
+        bool const hit_node_is_hovered = node.ptr() == document->hovered_node();
         Layout::Node* layout_node = nullptr;
-        if (parent_element_for_event_dispatch(*target_layout_node, node, layout_node))
-            update_cursor(read, target_layout_node, *node, target->chrome_widget, target->is_text_fragment);
-        return false;
+        bool const events_go_to_an_element = parent_element_for_event_dispatch(*target_layout_node, node, layout_node);
+        if (hit_node_is_hovered) {
+            if (events_go_to_an_element)
+                update_cursor(read, target_layout_node, *node, target->chrome_widget, target->is_text_fragment);
+            return false;
+        }
+        bool const full_update_would_hit_test_and_find_what_the_mouse_hovers_again = events_go_to_an_element
+            && m_effective_legacy_mouse_pointer_type == PointerType::Mouse
+            && m_effective_legacy_mouse_pointer_position == node
+            && m_native_mouse_hover_target == node
+            && !m_mousedown_target
+            && !m_nested_navigable_under_pointer;
+        if (full_update_would_hit_test_and_find_what_the_mouse_hovers_again) {
+            if (!m_navigable->leave_hover_update_to_end_of_user_scroll()) {
+                update_cursor(read, target_layout_node, *node, target->chrome_widget, target->is_text_fragment);
+                report_hovered_link_to_client(node);
+            }
+            return false;
+        }
     }
     update_hover_at_last_known_mouse_position(visual_animation_sample_time_nanoseconds);
     return false;
@@ -1923,8 +1941,16 @@ EventResult EventHandler::handle_text_editing_command(TextEditingCommand const& 
     return EventResult::Handled;
 }
 
+static bool s_is_handling_user_key_press_or_paste = false;
+
+bool EventHandler::is_handling_user_key_press_or_paste()
+{
+    return s_is_handling_user_key_press_or_paste;
+}
+
 EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved)
 {
+    TemporaryChange handling_user_key_press { s_is_handling_user_key_press_or_paste, true };
     if (!m_navigable->active_document())
         return EventResult::Dropped;
     if (!m_navigable->active_document()->is_fully_active())
@@ -2448,6 +2474,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
 
 EventResult EventHandler::handle_keyup(UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat)
 {
+    TemporaryChange handling_user_key_press { s_is_handling_user_key_press_or_paste, true };
     // Keyup events as a result of auto-repeat are not fired.
     // See: https://w3c.github.io/uievents/#events-keyboard-event-order
     if (repeat)
@@ -2923,6 +2950,9 @@ EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore
     if (!document || !document->is_fully_active())
         return EventResult::Dropped;
 
+    // NB: Only the user pastes, with a key or the UI's Paste command, so an edit the page makes in response is theirs.
+    TemporaryChange handling_user_paste { s_is_handling_user_key_press_or_paste, true };
+
     data_store->set_mode(HTML::DragDataStore::Mode::ReadOnly);
     auto data_transfer = HTML::DataTransfer::create(data_store);
 
@@ -3041,12 +3071,12 @@ void EventHandler::handle_gamepad_disconnected(Gamepad::GamepadHandle handle)
         child_navigable->event_handler().handle_gamepad_disconnected(handle);
 }
 
-void EventHandler::process_auto_scroll()
+void EventHandler::process_auto_scroll(double frame_timestamp)
 {
     if (m_auto_scroll_handler)
         m_auto_scroll_handler->perform_tick();
     if (m_middle_button_scroll_handler)
-        m_middle_button_scroll_handler->perform_tick();
+        m_middle_button_scroll_handler->perform_tick(frame_timestamp);
 }
 
 static GC::Ptr<DOM::StaticRange> collapsed_delete_target_range_for_input_event(DOM::Document const& document, DOM::Range const& range, Utf16FlyString const& input_type)

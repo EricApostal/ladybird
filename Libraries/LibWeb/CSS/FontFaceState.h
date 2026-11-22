@@ -26,6 +26,7 @@
 #include <LibWeb/CSS/RustDescriptorBlock.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
 #include <LibWeb/WebIDL/Buffers.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CSS {
 
@@ -188,17 +189,5 @@ private:
 };
 
 bool font_format_is_supported(Utf16View name);
-
-// Record that a style update wanted a web face loaded, on any thread. Loading a face changes its status, appends it to
-// every FontFaceSet it is in - under an execution context that runs author callbacks - and starts a fetch, none of
-// which may happen while a style update runs, nor anywhere but the main thread.
-void note_wanted_web_face(u64 face_id);
-
-// Load every face wanted since the last call, unless a style update is running: that one drains them at its end.
-void request_wanted_web_faces();
-
-// A style update defers every load its cascades want to its own end.
-void begin_deferred_web_face_loads();
-void end_deferred_web_face_loads();
 
 }

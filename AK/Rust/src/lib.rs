@@ -6,9 +6,14 @@
 
 //! Rust views of shared AK data structures.
 
+pub mod character_types;
+mod column;
+mod fast_hash;
 mod generic_lexer;
 pub mod math;
 pub mod perf_map;
+mod region;
+mod row_block;
 mod scope_guard;
 mod slice;
 pub mod stack;
@@ -16,11 +21,22 @@ mod string_conversions;
 pub mod waiter_list;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub mod windows_code_memory;
+mod word_chunk;
+mod zone;
+mod zone_bit_set;
+mod zone_map;
 
+pub use column::{Column, ColumnFull};
+pub use fast_hash::FastHasher;
 pub use generic_lexer::GenericLexer;
+pub use row_block::{RowBlock, RowBlockFull, RowList};
 pub use scope_guard::ScopeGuard;
 pub use slice::{Span, SpanMut, slice_from_raw_parts, slice_from_raw_parts_mut};
 pub use string_conversions::{UnsignedInteger, parse_ascii_digits};
+pub use word_chunk::WordChunk;
+pub use zone::{Zone, ZoneVec, ZoneVecIntoIter};
+pub use zone_bit_set::ZoneBitSet;
+pub use zone_map::{ZoneMap, ZoneSet};
 
 use core::mem::MaybeUninit;
 use std::num::NonZeroUsize;
@@ -103,8 +119,7 @@ unsafe extern "C" {
     ) -> u8;
     fn ladybird_encode_base64_to_utf16(data: *const u8, length: usize, url: bool, omit_padding: bool) -> usize;
     fn ladybird_release_unused_allocator_memory();
-    fn ladybird_enter_scratch_heap() -> *mut core::ffi::c_void;
-    fn ladybird_leave_scratch_heap(previous_heap: *mut core::ffi::c_void);
+    fn ladybird_set_idle_thread_memory_release(release: extern "C" fn());
     fn ladybird_convert_to_decimal_exponential_form(
         value: f64,
         sign: *mut bool,
@@ -517,6 +532,13 @@ pub fn release_unused_allocator_memory() {
     unsafe { ladybird_release_unused_allocator_memory() }
 }
 
+/// Sets the function that a thread pool calls on a thread that goes idle. It gives back the memory that the calling
+/// thread keeps outside the allocator for its next jobs, and does nothing on a thread that keeps none.
+pub fn set_idle_thread_memory_release(release: extern "C" fn()) {
+    // SAFETY: Any thread may set the function, which stays valid for as long as the process runs.
+    unsafe { ladybird_set_idle_thread_memory_release(release) }
+}
+
 /// Maps in, in one go, the pages of the room `vector` has past its elements for `additional` more, for writes about to
 /// fill it: a vector a large write grows into fresh memory then takes its pages at once rather than a fault at a time.
 /// Where the system cannot, the writes map them in as they come.
@@ -547,30 +569,6 @@ pub fn populate_room_for_write<T>(vector: &mut Vec<T>, additional: usize) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (vector, additional);
-}
-
-/// While this lives, what the calling thread allocates goes to a heap of its own. Work that frees
-/// nearly everything it allocates uses it to keep its temporary data out of the pages of what
-/// outlives it. Blocks stay valid after it ends. Scopes end in the reverse order they were entered in.
-/// It holds a pointer so that it stays on its thread.
-pub struct ScratchHeapScope {
-    previous_heap: *mut core::ffi::c_void,
-}
-
-impl ScratchHeapScope {
-    #[must_use = "the scratch heap is only in use while the scope lives"]
-    pub fn enter() -> Self {
-        // SAFETY: Takes no arguments, and any thread may call it.
-        let previous_heap = unsafe { ladybird_enter_scratch_heap() };
-        Self { previous_heap }
-    }
-}
-
-impl Drop for ScratchHeapScope {
-    fn drop(&mut self) {
-        // SAFETY: The heap is the one this thread entered the scratch heap from.
-        unsafe { ladybird_leave_scratch_heap(self.previous_heap) }
-    }
 }
 
 pub fn validate_utf16(string: &[u16]) -> bool {

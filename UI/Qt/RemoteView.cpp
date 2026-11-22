@@ -133,6 +133,36 @@ void RemoteView::set_device_pixel_ratio_and_viewport(double device_pixel_ratio, 
     HubConnection::the().async_view_set_viewport(view_id(), size, device_pixel_ratio);
 }
 
+void RemoteView::set_compositor_layer_hidden(u64 layer_id, bool hidden)
+{
+    HubConnection::the().async_view_set_compositor_layer_hidden(view_id(), layer_id, hidden);
+}
+
+void RemoteView::set_selected_compositor_layers(Vector<u64> layer_ids)
+{
+    HubConnection::the().async_view_set_selected_compositor_layers(view_id(), move(layer_ids));
+}
+
+void RemoteView::set_hovered_compositor_layer(Optional<u64> layer_id)
+{
+    HubConnection::the().async_view_set_hovered_compositor_layer(view_id(), layer_id);
+}
+
+void RemoteView::show_only_compositor_layers(Vector<u64> layer_ids)
+{
+    HubConnection::the().async_view_show_only_compositor_layers(view_id(), move(layer_ids));
+}
+
+void RemoteView::show_all_compositor_layers()
+{
+    HubConnection::the().async_view_show_all_compositor_layers(view_id());
+}
+
+void RemoteView::reset_compositor_layer_raster_counts()
+{
+    HubConnection::the().async_view_reset_compositor_layer_raster_counts(view_id());
+}
+
 u64 RemoteView::add_navigation_listener(NavigationListener listener)
 {
     auto id = m_next_navigation_listener_id++;
@@ -194,11 +224,11 @@ void RemoteView::did_present_frame_in_remote_layer(Gfx::IntSize size, double dev
         on_ready_to_paint();
 }
 
-void RemoteView::take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)> callback)
+void RemoteView::take_frame_snapshot(Function<void(Optional<Gfx::ShareableBitmap>)> callback)
 {
     auto request_id = m_next_request_id++;
     m_pending_frame_snapshots.set(request_id, move(callback));
-    HubConnection::the().async_view_take_frame_snapshot(view_id(), request_id, maximum_size);
+    HubConnection::the().async_view_take_frame_snapshot(view_id(), request_id);
 }
 
 void RemoteView::did_take_frame_snapshot(u64 request_id, Optional<Gfx::ShareableBitmap> snapshot)
@@ -376,6 +406,16 @@ ErrorOr<void> RemoteView::restore_session_history_from_snapshot(WebView::Session
         return Error::from_string_literal("Unable to restore the session history");
     return {};
 }
+
+Optional<u64> RemoteView::keep_state_for_discarding()
+{
+    return HubConnection::the().view_keep_state_for_discarding(view_id());
+}
+
+void RemoteView::restore_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    HubConnection::the().async_view_restore_state_of_discarded_tab(view_id(), discarded_tab_state_id);
+}
 #else
 Optional<i32> RemoteView::history_step_at_delta(int delta) const
 {
@@ -415,6 +455,18 @@ WebView::SessionHistorySnapshot RemoteView::session_history_snapshot() const
 ErrorOr<void> RemoteView::restore_session_history_from_snapshot(WebView::SessionHistorySnapshot snapshot)
 {
     return m_view->restore_session_history_from_snapshot(move(snapshot));
+}
+
+Optional<u64> RemoteView::keep_state_for_discarding()
+{
+    return m_view->keep_state_for_discarding();
+}
+
+// NB: The tab's pages must find their sessionStorage as they load, so this can't wait for the Hub's turn.
+void RemoteView::restore_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    m_view->restore_state_of_discarded_tab(discarded_tab_state_id);
+    m_view->push_state_to_ui();
 }
 #endif
 

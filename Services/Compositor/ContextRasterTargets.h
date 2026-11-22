@@ -13,7 +13,6 @@
 #include <AK/RefPtr.h>
 #include <AK/Span.h>
 #include <AK/StringView.h>
-#include <Compositor/BackingStoreManager.h>
 #include <Compositor/CanvasSurfaceRegistry.h>
 #include <Compositor/CompositorCoreHost.h>
 #include <Compositor/DisplayListRasterCache.h>
@@ -53,14 +52,7 @@ public:
     DrawnFonts const& overlay_fonts() const { return m_overlay_fonts; }
     DisplayListRasterCache& overlay_raster_cache() { return m_overlay_raster_cache; }
     // Shapes a label of the overlays, in a font that the overlays' fonts then hold.
-    Optional<OverlayLabel> shape_overlay_label(Optional<StringView> font_family, double device_pixel_ratio, StringView text);
-
-    BackingStoreManager& backing_stores() { return m_backing_stores; }
-    BackingStoreManager const& backing_stores() const { return m_backing_stores; }
-
-    // A surface of the pool for the next content shown from it, which the window server is not busy with.
-    RefPtr<PresentableSurface> next_presentable_surface(u32 pool, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&);
-    void drop_presentable_surface_pool(u32 pool) { m_presentable_surface_pools.remove(pool); }
+    Optional<OverlayLabel> shape_overlay_label(Optional<StringView> font_family, float font_size_in_points, double device_pixel_ratio, StringView text);
 
     // The video sinks that the display list of the context draws. Answers whether these are other sinks than before.
     bool set_drawn_video_sinks(ReadonlySpan<u64> handles);
@@ -74,8 +66,6 @@ private:
     OwnedCanvasSurfaces m_canvas_surfaces;
     DrawnFonts m_overlay_fonts;
     DisplayListRasterCache m_overlay_raster_cache;
-    BackingStoreManager m_backing_stores;
-    HashMap<u32, PresentableSurfacePool> m_presentable_surface_pools;
     HashTable<Media::VideoSinkHandle> m_drawn_video_sinks;
 };
 

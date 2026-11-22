@@ -35,7 +35,7 @@ pub(in crate::codegen) enum KeyName {
     Identity(u64),
 }
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// Looks up the own data property that the string `key` names on the
     /// object in `base` in the VM's keyed property lookup cache, like the
     /// runtime's keyed get does when the access's own cache has nothing for
@@ -288,8 +288,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let not_polymorphic = self.masm.new_label();
         self.property_cache_address(entry, executable, cache_index)?;
         self.masm.load64(entry, &Address::new(entry, 0));
-        let was_megamorphic = self.executables[executable as usize]
-            .property_caches
+        let was_megamorphic = self.snapshot[self.snapshot.executables[executable as usize].property_caches]
             .get(cache_index as usize)
             .is_some_and(|cache| cache.kind == PropertyCacheKind::Megamorphic);
         if was_megamorphic {
@@ -381,7 +380,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     }
 }
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// Where a cache probe branches when it finds nothing: the target of the
     /// branch on its result that follows it, if code generation fused them,
     /// or a new label. Returns whether it is fused.

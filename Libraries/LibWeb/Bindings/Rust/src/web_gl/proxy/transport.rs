@@ -28,7 +28,6 @@ pub(crate) trait Transport {
     type Frame;
     type DrawingBufferPixels;
 
-    fn max_frames_per_message(&self) -> usize;
     fn create_shared_memory(&self, size: usize) -> Option<Self::SharedMemory>;
 
     fn canvas_id(&self) -> Option<u64>;
@@ -48,6 +47,8 @@ pub(crate) trait Transport {
     /// Returns once the replayer has executed everything published, or false if it never will.
     fn wait_until_published_commands_executed(&self) -> bool;
     fn send_commands(&self, commands: &[u8], frames: &[Self::Frame]);
+    /// Sends the records that the first `size_in_bytes` bytes of memory from `create_shared_memory` hold.
+    fn send_commands_written_to(&self, memory: &Self::SharedMemory, size_in_bytes: usize, frames: &[Self::Frame]);
 
     fn present_canvas(&self, preserve_drawing_buffer: bool);
     fn clear_drawing_buffer(&self);

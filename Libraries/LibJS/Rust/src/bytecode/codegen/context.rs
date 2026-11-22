@@ -41,6 +41,8 @@ use super::names::NameTables;
 /// The most entries that a table keeps its memory for when the next compile takes over.
 pub(super) const MAXIMUM_SPARE_CAPACITY: usize = 1024;
 
+const MAXIMUM_SPARE_BYTECODE_SIZE: usize = 64 * 1024;
+
 /// Feedback slot indices are encoded as u16. Sites beyond the last index share
 /// it, which only merges their feedback.
 const MAX_FEEDBACK_SLOT_COUNT: u32 = u16::MAX as u32 + 1;
@@ -93,7 +95,7 @@ thread_local! {
 
 /// The state of generating code for one function.
 pub struct Generator<'t> {
-    pub(super) tree: &'t SyntaxTree,
+    pub(super) tree: &'t SyntaxTree<'t>,
     pub(super) context: ManuallyDrop<Box<CodegenContext>>,
 
     pub(super) current_source_offset: SourceOffset,
@@ -107,6 +109,11 @@ pub struct Generator<'t> {
     pub(super) builtin_abstract_operations_enabled: bool,
     pub(super) eager_compile_direct_iifes: bool,
     pub(super) contains_direct_call_to_eval_in_non_strict_mode: bool,
+    /// Whether the code makes private or variable environments, so that it starts with `EnterWithOwnEnvironments`.
+    pub(super) keeps_own_environments: bool,
+    /// Whether the code is a sloppy function that uses its this value, which its callers pass as it is, so that it
+    /// starts with `EnterCoercingThis`.
+    pub(super) coerces_this: bool,
     pub(super) enclosing_environment_scope: Option<Arc<EnclosingEnvironmentScope>>,
     pub(super) variable_environment_coordinate_scope_index: Option<usize>,
     pub(super) enclosing_code: Arc<EnclosingCode>,
@@ -164,13 +171,17 @@ impl Drop for Generator<'_> {
     fn drop(&mut self) {
         // SAFETY: This is the last that anything sees of the context.
         let mut context = unsafe { ManuallyDrop::take(&mut self.context) };
+        // NB: Free an outsized context rather than keep its memory for good.
+        if context.stream.bytecode_capacity() > MAXIMUM_SPARE_BYTECODE_SIZE {
+            return;
+        }
         context.clear();
         SPARE_CONTEXT.set(Some(context));
     }
 }
 
 impl<'t> Generator<'t> {
-    pub(super) fn new(tree: &'t SyntaxTree, enclosing_code: Arc<EnclosingCode>, stack_limit: usize) -> Self {
+    pub(super) fn new(tree: &'t SyntaxTree<'t>, enclosing_code: Arc<EnclosingCode>, stack_limit: usize) -> Self {
         let mut context = SPARE_CONTEXT.take().unwrap_or_default();
         context.names.begin_compile(&tree.script);
         Self {
@@ -185,6 +196,8 @@ impl<'t> Generator<'t> {
             builtin_abstract_operations_enabled: false,
             eager_compile_direct_iifes: false,
             contains_direct_call_to_eval_in_non_strict_mode: false,
+            keeps_own_environments: false,
+            coerces_this: false,
             enclosing_environment_scope: None,
             variable_environment_coordinate_scope_index: None,
             enclosing_code,

@@ -53,6 +53,7 @@
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/LocalFileRoot.h>
 #include <LibWebView/MediaSessionCoordinator.h>
 #include <LibWebView/Options.h>
 #include <LibWebView/PlatformFeatureDecisions.h>
@@ -96,6 +97,7 @@ public:
 
     static Settings& settings() { return *the().m_settings; }
     static Profile const& profile() { return *the().m_profile; }
+    static LocalFileGrantPolicy const& local_file_grant_policy() { return the().m_local_file_grant_policy; }
     BrowserProcess& browser_process() { return *m_browser_process; }
     bool should_exit_after_profile_coordination() const { return m_should_exit_after_profile_coordination; }
     // Whether the process exits because a browser is running for the profile, but does not take what we were asked to
@@ -115,6 +117,7 @@ public:
     Translator* translator() { return m_translator.ptr(); }
     void set_translator(OwnPtr<Translator>);
     MicrophoneAuthorizer& microphone_authorizer();
+    DefaultBrowser& default_browser();
     static FontService& font_service() { return *the().m_font_service; }
     static FontServiceHost& font_service_host() { return *the().m_font_service_host; }
     JsonValue const& site_compatibility_data() const { return m_site_compatibility_data; }
@@ -153,6 +156,14 @@ public:
     virtual bool platform_scrollbar_track_press_jumps() const { return false; }
     // Tells the compositor of a change to what platform_scrollbar_track_press_jumps() returns.
     void platform_scrollbar_track_press_behavior_changed();
+    // Returns true if the platform's settings ask for less motion, which pages see while the motion preference is Auto.
+    virtual bool platform_prefers_reduced_motion() const { return false; }
+    // Tells every page of a change to what platform_prefers_reduced_motion() returns.
+    void platform_motion_preference_changed();
+    // Returns true if the platform's settings ask for more contrast, which pages see while the contrast preference is Auto.
+    virtual bool platform_prefers_more_contrast() const { return false; }
+    // Tells every page of a change to what platform_prefers_more_contrast() returns.
+    void platform_contrast_preference_changed();
     // The languages the user prefers, as the platform lists them (BCP 47 tags, most preferred first).
     virtual Vector<String> platform_preferred_languages() const { return {}; }
     // The GPU the platform presents on, which the compositor paints on too, so that it can share its frames without a copy.
@@ -234,7 +245,8 @@ public:
     ErrorOr<Core::GeolocationProvider::WatchId, Core::GeolocationError> start_watching_geolocation_position(Core::GeolocationProvider::SuccessCallback on_success, Core::GeolocationProvider::ErrorCallback on_error);
     void stop_watching_geolocation_position(Core::GeolocationProvider::WatchId);
 
-    bool same_origin_tabs_may_share_a_process() const;
+    TabProcesses tab_processes() const;
+    bool tabs_may_share_processes() const;
     ErrorOr<NonnullRefPtr<WebContentPage>> open_page_for_new_tab(IsPrivate);
     struct ChildFrameWebContentProcess {
         NonnullRefPtr<WebContentClient> client;
@@ -269,6 +281,8 @@ public:
     // Compositor connection to pair it with.
     bool connect_video_presentation_to_compositor(WebContentClient&, IPC::TransportHandle compositor_end);
     ErrorOr<IPC::TransportHandle> connect_new_compositor_canvas_client();
+    // Counts the Compositor processes that were launched, so that a client can tell which one it is connected to.
+    u64 compositor_generation() const { return m_compositor_generation; }
     void register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
     ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
     void update_compositor_viewport(Web::CompositorContextId, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
@@ -291,7 +305,7 @@ public:
     void begin_synchronized_resize(u64 remote_layer_id, u64 token);
     void await_synchronized_resize_frame(u64 remote_layer_id, u64 token, Gfx::IntSize);
     void commit_synchronized_resize(u64 remote_layer_id, u64 token);
-    void take_frame_snapshot(Web::CompositorContextId, Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)>);
+    void take_frame_snapshot(Web::CompositorContextId, Function<void(Optional<Gfx::ShareableBitmap>)>);
     bool handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&, bool allow_keyboard_scroll);
     bool handle_and_dispatch_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
     bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
@@ -327,9 +341,11 @@ public:
 
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;
     virtual void display_error_dialog(StringView error_message) const;
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     virtual void display_update_check_result(UpdateCheckResult const&, UpdateCheckTrigger) { }
 
     UpdateChecker* update_checker() { return m_update_checker.ptr(); }
+#endif
 
     // FIXME: We should implement UI-agnostic platform APIs to interact with the system clipboard.
     enum class ClipboardType : u8 {
@@ -380,6 +396,8 @@ public:
     void set_blocks_pop_ups(bool);
     void set_shows_line_box_borders(bool);
     void set_shows_caret_hit_test_debug_overlay(bool);
+    bool shows_compositor_layers() const { return m_shows_compositor_layers; }
+    void set_shows_compositor_layers(bool);
 
     bool devtools_enabled() const { return m_devtools; }
     void dump_cookies() const;
@@ -409,6 +427,9 @@ public:
     // Calls back once the features are decided from this launch's probe rather than from cached facts.
     void when_platform_features_are_current(Function<void()>);
     PlatformFeatures::ProcessFeatures platform_features_for(FeatureProcess) const;
+    // Whether GPU painting is in the features the Compositor was last launched with. Until the Compositor first launches,
+    // it counts as enabled.
+    bool compositor_gpu_painting_enabled() const { return m_compositor_gpu_painting_enabled; }
     // Every feature's decision and the facts they were made from, for people to read.
     JsonObject platform_features_report() const;
     // The same as header lines of a report that leaves the machine: the features of one process or of all of them, the
@@ -427,13 +448,13 @@ protected:
     virtual void create_platform_actions() { }
     virtual Core::EventLoop& create_platform_event_loop();
     virtual NonnullOwnPtr<MicrophoneAuthorizer> create_microphone_authorizer();
+    virtual NonnullOwnPtr<DefaultBrowser> create_default_browser();
 
     virtual bool should_coordinate_browser_process() const { return true; }
     // The process that shows this browser to the user, if that is not this process.
     virtual Optional<pid_t> ui_process_id() const { return {}; }
     virtual bool captures_browser_crashes() const { return false; }
     virtual bool should_use_os_geolocation() const { return true; }
-    virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::IFrame; }
 
     virtual NonnullRefPtr<Core::Promise<ByteString>> ask_user_for_download_path(ByteString const& file) const;
 
@@ -447,6 +468,7 @@ protected:
 
     virtual void on_devtools_enabled() const { }
     virtual void on_devtools_disabled() const { }
+    virtual void on_compositor_gpu_painting_changed() const { }
 
     Main::Arguments& arguments() { return m_arguments; }
 
@@ -596,6 +618,7 @@ private:
     static Application* s_the;
 
     Optional<Profile> m_profile;
+    LocalFileGrantPolicy m_local_file_grant_policy;
     OwnPtr<Settings> m_settings;
     OwnPtr<BrowserProcess> m_browser_process;
     bool m_should_exit_after_profile_coordination { false };
@@ -623,7 +646,9 @@ private:
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
     RefPtr<Core::Timer> m_content_blocker_list_update_timer;
     ByteString m_instance_data_directory;
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     OwnPtr<UpdateChecker> m_update_checker;
+#endif
     struct PendingContentBlockerListUpdate {
         String identifier;
         String name;
@@ -649,6 +674,7 @@ private:
     OwnPtr<RequestServerManager> m_request_server_manager;
     OwnPtr<ImageDecoderManager> m_image_decoder_manager;
     RefPtr<CompositorClient> m_compositor_client;
+    u64 m_compositor_generation { 0 };
     RefPtr<CompositorPresentationClient> m_compositor_presentation_client;
     u64 m_compositor_presentation_id { 0 };
     // IDs are never reused, so one from before a Compositor restart names no layer of the new process.
@@ -661,6 +687,7 @@ private:
     // Set when the Browser ends a Compositor to relaunch it with other features, which does not count as a crash.
     bool m_compositor_relaunch_is_planned { false };
     ByteString m_compositor_launched_features;
+    bool m_compositor_gpu_painting_enabled { true };
 
     FeatureOverrides m_feature_overrides;
     HashMap<PlatformFeatures::Feature, String> m_feature_runtime_failures;
@@ -700,6 +727,7 @@ private:
     OwnPtr<SpellChecker> m_spell_checker;
     OwnPtr<Translator> m_translator;
     OwnPtr<MicrophoneAuthorizer> m_microphone_authorizer;
+    OwnPtr<DefaultBrowser> m_default_browser;
     OwnPtr<Core::TimeZoneWatcher> m_time_zone_watcher;
 
     Core::EventLoop* m_event_loop { nullptr };
@@ -707,6 +735,7 @@ private:
     OwnPtr<IPC::HandleBrokerServer> m_handle_broker_server;
 #endif
     OwnPtr<ProcessManager> m_process_manager;
+    OwnPtr<TabDiscarder> m_tab_discarder;
 
     Web::CSS::PreferredColorScheme m_color_scheme { Web::CSS::PreferredColorScheme::Auto };
     Web::CSS::PreferredContrast m_contrast { Web::CSS::PreferredContrast::Auto };
@@ -717,6 +746,7 @@ private:
     bool m_blocks_pop_ups { true };
     bool m_shows_line_box_borders { false };
     bool m_shows_caret_hit_test_debug_overlay { false };
+    bool m_shows_compositor_layers { false };
 
     Web::Clipboard::SystemClipboardItem m_clipboard;
 

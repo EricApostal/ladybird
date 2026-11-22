@@ -20,6 +20,7 @@
 //! cell, and on empty free lists.
 
 use super::Codegen;
+use super::RegisterList;
 use super::probes::CacheRegisters;
 use super::slow_path_calls::slow_path_saved_registers;
 use crate::asm::Address;
@@ -53,9 +54,9 @@ pub(super) struct DeferredStorageGrowth {
     shape: Gpr,
 }
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
-    fn growth_registers() -> Option<Vec<Gpr>> {
-        let registers = slow_path_saved_registers::<M>().iter().collect::<Vec<_>>();
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
+    fn growth_registers() -> Option<RegisterList<Gpr>> {
+        let registers = slow_path_saved_registers::<M>().iter().collect::<RegisterList<_>>();
         (registers.len() >= WORK_REGISTER_COUNT + 2).then_some(registers)
     }
 
@@ -68,8 +69,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             && info.storage_values_offset as usize == 8 * info.storage_template.len()
             && info.storage_capacity_offset + 8 == info.storage_values_offset
             && i64::from(self.runtime.layout.named_properties_capacity) == -8
-            && info
-                .storage_size_classes
+            && self.snapshot[info.storage_size_classes]
                 .iter()
                 .all(|size_class| size_class.cell_size == info.storage_values_offset + 8 * size_class.capacity)
     }
@@ -107,7 +107,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     }
 
     pub(super) fn emit_deferred_storage_growths(&mut self) {
-        let growths = std::mem::take(&mut self.deferred_storage_growths);
+        let growths = self.deferred_storage_growths.take();
         if growths.is_empty() {
             return;
         }
@@ -144,8 +144,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Architecture::X86_64 => 8,
             Architecture::AArch64 => 0,
         };
-        let info = self.runtime.array_allocation.clone();
-        let objects = self.runtime.object_allocation.clone();
+        let info = self.runtime.array_allocation;
+        let objects = self.runtime.object_allocation;
         let offsets = self.runtime.offsets;
         let scratch = self.pinned.scratch;
         let at = |base: Gpr, offset: u32| Address::new(base, offset as i32);
@@ -184,7 +184,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         //     kind, which must be a cell's: malloc storage is freed when
         //     replaced.
         let capacity_offset = self.runtime.layout.named_properties_capacity;
-        let cell_kind = info.storage_template[info.storage_capacity_offset as usize / 8] >> 32;
+        let cell_kind = self.snapshot[info.storage_template][info.storage_capacity_offset as usize / 8] >> 32;
         self.masm.load32(old_capacity, &Address::new(storage, capacity_offset));
         self.masm.load32(scratch, &Address::new(storage, capacity_offset + 4));
         self.masm
@@ -202,7 +202,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.move32(capacity, scratch);
         self.masm.bind(at_least_needed);
         let found = self.masm.new_label();
-        for size_class in &info.storage_size_classes {
+        let snapshot = self.snapshot;
+        for size_class in &snapshot[info.storage_size_classes] {
             let next = self.masm.new_label();
             self.masm
                 .branch32_imm(Condition::Above, capacity, size_class.capacity as i32, next);
@@ -233,7 +234,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         }
 
         // The header, then the values: undefined beyond the old ones.
-        for (index, word) in info.storage_template.iter().enumerate() {
+        for (index, word) in snapshot[info.storage_template].iter().enumerate() {
             self.masm.store_imm64(&at(cell, 8 * index as u32), *word);
         }
         self.masm.store32(&at(cell, info.storage_capacity_offset), capacity);

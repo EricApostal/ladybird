@@ -79,11 +79,11 @@ void CompositorPresentationClient::did_present_frame_in_remote_layer(Web::Compos
         page->did_present_frame_in_remote_layer(content_rect, damage_rect, device_pixel_ratio);
 }
 
-void CompositorPresentationClient::take_frame_snapshot(Web::CompositorContextId context_id, Optional<Gfx::IntSize> maximum_size, FrameSnapshotCallback callback)
+void CompositorPresentationClient::take_frame_snapshot(Web::CompositorContextId context_id, FrameSnapshotCallback callback)
 {
     auto request_id = m_next_frame_snapshot_request_id++;
     m_pending_frame_snapshots.set(request_id, move(callback));
-    async_take_frame_snapshot(context_id, request_id, maximum_size);
+    async_take_frame_snapshot(context_id, request_id);
 }
 
 void CompositorPresentationClient::fail_pending_frame_snapshots()
@@ -127,6 +127,12 @@ void CompositorPresentationClient::did_consume_input_event(Web::CompositorContex
 {
     if (auto* page = page_for_compositor_context_id(context_id))
         page->did_consume_input_event_in_compositor(event_id);
+}
+
+void CompositorPresentationClient::did_update_compositor_layers(Web::CompositorContextId context_id, Compositing::CompositorLayersDescription layers)
+{
+    if (auto* page = page_for_compositor_context_id(context_id))
+        page->did_update_compositor_layers(layers);
 }
 
 void CompositorPresentationClient::did_not_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id)

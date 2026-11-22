@@ -15,7 +15,7 @@ use super::query::{DepthSortingState, item_contains_point};
 use super::*;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::painting::host::FfiHitTestQueryCallbacks;
-use crate::painting::ink_overflow::{HitTestBoundOfLine, ScopeInkBound, scope_ink_bound};
+use crate::painting::ink_overflow::HitTestBoundOfLine;
 use crate::painting::paint_order_plan::{
     PaintOrderInputs, PaintOrderItem, PaintProducer, PaintScope, PaintScopeKind, PaintScopePlan, PlanLeavesOut,
 };
@@ -106,6 +106,8 @@ struct WhatThePointMisses<'walk, 'a, R: PaintRead> {
 }
 
 impl<R: PaintRead> PlanLeavesOut for WhatThePointMisses<'_, '_, R> {
+    const LEAVES_OUT_THE_SAME_CHILD_SCOPES_IN_EVERY_PHASE: bool = true;
+
     fn leaves_out_child_scope(&mut self, child: PaintScope, child_inputs: PaintOrderInputs) -> bool {
         self.walk.point_misses_child_scope(child, child_inputs, self.owner)
     }
@@ -115,6 +117,19 @@ impl<R: PaintRead> PlanLeavesOut for WhatThePointMisses<'_, '_, R> {
             && self
                 .walk
                 .point_misses_line(line_root, line_index, self.owner.absolute_content_origin)
+    }
+
+    fn paint_children_kept_by_an_earlier_phase(&mut self, owner: NodeSlotId) -> Option<&[NodeSlotId]> {
+        self.walk
+            .paint_children_the_point_may_be_over
+            .get(&owner)
+            .map(|children| children.as_slice())
+    }
+
+    fn keep_paint_children_for_later_phases(&mut self, owner: NodeSlotId, children_in_tree_order: &[NodeSlotId]) {
+        self.walk
+            .paint_children_the_point_may_be_over
+            .insert(owner, SmallVec::from_slice(children_in_tree_order));
     }
 }
 
@@ -146,6 +161,7 @@ enum Flow {
 
 struct PointWalk<'a, R: PaintRead> {
     rows: &'a R,
+    viewport: NodeSlotId,
     callbacks: &'a FfiHitTestQueryCallbacks,
     viewport_mapping: ViewportMapping<'a>,
     point: CssPixelPoint,
@@ -157,6 +173,7 @@ struct PointWalk<'a, R: PaintRead> {
     local_points_ignoring_clips: FastMap<SpatialNodeIndex, Option<FloatPoint>>,
     last_local_point_ignoring_clips: Option<(SpatialNodeIndex, Option<FloatPoint>)>,
     hits_of_producer_in_paint_order: Vec<PointHit>,
+    paint_children_the_point_may_be_over: FastMap<NodeSlotId, SmallVec<[NodeSlotId; 8]>>,
     /// What lies under the point, topmost first as the walk met it.
     hits: Vec<PointHit>,
     /// The 3D rendering context the topmost hit is in, whose planes paint sorted by depth: the walk goes on until
@@ -308,6 +325,8 @@ impl<R: PaintRead> PointWalk<'_, R> {
             .contains_point(to_css_point(local))
     }
 
+    /// Whether nothing the child scope paints can be under the point. A point that cannot be taken into the space of
+    /// the child's box misses nothing.
     fn point_misses_child_scope(
         &mut self,
         child: PaintScope,
@@ -315,15 +334,11 @@ impl<R: PaintRead> PointWalk<'_, R> {
         owner: PlacedOwner,
     ) -> bool {
         let rows = self.rows;
-        if !rows.paintable_row_is_populated(child.owner) || !child_inputs.forms_containing_block_for_children() {
-            return false;
-        }
-        let data = rows.paintable_data(child.owner);
-        let paints_positioned_descendants_hoisted_to_it =
-            child.kind == PaintScopeKind::PaintedAsStackingContext && data.establishes_stacking_context;
-        if paints_positioned_descendants_hoisted_to_it || !self.is_placed_at_its_committed_offset_in(child.owner, owner)
+        if child.owner == self.viewport
+            || !rows.paintable_row_is_populated(child.owner)
+            || !child_inputs.forms_containing_block_for_children()
         {
-            return self.point_misses_scope(child);
+            return false;
         }
         let ink = rows.stored_ink_overflow(child.owner);
         if ink.unbounded || ink.contribution_unbounded {
@@ -339,32 +354,27 @@ impl<R: PaintRead> PointWalk<'_, R> {
                     )
                 })
             });
-        let content_origin = owner.absolute_content_origin.translated(offset.x, offset.y);
+        let content_origin = if self.is_placed_at_its_committed_offset_in(child.owner, owner) {
+            owner.absolute_content_origin.translated(offset.x, offset.y)
+        } else {
+            paintable_geometry::absolute_rect(rows, child.owner).location()
+        };
         let padding_box_origin = CssPixelPoint::new(content_origin.x - padding_left, content_origin.y - padding_top);
         let bound = ink.rect.translated_by(padding_box_origin);
+        let data = rows.paintable_data(child.owner);
         let Some(local) = self.local_point_ignoring_clips(data.accumulated_visual_context) else {
             return false;
         };
         let one_pixel = CssPixels::from_integer(1);
-        !bound
+        if bound
             .inflated(one_pixel, one_pixel, one_pixel, one_pixel)
             .contains_point(to_css_point(local))
-    }
-
-    /// Whether nothing the scope paints can be under the point. A point that cannot be taken into the owner's space
-    /// misses nothing.
-    fn point_misses_scope(&mut self, scope: PaintScope) -> bool {
-        let ScopeInkBound::Rect(bound) = scope_ink_bound(self.rows, scope) else {
+        {
             return false;
-        };
-        let own_context = self.rows.paintable_data(scope.owner).accumulated_visual_context;
-        let Some(local) = self.local_point_ignoring_clips(own_context) else {
-            return false;
-        };
-        let one_pixel = CssPixels::from_integer(1);
-        !bound
-            .inflated(one_pixel, one_pixel, one_pixel, one_pixel)
-            .contains_point(to_css_point(local))
+        }
+        let paints_boxes_hoisted_to_it =
+            child.kind == PaintScopeKind::PaintedAsStackingContext && data.establishes_stacking_context;
+        !paints_boxes_hoisted_to_it || child.owner_contains_the_boxes_hoisted_to_its_stacking_context(rows)
     }
 
     fn scope(&mut self, scope: PaintScope, owner_absolute_content_origin: CssPixelPoint) -> Flow {
@@ -531,6 +541,7 @@ fn walk_for<'a, R: PaintRead>(
 ) -> PointWalk<'a, R> {
     let mut walk = PointWalk {
         rows,
+        viewport: query.viewport,
         callbacks: query.callbacks,
         viewport_mapping: query.callbacks.viewport_mapping(query.tree),
         point: query.point,
@@ -542,6 +553,7 @@ fn walk_for<'a, R: PaintRead>(
         local_points_ignoring_clips: FastMap::default(),
         last_local_point_ignoring_clips: None,
         hits_of_producer_in_paint_order: Vec::new(),
+        paint_children_the_point_may_be_over: FastMap::default(),
         hits: Vec::new(),
         sorting_group_of_topmost_hit: None,
         walk_left_the_sorting_group: false,

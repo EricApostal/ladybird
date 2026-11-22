@@ -9,18 +9,22 @@
 mod input;
 pub mod messages;
 pub mod presenting;
+mod remote_layers;
 mod testing;
 mod wheel;
 
 use crate::context_state::{ContextState, ContextUpdateResult, FirstWheelStepRoute};
 use crate::host::{
     ContextTimer, DisplayTickInputs, DisplayTickResult, Host, PendingFrame, PresentRequest, PresentScheduling,
-    PresentationId, WebContentClientId,
+    PresentationId, Timer, WebContentClientId,
 };
-use crate::overlays::UIOverlays;
+use crate::overlays::{UIOverlays, UIOverlaysChange};
 use crate::presenting::ContextPresenting;
-use crate::raster_host::{RasterHost, SurfaceHandle};
+use crate::raster_host::RasterHost;
+use crate::remote_layers::RemoteLayers;
+use crate::surfaces::painting_surface::PaintingSurface;
 use crate::wheel_gesture_routing::WheelGestureIdAllocator;
+use libcompositing_rust::display_list::layers::UnvalidatedLayerPlan;
 use libcompositing_rust::ipc_types::Compositing_ContextVisibility as ContextVisibility;
 use libcompositing_rust::scrolling::{
     AccumulatedVisualContextTree, CompositorContextId, DisplayList, KeyboardScrollState, ScrollStateSnapshot,
@@ -46,6 +50,9 @@ pub struct CompositorCore {
     wheel_gesture_id_allocator: Rc<WheelGestureIdAllocator>,
     scrollbars_always_shown: bool,
     display_list_chunk_stores: RefCell<crate::display_list_chunk_stores::DisplayListChunkStores>,
+    remote_layers: RefCell<RemoteLayers>,
+    canvas_2d_contexts: RefCell<crate::canvas_2d_contexts::Canvas2DContexts>,
+    webgl_contexts: RefCell<crate::webgl::WebGLContexts>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +125,9 @@ impl CompositorCore {
             wheel_gesture_id_allocator: Rc::new(WheelGestureIdAllocator::default()),
             scrollbars_always_shown,
             display_list_chunk_stores: RefCell::default(),
+            remote_layers: RefCell::default(),
+            canvas_2d_contexts: RefCell::default(),
+            webgl_contexts: RefCell::default(),
         }
     }
 
@@ -128,10 +138,9 @@ impl CompositorCore {
         &self,
         client: WebContentClientId,
         context_id: CompositorContextId,
-        sent: Vec<libcompositing_rust::display_list::storage::ReceivedChunk>,
+        sent: Vec<libcompositing_rust::display_list::storage::ListChunk>,
         chunks_in_paint_order: &[libcompositing_rust::display_list::chunks::ChunkId],
-    ) -> Result<Option<Vec<std::sync::Arc<libcompositing_rust::display_list::storage::ReceivedChunk>>>, &'static str>
-    {
+    ) -> Result<Option<Vec<std::sync::Arc<libcompositing_rust::display_list::storage::ListChunk>>>, &'static str> {
         self.display_list_chunk_stores
             .borrow_mut()
             .take_in(client, context_id, sent, chunks_in_paint_order)
@@ -139,6 +148,14 @@ impl CompositorCore {
 
     pub fn raster(&self) -> &RasterHost {
         &self.raster
+    }
+
+    pub fn canvas_2d_contexts(&self) -> std::cell::RefMut<'_, crate::canvas_2d_contexts::Canvas2DContexts> {
+        self.canvas_2d_contexts.borrow_mut()
+    }
+
+    pub fn webgl_contexts(&self) -> std::cell::RefMut<'_, crate::webgl::WebGLContexts> {
+        self.webgl_contexts.borrow_mut()
     }
 
     /// Schedules what a message the core took asked for.
@@ -197,6 +214,9 @@ impl CompositorCore {
         }
         self.contexts.remove(&context_id);
         self.presenting.remove(&context_id);
+        self.remote_layers.borrow_mut().context_destroyed(context_id);
+        self.host
+            .destroy_timers(|timer| matches!(timer, Timer::Context(id, _) if *id == context_id));
         self.display_list_chunk_stores.borrow_mut().forget_context(context_id);
         self.update_scroll_capabilities();
         self.raster
@@ -328,10 +348,22 @@ impl CompositorCore {
         let Some(context) = self.context_if_present(context_id) else {
             return;
         };
-        if context.borrow_mut().set_ui_overlays(ui_overlays, now) {
-            self.request_present_repainting_everything(context_id, context);
+        let change = context.borrow_mut().set_ui_overlays(ui_overlays, now);
+        match change {
+            UIOverlaysChange::Nothing => {}
+            UIOverlaysChange::OnlyCompositorLayers => self.request_present_keeping_tiles(context_id),
+            UIOverlaysChange::RepaintsEverything => self.request_present_repainting_everything(context_id, context),
         }
         self.finish_entry(now);
+    }
+
+    fn request_present_keeping_tiles(&self, context_id: CompositorContextId) {
+        self.present_requests.borrow_mut().push(PresentRequest {
+            context_id,
+            viewport_rect: None,
+            forced_damage_rect: Default::default(),
+            scheduling: PresentScheduling::OnNextDisplayTick,
+        });
     }
 
     // A frame at the viewport rect the context is presented at, which repaints all of it.
@@ -348,11 +380,24 @@ impl CompositorCore {
         let _entered = self.enter();
 
         self.presentations.borrow_mut().insert(presentation_id, capabilities);
+        self.remote_layers
+            .borrow_mut()
+            .register_presentation(presentation_id, &self.raster);
     }
 
     // Leaves every context bound to the presentation unbound.
     pub fn unregister_presentation(&self, presentation_id: PresentationId, now: MonotonicTime) {
         let _entered = self.enter();
+
+        let was_holding_changes = self.remote_layers.borrow().is_holding_changes();
+        let stopped = self
+            .remote_layers
+            .borrow_mut()
+            .unregister_presentation(presentation_id, &self.raster);
+        self.update_synchronized_resize_hold_timer(was_holding_changes);
+        for context_id in stopped {
+            self.stop_showing_context_in_remote_layer(context_id, now);
+        }
 
         let bound_context_ids: Vec<CompositorContextId> = self
             .contexts
@@ -414,12 +459,7 @@ impl CompositorCore {
 
     fn invalidate_and_resize_backing_stores(&self, context_id: CompositorContextId, now: MonotonicTime) {
         if let Some(presenting) = self.presenting_of(context_id) {
-            let environment = self.environment(
-                context_id,
-                now,
-                &libcompositing_rust::display_list::replay::NoCompositedContexts,
-            );
-            presenting.borrow_mut().invalidate_backing_stores(&environment);
+            presenting.borrow_mut().invalidate_backing_stores();
         }
         self.resize_backing_stores_if_needed(context_id, now);
     }
@@ -454,17 +494,6 @@ impl CompositorCore {
         self.update_scroll_capabilities();
         // The new presentation has seen none of the context's buffers, so it gets buffers of its own.
         self.invalidate_and_resize_backing_stores(context_id, now);
-        self.finish_entry(now);
-    }
-
-    pub fn set_shown_in_remote_layer(&self, context_id: CompositorContextId, shown: bool, now: MonotonicTime) {
-        let _entered = self.enter();
-
-        if shown {
-            self.start_showing_context_in_remote_layer(context_id, now);
-        } else {
-            self.stop_showing_context_in_remote_layer(context_id, now);
-        }
         self.finish_entry(now);
     }
 
@@ -621,10 +650,10 @@ impl CompositorCore {
     pub fn presented_store_released(&self, context_id: CompositorContextId, bitmap_id: i32, now: MonotonicTime) {
         let _entered = self.enter();
 
-        if self.presenting_of(context_id).is_none() {
+        let Some(presenting) = self.presenting_of(context_id) else {
             return;
-        }
-        if !self.raster.release_store(context_id, bitmap_id) {
+        };
+        if !presenting.borrow_mut().release_presented_store(bitmap_id) {
             return;
         }
         self.schedule_pending_present_frame_if_unblocked(context_id, now);
@@ -684,7 +713,7 @@ impl CompositorCore {
     pub fn paint_screenshot(
         &self,
         context_id: CompositorContextId,
-        target: &SurfaceHandle,
+        target: &Rc<PaintingSurface>,
         now: MonotonicTime,
     ) -> bool {
         let _entered = self.enter();
@@ -698,7 +727,7 @@ impl CompositorCore {
         &self,
         context_id: CompositorContextId,
         now: MonotonicTime,
-    ) -> Option<(SurfaceHandle, IntSize)> {
+    ) -> Option<(Rc<PaintingSurface>, IntSize)> {
         let _entered = self.enter();
 
         self.presented_frame_for_snapshot_inner(context_id, now)
@@ -724,6 +753,41 @@ impl CompositorCore {
         );
         self.finish_entry(now);
         installed
+    }
+
+    /// Forgets the plan of layers of the context, ahead of a display list or a visual context tree from WebContent that
+    /// the context may not install.
+    pub fn forget_layer_plan(&self, context_id: CompositorContextId) {
+        let _entered = self.enter();
+
+        let context = self.context_if_present(context_id).expect("context exists");
+        context.borrow_mut().forget_layer_plan();
+    }
+
+    /// Takes the plan of layers that came with the display list or the visual context tree the context just installed.
+    /// Fails for a plan that does not pass the checks against them.
+    pub fn take_layer_plan_of_installed_update(
+        &self,
+        context_id: CompositorContextId,
+        layer_plan: Option<UnvalidatedLayerPlan>,
+    ) -> Result<(), &'static str> {
+        let _entered = self.enter();
+
+        let context = self.context_if_present(context_id).expect("context exists");
+        context.borrow_mut().take_layer_plan_of_installed_update(layer_plan)
+    }
+
+    /// Takes the plan of layers that came with a scroll state, if any. Fails for a plan that does not pass the checks
+    /// against the display list and the visual context tree it is of.
+    pub fn take_layer_plan_of_scroll_state(
+        &self,
+        context_id: CompositorContextId,
+        layer_plan: Option<UnvalidatedLayerPlan>,
+    ) -> Result<(), &'static str> {
+        let _entered = self.enter();
+
+        let context = self.context_if_present(context_id).expect("context exists");
+        context.borrow_mut().take_layer_plan_of_scroll_state(layer_plan)
     }
 
     /// Tells the host which fonts, image frames, video sinks and SVG images the context draws, now that it took a
@@ -783,18 +847,38 @@ impl CompositorCore {
             let event = context.borrow_mut().end_scroll_fling();
             self.dispatch_scroll_fling_step(context_id, context, event, now);
         }
-        let became_visible = context.borrow().visibility() != visibility && visibility == ContextVisibility::Visible;
+        let visibility_changes = context.borrow().visibility() != visibility;
+        let became_visible = visibility_changes && visibility == ContextVisibility::Visible;
         context.borrow_mut().set_visibility(visibility);
+        if visibility_changes
+            && visibility == ContextVisibility::Hidden
+            && let Some(presenting) = self.presenting_of(context_id)
+        {
+            presenting
+                .borrow()
+                .schedule_hidden_store_retirement(context_id, &self.host);
+        }
         if became_visible {
+            self.host.cancel_timer(context_id, ContextTimer::HiddenStoreRetirement);
+            self.restore_backing_stores_retired_while_hidden(context_id, now);
             self.resume_presentation_after_becoming_visible(context_id, now);
         }
         self.finish_entry(now);
         became_visible
     }
 
-    pub fn timer_fired(&self, context_id: CompositorContextId, timer: ContextTimer, now: MonotonicTime) {
+    pub fn timer_fired(&self, number: u64, now: MonotonicTime) {
         let _entered = self.enter();
 
+        match self.host.timer_of_number(number) {
+            Some(Timer::Context(context_id, timer)) => self.context_timer_fired(context_id, timer, now),
+            Some(Timer::SynchronizedResizeHold) => self.synchronized_resize_hold_timed_out(),
+            None => {}
+        }
+        self.finish_entry(now);
+    }
+
+    fn context_timer_fired(&self, context_id: CompositorContextId, timer: ContextTimer, now: MonotonicTime) {
         let Some(context) = self.context_if_present(context_id) else {
             return;
         };
@@ -806,6 +890,24 @@ impl CompositorCore {
                 self.resize_backing_stores_if_needed(context_id, now);
             }
             ContextTimer::SurplusStoreRetirement => self.retire_idle_surplus_backing_stores(context_id),
+            ContextTimer::HiddenStoreRetirement => self.retire_backing_stores_of_hidden_context(context_id),
+            ContextTimer::SpareTileEviction => {
+                if let Some(presenting) = self.presenting_of(context_id) {
+                    let environment = self.environment(
+                        context_id,
+                        now,
+                        &libcompositing_rust::display_list::replay::NoCompositedContexts,
+                    );
+                    presenting.borrow_mut().spare_tile_eviction_timer_fired(&environment);
+                }
+            }
+            ContextTimer::TileRasterScratchSurfaceRelease => {
+                if let Some(presenting) = self.presenting_of(context_id) {
+                    presenting
+                        .borrow_mut()
+                        .tile_raster_scratch_surface_release_timer_fired();
+                }
+            }
             _ => {
                 let caret_damage_rect = context.borrow_mut().timer_fired(timer, now);
                 if let Some(caret_damage_rect) = caret_damage_rect {
@@ -818,7 +920,6 @@ impl CompositorCore {
                 }
             }
         }
-        self.finish_entry(now);
     }
 
     pub(super) fn context_still_nested_in(
@@ -952,6 +1053,14 @@ impl CompositorCore {
                     context_id,
                     viewport_rect: None,
                     forced_damage_rect: overlay_fade_damage_rect,
+                    scheduling: PresentScheduling::WithDisplayTickInProgress,
+                });
+            }
+            if context.borrow_mut().compositor_layers_overlay_needs_frame(frame_time) {
+                self.present_requests.borrow_mut().push(PresentRequest {
+                    context_id,
+                    viewport_rect: None,
+                    forced_damage_rect: Default::default(),
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }

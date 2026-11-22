@@ -76,16 +76,26 @@ impl ScriptOrModuleSlot {
 #[repr(C)]
 pub struct ExecutionContext {
     pub function: Cell<Option<Gc<FunctionObject>>>,
-    pub realm: Cell<Option<Gc<Realm>>>,
-    pub script_or_module: ScriptOrModuleSlot,
+    /// The [[Realm]] of a frame without a function, which native code makes. A frame with a function runs in the
+    /// function's realm, and this holds an old value: read it through `ExecutionContext::realm()`.
+    pub realm_without_function: Cell<Option<Gc<Realm>>>,
+    /// The [[ScriptOrModule]] of a frame without a function, which native code makes. A frame with a function gets
+    /// it from the function, and this holds an old value: read it through `ExecutionContext::script_or_module()`.
+    pub script_or_module_without_function: ScriptOrModuleSlot,
     pub lexical_environment: Cell<Option<Gc<Environment>>>,
-    pub variable_environment: Cell<Option<Gc<Environment>>>,
-    pub private_environment: Cell<Option<Gc<PrivateEnvironment>>>,
-    /// Tells frames apart for the debugger. Frames that JIT code creates have none (0) until the debugger asks (see
+    /// The [[VariableEnvironment]] of a frame that keeps its own (see `ExecutionContext::keeps_variable_environment()`).
+    /// Other frames get it from their function, and this holds an old value: read it through
+    /// `ExecutionContext::variable_environment()`.
+    pub variable_environment_in_frame: Cell<Option<Gc<Environment>>>,
+    /// The [[PrivateEnvironment]] of a frame without a function, or of a frame whose code starts with
+    /// `EnterWithOwnEnvironments`. Other frames get it from their function, and this holds an old value: read it
+    /// through `ExecutionContext::private_environment()`.
+    pub private_environment_in_frame: Cell<Option<Gc<PrivateEnvironment>>>,
+    /// Tells frames apart for the debugger and the JIT. Frames have none (0) until something asks (see
     /// Vm::frame_id_of()).
     pub frame_id: Cell<u64>,
     pub program_counter: Cell<u32>,
-    pub skip_when_determining_incumbent_counter: Cell<u32>,
+    /// The yield fields are only valid in frames of code that can yield or await, which the runtime makes.
     pub yield_continuation: Cell<u32>,
     pub yield_is_await: Cell<bool>,
     pub yield_value_is_iterator_result: Cell<bool>,

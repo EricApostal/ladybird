@@ -38,22 +38,27 @@ static void post_message_to_presentation(void* host, u64 presentation_id, Readon
     static_cast<CompositorCoreHost*>(host)->post_message_to_presentation(PresentationId { presentation_id }, buffer);
 }
 
-static void set_timer(void* host, u64 context_id, ContextTimer timer, i64 delay_nanoseconds)
+static void set_timer(void* host, u64 timer_number, i64 delay_nanoseconds)
 {
-    static_cast<CompositorCoreHost*>(host)->set_timer(Web::CompositorContextId { context_id }, timer, AK::Duration::from_nanoseconds(delay_nanoseconds));
+    static_cast<CompositorCoreHost*>(host)->set_timer(timer_number, AK::Duration::from_nanoseconds(delay_nanoseconds));
 }
 
-static void cancel_timer(void* host, u64 context_id, ContextTimer timer)
+static void cancel_timer(void* host, u64 timer_number)
 {
-    static_cast<CompositorCoreHost*>(host)->cancel_timer(Web::CompositorContextId { context_id }, timer);
+    static_cast<CompositorCoreHost*>(host)->cancel_timer(timer_number);
 }
 
-static void shape_overlay_label(void* host, u64 context_id, bool has_font_family, ReadonlyBytes font_family, double device_pixel_ratio, ReadonlyBytes text, void* receiver, void (*receive)(void*, RustFFI::FfiOverlayLabel const*))
+static void destroy_timer(void* host, u64 timer_number)
+{
+    static_cast<CompositorCoreHost*>(host)->destroy_timer(timer_number);
+}
+
+static void shape_overlay_label(void* host, u64 context_id, bool has_font_family, ReadonlyBytes font_family, float font_size_in_points, double device_pixel_ratio, ReadonlyBytes text, void* receiver, void (*receive)(void*, RustFFI::FfiOverlayLabel const*))
 {
     Optional<StringView> font_family_view;
     if (has_font_family)
         font_family_view = StringView { font_family };
-    auto label = static_cast<CompositorCoreHost*>(host)->shape_overlay_label(Web::CompositorContextId { context_id }, font_family_view, device_pixel_ratio, StringView { text });
+    auto label = static_cast<CompositorCoreHost*>(host)->shape_overlay_label(Web::CompositorContextId { context_id }, font_family_view, font_size_in_points, device_pixel_ratio, StringView { text });
     if (!label.has_value())
         return;
     RustFFI::FfiOverlayLabel ffi_label {
@@ -82,6 +87,7 @@ CompositorCore::CompositorCore(CompositorCoreHost& host, RustFFI::FfiRasterHost 
         .post_message_to_presentation = Compositor::post_message_to_presentation,
         .set_timer = Compositor::set_timer,
         .cancel_timer = Compositor::cancel_timer,
+        .destroy_timer = Compositor::destroy_timer,
         .shape_overlay_label = Compositor::shape_overlay_label,
     };
     m_core = RustFFI::compositor_core_create(ffi_host, raster_host, scrollbars_always_shown, gpu);
@@ -162,7 +168,9 @@ void CompositorCore::set_ui_overlays(Web::CompositorContextId context_id, Compos
 {
     auto const& paused_debugger = overlays.paused_debugger;
     auto const& picture_in_picture_controls = overlays.picture_in_picture_controls;
+    auto const& compositor_layers = overlays.compositor_layers;
     auto font_family = paused_debugger.has_value() && paused_debugger->font_family.has_value() ? paused_debugger->font_family->bytes() : ReadonlyBytes {};
+    auto compositor_layers_font_family = compositor_layers.has_value() && compositor_layers->font_family.has_value() ? compositor_layers->font_family->bytes() : ReadonlyBytes {};
     RustFFI::FfiUIOverlays ffi_overlays {
         .has_paused_debugger = paused_debugger.has_value(),
         .paused_debugger_has_font_family = paused_debugger.has_value() && paused_debugger->font_family.has_value(),
@@ -173,6 +181,14 @@ void CompositorCore::set_ui_overlays(Web::CompositorContextId context_id, Compos
         .picture_in_picture_controls_shown = picture_in_picture_controls.has_value() && picture_in_picture_controls->shown,
         .picture_in_picture_controls_has_hovered_control = picture_in_picture_controls.has_value() && picture_in_picture_controls->hovered_control.has_value(),
         .picture_in_picture_controls_hovered_control = picture_in_picture_controls.has_value() && picture_in_picture_controls->hovered_control.has_value() ? to_underlying(*picture_in_picture_controls->hovered_control) : u8 { 0 },
+        .has_compositor_layers = compositor_layers.has_value(),
+        .compositor_layers_has_font_family = compositor_layers.has_value() && compositor_layers->font_family.has_value(),
+        .compositor_layers_font_family = compositor_layers_font_family,
+        .compositor_layers_hidden_layer_ids = compositor_layers.has_value() ? compositor_layers->hidden_layer_ids.span() : ReadonlySpan<u64> {},
+        .compositor_layers_selected_layer_ids = compositor_layers.has_value() ? compositor_layers->selected_layer_ids.span() : ReadonlySpan<u64> {},
+        .compositor_layers_has_hovered_layer_id = compositor_layers.has_value() && compositor_layers->hovered_layer_id.has_value(),
+        .compositor_layers_hovered_layer_id = compositor_layers.has_value() ? compositor_layers->hovered_layer_id.value_or(0) : 0,
+        .compositor_layers_raster_count_reset_generation = compositor_layers.has_value() ? compositor_layers->raster_count_reset_generation : 0,
     };
     RustFFI::compositor_core_set_ui_overlays(m_core, context_id.value(), &ffi_overlays, now().nanoseconds());
 }
@@ -200,11 +216,6 @@ void CompositorCore::set_scrollbar_track_press_jumps(PresentationId presentation
 void CompositorCore::bind_presentation(Web::CompositorContextId context_id, PresentationId presentation_id)
 {
     RustFFI::compositor_core_bind_presentation(m_core, context_id.value(), presentation_id.value(), now().nanoseconds());
-}
-
-void CompositorCore::set_shown_in_remote_layer(Web::CompositorContextId context_id, bool shown)
-{
-    RustFFI::compositor_core_set_shown_in_remote_layer(m_core, context_id.value(), shown, now().nanoseconds());
 }
 
 void CompositorCore::set_display_metadata(Web::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
@@ -277,6 +288,11 @@ void CompositorCore::canvas_content_changed(WebContentClientId client, Compositi
     RustFFI::compositor_core_canvas_content_changed(m_core, client.value(), canvas_id.value(), now().nanoseconds());
 }
 
+void CompositorCore::forget_web_content_client(WebContentClientId client)
+{
+    RustFFI::compositor_core_forget_web_content_client(m_core, client.value());
+}
+
 bool CompositorCore::paint_screenshot(Web::CompositorContextId context_id, Gfx::PaintingSurface& surface)
 {
     return RustFFI::compositor_core_paint_screenshot(m_core, context_id.value(), &surface, now().nanoseconds());
@@ -284,22 +300,29 @@ bool CompositorCore::paint_screenshot(Web::CompositorContextId context_id, Gfx::
 
 Optional<CompositorCore::PresentedFrame> CompositorCore::presented_frame_for_snapshot(Web::CompositorContextId context_id)
 {
-    void* surface = nullptr;
     Gfx::IntSize frame_size;
-    if (!RustFFI::compositor_core_presented_frame_for_snapshot(m_core, context_id.value(), now().nanoseconds(), &surface, &frame_size))
+    auto const* surface = RustFFI::compositor_core_presented_frame_for_snapshot(m_core, context_id.value(), now().nanoseconds(), &frame_size);
+    if (!surface)
         return {};
-    return PresentedFrame { adopt_ref(*static_cast<Gfx::PaintingSurface*>(surface)), frame_size };
+    return PresentedFrame { adopt_ref(const_cast<Gfx::PaintingSurface&>(*surface)), frame_size };
 }
 
-void CompositorCore::timer_fired(Web::CompositorContextId context_id, ContextTimer timer)
+void CompositorCore::timer_fired(u64 timer_number)
 {
-    RustFFI::compositor_core_timer_fired(m_core, context_id.value(), timer, now().nanoseconds());
+    RustFFI::compositor_core_timer_fired(m_core, timer_number, now().nanoseconds());
 }
 
 IPC::RawMessage::OutcomeInRust CompositorCore::handle_message_from_web_content(WebContentClientId client_id, IPC::RawMessage& message)
 {
     return message.hand_to_rust([&](IPC::FfiRawMessage raw_message) {
         RustFFI::compositor_core_handle_web_content_message(m_core, client_id.value(), raw_message, now().nanoseconds());
+    });
+}
+
+IPC::RawMessage::OutcomeInRust CompositorCore::handle_message_from_control(IPC::RawMessage& message)
+{
+    return message.hand_to_rust([&](IPC::FfiRawMessage raw_message) {
+        RustFFI::compositor_core_handle_control_message(m_core, raw_message, now().nanoseconds());
     });
 }
 

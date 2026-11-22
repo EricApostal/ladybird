@@ -31,7 +31,7 @@ pub struct WeakRef {
 
 // SAFETY: Visits the target while the execution generation it was last used in is current, which keeps it alive for
 // the rest of the job as AddToKeptObjects does. Otherwise it is held weakly, and remove_dead_cells() forgets it once
-// it dies.
+// it dies, or hands its slot to a collection that moves cells.
 unsafe impl Trace for WeakRef {
     fn trace(&self, visitor: &mut Visitor) {
         self.base.trace(visitor);
@@ -39,7 +39,7 @@ unsafe impl Trace for WeakRef {
         // SAFETY: The VM owns the heap and destroys it before anything else, so it outlives every WeakRef.
         let execution_generation = unsafe { self.vm_execution_generation.as_ref() }.get();
         if execution_generation == self.last_execution_generation.get() {
-            self.value.get().trace(visitor);
+            self.value.trace(visitor);
         }
     }
 }
@@ -95,10 +95,13 @@ impl WeakRef {
             .expect("the weak container is a WeakRef");
         let value = weak_ref.value.get();
         let is_alive = value.is_empty() || !sweep.is_dead(value.as_cell());
-        if is_alive {
+        if !is_alive {
+            weak_ref.value.set(Value::EMPTY);
             return;
         }
-
-        weak_ref.value.set(Value::EMPTY);
+        if sweep.moves_cells() {
+            // SAFETY: The slot is in the WeakRef, which nothing changes until the collection is over.
+            unsafe { sweep.record_value_slot(&*weak_ref.value.as_ptr()) };
+        }
     }
 }

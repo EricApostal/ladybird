@@ -65,6 +65,7 @@ public:
     virtual void die() override;
 
     void request_file(Web::PageId page_id, Web::FileRequest);
+    void request_file_for_webdriver(Web::PageId page_id, u64 command_id, Web::FileRequest);
 
     PageHost& page_host() { return *m_page_host; }
     PageHost const& page_host() const { return *m_page_host; }
@@ -236,6 +237,7 @@ private:
 
     virtual void set_listen_for_dom_mutations(Web::PageId page_id, bool) override;
     virtual void set_has_devtools_client(Web::PageId page_id, bool has_devtools_client) override;
+    virtual void save_session_history_entry_states(Web::PageId page_id) override;
     virtual void start_sending_console_output(Web::PageId page_id, bool messages, bool errors) override;
     virtual void get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void get_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
@@ -327,6 +329,7 @@ private:
     virtual void take_dom_node_screenshot(Web::PageId page_id, Web::UniqueNodeID node_id) override;
 
     virtual void request_internal_page_info(Web::PageId page_id, WebView::PageInfoType) override;
+    virtual void describe_owners_of_visual_context_nodes(Web::PageId page_id, Vector<u32> spatial_node_indices, Vector<u32> effect_node_indices) override;
 
     virtual void get_selected_text(Web::PageId page_id, u64 request_id) override;
     virtual void generate_text_fragment_url(Web::PageId page_id, u64 request_id, u64 generation_id) override;

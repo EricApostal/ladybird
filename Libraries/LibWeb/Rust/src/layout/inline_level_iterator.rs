@@ -83,24 +83,28 @@ fn shaped_glyphs_from(
     shape.with_baseline_start(baseline_start_x).into_glyphs()
 }
 
-/// `glyphs`, the glyphs of a text item past its leading tabs, after a glyph that paints nothing standing for the
-/// `tab_count` tabs and advancing to the tab stop at `tab_advance`, so that the code units of the item's glyphs line up
-/// with those of its text.
-fn glyphs_after_tab_spacer(
+/// `glyphs`, the glyphs of a text item past its leading tabs, after a glyph for each of those tabs that paints nothing
+/// and advances to the tab's stop by the tab's entry in `tab_advances`, so that the code units of the item's glyphs line
+/// up with those of its text.
+fn glyphs_after_tab_spacers(
     glyphs: &libgfx_rust::text_layout::GlyphBuffer,
-    tab_count: usize,
-    tab_advance: f32,
+    tab_advances: &[f32],
 ) -> libgfx_rust::text_layout::GlyphBuffer {
     use libgfx_rust::text_layout::{DrawGlyph, GlyphBuffer, PlacedGlyph};
-    let tab_count_u32 = u32::try_from(tab_count).expect("tab counts fit in 32 bits");
+    let tab_count_u32 = u32::try_from(tab_advances.len()).expect("tab counts fit in 32 bits");
     let mut with_spacer = GlyphBuffer::default();
-    with_spacer.push_placed(PlacedGlyph {
-        glyph: DrawGlyph::new(tab_advance, 0, tab_count, false),
-        x: 0.0,
-        y: glyphs.placed().next().map_or(0.0, |placed| placed.y),
-        cluster_start: 0,
-        is_rtl: false,
-    });
+    let y = glyphs.placed().next().map_or(0.0, |placed| placed.y);
+    let mut x = 0.0;
+    for (index, &tab_advance) in tab_advances.iter().enumerate() {
+        with_spacer.push_placed(PlacedGlyph {
+            glyph: DrawGlyph::new(tab_advance, 0, 1, false),
+            x,
+            y,
+            cluster_start: u32::try_from(index).expect("tab counts fit in 32 bits"),
+            is_rtl: false,
+        });
+        x += tab_advance;
+    }
     for placed in glyphs.placed() {
         with_spacer.push_placed(PlacedGlyph {
             cluster_start: placed.cluster_start + tab_count_u32,
@@ -373,6 +377,19 @@ impl Item {
         self.border_start + self.padding_start + self.inline_size + self.padding_end + self.border_end
     }
 
+    /// Whether the item carries the edges of any inline box it starts or ends.
+    fn carries_inline_box_edges(&self) -> bool {
+        let none = CssPixels::default();
+        self.margin_start != none
+            || self.border_start != none
+            || self.padding_start != none
+            || self.padding_end != none
+            || self.border_end != none
+            || self.margin_end != none
+            || self.entered_right_to_left_end_margin != none
+            || self.exited_right_to_left_end_margin != none
+    }
+
     pub(crate) fn is_ascii_whitespace(&self, context: &inline_formatting_context::InlineFormattingContext<'_>) -> bool {
         assert_eq!(self.type_, ItemType::Text);
         let text = &context.pass.text_content(self.node).text;
@@ -463,7 +480,14 @@ impl Item {
             .filter(move |offset| *offset > start && *offset < end)
     }
 
+    #[inline]
     pub(crate) fn has_soft_wraps(&self, prepared: &PreparedInlineContent) -> bool {
+        if prepared.soft_wraps.is_empty()
+            || self.type_ != ItemType::Text
+            || !self.prepared_item(prepared).has(PreparedItem::SOFT_WRAPS)
+        {
+            return false;
+        }
         self.soft_wrap_offsets(prepared).next().is_some()
     }
 
@@ -928,6 +952,7 @@ struct TextNodeContext<'pass> {
     text: &'pass [u16],
     next_chunk_index: usize,
     independent_chunks_until: usize,
+    can_memoize_independent_chunks: bool,
     style: StyleValues<'pass>,
     letter_spacing: f32,
     word_spacing: f32,
@@ -1220,7 +1245,24 @@ impl<'pass> InlineContentPreparer<'pass> {
                     && !facts.produces_line_box_fragment_when_empty()
                     && self.pass.text_content(self.current_node).text.is_empty())
         };
-        let event = InlineBoxEvent::leaving_innermost_box(self.inline_box_event_position(), before_item);
+        // NB: A wbr has no item, so a box that ends right after one ends with the item before the wbr instead, and its
+        //     end edges stay on the line of that item when the line breaks at the wbr.
+        let mut position = self.inline_box_event_position();
+        if !self.current_node.is_invalid()
+            && self.facts(self.current_node).is_word_break_opportunity_node()
+            && let Some(previous_item_index) = self.buffers.items.len().checked_sub(1)
+        {
+            let previous_item_position = InlineBoxEvent::position_at(previous_item_index, false);
+            if self
+                .buffers
+                .box_events
+                .last()
+                .is_none_or(|event| event.position() <= previous_item_position)
+            {
+                position = previous_item_position;
+            }
+        }
+        let event = InlineBoxEvent::leaving_innermost_box(position, before_item);
         self.buffers.box_events.push(event);
     }
 
@@ -1283,6 +1325,7 @@ impl<'pass> InlineContentPreparer<'pass> {
             if facts.is_inline()
                 && facts.has_box_model_metrics()
                 && !facts.is_break_node()
+                && !facts.is_word_break_opportunity_node()
                 && self.style(self.next_node).display().is_flow_inside()
                 && !self.is_out_of_flow(self.next_node)
                 && !facts.is_atomic_inline()
@@ -1319,14 +1362,26 @@ impl<'pass> InlineContentPreparer<'pass> {
             self.is_unidirectional_left_to_right,
         );
         let facts = self.facts(text_node);
+        let letter_spacing = style.letter_spacing().to_double() as f32;
+        let word_spacing = style.word_spacing().to_double() as f32;
+        let can_memoize_independent_chunks =
+            self.is_unidirectional_left_to_right && style.writing_mode() == writing_mode::HORIZONTAL_TB;
+        let independent_chunks_until = if can_memoize_independent_chunks
+            && chunks.independent_chunks_for_spacing.get() == Some(&(letter_spacing.to_bits(), word_spacing.to_bits()))
+        {
+            usize::MAX
+        } else {
+            0
+        };
         self.text_node_context = Some(TextNodeContext {
             chunks,
             text: &self.pass.text_content(text_node).text,
             next_chunk_index: 0,
-            independent_chunks_until: 0,
+            independent_chunks_until,
+            can_memoize_independent_chunks,
             style,
-            letter_spacing: style.letter_spacing().to_double() as f32,
-            word_spacing: style.word_spacing().to_double() as f32,
+            letter_spacing,
+            word_spacing,
             writing_mode: style.writing_mode(),
             text_orientation: style.text_orientation(),
             should_wrap_lines,
@@ -1435,6 +1490,12 @@ impl<'pass> InlineContentPreparer<'pass> {
                 .expect("layout read a font group that never received a frozen font list");
             (chunk, first_available_font)
         } else {
+            if text_context.can_memoize_independent_chunks {
+                let _ = chunks.independent_chunks_for_spacing.set((
+                    text_context.letter_spacing.to_bits(),
+                    text_context.word_spacing.to_bits(),
+                ));
+            }
             if !text_context.text.is_empty() {
                 let regional_indicators = text_chunker::trailing_regional_indicator_count(text_context.text);
                 // NB: Each regional indicator is a surrogate pair.
@@ -1580,6 +1641,12 @@ impl<'pass> InlineContentPreparer<'pass> {
             text_context.word_spacing,
             text_chunker::joining_context(full_text, shaped_range),
         );
+        // Remember the decision only if every combined run is restored to its original chunks. Text, font, and break-rule
+        // changes replace the chunk memo, while spacing is checked separately.
+        if text_context.next_chunk_index != next_chunk_index && (!has_soft_wraps || shape.requires_context_for_breaks())
+        {
+            text_context.can_memoize_independent_chunks = false;
+        }
         if has_soft_wraps && !shape.requires_context_for_breaks() {
             // Independent glyphs can keep their small, separately measured chunks. Remember the end of this run so
             // that preparing each following chunk doesn't shape the same suffix again.
@@ -1661,7 +1728,10 @@ impl<'pass> InlineContentPreparer<'pass> {
             && let Some(previous_text) = self.previous_text.take()
             && wraps_at_boundary
         {
-            if previous_node.is_some_and(|node| !self.facts(node).is_text_node()) {
+            if previous_node.is_some_and(|node| {
+                let facts = self.facts(node);
+                !facts.is_text_node() && !facts.is_word_break_opportunity_node()
+            }) {
                 can_break_before = text_chunker::soft_wrap_opportunity_after_atomic_inline(&full_text[chunk.start..]);
             } else {
                 let style = text_context.style;
@@ -1761,6 +1831,19 @@ impl<'pass> InlineContentPreparer<'pass> {
                     self.skip_to_next();
                     continue;
                 }
+            }
+            if facts.is_word_break_opportunity_node() {
+                // https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-wbr-element
+                // "The wbr element represents a line break opportunity."
+                // NB: The wbr stands in the text before the text after it as U+200B ZERO WIDTH SPACE, which the line
+                //     breaker allows a break after, if the nearest common ancestor of the wbr and that text wraps.
+                self.previous_text = Some(&ZERO_WIDTH_SPACE);
+                self.previous_node = Some(node);
+                self.previous_text_breaks_all = false;
+                self.previous_text_regional_indicators = 0;
+                self.code_unit_before_previous_text = None;
+                self.skip_to_next();
+                continue;
             }
             if !facts.is_box() {
                 self.skip_to_next();
@@ -2055,18 +2138,9 @@ impl<'context> RunItemResolver<'_, 'context> {
     fn exit_node_with_box_model_metrics(&mut self, before_item: bool, within_item: bool) {
         let (node, in_flow_item_count_at_start) = self.box_model_node_stack.pop().unwrap();
         let sides = self.context().sides_of_entered_inline_box(node);
-        // https://quirks.spec.whatwg.org/#the-line-height-calculation-quirk
-        // No item tells the line builder about an inline box that holds no in-flow item, so it's kept apart, for the
-        // line it's on to take its strut from — except in quirks mode, where an inline box without text has none
-        // unless it has a border or padding at its start or end.
-        let none = CssPixels::default();
-        if in_flow_item_count_at_start == self.in_flow_item_count
-            && (!self.context().facts(node).document_in_quirks_mode()
-                || sides.border_left != none
-                || sides.border_right != none
-                || sides.padding_left != none
-                || sides.padding_right != none)
-        {
+        // NB: No item tells the line builder about an inline box that holds no in-flow item, so it's kept apart, for
+        //     the line it's on to place it and take its strut from.
+        if in_flow_item_count_at_start == self.in_flow_item_count {
             let empty_box = EmptyInlineBox {
                 position: self.item_count,
                 node,
@@ -2197,34 +2271,54 @@ impl<'context> RunItemResolver<'_, 'context> {
         let prepared = self.prepared;
         let mut inline_offset = 0.0f32;
         let mut upright_advance_after_tabs = None;
-        let mut tab_count = 0;
+        let mut tab_advances = Vec::new();
         if prepared_item.has(PreparedItem::TAB_STOP) {
             let tab_stop = prepared.tab_stops[self.next_tab_stop];
             self.next_tab_stop += 1;
             let tab_inline_size = tab_stop.tab_inline_size;
-            let accumulated = self.accumulated_inline_size_for_tabs;
-            let mut tab_stop_distance = if accumulated > CssPixels::default() {
-                accumulated.div_as_fraction(tab_inline_size).ceil() * tab_inline_size - accumulated
-            } else {
-                tab_inline_size
+            // https://drafts.csswg.org/css-text-3/#white-space-phase-2
+            // "each preserved tab is rendered as a horizontal shift that lines up the start edge of the next glyph with
+            // the next tab stop. If this distance is less than 0.5ch, then the subsequent tab stop is used instead."
+            // NB: So each tab of a run advances from where the tab before it ended, to a tab stop of its own.
+            let distance_to_tab_stop = |position: CssPixels| {
+                // https://drafts.csswg.org/css-text-3/#white-space-phase-2
+                // "If the tab size is zero, preserved tabs are not rendered."
+                if tab_inline_size == CssPixels::default() {
+                    return CssPixels::default();
+                }
+                // NB: The next tab stop is the first one after the position, even if the position is on a tab stop.
+                let mut distance = position.div_as_fraction(tab_inline_size).ceil() * tab_inline_size - position;
+                if distance <= CssPixels::default() {
+                    distance += tab_inline_size;
+                }
+                if distance.to_double() < f64::from(tab_stop.zero_advance) * 0.5 {
+                    distance += tab_inline_size;
+                }
+                distance
             };
-            if tab_stop_distance.to_double() < f64::from(tab_stop.zero_advance) * 0.5 {
-                tab_stop_distance += tab_inline_size;
+            let accumulated = self.accumulated_inline_size_for_tabs;
+            let mut position = accumulated;
+            let mut previous_end = 0.0f32;
+            for _ in 0..tab_stop.tab_count {
+                position += distance_to_tab_stop(position);
+                let end = (position - accumulated).to_double() as f32;
+                tab_advances.push(end - previous_end);
+                previous_end = end;
             }
-            tab_stop_distance = tab_stop_distance * tab_stop.tab_count as usize;
-            inline_offset = tab_stop_distance.to_double() as f32;
+            inline_offset = previous_end;
             upright_advance_after_tabs = tab_stop.upright_advance;
-            tab_count = tab_stop.tab_count as usize;
         }
         let shape = prepared_item.shape();
         let mut width = shape.width();
         let mut owned_glyph_run = None;
-        if inline_offset != 0.0 || upright_advance_after_tabs.is_some() {
+        // NB: Tabs that tab-size: 0 doesn't render still get the spacer glyph, so that the code units of the item's
+        //     glyphs line up with those of its text.
+        if inline_offset != 0.0 || upright_advance_after_tabs.is_some() || !tab_advances.is_empty() {
             let mut glyphs = shaped_glyphs_from(shape, inline_offset);
             if let Some(advance) = upright_advance_after_tabs {
                 width = set_glyphs_upright(&mut glyphs, inline_offset, advance);
-            } else if tab_count > 0 {
-                glyphs = glyphs_after_tab_spacer(&glyphs, tab_count, inline_offset);
+            } else if !tab_advances.is_empty() {
+                glyphs = glyphs_after_tab_spacers(&glyphs, &tab_advances);
             }
             owned_glyph_run = Some(Box::new(OwnedGlyphRun {
                 glyphs,
@@ -2554,6 +2648,14 @@ impl InlineLevelIterator {
         self.items.as_slice()
     }
 
+    pub(crate) fn contains_only_unbreakable_text(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> bool {
+        self.items().iter().all(|item| item.type_ == ItemType::Text)
+            && sequence_length(context, &self.prepared, self.items(), false, false).0 == self.items().len()
+    }
+
     pub(crate) fn skip_items(&mut self, count: usize) {
         self.items.skip(count);
     }
@@ -2614,6 +2716,7 @@ impl InlineLevelIterator {
         let edges = sequence_inline_extent(
             context,
             items[..start].iter().filter(|item| item.type_ == ItemType::InlineEdge),
+            None,
         );
         let content = match items.get(start) {
             Some(item) if item.type_ == ItemType::Element => inline_extent([item]),
@@ -2631,6 +2734,26 @@ impl InlineLevelIterator {
         item: &Item,
         stop_at_overflow_breakable_text: bool,
     ) -> CssPixels {
+        // An item with no internal break or trailing whitespace is the whole run when the next item can break. Overflow
+        // breaking stays on the segment-measuring path. The extent includes every inline edge, and the hyphen that a
+        // soft hyphen at the item's end draws if the line breaks there.
+        if item.type_ == ItemType::Text
+            && !item.is_collapsible_whitespace
+            && item.trailing_whitespace.length_in_code_units == 0
+            && self.items().first().is_none_or(|next| next.can_break_before)
+            && !item.has_soft_wraps(&self.prepared)
+            && (!stop_at_overflow_breakable_text || !item.allows_overflow_break(context))
+        {
+            let hyphen = hyphen_ending_sequence(
+                context,
+                &self.prepared,
+                SequenceEnd::Other,
+                None,
+                Some(item),
+                starts_line_content(self.items().iter()),
+            );
+            return inline_extent([item]) + hyphen;
+        }
         let items = std::iter::once(item).chain(self.items());
         let (length, end) = sequence_length(
             context,
@@ -2652,8 +2775,14 @@ impl InlineLevelIterator {
                 None,
                 false,
             );
-            return sequence_inline_extent(context, items.take(length).chain(first_grapheme_cluster.as_ref())) + hyphen;
+            return sequence_inline_extent(context, items.take(length).chain(first_grapheme_cluster.as_ref()), None)
+                + hyphen;
         }
+        let whitespace_after = if end == SequenceEnd::Whitespace && length > 0 {
+            items.clone().nth(length)
+        } else {
+            None
+        };
         let length = length.max(1);
         let hyphen = hyphen_ending_sequence(
             context,
@@ -2663,7 +2792,7 @@ impl InlineLevelIterator {
             last_line_content(items.clone().take(length)),
             starts_line_content(items.clone().skip(length)),
         );
-        sequence_inline_extent(context, items.take(length)) + hyphen
+        sequence_inline_extent(context, items.take(length), whitespace_after) + hyphen
     }
 
     pub(crate) fn inline_size_following_text(
@@ -2688,7 +2817,8 @@ impl InlineLevelIterator {
         } else {
             CssPixels::default()
         };
-        sequence_inline_extent(context, items.take(length).chain(prefix.as_ref())) + hyphen - inline_extent([item])
+        sequence_inline_extent(context, items.take(length).chain(prefix.as_ref()), None) + hyphen
+            - inline_extent([item])
     }
 
     pub(crate) fn next_non_whitespace_text_allows_overflow_break(
@@ -2725,11 +2855,13 @@ pub(crate) fn whitespace_and_sequence_inline_size(
     if length == 0 && prefix.is_none() {
         return None;
     }
+    let whitespace_after = (end == SequenceEnd::Whitespace && length > 0).then(|| &items[length]);
     let size = sequence_inline_extent(
         context,
         std::iter::once(whitespace)
             .chain(&items[..length])
             .chain(prefix.as_ref()),
+        whitespace_after,
     );
     let hyphen = hyphen_ending_sequence(
         context,
@@ -2751,7 +2883,12 @@ pub(crate) fn sequence_inline_size(
     let (length, end) = sequence_length(context, prepared, items, stop_at_overflow_breakable_text, false);
     let first_grapheme_cluster = matches!(end, SequenceEnd::OverflowBreakableText | SequenceEnd::SoftWrapInText)
         .then(|| first_breakable_segment(context, prepared, &items[length], end));
-    let size = sequence_inline_extent(context, items[..length].iter().chain(first_grapheme_cluster.as_ref()));
+    let whitespace_after = (end == SequenceEnd::Whitespace && length > 0).then(|| &items[length]);
+    let size = sequence_inline_extent(
+        context,
+        items[..length].iter().chain(first_grapheme_cluster.as_ref()),
+        whitespace_after,
+    );
     let hyphen = hyphen_ending_sequence(
         context,
         prepared,
@@ -2816,6 +2953,8 @@ enum SequenceEnd {
     ForcedBreak,
     OverflowBreakableText,
     SoftWrapInText,
+    /// White space that wraps ends the sequence: The line can break after it.
+    Whitespace,
     Other,
 }
 
@@ -2831,6 +2970,13 @@ fn sequence_length<'item>(
         match item.type_ {
             ItemType::ForcedBreak => return (length, SequenceEnd::ForcedBreak),
             ItemType::BlockLevelBox => break,
+            // NB: The edges of an inline box that no item took, such as those after white space that was removed at
+            //     the end of the block, offer no soft wrap opportunity: They stay on the line with the content
+            //     before them.
+            ItemType::InlineEdge => {
+                length += 1;
+                continue;
+            }
             _ => {}
         }
         // NB: The sequence ends at its next soft wrap opportunity, such as the one after a hyphen.
@@ -2839,17 +2985,17 @@ fn sequence_length<'item>(
         }
         let style = context.style(context.style_source(item.node));
         if style.text_wrap_mode() == text_wrap_mode::WRAP {
-            if item.type_ != ItemType::Text || item.is_collapsible_whitespace {
+            if item.type_ != ItemType::Text {
                 break;
             }
-            if item.is_ascii_whitespace(context) {
-                break;
+            if item.is_collapsible_whitespace || item.is_ascii_whitespace(context) {
+                return (length, SequenceEnd::Whitespace);
             }
             if stop_at_overflow_breakable_text && context.overflow_break_applies(item.node) {
                 return (length, SequenceEnd::OverflowBreakableText);
             }
         }
-        if item.has_soft_wraps(prepared) && !(length == 0 && include_first_whole_item) {
+        if !(length == 0 && include_first_whole_item) && item.has_soft_wraps(prepared) {
             return (length, SequenceEnd::SoftWrapInText);
         }
         length += 1;
@@ -2905,9 +3051,13 @@ fn first_breakable_segment(
     cluster
 }
 
+/// The inline extent of `items`, without the white space that collapses or hangs at their end. `whitespace_after` is the
+/// white space that ends the sequence, if any: The line breaks after it, so the edges of the inline boxes it starts or
+/// ends are on the line too, while the white space itself collapses or hangs there.
 fn sequence_inline_extent<'item>(
     context: &inline_formatting_context::InlineFormattingContext<'_>,
     items: impl Iterator<Item = &'item Item> + Clone,
+    whitespace_after: Option<&'item Item>,
 ) -> CssPixels {
     let mut last_content = None::<(usize, CssPixels)>;
     for (index, item) in items.clone().enumerate() {
@@ -2927,22 +3077,38 @@ fn sequence_inline_extent<'item>(
             last_content = Some((index, whitespace.inline_size));
         }
     }
+    // NB: Under white-space-collapse: break-spaces, white space takes up its room even at a line's end. White space that
+    //     collapses is never under break-spaces, so only preserved white space needs its style. And white space that
+    //     hangs and carries no box edges adds nothing, so it's left out of the measurement altogether.
+    let whitespace_after = whitespace_after.and_then(|item| {
+        let hangs = item.is_collapsible_whitespace
+            || context.style(context.style_source(item.node)).white_space_collapse()
+                != white_space_collapse::BREAK_SPACES;
+        (!hangs || item.carries_inline_box_edges())
+            .then(|| (item, if hangs { item.inline_size } else { CssPixels::default() }))
+    });
     let mut previous_placed_item = None::<&Item>;
-    inline_extent_without_removed_whitespace(items.enumerate().map(move |(index, item)| {
-        let collapses = item.is_collapsible_whitespace
-            && previous_placed_item
-                .is_some_and(|previous| previous.type_ == ItemType::Text && previous.ends_in_ascii_space(context));
-        if !collapses {
-            previous_placed_item = Some(item);
-        }
-        let removed_inline_size = match last_content {
-            _ if collapses => item.inline_size,
-            Some((last_index, _)) if index < last_index => CssPixels::default(),
-            Some((last_index, whitespace_inline_size)) if index == last_index => whitespace_inline_size,
-            _ => item.inline_size,
-        };
-        (item, removed_inline_size)
-    }))
+    inline_extent_without_removed_whitespace(
+        items
+            .enumerate()
+            .map(move |(index, item)| {
+                let collapses = item.is_collapsible_whitespace
+                    && previous_placed_item.is_some_and(|previous| {
+                        previous.type_ == ItemType::Text && previous.ends_in_ascii_space(context)
+                    });
+                if !collapses {
+                    previous_placed_item = Some(item);
+                }
+                let removed_inline_size = match last_content {
+                    _ if collapses => item.inline_size,
+                    Some((last_index, _)) if index < last_index => CssPixels::default(),
+                    Some((last_index, whitespace_inline_size)) if index == last_index => whitespace_inline_size,
+                    _ => item.inline_size,
+                };
+                (item, removed_inline_size)
+            })
+            .chain(whitespace_after),
+    )
 }
 
 pub(crate) fn inline_extent<'item>(items: impl IntoIterator<Item = &'item Item>) -> CssPixels {
@@ -2972,3 +3138,6 @@ fn inline_extent_without_removed_whitespace<'item>(
 
 /// What an atomic inline stands for in the text around it when looking for soft wrap opportunities.
 static OBJECT_REPLACEMENT_CHARACTER: [u16; 1] = [0xFFFC];
+
+/// What a `<wbr>` stands for in the text before the text after it when looking for soft wrap opportunities.
+static ZERO_WIDTH_SPACE: [u16; 1] = [0x200B];

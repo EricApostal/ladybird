@@ -22,7 +22,6 @@
 #include <LibWebCommon/HTML/BrowsingContext.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/WebDriver/Error.h>
-#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/AudioServerControlClient.h>
 #include <LibWebView/BlobURLStore.h>
@@ -92,8 +91,11 @@ void WebContentClient::note_hosted_document(CanonicalDocument const& document)
             m_origin_of_hosted_tabs = origin;
             m_hosted_tabs_are_origin_keyed = document.relevant_global_object().agent().agent_cluster_is_origin_keyed();
         }
-        if (has_hosted_only_tabs_like(document))
+        if (has_hosted_only_tabs_of_the_site_of(document)) {
+            if (origin != *m_origin_of_hosted_tabs)
+                m_has_hosted_tabs_of_more_than_one_origin_of_a_site = true;
             return;
+        }
     } else if (!document.is_top_level() && m_origin_of_hosted_tabs.has_value()) {
         // NB: A data: URL iframe is hosted in the process of the document that made it, and holds only what that
         //     document already had.
@@ -109,15 +111,37 @@ void WebContentClient::note_hosted_document(CanonicalDocument const& document)
     m_origin_of_hosted_tabs.clear();
 }
 
+static bool tabs_of_a_site_share_processes()
+{
+    return Application::the().tab_processes() == TabProcesses::PerSite;
+}
+
 bool WebContentClient::has_hosted_only_tabs_like(CanonicalDocument const& document) const
 {
-    return m_origin_of_hosted_tabs == document.origin()
+    if (tabs_of_a_site_share_processes())
+        return has_hosted_only_tabs_of_the_site_of(document);
+    return !m_has_hosted_tabs_of_more_than_one_origin_of_a_site && m_origin_of_hosted_tabs == document.origin()
         && m_hosted_tabs_are_origin_keyed == document.relevant_global_object().agent().agent_cluster_is_origin_keyed();
 }
 
 bool WebContentClient::has_hosted_only_tabs_unlike(CanonicalDocument const& document) const
 {
+    // NB: The user may want no tabs to share a process, which makes every other tab unlike the tabs of a process.
+    if (Application::the().tab_processes() == TabProcesses::PerTab)
+        return m_origin_of_hosted_tabs.has_value();
+    if (tabs_of_a_site_share_processes())
+        return m_origin_of_hosted_tabs.has_value() && !has_hosted_only_tabs_of_the_site_of(document);
     return m_origin_of_hosted_tabs.has_value() && !has_hosted_only_tabs_like(document);
+}
+
+// NB: An origin-keyed tab keeps apart from the other origins of its site, so its site is just its origin.
+bool WebContentClient::has_hosted_only_tabs_of_the_site_of(CanonicalDocument const& document) const
+{
+    if (!m_origin_of_hosted_tabs.has_value() || m_hosted_tabs_are_origin_keyed != document.relevant_global_object().agent().agent_cluster_is_origin_keyed())
+        return false;
+    if (m_hosted_tabs_are_origin_keyed)
+        return *m_origin_of_hosted_tabs == document.origin();
+    return m_origin_of_hosted_tabs->is_same_site(document.origin());
 }
 
 bool WebContentClient::hosts_an_environment_with_storage_key(Web::StorageAPI::StorageKey const& storage_key)
@@ -789,7 +813,38 @@ bool WebContentClient::renderers_may_synthesize_input_for_testing()
 
 bool WebContentClient::may_read_local_files() const
 {
-    return m_has_hosted_local_file_content;
+    return !m_local_file_roots.is_empty();
+}
+
+ErrorOr<void> WebContentClient::add_local_file_root(LocalFileRoot root)
+{
+    if (m_local_file_roots.contains_slow(root))
+        return {};
+    // NB: Site isolation places local file content only in a process of its root, so a second root here would merge
+    //     what two folders' pages may read. It's refused rather than added.
+    if (!m_local_file_roots.is_empty() && Application::the().tab_processes() != TabProcesses::PerTabWithoutSiteIsolation)
+        return Error::from_string_literal("A process may read local files under one root only");
+    m_local_file_roots.append(move(root));
+    return {};
+}
+
+LocalFileAccess WebContentClient::local_file_access() const
+{
+    if (m_local_file_roots.is_empty())
+        return {};
+    return m_local_file_roots;
+}
+
+LocalFileAccess WebContentClient::local_file_access_of_process_hosting(Web::HTML::EnvironmentId const& environment_id)
+{
+    LocalFileAccess local_file_access;
+    for_each_client([&](WebContentClient& client) {
+        if (!client.hosted_environment(environment_id).has_value())
+            return IterationDecision::Continue;
+        local_file_access = client.local_file_access();
+        return IterationDecision::Break;
+    });
+    return local_file_access;
 }
 
 Messages::WebContentClient::DidRequestAllCookiesWebdriverResponse WebContentClient::did_request_all_cookies_webdriver(URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context)
@@ -1045,7 +1100,7 @@ Messages::WebContentClient::DidLoseRequestServerConnectionResponse WebContentCli
 
 Messages::WebContentClient::RequestMediaServerConnectionResponse WebContentClient::request_media_server_connection()
 {
-    auto connection = connect_new_media_server_client(m_media_server_client, child_id(), [weak_self = make_weak_ptr<WebContentClient>()]() -> ErrorOr<IPC::TransportHandle> {
+    auto connection = connect_new_media_server_client(m_media_server_client, child_id(), is_private(), [weak_self = make_weak_ptr<WebContentClient>()]() -> ErrorOr<IPC::TransportHandle> {
         auto self = weak_self.strong_ref();
         if (!self)
             return Error::from_string_literal("The WebContent process is gone");
@@ -1094,7 +1149,7 @@ ErrorOr<IPC::TransportHandle> WebContentClient::connect_audio_server_client()
 ErrorOr<void> WebContentClient::ensure_audio_server_controller()
 {
     auto* previous_controller = m_audio_server_client.ptr();
-    TRY(ensure_audio_server_is_running(m_audio_server_client, child_id()));
+    TRY(ensure_audio_server_is_running(m_audio_server_client, child_id(), is_private()));
     if (m_audio_server_client.ptr() == previous_controller)
         return {};
     // A server that isn't told everything gets no clients; the next attempt starts over with another.

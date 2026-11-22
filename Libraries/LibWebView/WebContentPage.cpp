@@ -16,7 +16,6 @@
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/SecureContexts/AbstractOperations.h>
 #include <LibWebCommon/WebDriver/Error.h>
-#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BrowsingSession.h>
@@ -546,6 +545,12 @@ void WebContentPage::did_consume_input_event_in_compositor(u64 event_id)
     }
 }
 
+void WebContentPage::did_update_compositor_layers(Compositing::CompositorLayersDescription const& layers)
+{
+    if (displays_tab())
+        view().did_update_compositor_layers({}, layers);
+}
+
 void WebContentPage::did_not_dispatch_input_event_through_compositor(u64 event_id)
 {
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor did not dispatch input event {} for page {}; sending it to WebContent directly", event_id, m_id);
@@ -681,6 +686,7 @@ void WebContentPage::close()
             view->did_lose_input_event_endpoint({}, *this);
     }
     m_needs_beforeunload_check = true;
+    m_had_user_edits = false;
     m_history_recorded_url_for_current_load.clear();
     if (m_client) {
         m_client->update_audio_capture_permission();
@@ -773,7 +779,7 @@ void WebContentPage::did_request_navigation_of_navigable(Web::HTML::CrossProcess
     //    3. Set initiatorOriginSnapshot to sourceDocument's origin.
     navigation.initiator_origin_snapshot = source_document.origin();
 
-    target->begin_navigation(move(navigation), move(source_page));
+    target->begin_navigation(move(navigation), move(source_page), client().local_file_access());
 }
 
 static bool navigation_can_violate(Web::ContentSecurityPolicy::RemoteViolationDirective directive, CanonicalNavigable const& navigable, Web::HTML::NavigationPopulationRequest const& request)
@@ -1304,6 +1310,12 @@ void WebContentPage::did_get_internal_page_info(WebView::PageInfoType type, Opti
         view().did_receive_internal_page_info({}, type, info);
 }
 
+void WebContentPage::did_describe_owners_of_visual_context_nodes(u64 structural_epoch, Vector<u32> spatial_node_indices, Vector<u32> effect_node_indices, Vector<String> owners)
+{
+    if (displays_tab())
+        view().did_describe_owners_of_visual_context_nodes({}, structural_epoch, spatial_node_indices, effect_node_indices, owners);
+}
+
 void WebContentPage::did_get_selected_text(u64 request_id, ByteString selection)
 {
     view().did_receive_selected_text({}, request_id, move(selection));
@@ -1436,6 +1448,30 @@ Messages::WebContentClient::ConnectToStorageAreaResponse WebContentPage::connect
 void WebContentPage::did_change_needs_beforeunload_check(bool needs_beforeunload_check)
 {
     m_needs_beforeunload_check = needs_beforeunload_check;
+}
+
+void WebContentPage::did_change_had_user_edits(bool had_user_edits)
+{
+    m_had_user_edits = had_user_edits;
+}
+
+void WebContentPage::did_save_session_history_entry_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryPersistedState persisted_state)
+{
+    if (!has_traversable())
+        return;
+    // NB: A page saves the state of the documents it hosts alone.
+    auto navigable = hosted_navigable(navigable_id);
+    if (!navigable.has_value() || !hosts_active_document_of(*navigable))
+        return;
+    traversable().save_session_history_entry_persisted_state({}, *navigable, persisted_state);
+}
+
+void WebContentPage::did_save_session_history_entry_states()
+{
+    if (!has_traversable())
+        return;
+    if (auto view = traversable().view(); view.has_value())
+        view->did_save_session_history_entry_states({}, *this);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#transient-activation-duration
@@ -1661,46 +1697,33 @@ void WebContentPage::did_change_picture_in_picture_player_controls_visibility(bo
     view().did_change_picture_in_picture_player_controls_visibility({}, shown);
 }
 
-// A navigation's population steps run in the process with its source document, which need not have hosted local file
-// content. For a navigation to a file: URL the UI process admitted, that process reads the file the URL names, as it does
-// for a history step to an entry of one.
-bool WebContentPage::populates_a_navigation_to_local_file(ByteString const& path) const
-{
-    if (traversable().page_populates_a_history_entry_for_local_file(*this, path))
-        return true;
-
-    bool result = false;
-    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
-        auto navigation = navigable.uncommitted_navigation();
-        result = navigation
-            && navigation->worker() == this
-            && navigation->url.scheme() == "file"sv
-            && navigation->url.file_path() == path;
-        return result ? IterationDecision::Break : IterationDecision::Continue;
-    });
-    return result;
-}
-
 void WebContentPage::did_request_file(ByteString path, i32 request_id)
 {
     // NB: The renderer's sandbox keeps it out of the local file system, so this is the only way it can read a file.
-    //     Answer only a process that has hosted local file content, one reading the file a navigation it populates
-    //     names, or one selecting a file that WebDriver's Element Send Keys command it runs names: any other could
-    //     read every file the user can.
-    auto selects_file_for_webdriver = [&] {
-        auto view = traversable().view();
-        return view.has_value() && view->is_running_webdriver_command_to_select_file(*this, path);
-    };
-    if (!client().may_read_local_files() && !populates_a_navigation_to_local_file(path) && !selects_file_for_webdriver()) {
+    //     Answer only a process that has hosted local file content, for a file under its roots. The UI process reads
+    //     the file a navigation names itself, for the process creating the document.
+    auto file = open_local_file_for_renderer(path, client().local_file_roots());
+    if (file.is_error())
+        async_handle_file_return(file.error().code(), {}, request_id);
+    else
+        async_handle_file_return(0, move(file.value().file), request_id);
+}
+
+// NB: For a file input, Element Send Keys selects the files listed in its text. The page running the command may read
+//     those files and no others.
+void WebContentPage::did_request_file_for_webdriver(u64 command_id, ByteString path, i32 request_id)
+{
+    auto view = traversable().view();
+    if (!view.has_value() || !view->is_running_webdriver_command_to_select_file(*this, command_id, path)) {
         async_handle_file_return(EACCES, {}, request_id);
         return;
     }
 
-    auto file = open_local_file_for_renderer(path);
+    auto file = open_local_file_the_user_chose(path);
     if (file.is_error())
         async_handle_file_return(file.error().code(), {}, request_id);
     else
-        async_handle_file_return(0, file.release_value(), request_id);
+        async_handle_file_return(0, move(file.value().file), request_id);
 }
 
 void WebContentPage::did_request_color_picker(Color current_color)
@@ -1787,6 +1810,11 @@ bool WebContentPage::document_may_use(Web::HTML::CrossProcessId document_id, Web
         return m_file_permission_grants.find_first_index_if([&](auto const& grant) { return grant.document_id == document_id && grant.name == name; }).has_value();
     }
     return manager.effective_state(name, *top_level_origin) == Web::Permissions::EffectiveState::Granted;
+}
+
+bool WebContentPage::hosts_a_local_file_document_that_may_use(Web::Permissions::PermissionName name) const
+{
+    return any_of(m_file_permission_grants, [&](auto const& grant) { return grant.name == name && document_may_use(grant.document_id, name); });
 }
 
 void WebContentPage::did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId document_id)
@@ -2200,6 +2228,17 @@ void WebContentPage::did_insert_clipboard_item(Web::Clipboard::SystemClipboardIt
 {
     if (!has_transient_user_activation())
         return;
+
+    // A page writes only text, HTML and PNG data. Any other format can carry more, like a list of file URLs that the
+    // next paste opens for the page. The internals object stands in for other applications, so tests write any format.
+    if (!WebContentClient::renderers_may_synthesize_input_for_testing()) {
+        item.system_clipboard_representations.remove_all_matching([](Web::Clipboard::SystemClipboardRepresentation const& representation) {
+            return !representation.data.has<ByteString>() || !representation.name.is_one_of("text/plain"sv, "text/html"sv, "image/png"sv);
+        });
+        if (item.system_clipboard_representations.is_empty())
+            return;
+    }
+
     if (writing_document_id.has_value()) {
         if (auto document = hosted_document_with_id(*writing_document_id))
             view().did_insert_clipboard_item_written_by(document->origin(), item);
@@ -2302,10 +2341,6 @@ void WebContentPage::request_history_operation(Web::HTML::CrossProcessId operati
     // Only the process hosting a navigable's active document appends its synchronous navigation steps.
     if (auto const* same_document = parameters.get_pointer<Web::FinalizeSameDocumentNavigationHistoryOperationParameters>(); same_document && !hosted_navigable(same_document->navigable_id).has_value()) {
         async_complete_history_operation(operation_id, {}, traversable().session_history().size());
-        return;
-    }
-    if (auto const* resume = parameters.get_pointer<Web::ResumeTraverseHistoryOperationParameters>(); resume && !traversable().session_history().get_the_used_step(resume->target_step).has_value()) {
-        client().did_misbehave("request_history_operation"sv, "resumed traversal to a step before every used step"sv);
         return;
     }
     traversable().enqueue_history_operation(operation_id, move(parameters), *this);
@@ -2700,6 +2735,7 @@ void WebContentPage::did_request_navigation_start(Web::HTML::CrossProcessId navi
         .sequence_number = target_navigable->top_level_traversable().next_sequence_number(),
         .state = CanonicalNavigation::CheckingIfUnloadingIsCanceled { start_request.release_value() },
         .page = this,
+        .local_file_access = client().local_file_access(),
     });
     begin_navigation_unload_check(*target_navigable, navigation_id);
 }
@@ -2743,7 +2779,9 @@ void WebContentPage::did_complete_navigation_unload_check(Web::HTML::CrossProces
         Application::the().allocate_ui_process_cross_process_id());
     population_request.target_snapshot_params.sandboxing_flags |= navigable->snapshot_target_snapshot_params().sandboxing_flags;
     ongoing_navigation->history_entry = MUST(CanonicalSessionHistoryEntry::create_from_descriptor(Web::HTML::create_session_history_entry_descriptor(population_request.history_entry, 0)));
-    ongoing_navigation->state = CanonicalNavigation::CreatingNavigationParams { NavigationLoader::create(move(population_request)) };
+    // NB: The UI process admitted the navigation, so it reads a file: URL's file itself, with the navigation's local
+    //     file access.
+    ongoing_navigation->state = CanonicalNavigation::CreatingNavigationParams { NavigationLoader::create(move(population_request), ongoing_navigation->local_file_access) };
     async_create_navigation_params(ongoing_navigation->loader()->request());
 
     // Requesting navigation params starts the fetch, so a view's top-level population begins its recorded
@@ -3063,8 +3101,8 @@ void WebContentPage::did_finish_loading(Web::HTML::CrossProcessId navigable_id, 
     if (navigable->tracked_load_navigation_id() != navigable->active_document_load().navigation_id)
         return;
 
-    // NB: The document a traversal is fetching a replacement for does not finish the traversal's load.
-    if (navigable->is_top_level_traversable() && traversable().has_unactivated_traversal_load())
+    // NB: The document a history operation is fetching a replacement for does not finish the operation's load.
+    if (navigable->is_top_level_traversable() && traversable().has_unactivated_load())
         return;
 
     navigable->clear_active_document_load();
@@ -3786,10 +3824,14 @@ Messages::WebContentClient::DidAddBlobUrlEntryResponse WebContentPage::did_add_b
     entry.origin = environment->origin();
 
     // 4. Set store[url] to entry.
-    // NB: A document created from the URL in another process reads local files as local file content does, so the
-    //     store remembers whether local file content added the entry.
-    auto added_by_local_file_content = client().may_read_local_files() ? AddedByLocalFileContent::Yes : AddedByLocalFileContent::No;
-    return client().session().blob_url_store->add_entry(move(url), move(entry), WeakPtr<WebContentClient> { client() }, added_by_local_file_content);
+    // NB: A document created from the URL in another process reads local files under the root of the content that
+    //     added the entry, or of its process when that has just one.
+    Optional<LocalFileRoot> root_of_adder;
+    if (auto document = document_with_hosted_environment(environment_id); document.has_value() && document->local_file_root().has_value())
+        root_of_adder = document->local_file_root();
+    else if (client().local_file_roots().size() == 1)
+        root_of_adder = client().local_file_roots().first();
+    return client().session().blob_url_store->add_entry(move(url), move(entry), WeakPtr<WebContentClient> { client() }, move(root_of_adder));
 }
 
 // https://w3c.github.io/FileAPI/#dfn-revokeObjectURL

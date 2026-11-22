@@ -10,15 +10,19 @@
 
 #![allow(non_camel_case_types)]
 
-use crate::css_pixels::{CssPixelPoint, CssPixels};
+use crate::css_pixels::CssPixelPoint;
 use crate::display_list::chunks::ChunkId;
-use crate::display_list::commands::{CompositorContextId, UniqueNodeId};
+use crate::display_list::commands::{CanvasId, CompositorContextId, UniqueNodeId};
+use crate::display_list::layers::{LayerPlan, UnvalidatedLayerPlan};
 use crate::display_list::storage::PackedChunkSize;
 use crate::visual_context::VisualContextTree;
 use libipc_rust::wire::{Decode, DecodeError, Decoder, Encode, EncodeError, Encoder, File};
 use std::sync::Arc;
 
 pub type Web_CompositorContextId = CompositorContextId;
+pub type Compositing_CanvasId = CanvasId;
+pub type Compositing_WebGL_ImageSource = crate::webgl::ImageSource;
+pub type Gfx_AlphaType = crate::display_list::canvas_2d_recorder::AlphaType;
 pub type Web_UniqueNodeID = UniqueNodeId;
 pub type Web_CSSPixelPoint = CssPixelPoint;
 pub type Gfx_IntPoint = libgfx_rust::IntPoint;
@@ -30,75 +34,12 @@ pub type Gfx_Color = libgfx_rust::Color;
 pub type Compositing_VisualContextTree = Arc<VisualContextTree>;
 pub type Compositing_ScrollStateSnapshot = crate::scrolling::ScrollStateSnapshot;
 pub type Compositing_DisplayList = SharedDisplayList;
+pub type Compositing_LayerPlan = LayerPlanOnWire;
 
-impl Encode for CompositorContextId {
-    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
-        encoder.encode(&self.0)
-    }
-}
-
-impl Decode for CompositorContextId {
-    const MIN_ENCODED_SIZE: usize = size_of::<u64>();
-
-    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self(decoder.decode()?))
-    }
-}
-
-impl Encode for UniqueNodeId {
-    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
-        encoder.encode(&self.0)
-    }
-}
-
-impl Decode for UniqueNodeId {
-    const MIN_ENCODED_SIZE: usize = size_of::<i64>();
-
-    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self(decoder.decode()?))
-    }
-}
-
-impl Encode for CssPixelPoint {
-    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
-        encoder.encode(&self.x.raw_value())?;
-        encoder.encode(&self.y.raw_value())
-    }
-}
-
-impl Decode for CssPixelPoint {
-    const MIN_ENCODED_SIZE: usize = 2 * size_of::<i32>();
-
-    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
-            x: CssPixels::from_raw(decoder.decode()?),
-            y: CssPixels::from_raw(decoder.decode()?),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Web_DevicePixelPoint {
     pub x: i32,
     pub y: i32,
-}
-
-impl Encode for Web_DevicePixelPoint {
-    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
-        encoder.encode(&self.x)?;
-        encoder.encode(&self.y)
-    }
-}
-
-impl Decode for Web_DevicePixelPoint {
-    const MIN_ENCODED_SIZE: usize = 2 * size_of::<i32>();
-
-    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
-            x: decoder.decode()?,
-            y: decoder.decode()?,
-        })
-    }
 }
 
 #[allow(non_upper_case_globals)]
@@ -160,7 +101,7 @@ impl Decode for Core_AnonymousBuffer {
 /// `Compositing::DisplayList`: a display list on its way to the compositor. It names its chunks in paint order, and
 /// carries the records and runs of those the compositor does not keep packed in shared memory, which the compositor
 /// copies out of it, with what travels beside them.
-#[derive(Debug)]
+#[derive(Debug, Encode, Decode)]
 pub struct SharedDisplayList {
     pub chunks_in_paint_order: Vec<ChunkId>,
     pub packed_chunks: Core_AnonymousBuffer,
@@ -170,25 +111,41 @@ pub struct SharedDisplayList {
     pub async_scrolling_metadata: Option<Compositing_AsyncScrollingMetadata>,
 }
 
-impl Encode for SharedDisplayList {
-    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
-        encoder.encode(&self.chunks_in_paint_order)?;
-        encoder.encode(&self.packed_chunks)?;
-        encoder.encode(&self.packed_chunk_sizes)?;
-        encoder.encode(&self.properties)?;
-        encoder.encode(&self.async_scrolling_metadata)
+/// `Compositing::LayerPlan`: a plan of the layers of a display list on its way to the compositor. WebContent encodes a
+/// plan it made, and the compositor decodes a plan that nothing reads until it passes the checks against the list and the
+/// tree it is installed with.
+#[derive(Debug)]
+pub enum LayerPlanOnWire {
+    Planned(Arc<LayerPlan>),
+    Received(Box<UnvalidatedLayerPlan>),
+}
+
+impl LayerPlanOnWire {
+    /// The plan a message from WebContent carried, which nothing reads until it is checked.
+    pub fn into_received(self) -> UnvalidatedLayerPlan {
+        match self {
+            Self::Received(layer_plan) => *layer_plan,
+            Self::Planned(_) => unreachable!("a message the compositor decoded carries a received plan"),
+        }
     }
 }
 
-impl Decode for SharedDisplayList {
+impl Encode for LayerPlanOnWire {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        match self {
+            Self::Planned(plan) => encoder.encode(&**plan),
+            Self::Received(_) => Err(EncodeError::InvalidValue(
+                "A plan of layers goes on only from the process that planned it",
+            )),
+        }
+    }
+}
+
+impl Decode for LayerPlanOnWire {
+    const MIN_ENCODED_SIZE: usize = UnvalidatedLayerPlan::MIN_ENCODED_SIZE;
+
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
-            chunks_in_paint_order: decoder.decode()?,
-            packed_chunks: decoder.decode()?,
-            packed_chunk_sizes: decoder.decode()?,
-            properties: decoder.decode()?,
-            async_scrolling_metadata: decoder.decode()?,
-        })
+        Ok(Self::Received(Box::new(decoder.decode()?)))
     }
 }
 
@@ -207,24 +164,6 @@ impl Decode for ChunkId {
     }
 }
 
-impl Encode for PackedChunkSize {
-    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
-        encoder.encode(&self.record_bytes)?;
-        encoder.encode(&self.run_count)
-    }
-}
-
-impl Decode for PackedChunkSize {
-    const MIN_ENCODED_SIZE: usize = 2 * size_of::<u64>();
-
-    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
-            record_bytes: decoder.decode()?,
-            run_count: decoder.decode()?,
-        })
-    }
-}
-
 include!(concat!(env!("OUT_DIR"), "/AsyncScrollNodeStableID.rs"));
 include!(concat!(env!("OUT_DIR"), "/DisplayListProperties.rs"));
 include!(concat!(env!("OUT_DIR"), "/InputEvent.rs"));
@@ -235,6 +174,7 @@ include!(concat!(env!("OUT_DIR"), "/MouseButton.rs"));
 include!(concat!(env!("OUT_DIR"), "/TextEditingCommand.rs"));
 include!(concat!(env!("OUT_DIR"), "/Types.rs"));
 
+include!(concat!(env!("OUT_DIR"), "/CompositorControlServerEndpoint.rs"));
 include!(concat!(env!("OUT_DIR"), "/CompositorPresentationClientEndpoint.rs"));
 include!(concat!(env!("OUT_DIR"), "/CompositorPresentationServerEndpoint.rs"));
 include!(concat!(env!("OUT_DIR"), "/CompositorWebContentClientEndpoint.rs"));

@@ -474,6 +474,7 @@ public:
     Color text_decoration_color() const { return CSS::resolve_style_color(style_group<CSS::ComputedValues::TextResetValues>().text_decoration_color, color()); }
     CSSPixels line_height() const { return style_group<CSS::ComputedValues::FontValues>().line_height_used_value(); }
     CSSPixels font_size() const { return style_group<CSS::ComputedValues::FontValues>().font_size; }
+    double font_size_for_lengths() const { return style_group<CSS::ComputedValues::FontValues>().font_size_for_lengths(); }
     Gfx::FontCascadeList const& font_list() const { return style_group<CSS::ComputedValues::FontValues>().font_list_value(); }
     CSS::LengthBox inset() const { return length_box(style_group<CSS::ComputedValues::SurroundValues>().inset); }
     CSS::LengthBox margin() const { return length_box(style_group<CSS::ComputedValues::SurroundValues>().margin); }
@@ -526,7 +527,7 @@ public:
     void set_computed_values(Layout::BegunRead const& read, NonnullRefPtr<CSS::ComputedValues const>);
     // Takes the record its DOM target installed, where it followed the target's record. The target still holds the
     // record it held before until the engine takes the new one in, so the render state compares the two.
-    void set_style_record_identity(CSS::StyleRecordID);
+    void set_style_record_identity(CSS::InstalledStyle const&);
     void refresh_style_from_arena(CSS::StyleRecordID, void const* payloads, bool derived, bool should_attach_resources);
     // The pin lives on the node's arena row and is released with it, so
     // Document::tear_down_layout_tree() must free the layout root before the document's style
@@ -535,11 +536,12 @@ public:
     void release_pinned_style_record();
 
 private:
-    bool keeps_style_until_rebuilt(CSS::StyleRecordID);
+    // NB: These take the style of the record where the caller holds it, which spares asking the engine for it.
+    bool keeps_style_until_rebuilt(CSS::StyleRecordID, CSS::InstalledStyle const* = nullptr);
     virtual bool is_node_with_style() const final { return true; }
 
-    void publish_style_record_to_node_data();
-    void adopt_style_record_installed_by_render_state();
+    void publish_style_record_to_node_data(CSS::InstalledStyle const* = nullptr);
+    void adopt_style_record_installed_by_render_state(CSS::InstalledStyle const* = nullptr);
     void did_update_style_record();
 
     void rebuild_image_observers(Vector<RefPtr<CSS::CursorStyleValue const>>);

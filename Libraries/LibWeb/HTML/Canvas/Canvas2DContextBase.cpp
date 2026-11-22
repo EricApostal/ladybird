@@ -12,6 +12,7 @@
  */
 
 #include <AK/Utf16StringBuilder.h>
+#include <LibCompositing/CanvasColorSpace.h>
 #include <LibCompositing/RustFFI.h>
 #include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibGfx/AffineTransform.h>
@@ -44,7 +45,6 @@
 #include <LibWeb/HTML/Canvas/Canvas2DContextBase.h>
 #include <LibWeb/HTML/Canvas/CanvasDrawImage.h>
 #include <LibWeb/HTML/Canvas/PredefinedColorSpace.h>
-#include <LibWeb/HTML/Canvas/RemoteCanvas2DTransport.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
@@ -84,8 +84,8 @@ struct ContextCreationArguments {
 // `FontMetricsSource` of Bindings/Rust/src/canvas_2d/canvas.rs: the font of the context, if it has one yet.
 struct FontMetricsSource {
     Gfx::FontCascadeList const* cascade { nullptr };
-    // The size of the font, as the raw value of a CSSPixels.
-    i32 font_size { 0 };
+    // The computed size of the font in pixels, unrounded, which lengths relative to it scale.
+    double font_size { 0 };
 };
 
 // `ResolvedFontAbi` of Bindings/Rust/src/canvas_2d/canvas.rs.
@@ -93,7 +93,7 @@ struct ResolvedFont {
     // A Gfx::FontCascadeList with a reference that Rust takes over.
     Gfx::FontCascadeList const* cascade { nullptr };
     u64 environment_generation { 0 };
-    i32 font_size { 0 };
+    double font_size { 0 };
     // An AK::Utf16String that Rust takes over.
     FlatPtr serialized { 0 };
 };
@@ -160,7 +160,7 @@ bool web_canvas_2d_context_draw_image_bitmap(void* context, void* image_bitmap, 
 // What the Rust implementation asks of LibWeb, declared in Bindings/Rust/src/canvas_2d/canvas.rs.
 void web_canvas_2d_canvas_did_change_content(void* canvas_host);
 void web_canvas_2d_canvas_did_create_backing_storage(void* canvas_host);
-void* web_canvas_2d_canvas_create_transport(void* canvas_host);
+bool web_canvas_2d_canvas_create_transport(void* canvas_host, Compositor::CompositorHost::Canvas2DTransport* out_transport);
 void* web_canvas_2d_canvas_wrapper(void* canvas, bool canvas_is_offscreen, void* realm);
 void* web_canvas_2d_canvas_relevant_realm(void* canvas_host);
 u64 web_canvas_2d_canvas_font_environment_generation(void* canvas_host);
@@ -180,8 +180,7 @@ bool web_canvas_2d_image_is_not_origin_clean(void* source_wrapper, CanvasImageSo
 bool web_canvas_2d_image_source_canvas_id(void* source_wrapper, CanvasImageSourceKind, u64* out_canvas_id, bool* out_source_is_2d);
 Gfx::DecodedImageFrame* web_canvas_2d_image_source_frame(void* source_wrapper, CanvasImageSourceKind, i32 raster_width, i32 raster_height, bool* out_rasterized);
 bool web_canvas_2d_capture_video_frame(void* source_wrapper, CapturedVideoFrame* out_frame);
-void* web_canvas_2d_video_transport(void* source_wrapper);
-void web_canvas_2d_video_frame_hold_unref(Compositing::VideoFrameHold*);
+bool web_canvas_2d_video_transport(void* source_wrapper, Compositor::CompositorHost::Canvas2DTransport* out_transport);
 void web_canvas_2d_set_video_frame_copy(Optional<Gfx::DecodedImageFrame>* out_frame, Gfx::DecodedImageFrame const* frame);
 
 // What Bindings/Rust/src/html/canvas_gradient.rs asks of LibWeb.
@@ -338,19 +337,20 @@ void web_canvas_2d_canvas_did_create_backing_storage(void* canvas_host)
     host_from(canvas_host).did_create_canvas_backing_storage();
 }
 
-static void* transport_for(Page& page)
+static bool transport_for(Page& page, Compositor::CompositorHost::Canvas2DTransport* out_transport)
 {
     if (!page.has_compositor_host())
-        return nullptr;
+        return false;
     auto transport = page.compositor_host().create_canvas_2d_transport();
-    if (!transport)
-        return nullptr;
-    return &transport.release_nonnull().leak_ref();
+    if (!transport.has_value())
+        return false;
+    *out_transport = *transport;
+    return true;
 }
 
-void* web_canvas_2d_canvas_create_transport(void* canvas_host)
+bool web_canvas_2d_canvas_create_transport(void* canvas_host, Compositor::CompositorHost::Canvas2DTransport* out_transport)
 {
-    return transport_for(host_from(canvas_host).canvas_page());
+    return transport_for(host_from(canvas_host).canvas_page(), out_transport);
 }
 
 void* web_canvas_2d_canvas_wrapper(void* canvas, bool canvas_is_offscreen, void* realm_pointer)
@@ -525,7 +525,7 @@ static bool resolve_font(CanvasType& canvas_element, Utf16View font, CanvasFontS
     out_font = {
         .cascade = &cascade.leak_ref(),
         .environment_generation = font_computer.environment_generation(),
-        .font_size = font_size.raw_value(),
+        .font_size = computed_font_size->as_length().length().absolute_length_to_px_without_rounding(),
         // On getting, the font attribute must return the serialized form of the current font of the context (with no 'line-height' component).
         .serialized = resolved_font_style_value->to_utf16_string(CSS::SerializationMode::ResolvedValue).into_raw(),
     };
@@ -553,7 +553,7 @@ static CSS::ComputationContext computation_context_for(CanvasHost& canvas_host, 
         }
 
         auto const& first_font = font.cascade->first_available_font();
-        return CSS::Length::FontMetrics { CSSPixels::from_raw(font.font_size), first_font.pixel_metrics(), CSS::InitialValues::line_height() };
+        return CSS::Length::FontMetrics { font.font_size, first_font.pixel_metrics(), CSS::InitialValues::line_height() };
     }();
 
     return {
@@ -708,7 +708,7 @@ Gfx::DecodedImageFrame* web_canvas_2d_image_frame_from_pixels(u8 const* first_ro
     auto row_size = static_cast<size_t>(width) * sizeof(Gfx::RawPixel);
     for (int y = 0; y < height; ++y)
         __builtin_memcpy(bitmap.value()->scanline(y), first_row + static_cast<size_t>(y) * pitch, row_size);
-    auto frame = Gfx::DecodedImageFrame::create(*bitmap.release_value(), gfx_color_space_for(predefined_color_space_from_underlying(color_space)));
+    auto frame = Gfx::DecodedImageFrame::create(*bitmap.release_value(), Compositing::gfx_color_space_for(predefined_color_space_from_underlying(color_space)));
     if (frame.is_error())
         return nullptr;
     return new Gfx::DecodedImageFrame { frame.release_value() };
@@ -853,15 +853,10 @@ bool web_canvas_2d_capture_video_frame(void* source_wrapper, CapturedVideoFrame*
     return true;
 }
 
-void* web_canvas_2d_video_transport(void* source_wrapper)
+bool web_canvas_2d_video_transport(void* source_wrapper, Compositor::CompositorHost::Canvas2DTransport* out_transport)
 {
     auto& video = Bindings::impl_from<HTMLVideoElement>(*static_cast<JS::Object*>(source_wrapper));
-    return transport_for(video.document().page());
-}
-
-void web_canvas_2d_video_frame_hold_unref(Compositing::VideoFrameHold* hold)
-{
-    hold->unref();
+    return transport_for(video.document().page(), out_transport);
 }
 
 void web_canvas_2d_set_video_frame_copy(Optional<Gfx::DecodedImageFrame>* out_frame, Gfx::DecodedImageFrame const* frame)

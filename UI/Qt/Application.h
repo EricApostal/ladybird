@@ -39,8 +39,10 @@ namespace Ladybird {
 class WebUIPages;
 
 class Bookmarks;
+class CompositorLayersWindow;
 class ProcessManagerWindow;
 class SoftwareUpdater;
+class WebContentView;
 
 struct WindowConfiguration {
     Optional<Web::DevicePixels> x {};
@@ -87,8 +89,12 @@ public:
 #endif
 
     Optional<u16> devtools_port() const { return m_devtools_port; }
+    URL::URL new_bug_report_url() const;
+    bool shows_cpu_painting_bar() const { return !m_gpu_painting_enabled && !m_cpu_painting_bar_dismissed; }
+    void dismiss_cpu_painting_bar();
     bool has_translator() const;
     WebView::MicrophoneAuthorizer* microphone_authorizer() { return m_microphone_authorizer.ptr(); }
+    WebView::DefaultBrowser* default_browser() { return m_default_browser.ptr(); }
     // The status to exit with right away, if the browser has nothing for this process to do.
     Optional<int> exit_status_if_done() const;
     ErrorOr<int> execute();
@@ -143,6 +149,7 @@ public:
     void restart_private_browsing_session();
     void focus_location_editor();
     void show_process_manager();
+    void set_shows_compositor_layers(bool);
     // Asks every window's pages if they may unload, one window at a time. Once all of them agree, it confirms stopping
     // the downloads and quits; if a page refuses or the downloads are kept, the quit is canceled and no window closes.
     void quit();
@@ -169,7 +176,7 @@ public:
     BrowserWindow* active_window_if_any() const { return m_active_window; }
     BrowserWindow* non_private_window_if_any() const;
 
-#if defined(AK_OS_MACOS)
+#if defined(LADYBIRD_HAS_SPARKLE)
     SoftwareUpdater* software_updater() { return m_software_updater.ptr(); }
 #endif
 
@@ -274,7 +281,9 @@ private:
     void ask_user_for_download_path(u64 request_id, ByteString const& file) const;
     void display_download_confirmation_dialog(StringView download_name, ByteString const& path) const;
     void display_error_dialog(StringView error_message) const;
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     void display_update_check_result(WebView::UpdateCheckResult::Kind, Optional<String> const& version, WebView::InstallMethod, WebView::UpdateCheckTrigger);
+#endif
     void open_file(String const& path) const;
 
     virtual void crash_reports_changed() override;
@@ -298,6 +307,8 @@ private:
     virtual bool platform_reports_scroll_momentum() const override;
     virtual bool platform_scrolls_elastically() const override;
     virtual bool platform_scrollbar_track_press_jumps() const override;
+    virtual bool platform_prefers_reduced_motion() const override;
+    virtual bool platform_prefers_more_contrast() const override;
     virtual Vector<String> platform_preferred_languages() const override;
     virtual Optional<Gfx::GpuDeviceIdentity> platform_presentation_gpu_device() const override;
     virtual Vector<u64> platform_presentation_drm_format_modifiers() const override;
@@ -313,6 +324,8 @@ private:
 
     void did_enable_devtools(u16 port);
     void did_disable_devtools();
+    void did_change_gpu_painting(bool enabled);
+    void update_cpu_painting_bars() const;
     void on_recently_closed_entries_changed() const;
     void did_clear_history_since(UnixDateTime);
     void create_session_store(ByteString const& data_directory, bool persists_sessions);
@@ -323,6 +336,8 @@ private:
 
     String m_command_line;
     Optional<u16> m_devtools_port;
+    bool m_gpu_painting_enabled { true };
+    bool m_cpu_painting_bar_dismissed { false };
 
 #ifdef LADYBIRD_HUB_IN_OWN_PROCESS
     ErrorOr<void> connect_to_hub(Main::Arguments const&);
@@ -349,8 +364,9 @@ private:
     OwnPtr<WebView::Translator> m_translator;
     OwnPtr<WebView::SpellChecker> m_spell_checker;
     OwnPtr<WebView::MicrophoneAuthorizer> m_microphone_authorizer;
+    OwnPtr<WebView::DefaultBrowser> m_default_browser;
     OwnPtr<WebView::Settings> m_settings;
-#if defined(AK_OS_MACOS)
+#if defined(LADYBIRD_HAS_SPARKLE)
     OwnPtr<SoftwareUpdater> m_software_updater;
 #endif
     OwnPtr<SessionStore> m_session_store;
@@ -375,6 +391,8 @@ private:
     u64 m_next_external_url_handler_id { 1 };
     BrowserWindow* m_active_window { nullptr };
     OwnPtr<ProcessManagerWindow> m_process_manager_window;
+    OwnPtr<CompositorLayersWindow> m_compositor_layers_window;
+    QPointer<WebContentView> m_view_picking_compositor_layer;
     RefPtr<Action> m_open_task_manager_action;
 
     bool m_private_session_restart_in_progress { false };

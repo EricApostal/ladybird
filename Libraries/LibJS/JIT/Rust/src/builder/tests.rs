@@ -6,53 +6,80 @@
 
 use super::*;
 use crate::bytecode::test_support::*;
-use crate::ir::dump;
 use crate::snapshot::ExecutableSnapshot;
+use crate::snapshot::List;
+
+/// `graph` as text (see `crate::ir::dump()`).
+fn dump(graph: &Graph, layout: &crate::bytecode::FrameLayout) -> String {
+    crate::ir::dump(graph, layout).to_string()
+}
 
 /// The constants of `test_layout()`: c0 is 0 and c1 is 10.
 pub(crate) fn test_constants() -> Vec<u64> {
     vec![value::int32(0), value::int32(10)]
 }
 
-/// A snapshot of `program`. Its `bytecode_address` points at the snapshot's
-/// own copy of the bytecode.
-pub(crate) fn snapshot_for(program: &Program, layout: FrameLayout) -> Snapshot {
-    let mut snapshot = Snapshot {
-        executables: vec![ExecutableSnapshot {
-            bytecode: program.bytes.clone(),
-            bytecode_address: 0,
-            layout,
-            constants: test_constants(),
-            exception_handlers: program.handlers.clone(),
-            ..ExecutableSnapshot::default()
-        }],
-        ..Snapshot::default()
+/// Adds `program` to `snapshot` as its next executable. Its `bytecode_address` points at a copy of the bytecode that
+/// stays where it is for the rest of the test run: compiled code has the address, and the pools of a snapshot move
+/// when they grow.
+pub(crate) fn add_program(snapshot: &mut Snapshot, program: &Program, layout: FrameLayout) {
+    let code: &'static [u8] = Box::leak(program.bytes.clone().into_boxed_slice());
+    let executable = ExecutableSnapshot {
+        bytecode: snapshot.add(code),
+        bytecode_address: code.as_ptr() as u64,
+        layout,
+        constants: snapshot.add(&test_constants()),
+        exception_handlers: snapshot.add(&program.handlers),
+        ..ExecutableSnapshot::default()
     };
-    snapshot.executables[0].bytecode_address = snapshot.executables[0].bytecode.as_ptr() as u64;
+    snapshot.add_executable(executable);
+}
+
+/// A snapshot of `program`.
+pub(crate) fn snapshot_for(program: &Program, layout: FrameLayout) -> Snapshot {
+    let mut snapshot = Snapshot::new();
+    add_program(&mut snapshot, program, layout);
+    // NB: The functions of the tests run in the realm of the compiled code.
+    snapshot.runtime.realm = CellId(inlining::REALM);
     snapshot
 }
 
 /// Builds the graph of `program` with `test_layout()`. The instructions with
 /// the indices in `never_ran` are treated as never having run.
-pub(crate) fn build_with_layout(program: &Program, layout: FrameLayout, never_ran: &[usize]) -> Graph {
+pub(crate) fn build_with_layout(program: &Program, layout: FrameLayout, never_ran: &[usize]) -> Graph<'static> {
     let snapshot = snapshot_for(program, layout);
     let never_ran_pcs = never_ran
         .iter()
         .map(|index| program.offsets[*index])
         .collect::<Vec<_>>();
-    let mut graph = build_graph_with_feedback(&snapshot, &|pc| !never_ran_pcs.contains(&pc)).unwrap();
-    crate::passes::optimize(&mut graph, &layout, true);
+    let mut graph =
+        build_graph_with_feedback(&snapshot, &|pc| !never_ran_pcs.contains(&pc), crate::test_zone()).unwrap();
+    crate::passes::optimize(
+        &mut graph,
+        &layout,
+        true,
+        &mut crate::test_work(),
+        &mut crate::test_steps(),
+    )
+    .unwrap();
     graph
 }
 
 /// Builds and optimizes the graph of `snapshot`, like compilation does.
-pub(crate) fn optimized_graph(snapshot: &Snapshot) -> Graph {
-    let mut graph = build_graph(snapshot).unwrap();
-    crate::passes::optimize(&mut graph, &snapshot.executables[0].layout, true);
+pub(crate) fn optimized_graph(snapshot: &Snapshot) -> Graph<'static> {
+    let mut graph = build_graph(snapshot, crate::test_zone()).unwrap();
+    crate::passes::optimize(
+        &mut graph,
+        &snapshot.executables[0].layout,
+        true,
+        &mut crate::test_work(),
+        &mut crate::test_steps(),
+    )
+    .unwrap();
     graph
 }
 
-pub(crate) fn build(program: &Program) -> Graph {
+pub(crate) fn build(program: &Program) -> Graph<'static> {
     build_with_layout(program, test_layout(), &[])
 }
 
@@ -62,11 +89,16 @@ fn executable_analyses_are_lazy_and_borrowed_by_independent_walks() {
     let snapshot = snapshot_for(&program, test_layout());
     let executable = &snapshot.executables[0];
     let cache = OnceCell::new();
-    let decoded = decoded_function(executable, &cache).unwrap();
+    let decoded = decoded_function(&snapshot, executable, &cache, crate::test_zone()).unwrap();
     assert!(decoded.analysis.get().is_none());
-    assert!(std::ptr::eq(decoded, decoded_function(executable, &cache).unwrap()));
-    let mut first = Function::new(0, executable, decoded, false).unwrap();
-    let second = Function::new(0, executable, decoded, false).unwrap();
+    assert!(std::ptr::eq(
+        decoded,
+        decoded_function(&snapshot, executable, &cache, crate::test_zone()).unwrap()
+    ));
+    let mut first = Function::new(&snapshot, 0, decoded, false, crate::test_zone()).unwrap();
+    first.start_walk();
+    let mut second = Function::new(&snapshot, 0, decoded, false, crate::test_zone()).unwrap();
+    second.start_walk();
     assert!(std::ptr::eq(first.cfg, second.cfg));
     assert!(std::ptr::eq(first.liveness, second.liveness));
     assert_eq!(first.instructions.as_ptr(), second.instructions.as_ptr());
@@ -82,16 +114,21 @@ fn cached_liveness_keeps_legacy_arguments_only_for_inlined_walks() {
         let snapshot = snapshot_for(&program, layout);
         let executable = &snapshot.executables[0];
         let cache = OnceCell::new();
-        let decoded = decoded_function(executable, &cache).unwrap();
-        let first = Function::new(0, executable, decoded, first_mode).unwrap();
-        let second = Function::new(0, executable, decoded, !first_mode).unwrap();
+        let decoded = decoded_function(&snapshot, executable, &cache, crate::test_zone()).unwrap();
+        let first = Function::new(&snapshot, 0, decoded, first_mode, crate::test_zone()).unwrap();
+        let second = Function::new(&snapshot, 0, decoded, !first_mode, crate::test_zone()).unwrap();
+        let live_in = |function: &Function<'_>, slot| {
+            let mut live = ak::ZoneBitSet::new_in(0, crate::test_zone());
+            function.liveness.live_in(0, &mut live);
+            live.contains(slot)
+        };
         assert!(std::ptr::eq(first.cfg, second.cfg));
         let argument_slot = layout
             .tracked_index(Operand::from_raw(layout.arguments_base()))
             .unwrap();
-        assert_eq!(first.liveness.live_in(0).contains(argument_slot), first_mode);
-        assert_eq!(second.liveness.live_in(0).contains(argument_slot), !first_mode);
-        let repeated = Function::new(0, executable, decoded, first_mode).unwrap();
+        assert_eq!(live_in(&first, argument_slot), first_mode);
+        assert_eq!(live_in(&second, argument_slot), !first_mode);
+        let repeated = Function::new(&snapshot, 0, decoded, first_mode, crate::test_zone()).unwrap();
         assert!(std::ptr::eq(first.liveness, repeated.liveness));
     }
 }
@@ -319,36 +356,40 @@ fn writes_to_constant_operands_go_to_the_frame() {
 
 #[test]
 fn loop_headers_inside_a_loop_body_add_their_phis_to_it() {
-    use crate::bitset::BitSet;
     use crate::bytecode::cfg::Cfg;
     use crate::bytecode::cfg::Loop;
+    use ak::ZoneBitSet;
 
+    let zone = crate::test_zone();
     // Loop 1's header lies in loop 0's body, but loop 1 extends outside it,
     // as `finally` dispatch can make happen. Loop 1 assigns slot 7.
     let assigned = |slots: &[usize]| {
-        let mut set = BitSet::new(10);
+        let mut set = ZoneBitSet::new_in(10, zone);
         slots.iter().for_each(|slot| set.insert(*slot));
         set
     };
     let cfg = Cfg {
-        blocks: Vec::new(),
-        reverse_post_order: Vec::new(),
-        loops: vec![
-            Loop {
-                header: 1,
-                back_edge_sources: vec![3],
-                blocks: vec![1, 2, 3],
-                assigned_slots: assigned(&[5]),
-            },
-            Loop {
-                header: 2,
-                back_edge_sources: vec![4],
-                blocks: vec![0, 2, 4],
-                assigned_slots: assigned(&[7]),
-            },
-        ],
+        blocks: ZoneVec::new_in(zone),
+        reverse_post_order: ZoneVec::new_in(zone),
+        loops: ZoneVec::from_iter_in(
+            [
+                Loop {
+                    header: 1,
+                    back_edge_sources: ZoneVec::from_slice_in(&[3], zone),
+                    blocks: ZoneVec::from_slice_in(&[1, 2, 3], zone),
+                    assigned_slots: assigned(&[5]),
+                },
+                Loop {
+                    header: 2,
+                    back_edge_sources: ZoneVec::from_slice_in(&[4], zone),
+                    blocks: ZoneVec::from_slice_in(&[0, 2, 4], zone),
+                    assigned_slots: assigned(&[7]),
+                },
+            ],
+            zone,
+        ),
     };
-    let slots = loop_phi_slots(&cfg);
+    let slots = loop_phi_slots(&cfg, zone);
     assert_eq!(slots[0].iter().collect::<Vec<_>>(), [5, 7]);
     assert_eq!(slots[1].iter().collect::<Vec<_>>(), [7]);
 }
@@ -367,10 +408,10 @@ fn instructions_whose_feedback_is_empty_never_ran() {
             Instruction::Return { value: r(6) },
         ]
     });
-    let compile = |arith: Vec<u8>, exit_sites| {
+    let compile = |arith: Vec<u8>, exit_sites: Vec<(u32, crate::code::ExitKind)>| {
         let mut snapshot = snapshot_for(&program, test_layout());
-        snapshot.executables[0].feedback.arith = arith;
-        snapshot.executables[0].exit_sites = exit_sites;
+        snapshot.executables[0].feedback.arith = snapshot.add(&arith);
+        snapshot.executables[0].exit_sites = snapshot.add(&exit_sites);
         dump(&optimized_graph(&snapshot), &test_layout())
     };
     let add_pc = program.offsets[1];
@@ -394,7 +435,7 @@ fn unsupported_instructions_fail_cleanly() {
         ]
     });
     let snapshot = snapshot_for(&program, test_layout());
-    let failure = build_graph(&snapshot).unwrap_err();
+    let failure = build_graph(&snapshot, crate::test_zone()).unwrap_err();
     assert!(matches!(
         failure,
         CompileFailure::UnsupportedInstruction {
@@ -583,8 +624,8 @@ fn counting_loop(feedback: u8, exit_sites: Vec<(u32, ExitKind)>) -> String {
         ]
     });
     let mut snapshot = snapshot_for(&program, test_layout());
-    snapshot.executables[0].feedback.arith = vec![feedback, feedback];
-    snapshot.executables[0].exit_sites = exit_sites;
+    snapshot.executables[0].feedback.arith = snapshot.add(&[feedback, feedback]);
+    snapshot.executables[0].exit_sites = snapshot.add(&exit_sites);
     dump(&optimized_graph(&snapshot), &test_layout())
 }
 
@@ -648,7 +689,8 @@ fn strict_equality_with_constants_compares_bits_and_feeds_branches_directly() {
         ]
     });
     let mut snapshot = snapshot_for(&program, test_layout());
-    snapshot.executables[0].constants[1] = value::UNDEFINED;
+    let constants = snapshot.executables[0].constants;
+    snapshot[constants][1] = value::UNDEFINED;
     let text = dump(&optimized_graph(&snapshot), &test_layout());
     assert_eq!(text.matches("TaggedEquals").count(), 2, "{text}");
     assert!(!text.contains("BranchTruthy"), "{text}");
@@ -669,12 +711,12 @@ fn strict_equality_of_identity_comparable_values_compares_bits() {
         ]
     });
     let mut snapshot = snapshot_for(&program, test_layout());
-    snapshot.executables[0].feedback.arith = vec![1 << 5];
+    snapshot.executables[0].feedback.arith = snapshot.add(&[1 << 5]);
     let text = dump(&optimized_graph(&snapshot), &test_layout());
     assert!(text.contains("CheckIdentityComparable"), "{text}");
     assert!(text.contains("TaggedEquals"), "{text}");
     // Numbers compare as numbers, other values in the slow path.
-    snapshot.executables[0].feedback.arith = vec![(1 << 5) | (1 << 1)];
+    snapshot.executables[0].feedback.arith = snapshot.add(&[(1 << 5) | (1 << 1)]);
     let text = dump(&optimized_graph(&snapshot), &test_layout());
     assert!(text.contains("Float64StrictlyEquals"), "{text}");
     assert!(text.contains("CallSlowPath StrictlyEquals"), "{text}");
@@ -722,7 +764,7 @@ fn calls_write_back_their_arguments_and_values_survive_them() {
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                arguments: vec![r(6)],
+                arguments: crate::test_zone().alloc_slice_copy(&[r(6)]),
             },
             Instruction::Mov { dst: l(0), src: r(7) },
             Instruction::Return { value: r(6) },
@@ -828,7 +870,7 @@ pub(crate) mod property_access {
     use crate::snapshot::PropertyCacheKind;
     use crate::snapshot::PropertyCacheSnapshot;
 
-    pub(crate) fn get_by_id(dst: Operand, base: Operand, cache: u32) -> Instruction {
+    pub(crate) fn get_by_id(dst: Operand, base: Operand, cache: u32) -> Instruction<'static> {
         Instruction::GetById {
             dst,
             base,
@@ -837,7 +879,7 @@ pub(crate) mod property_access {
         }
     }
 
-    pub(crate) fn put_by_id(base: Operand, src: Operand, cache: u32) -> Instruction {
+    pub(crate) fn put_by_id(base: Operand, src: Operand, cache: u32) -> Instruction<'static> {
         Instruction::PutById {
             base,
             property: PropertyKeyTableIndex(0),
@@ -873,8 +915,15 @@ pub(crate) mod property_access {
         }
     }
 
-    pub(crate) fn cache(entries: Vec<PropertyCacheEntrySnapshot>) -> PropertyCacheSnapshot {
-        PropertyCacheSnapshot {
+    /// A property cache with its entries, which a snapshot has in a list.
+    #[derive(Clone)]
+    pub(crate) struct PropertyCache {
+        pub kind: PropertyCacheKind,
+        pub entries: Vec<PropertyCacheEntrySnapshot>,
+    }
+
+    pub(crate) fn cache(entries: Vec<PropertyCacheEntrySnapshot>) -> PropertyCache {
+        PropertyCache {
             kind: if entries.len() == 1 {
                 PropertyCacheKind::Monomorphic
             } else {
@@ -884,14 +933,22 @@ pub(crate) mod property_access {
         }
     }
 
-    fn dump_with_caches(
-        program: &Program,
-        caches: Vec<PropertyCacheSnapshot>,
-        exit_sites: Vec<(u32, ExitKind)>,
-    ) -> String {
+    /// Adds `caches` and their entries to `snapshot`.
+    pub(crate) fn add_caches(snapshot: &mut Snapshot, caches: &[PropertyCache]) -> List<PropertyCacheSnapshot> {
+        let caches = caches
+            .iter()
+            .map(|cache| PropertyCacheSnapshot {
+                kind: cache.kind,
+                entries: snapshot.add(&cache.entries),
+            })
+            .collect::<Vec<_>>();
+        snapshot.add(&caches)
+    }
+
+    fn dump_with_caches(program: &Program, caches: Vec<PropertyCache>, exit_sites: Vec<(u32, ExitKind)>) -> String {
         let mut snapshot = snapshot_for(program, test_layout());
-        snapshot.executables[0].property_caches = caches;
-        snapshot.executables[0].exit_sites = exit_sites;
+        snapshot.executables[0].property_caches = add_caches(&mut snapshot, &caches);
+        snapshot.executables[0].exit_sites = snapshot.add(&exit_sites);
         snapshot.runtime.heap_region_offset_mask = (1 << 48) - 1;
         dump(&optimized_graph(&snapshot), &test_layout())
     }
@@ -1086,7 +1143,7 @@ pub(crate) mod property_access {
         let entry = |shape: u64, validated: bool| {
             let target = NativeCallTarget {
                 function: CellId(0x9000),
-                realm: CellId(0xa000),
+                realm: CellId(inlining::REALM),
                 entry: core::num::NonZeroU64::new(0xb000),
                 direct_getter: validated.then_some(DirectGetterFields {
                     wrapper_implementation: 8,
@@ -1133,11 +1190,9 @@ pub(crate) mod property_access {
             (Some(crate::snapshot::keyed_feedback_bits::MAGICAL_LENGTH), false),
         ] {
             let mut snapshot = snapshot_for(&get_length, test_layout());
-            snapshot.executables[0].property_caches = vec![cache(vec![entry(0x100, true)])];
-            snapshot.executables[0].feedback.keyed = feedback
-                .map(|bits| crate::snapshot::KeyedFeedbackSnapshot { bits })
-                .into_iter()
-                .collect();
+            snapshot.executables[0].property_caches = add_caches(&mut snapshot, &[cache(vec![entry(0x100, true)])]);
+            let keyed = feedback.map(|bits| crate::snapshot::KeyedFeedbackSnapshot { bits });
+            snapshot.executables[0].feedback.keyed = snapshot.add(keyed.as_slice());
             snapshot.runtime.heap_region_offset_mask = (1 << 48) - 1;
             let text = dump(&optimized_graph(&snapshot), &test_layout());
             assert_eq!(text.contains("CallNativeAccessor"), calls_getter, "{text}");
@@ -1205,7 +1260,7 @@ pub(crate) mod property_access {
         entry.prototype_chain_validity = Some(CellId(0x8000));
         entry.prototype_chain_valid = true;
         let mut snapshot = snapshot_for(&program, test_layout());
-        snapshot.executables[0].property_caches = vec![cache(vec![entry])];
+        snapshot.executables[0].property_caches = add_caches(&mut snapshot, &[cache(vec![entry])]);
         let graph = optimized_graph(&snapshot);
         let text = dump(&graph, &test_layout());
         // The code is valid where it starts, so the first load needs nothing,
@@ -1305,7 +1360,7 @@ pub(crate) mod property_access {
         assert!(!text.contains("CheckValue"), "{text}");
     }
 
-    fn get_by_value(dst: Operand, base: Operand, property: Operand) -> Instruction {
+    fn get_by_value(dst: Operand, base: Operand, property: Operand) -> Instruction<'static> {
         Instruction::GetByValue {
             keyed_feedback: 0,
             dst,
@@ -1327,8 +1382,9 @@ pub(crate) mod property_access {
             ]
         });
         let mut snapshot = snapshot_for(&program, test_layout());
-        snapshot.executables[0].feedback.keyed = vec![crate::snapshot::KeyedFeedbackSnapshot { bits: keyed_bits }];
-        snapshot.executables[0].exit_sites = exit_sites;
+        snapshot.executables[0].feedback.keyed =
+            snapshot.add(&[crate::snapshot::KeyedFeedbackSnapshot { bits: keyed_bits }]);
+        snapshot.executables[0].exit_sites = snapshot.add(&exit_sites);
         snapshot.runtime.layout.typed_array_kind_uint16 = 3;
         dump(&optimized_graph(&snapshot), &test_layout())
     }
@@ -1340,9 +1396,9 @@ pub(crate) mod property_access {
         // `return a0[10]` where the feedback saw indices of strings.
         let program = assemble(|_| vec![get_by_value(r(5), a(0), c(1)), Instruction::Return { value: r(5) }]);
         let mut snapshot = snapshot_for(&program, test_layout());
-        snapshot.executables[0].feedback.keyed = vec![crate::snapshot::KeyedFeedbackSnapshot {
+        snapshot.executables[0].feedback.keyed = snapshot.add(&[crate::snapshot::KeyedFeedbackSnapshot {
             bits: OTHER_KEY | OTHER_ELEMENTS,
-        }];
+        }]);
         snapshot.runtime.layout.single_ascii_character_strings = 0x1000;
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         assert!(
@@ -1419,9 +1475,10 @@ pub(crate) mod property_access {
         exit_sites: Vec<(u32, ExitKind)>,
     ) -> String {
         let mut snapshot = snapshot_for(program, test_layout());
-        snapshot.executables[0].constants[1] = KEY;
-        snapshot.executables[0].property_caches = vec![cache(entries)];
-        snapshot.executables[0].exit_sites = exit_sites;
+        let constants = snapshot.executables[0].constants;
+        snapshot[constants][1] = KEY;
+        snapshot.executables[0].property_caches = add_caches(&mut snapshot, &[cache(entries)]);
+        snapshot.executables[0].exit_sites = snapshot.add(&exit_sites);
         snapshot.runtime.heap_region_offset_mask = (1 << 48) - 1;
         dump(&optimized_graph(&snapshot), &test_layout())
     }
@@ -1521,10 +1578,10 @@ pub(crate) mod property_access {
             (7, TypedArrayElement::Float32),
             (8, TypedArrayElement::Float64),
         ] {
-            snapshot.executables[0].feedback.keyed = vec![crate::snapshot::KeyedFeedbackSnapshot {
+            snapshot.executables[0].feedback.keyed = snapshot.add(&[crate::snapshot::KeyedFeedbackSnapshot {
                 bits: 1 | (1 << (9 + kind)),
-            }];
-            snapshot.executables[0].exit_sites.clear();
+            }]);
+            snapshot.executables[0].exit_sites = List::empty();
             let text = dump(&optimized_graph(&snapshot), &test_layout());
             for name in ["CheckNumber", "CheckBounds"] {
                 assert!(text.contains(name), "{text}");
@@ -1541,7 +1598,7 @@ pub(crate) mod property_access {
                 _ => assert!(text.contains("Float64ToInt32"), "{text}"),
             }
             assert!(!text.contains("CallSlowPath"), "{text}");
-            snapshot.executables[0].exit_sites = vec![(0, ExitKind::BadType), (0, ExitKind::OutOfBounds)];
+            snapshot.executables[0].exit_sites = snapshot.add(&[(0, ExitKind::BadType), (0, ExitKind::OutOfBounds)]);
             let text = dump(&optimized_graph(&snapshot), &test_layout());
             assert!(!text.contains("CheckNumber"), "{text}");
             assert!(text.contains("CallSlowPath PutByValue"), "{text}");
@@ -1610,7 +1667,7 @@ pub(crate) mod property_access {
             shape: None,
             ..own(GetOwnProperty, 0x100, 1)
         };
-        let megamorphic = PropertyCacheSnapshot {
+        let megamorphic = PropertyCache {
             kind: PropertyCacheKind::Megamorphic,
             entries: vec![own(GetOwnProperty, 0x100, 1)],
         };
@@ -1655,14 +1712,19 @@ pub(crate) mod inlining {
     pub(crate) const REALM: u64 = 0x8000;
     pub(crate) const ENVIRONMENT: u64 = 0x9000;
 
-    pub(crate) fn call(dst: Operand, callee: Operand, this_value: Operand, arguments: Vec<Operand>) -> Instruction {
+    pub(crate) fn call(
+        dst: Operand,
+        callee: Operand,
+        this_value: Operand,
+        arguments: Vec<Operand>,
+    ) -> Instruction<'static> {
         Instruction::Call {
             call_feedback: 0,
             dst,
             callee,
             this_value,
             argument_count: u32::try_from(arguments.len()).unwrap(),
-            arguments,
+            arguments: crate::test_zone().alloc_slice_copy(&arguments),
         }
     }
 
@@ -1690,19 +1752,17 @@ pub(crate) mod inlining {
         let mut snapshot = snapshot_for(caller, test_layout());
         snapshot.runtime.heap_region_offset_mask = (1 << 48) - 1;
         snapshot.executables[0].cell = CellId(0x100);
-        snapshot.executables[0].feedback.call = vec![CallFeedbackSnapshot {
+        snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
             target: Some(function.function),
             inline_executable: Some(1),
             ..CallFeedbackSnapshot::default()
-        }];
-        let mut callee_snapshot = snapshot_for(callee, test_layout()).executables.remove(0);
+        }]);
+        add_program(&mut snapshot, callee, test_layout());
+        let callee_snapshot = &mut snapshot.executables[1];
         callee_snapshot.cell = CellId(0x200);
         callee_snapshot.function = Some(function);
         callee_snapshot.supports_legacy_arguments = !function.strict;
         callee_snapshot.environment = Some(CellId(ENVIRONMENT));
-        snapshot.executables.push(callee_snapshot);
-        let callee_bytes = snapshot.executables[1].bytecode.as_ptr() as u64;
-        snapshot.executables[1].bytecode_address = callee_bytes;
         snapshot.options.inlining = InliningLimits {
             always_inlined_instructions: 10,
             max_construct_instructions: 50,
@@ -1732,7 +1792,7 @@ pub(crate) mod inlining {
     /// The IR of `return a0.value` whose cache entries call getters that
     /// are closures of the callee `return this`.
     fn dump_getter_call(getters: &[u64], exit_sites: Vec<(u32, ExitKind)>) -> String {
-        use super::property_access::{cache, get_by_id, own};
+        use super::property_access::{add_caches, cache, get_by_id, own};
         use crate::snapshot::{AccessorFunctionSnapshot, PropertyCacheEntrySnapshot, PropertyCacheEntryType};
         let program = assemble(|_| vec![get_by_id(r(5), a(0), 0), Instruction::Return { value: r(5) }]);
         let callee = assemble(|_| {
@@ -1759,8 +1819,8 @@ pub(crate) mod inlining {
                 ..own(PropertyCacheEntryType::GetOwnProperty, 0x100 + 0x100 * index as u64, 0)
             })
             .collect();
-        snapshot.executables[0].property_caches = vec![cache(entries)];
-        snapshot.executables[0].exit_sites = exit_sites;
+        snapshot.executables[0].property_caches = add_caches(&mut snapshot, &[cache(entries)]);
+        snapshot.executables[0].exit_sites = snapshot.add(&exit_sites);
         dump(&optimized_graph(&snapshot), &test_layout())
     }
 
@@ -1790,7 +1850,7 @@ pub(crate) mod inlining {
 
     #[test]
     fn inlined_legacy_arguments_use_eligibility_but_keep_closures_conservative() {
-        use super::property_access::{cache, get_by_id, own};
+        use super::property_access::{add_caches, cache, get_by_id, own};
         use crate::snapshot::{AccessorFunctionSnapshot, PropertyCacheEntrySnapshot, PropertyCacheEntryType};
         let caller = assemble(|_| vec![get_by_id(r(5), a(0), 0), Instruction::Return { value: r(5) }]);
         let callee = assemble(|_| {
@@ -1821,8 +1881,8 @@ pub(crate) mod inlining {
                     ..own(PropertyCacheEntryType::GetOwnProperty, 0x100 + index * 0x100, 0)
                 })
                 .collect();
-            snapshot.executables[0].property_caches = vec![cache(entries)];
-            let graph = build_graph(&snapshot).unwrap();
+            snapshot.executables[0].property_caches = add_caches(&mut snapshot, &[cache(entries)]);
+            let graph = build_graph(&snapshot, crate::test_zone()).unwrap();
             let frames = graph
                 .frame_states
                 .iter()
@@ -2095,8 +2155,8 @@ pub(crate) mod inlining {
         });
         let mut snapshot = snapshot_with_callee(&caller, &callee, function(true, false));
         // The callee's Add never ran; the caller's did.
-        snapshot.executables[1].feedback.arith = vec![0];
-        snapshot.executables[0].feedback.arith = vec![0, 1];
+        snapshot.executables[1].feedback.arith = snapshot.add(&[0]);
+        snapshot.executables[0].feedback.arith = snapshot.add(&[0, 1]);
         assert_dump(
             &dump(&optimized_graph(&snapshot), &test_layout()),
             "
@@ -2184,17 +2244,19 @@ pub(crate) mod inlining {
         snapshot.executables[1].cell = snapshot.executables[0].cell;
         for index in 1..=3 {
             if index > 1 {
-                snapshot.executables.push(snapshot.executables[1].clone());
+                let copy = snapshot.executables[1];
+                snapshot.add_executable(copy);
             }
+            let calls = snapshot.add(&[CallFeedbackSnapshot {
+                target: Some(CellId(CALLEE_FUNCTION + (index as u64 % 3) * 0x100)),
+                inline_executable: Some((index % 3 + 1) as u32),
+                ..CallFeedbackSnapshot::default()
+            }]);
             let executable = &mut snapshot.executables[index];
             let function = executable.function.as_mut().unwrap();
             function.function = CellId(CALLEE_FUNCTION + (index as u64 - 1) * 0x100);
             executable.environment = Some(CellId(ENVIRONMENT + (index as u64 - 1) * 0x100));
-            executable.feedback.call = vec![CallFeedbackSnapshot {
-                target: Some(CellId(CALLEE_FUNCTION + (index as u64 % 3) * 0x100)),
-                inline_executable: Some((index % 3 + 1) as u32),
-                ..CallFeedbackSnapshot::default()
-            }];
+            executable.feedback.call = calls;
         }
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         assert_eq!(text.matches("CallSlowPath Call").count(), 1, "{text}");
@@ -2219,7 +2281,7 @@ pub(crate) mod inlining {
 
         // A call target that already turned out wrong here.
         let mut snapshot = snapshot_with_callee(&caller(), &identity, function(true, false));
-        snapshot.executables[0].exit_sites = vec![(caller().offsets[1], ExitKind::BadCallTarget)];
+        snapshot.executables[0].exit_sites = snapshot.add(&[(caller().offsets[1], ExitKind::BadCallTarget)]);
         assert!(!is_inlined(&snapshot));
 
         // Recursion, which inlines two levels deep.
@@ -2228,7 +2290,7 @@ pub(crate) mod inlining {
         assert!(is_inlined(&snapshot));
         let mut snapshot = snapshot_with_callee(&caller(), &caller(), function(true, false));
         snapshot.executables[1].cell = snapshot.executables[0].cell;
-        snapshot.executables[1].feedback.call = snapshot.executables[0].feedback.call.clone();
+        snapshot.executables[1].feedback.call = snapshot.executables[0].feedback.call;
         let recursive = dump(&optimized_graph(&snapshot), &test_layout());
         assert_eq!(recursive.matches("CallSlowPath Call").count(), 1, "{recursive}");
         // One check of the call target for each inlined level.
@@ -2241,11 +2303,15 @@ pub(crate) mod inlining {
         // Mutual recursion of f and g, which inline each other until each runs in three frames.
         let mut snapshot = snapshot_with_callee(&caller(), &caller(), function(true, false));
         snapshot.options.inlining.max_depth = 10;
-        snapshot.executables[1].feedback.call = snapshot.executables[0].feedback.call.clone();
-        let mut g = snapshot.executables[1].clone();
+        let call = snapshot[snapshot.executables[0].feedback.call][0];
+        let mut g = snapshot.executables[1];
         g.cell = CellId(0x300);
-        snapshot.executables[1].feedback.call[0].inline_executable = Some(2);
-        snapshot.executables.push(g);
+        g.feedback.call = snapshot.add(&[call]);
+        snapshot.executables[1].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
+            inline_executable: Some(2),
+            ..call
+        }]);
+        snapshot.add_executable(g);
         let mutual = dump(&optimized_graph(&snapshot), &test_layout());
         assert_eq!(mutual.matches("CallSlowPath Call").count(), 1, "{mutual}");
         assert!(mutual.contains("CallSlowPath Call @e2:"), "{mutual}");
@@ -2330,6 +2396,7 @@ pub(crate) mod inlining {
 
     #[test]
     fn methods_loaded_as_constants_are_inlined_without_a_callee_check() {
+        use crate::builder::tests::property_access::add_caches;
         use crate::builder::tests::property_access::cache;
         use crate::builder::tests::property_access::get_by_id;
         use crate::builder::tests::property_access::own;
@@ -2350,7 +2417,7 @@ pub(crate) mod inlining {
         entry.prototype = Some(CellId(0x7000));
         entry.prototype_chain_validity = Some(CellId(0x7100));
         entry.prototype_property = Some(CellId(CALLEE_FUNCTION));
-        snapshot.executables[0].property_caches = vec![cache(vec![entry])];
+        snapshot.executables[0].property_caches = add_caches(&mut snapshot, &[cache(vec![entry])]);
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         // The method's load is checked; the call of it is not.
         assert_eq!(text.matches("CheckValue").count(), 1, "{text}");
@@ -2359,6 +2426,7 @@ pub(crate) mod inlining {
 
     #[test]
     fn calls_forwarded_through_call_and_bound_functions_are_inlined() {
+        use crate::builder::tests::property_access::add_caches;
         use crate::builder::tests::property_access::cache;
         use crate::builder::tests::property_access::get_by_id;
         use crate::builder::tests::property_access::own;
@@ -2394,10 +2462,13 @@ pub(crate) mod inlining {
         entry.prototype_chain_validity = Some(CellId(0x7100));
         entry.prototype_property = Some(CellId(0x9000));
         entry.prototype_property_intrinsic = Some(Intrinsic::FunctionPrototypeCall);
-        snapshot.executables[0].property_caches = vec![cache(vec![entry])];
-        snapshot.executables[0].feedback.call[0].target = Some(CellId(0x9000));
-        snapshot.executables[0].feedback.call[0].inline_executable = None;
-        snapshot.executables[0].feedback.call[0].forwarded = Some(forwarded(Forwarding::Call));
+        snapshot.executables[0].property_caches = add_caches(&mut snapshot, &[cache(vec![entry])]);
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].target = Some(CellId(0x9000));
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].inline_executable = None;
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].forwarded = Some(forwarded(Forwarding::Call));
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         // The function `call` is called on is checked, and gets the second argument.
         assert!(text.contains("CheckValue 0xfff9000000005000 (v6)"), "{text}");
@@ -2412,10 +2483,13 @@ pub(crate) mod inlining {
             ]
         });
         let mut snapshot = snapshot_with_callee(&caller, &identity, function(true, false));
-        snapshot.executables[0].feedback.call[0].target = Some(CellId(0x9100));
-        snapshot.executables[0].feedback.call[0].inline_executable = None;
-        snapshot.executables[0].feedback.call[0].forwarded = Some(forwarded(Forwarding::Bound));
-        snapshot.executables[0].feedback.bound_arguments = vec![value::int32(7)];
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].target = Some(CellId(0x9100));
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].inline_executable = None;
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].forwarded = Some(forwarded(Forwarding::Bound));
+        snapshot.executables[0].feedback.bound_arguments = snapshot.add(&[value::int32(7)]);
         let graph = optimized_graph(&snapshot);
         let text = dump(&graph, &test_layout());
         assert!(text.contains("CheckValue 0xfff9000000009100"), "{text}");
@@ -2427,20 +2501,24 @@ pub(crate) mod inlining {
         let fifth = assemble(|_| vec![Instruction::Enter, Instruction::Return { value: fifth_argument }]);
         let mut snapshot = snapshot_with_callee(&caller, &fifth, function(true, false));
         snapshot.executables[1].layout.number_of_arguments = 5;
-        snapshot.executables[0].feedback.call[0].target = Some(CellId(0x9100));
-        snapshot.executables[0].feedback.call[0].inline_executable = None;
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].target = Some(CellId(0x9100));
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].inline_executable = None;
         let mut five = forwarded(Forwarding::Bound);
         five.bound_arguments_start = 2;
         five.bound_argument_count = 5;
-        snapshot.executables[0].feedback.call[0].forwarded = Some(five);
-        snapshot.executables[0].feedback.bound_arguments = (1..=8).map(value::int32).collect();
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].forwarded = Some(five);
+        snapshot.executables[0].feedback.bound_arguments = snapshot.add(&(1..=8).map(value::int32).collect::<Vec<_>>());
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         assert!(text.contains("CheckValue 0xfff9000000009100"), "{text}");
         assert!(text.contains("Return (#7)"), "{text}");
 
         // Bound arguments past the end of the table are not inlined.
         five.bound_arguments_start = 4;
-        snapshot.executables[0].feedback.call[0].forwarded = Some(five);
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].forwarded = Some(five);
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         assert!(!text.contains("CheckValue 0xfff9000000009100"), "{text}");
     }
@@ -2459,7 +2537,8 @@ pub(crate) mod inlining {
         };
         let identity = assemble(|_| vec![Instruction::Enter, Instruction::Return { value: a(0) }]);
         let mut snapshot = snapshot_with_callee(&caller(), &identity, function(true, false));
-        snapshot.executables[0].feedback.call[0].direct_call = Some(DirectCallTarget {
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].direct_call = Some(DirectCallTarget {
             function: function(true, false),
             ..target
         });
@@ -2467,8 +2546,10 @@ pub(crate) mod inlining {
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         assert!(!text.contains("CallDirect"), "{text}");
 
-        snapshot.executables[0].feedback.call[0].inline_executable = None;
-        snapshot.executables[0].feedback.call[0].direct_call = Some(target);
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].inline_executable = None;
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].direct_call = Some(target);
         let graph = optimized_graph(&snapshot);
         let text = dump(&graph, &test_layout());
         // NB: The callee, the `this` value (the sloppy callee reads it) and
@@ -2491,8 +2572,10 @@ pub(crate) mod inlining {
             ]
         });
         let mut many = snapshot_with_callee(&many_arguments, &identity, function(true, false));
-        many.executables[0].feedback.call[0].inline_executable = None;
-        many.executables[0].feedback.call[0].direct_call = Some(target);
+        let calls = many.executables[0].feedback.call;
+        many[calls][0].inline_executable = None;
+        let calls = many.executables[0].feedback.call;
+        many[calls][0].direct_call = Some(target);
         let text = dump(&optimized_graph(&many), &test_layout());
         let expected = format!(
             "CallDirect @{} storing operands (v6, #0, #10, #10, #10, #10, #10, #10) [fs",
@@ -2501,7 +2584,8 @@ pub(crate) mod inlining {
         assert!(text.contains(&expected), "{text}");
 
         // Without a target, the call is a call of the runtime's call helper.
-        snapshot.executables[0].feedback.call[0].direct_call = None;
+        let calls = snapshot.executables[0].feedback.call;
+        snapshot[calls][0].direct_call = None;
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         assert!(text.contains("CallSlowPath Call"), "{text}");
     }
@@ -2510,6 +2594,7 @@ pub(crate) mod inlining {
 mod arguments {
     use super::*;
     use crate::builder::tests::inlining::call;
+    use crate::builder::tests::property_access::add_caches;
     use crate::builder::tests::property_access::cache;
     use crate::builder::tests::property_access::get_by_id;
     use crate::builder::tests::property_access::own;
@@ -2517,7 +2602,7 @@ mod arguments {
     use crate::snapshot::Intrinsic;
     use crate::snapshot::PropertyCacheEntryType;
 
-    fn create_arguments(mapped: bool) -> Instruction {
+    fn create_arguments(mapped: bool) -> Instruction<'static> {
         Instruction::CreateArguments {
             dst: Some(l(0)),
             kind: u8::from(!mapped),
@@ -2552,10 +2637,13 @@ mod arguments {
         apply.prototype_property = Some(CellId(0x7200));
         apply.prototype_property_intrinsic = Some(Intrinsic::FunctionPrototypeApply);
         let text = build(&program, |snapshot| {
-            snapshot.executables[0].property_caches = vec![
-                cache(vec![own(PropertyCacheEntryType::GetOwnProperty, 0x100, 0)]),
-                cache(vec![apply]),
-            ];
+            snapshot.executables[0].property_caches = add_caches(
+                snapshot,
+                &[
+                    cache(vec![own(PropertyCacheEntryType::GetOwnProperty, 0x100, 0)]),
+                    cache(vec![apply]),
+                ],
+            );
         });
         assert!(text.contains("CallForwardingArguments"), "{text}");
         assert!(!text.contains("CreateArguments"), "{text}");
@@ -2564,10 +2652,13 @@ mod arguments {
         let mut not_apply = apply;
         not_apply.prototype_property_intrinsic = None;
         let text = build(&program, |snapshot| {
-            snapshot.executables[0].property_caches = vec![
-                cache(vec![own(PropertyCacheEntryType::GetOwnProperty, 0x100, 0)]),
-                cache(vec![not_apply]),
-            ];
+            snapshot.executables[0].property_caches = add_caches(
+                snapshot,
+                &[
+                    cache(vec![own(PropertyCacheEntryType::GetOwnProperty, 0x100, 0)]),
+                    cache(vec![not_apply]),
+                ],
+            );
         });
         assert!(text.contains("Generic CreateArguments"), "{text}");
     }
@@ -2604,7 +2695,7 @@ mod arguments {
                 Instruction::NewArray {
                     dst: r(7),
                     element_count: 0,
-                    elements: Vec::new(),
+                    elements: &[],
                 },
                 Instruction::ArrayAppend {
                     dst: r(7),
@@ -2692,7 +2783,7 @@ fn dump_bitwise_or(feedback: u8) -> String {
         ]
     });
     let mut snapshot = snapshot_for(&program, test_layout());
-    snapshot.executables[0].feedback.arith = vec![feedback];
+    snapshot.executables[0].feedback.arith = snapshot.add(&[feedback]);
     dump(&optimized_graph(&snapshot), &test_layout())
 }
 
@@ -2735,7 +2826,7 @@ fn numeric_feedback_uses_number_guards_instead_of_type_dispatch() {
         ]
     });
     let mut snapshot = snapshot_for(&program, test_layout());
-    snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::DOUBLE];
+    snapshot.executables[0].feedback.arith = snapshot.add(&[crate::snapshot::arith_feedback::DOUBLE]);
     let graph = optimized_graph(&snapshot);
     let text = dump(&graph, &test_layout());
     assert_eq!(text.matches("CheckNumber").count(), 2, "{text}");
@@ -2761,7 +2852,7 @@ fn captured_object_bindings_are_guarded_before_becoming_constants() {
     let mut snapshot = snapshot_for(&program, test_layout());
     let object = crate::snapshot::CellId(0x1234);
     let bits = value::tagged(value::OBJECT_TAG) | object.0;
-    snapshot.executables[0].captured_bindings.push((
+    snapshot.executables[0].captured_bindings = snapshot.add(&[(
         coordinate,
         crate::snapshot::GlobalValueSnapshot {
             bits,
@@ -2771,7 +2862,7 @@ fn captured_object_bindings_are_guarded_before_becoming_constants() {
             typed_array: None,
             has_instance: None,
         },
-    ));
+    )]);
     let graph = optimized_graph(&snapshot);
     let text = dump(&graph, &test_layout());
     assert!(text.contains("LoadEnvironmentBinding 2"), "{text}");
@@ -2779,7 +2870,7 @@ fn captured_object_bindings_are_guarded_before_becoming_constants() {
     assert!(text.contains(&format!("Return (#0x{bits:x})")), "{text}");
     assert!(graph.embedded_cells.contains(&object));
 
-    snapshot.executables[0].exit_sites.push((0, ExitKind::UnexpectedValue));
+    snapshot.executables[0].exit_sites = snapshot.add(&[(0, ExitKind::UnexpectedValue)]);
     let text = dump(&optimized_graph(&snapshot), &test_layout());
     assert!(text.contains("LoadEnvironmentBinding 2"), "{text}");
     assert!(!text.contains("CheckValue"), "{text}");
@@ -2811,12 +2902,12 @@ fn captured_typed_arrays_use_guarded_fixed_lengths() {
     });
     let mut snapshot = snapshot_for(&program, test_layout());
     snapshot.runtime.layout.typed_array_kind_uint16 = 3;
-    snapshot.executables[0].feedback.keyed = vec![KeyedFeedbackSnapshot {
+    snapshot.executables[0].feedback.keyed = snapshot.add(&[KeyedFeedbackSnapshot {
         bits: 1 | (1 << (9 + 3)),
-    }];
+    }]);
     let object = crate::snapshot::CellId(0x1234);
     let bits = value::tagged(value::OBJECT_TAG) | object.0;
-    snapshot.executables[0].captured_bindings.push((
+    snapshot.executables[0].captured_bindings = snapshot.add(&[(
         coordinate,
         GlobalValueSnapshot {
             bits,
@@ -2829,7 +2920,7 @@ fn captured_typed_arrays_use_guarded_fixed_lengths() {
                 fixed_length: Some(8),
             }),
         },
-    ));
+    )]);
     let text = dump(&optimized_graph(&snapshot), &test_layout());
     assert!(text.contains("CheckTypedArrayStorage"), "{text}");
     assert!(text.contains("LoadTypedArrayDataOffset"), "{text}");
@@ -2837,7 +2928,8 @@ fn captured_typed_arrays_use_guarded_fixed_lengths() {
     assert!(!text.contains("CheckElements"), "{text}");
     assert!(!text.contains("CheckBounds"), "{text}");
 
-    snapshot.executables[0].captured_bindings[0]
+    let captured_bindings = snapshot.executables[0].captured_bindings;
+    snapshot[captured_bindings][0]
         .1
         .typed_array
         .as_mut()
@@ -2848,12 +2940,8 @@ fn captured_typed_arrays_use_guarded_fixed_lengths() {
     assert!(!text.contains("CheckTypedArrayStorage"), "{text}");
     assert!(!text.contains("CheckElements"), "{text}");
 
-    snapshot.executables[0].captured_bindings[0]
-        .1
-        .typed_array
-        .as_mut()
-        .unwrap()
-        .element = TypedArrayElement::Int8;
+    let captured_bindings = snapshot.executables[0].captured_bindings;
+    snapshot[captured_bindings][0].1.typed_array.as_mut().unwrap().element = TypedArrayElement::Int8;
     let text = dump(&optimized_graph(&snapshot), &test_layout());
     assert!(text.contains("CheckElements TypedArray(Uint16)"), "{text}");
 }
@@ -2873,14 +2961,14 @@ fn array_length_specialization_requires_monomorphic_receivers_and_exit_gates() {
         ]
     });
     let mut snapshot = snapshot_for(&program, test_layout());
-    snapshot.executables[0].feedback.cache_value = vec![crate::snapshot::value_feedback::INT32];
+    snapshot.executables[0].feedback.cache_value = snapshot.add(&[crate::snapshot::value_feedback::INT32]);
     for bits in [
         0,
         keyed_feedback_bits::OTHER_ELEMENTS,
         keyed_feedback_bits::MAGICAL_LENGTH | keyed_feedback_bits::OTHER_ELEMENTS,
         keyed_feedback_bits::MAGICAL_LENGTH,
     ] {
-        snapshot.executables[0].feedback.keyed = vec![KeyedFeedbackSnapshot { bits }];
+        snapshot.executables[0].feedback.keyed = snapshot.add(&[KeyedFeedbackSnapshot { bits }]);
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         if bits == keyed_feedback_bits::MAGICAL_LENGTH {
             assert!(text.contains("CheckArray"), "{text}");
@@ -2892,7 +2980,7 @@ fn array_length_specialization_requires_monomorphic_receivers_and_exit_gates() {
         }
     }
     for kind in [ExitKind::BadType, ExitKind::Overflow] {
-        snapshot.executables[0].exit_sites = vec![(0, kind)];
+        snapshot.executables[0].exit_sites = snapshot.add(&[(0, kind)]);
         let text = dump(&optimized_graph(&snapshot), &test_layout());
         assert!(!text.contains("CheckArray"), "{text}");
         assert!(text.contains("CallSlowPath"), "{text}");
@@ -2926,7 +3014,7 @@ mod globals {
                 object: CellId(0x1000),
                 declarative_environment: CellId(0x2000),
                 environment_serial: 1,
-                caches: vec![cache],
+                caches: snapshot.add(&[cache]),
             });
             dump(&optimized_graph(&snapshot), &test_layout())
         };

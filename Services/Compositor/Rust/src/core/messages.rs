@@ -8,29 +8,45 @@
 //! sender may ask for, and the answer a synchronous one gets.
 
 use super::{CompositorCore, ContextOwnerCheckResult};
+use crate::canvas_2d_contexts::ContextCreation;
 use crate::display_list_chunk_stores::chunks_of_list_sent_whole;
 use crate::host::{PresentationId, WebContentClientId};
+use crate::raster_host::SharedMemory;
+use crate::webgl::host::{ContextOptions, MappedMemory};
+use crate::webgl::replay::ReplayError;
+use libcompositing_rust::display_list::commands::CanvasId;
 use libcompositing_rust::display_list::replay::{ReplayFrame, ReplaySelection, replay_display_list};
 use libcompositing_rust::display_list::storage::DisplayListStorage;
 use libcompositing_rust::display_list::window::RecordedWindow;
+use libcompositing_rust::ipc_types::compositor_control_server::messages::{
+    AwaitSynchronizedResizeFrame, BeginSynchronizedResize, CommitSynchronizedResize, CreateRemoteLayer,
+    CreateRemoteLayerResponse, DestroyRemoteLayer, SetRemoteLayerFit, ShowContextInRemoteLayer,
+};
 use libcompositing_rust::ipc_types::compositor_presentation_client::messages::DidNotDispatchInputEvent;
 use libcompositing_rust::ipc_types::compositor_presentation_server::messages::{
     HandleAndDispatchKeyEvent, HandleAndDispatchMouseEvent, HandleAndDispatchPinchEvent,
 };
-use libcompositing_rust::ipc_types::compositor_web_content_client::messages::DidRasterizeDisplayList;
 use libcompositing_rust::ipc_types::compositor_web_content_server::messages::{
     ApplyScrollRequests, BeginInputTraceForTesting, BeginInputTraceForTestingResponse,
-    ClearPerTestInputStateForTesting, ClearPerTestInputStateForTestingResponse, InvalidateKeyboardScrollState,
-    InvalidateKeyboardScrollStateResponse, InvalidateWheelEventListenerState, RasterizeDisplayList,
-    RouteFirstWheelStepForTesting, RouteFirstWheelStepForTestingResponse, ScrollStateForTesting,
-    ScrollStateForTestingResponse, TakeInputTraceForTesting, TakeInputTraceForTestingResponse,
+    ClearPerTestInputStateForTesting, ClearPerTestInputStateForTestingResponse, CreateCanvas2dContext,
+    CreateWebglContext, CreateWebglContextResponse, DestroyCanvas2dContext, DestroyWebglContext,
+    InvalidateKeyboardScrollState, InvalidateKeyboardScrollStateResponse, InvalidateWheelEventListenerState,
+    RasterizeDisplayList, RasterizeDisplayListResponse, ReadBackCanvas2dPixels, ReadBackCanvas2dPixelsResponse,
+    ReserveCanvasIds, ReserveCanvasIdsResponse, RouteFirstWheelStepForTesting, RouteFirstWheelStepForTestingResponse,
+    ScrollStateForTesting, ScrollStateForTestingResponse, TakeInputTraceForTesting, TakeInputTraceForTestingResponse,
     TakePendingAsyncScrollUpdates, TakePendingAsyncScrollUpdatesResponse, TakeWheelEventFromMainThread,
-    TakeWheelEventFromMainThreadResponse, UpdateDisplayList, UpdateScrollState, UpdateVisualContextTree,
-    WheelEventCanceled, WheelEventLetThrough, WheelEventLetThroughResponse,
+    TakeWheelEventFromMainThreadResponse, UpdateCanvas2dStream, UpdateDisplayList, UpdateScrollState,
+    UpdateVisualContextTree, WebglClearDrawingBuffer, WebglCommands, WebglCommandsFromSharedBuffer,
+    WebglDrainCommandBuffer, WebglDrainCommandBufferResponse, WebglPresentCanvas, WebglReadBackDrawingBuffer,
+    WebglReadBackDrawingBufferResponse, WebglReadBufferSubData, WebglReadBufferSubDataResponse, WebglReadPixels,
+    WebglReadPixelsResponse, WebglSetCommandBuffer, WebglSyncCall, WebglSyncCallResponse, WheelEventCanceled,
+    WheelEventLetThrough, WheelEventLetThroughResponse,
 };
 use libcompositing_rust::ipc_types::{
+    Compositing_RemoteLayerHostHandle, Compositing_RemoteLayerHostKind, Compositing_WebGL_WebGLVersion,
     Compositing_WheelEventAnswer as WheelEventAnswer, Compositing_WheelStepLetThrough as WheelStepLetThrough,
-    SharedDisplayList, compositor_presentation_server, compositor_web_content_server,
+    Core_AnonymousBuffer, LayerPlanOnWire, SharedDisplayList, compositor_control_server,
+    compositor_presentation_server, compositor_web_content_server,
 };
 use libcompositing_rust::scrolling::async_scrolling_state::AsyncScrollOperationID;
 use libcompositing_rust::scrolling::{AccumulatedVisualContextTree, DisplayList};
@@ -39,7 +55,7 @@ use libcompositing_rust::scrolling::{
     PinchEvent, ScrollRequest,
 };
 use libcompositing_rust::time::MonotonicTime;
-use libgfx_rust::FloatPoint;
+use libgfx_rust::{FloatPoint, IntRect, IntSize};
 use libipc_rust::Misbehavior;
 use std::io::Write;
 use std::rc::Rc;
@@ -54,6 +70,14 @@ fn display_list_timing_enabled() -> bool {
 
 const DISPLAY_LIST_WITH_UNUSABLE_SCROLLING_STATE: &str =
     "WebContent published a display list with scrolling state the compositor cannot use";
+
+fn misbehavior_of_layer_plan(why_plan_fails_checks: &'static str) -> Misbehavior {
+    let _ = writeln!(
+        std::io::stderr(),
+        "Compositor: Rejecting plan of layers from WebContent: {why_plan_fails_checks}"
+    );
+    Misbehavior("WebContent sent a plan of layers that does not fit its display list and visual context tree")
+}
 
 // The main thread allocates the ids of the scrolls it requests from here up, so that they never meet the ids the
 // compositor allocates for scrolls of its own.
@@ -226,7 +250,7 @@ impl MessagesFromWebContent<'_> {
         let storage = match raster
             .receive_display_list_chunks(packed_chunks, &packed_chunk_sizes)
             .and_then(|sent| chunks_of_list_sent_whole(sent, &chunks_in_paint_order))
-            .and_then(|chunks| DisplayListStorage::of_received_chunks(&chunks))
+            .and_then(DisplayListStorage::of_chunks)
         {
             Ok(storage) => storage,
             Err(error) => {
@@ -242,7 +266,7 @@ impl MessagesFromWebContent<'_> {
         };
         let tree = message.visual_context_tree;
         if properties.compatible_visual_context_tree_structural_epoch != tree.structural_epoch
-            || !tree.display_list_references_only_live_nodes(storage.command_runs())
+            || !tree.display_list_references_only_live_nodes(storage.runs())
         {
             return not_rasterized("Display list does not match its visual context tree");
         }
@@ -257,9 +281,7 @@ impl MessagesFromWebContent<'_> {
             let frame = ReplayFrame::unscrolled(time_ns);
             replay_display_list(
                 &tree,
-                storage.bytes(),
-                storage.command_runs(),
-                storage.effect_clip_plan(&tree),
+                &storage,
                 properties.root_group_color,
                 &frame,
                 ReplaySelection::default(),
@@ -270,7 +292,258 @@ impl MessagesFromWebContent<'_> {
     }
 }
 
+fn misbehavior(error: ReplayError) -> Misbehavior {
+    Misbehavior(error.0)
+}
+
+impl MessagesFromWebContent<'_> {
+    fn map_shared_memory(&self, buffer: Core_AnonymousBuffer) -> Result<Option<SharedMemory>, Misbehavior> {
+        self.core.raster().map_shared_memory(buffer).ok_or(Misbehavior(
+            "WebContent sent shared memory that does not hold as much as it claims",
+        ))
+    }
+}
+
 impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
+    fn reserve_canvas_ids(&mut self, _: ReserveCanvasIds) -> Result<ReserveCanvasIdsResponse, Misbehavior> {
+        let reserved_ids = self
+            .core
+            .canvas_2d_contexts()
+            .reserve_ids(self.client_id, self.core.raster())
+            .map_err(Misbehavior)?;
+        Ok(ReserveCanvasIdsResponse {
+            first_canvas_id: CanvasId(reserved_ids.start),
+            count: reserved_ids.end - reserved_ids.start,
+        })
+    }
+
+    fn create_canvas_2d_context(&mut self, message: CreateCanvas2dContext) -> Result<(), Misbehavior> {
+        let creation = ContextCreation {
+            canvas_id: message.canvas_id,
+            size: message.size,
+            alpha: message.alpha,
+            will_read_frequently: message.will_read_frequently,
+            color_space: message.color_space,
+        };
+        self.core
+            .canvas_2d_contexts()
+            .create(self.client_id, self.core.raster(), creation)
+            .map_err(Misbehavior)
+    }
+
+    fn update_canvas_2d_stream(&mut self, message: UpdateCanvas2dStream) -> Result<(), Misbehavior> {
+        self.core
+            .canvas_2d_contexts()
+            .play_stream(self.client_id, self.core.raster(), &message.segments)
+            .map_err(Misbehavior)
+    }
+
+    fn destroy_canvas_2d_context(&mut self, message: DestroyCanvas2dContext) -> Result<(), Misbehavior> {
+        self.core
+            .canvas_2d_contexts()
+            .destroy(self.client_id, self.core.raster(), message.canvas_id);
+        Ok(())
+    }
+
+    fn create_webgl_context(&mut self, message: CreateWebglContext) -> Result<CreateWebglContextResponse, Misbehavior> {
+        let options = ContextOptions {
+            webgl2: message.webgl_version == Compositing_WebGL_WebGLVersion::WebGL2,
+            depth: message.depth,
+            stencil: message.stencil,
+            antialias: message.antialias,
+            size: message.size,
+        };
+        let created = self
+            .core
+            .webgl_contexts()
+            .create(self.core.raster(), self.client_id, options);
+        Ok(match created {
+            Some(created) => CreateWebglContextResponse {
+                success: true,
+                canvas_id: created.canvas_id,
+                supported_extensions: created.supported_extensions.into_iter().map(Into::into).collect(),
+            },
+            None => CreateWebglContextResponse {
+                success: false,
+                canvas_id: CanvasId(0),
+                supported_extensions: Vec::new(),
+            },
+        })
+    }
+
+    fn destroy_webgl_context(&mut self, message: DestroyWebglContext) -> Result<(), Misbehavior> {
+        self.core
+            .webgl_contexts()
+            .destroy(self.core.raster(), self.client_id, message.canvas_id);
+        Ok(())
+    }
+
+    fn webgl_set_command_buffer(&mut self, message: WebglSetCommandBuffer) -> Result<(), Misbehavior> {
+        let command_buffer = self.map_shared_memory(message.command_buffer)?;
+        self.core
+            .webgl_contexts()
+            .set_command_buffer(
+                self.client_id,
+                message.canvas_id,
+                command_buffer.map(|memory| Box::new(memory) as Box<dyn MappedMemory>),
+            )
+            .map_err(misbehavior)
+    }
+
+    fn webgl_commands_from_shared_buffer(&mut self, message: WebglCommandsFromSharedBuffer) -> Result<(), Misbehavior> {
+        self.core
+            .webgl_contexts()
+            .execute_commands_from_shared_buffer(
+                self.core.raster(),
+                self.client_id,
+                message.canvas_id,
+                message.offset,
+                message.size_in_bytes,
+                message.flush_sequence_number,
+                &message.image_sources,
+            )
+            .map_err(misbehavior)
+    }
+
+    fn webgl_drain_command_buffer(
+        &mut self,
+        _: WebglDrainCommandBuffer,
+    ) -> Result<WebglDrainCommandBufferResponse, Misbehavior> {
+        Ok(WebglDrainCommandBufferResponse)
+    }
+
+    fn webgl_commands(&mut self, message: WebglCommands) -> Result<(), Misbehavior> {
+        let commands = self.map_shared_memory(message.commands)?;
+        self.core
+            .webgl_contexts()
+            .execute_commands(
+                self.core.raster(),
+                self.client_id,
+                message.canvas_id,
+                commands.as_ref().map(|memory| memory as &dyn MappedMemory),
+                message.size_in_bytes,
+                &message.image_sources,
+            )
+            .map_err(misbehavior)
+    }
+
+    fn webgl_present_canvas(&mut self, message: WebglPresentCanvas) -> Result<(), Misbehavior> {
+        self.core
+            .webgl_contexts()
+            .present(
+                self.core.raster(),
+                self.client_id,
+                message.canvas_id,
+                message.preserve_drawing_buffer,
+            )
+            .map_err(misbehavior)
+    }
+
+    fn webgl_clear_drawing_buffer(&mut self, message: WebglClearDrawingBuffer) -> Result<(), Misbehavior> {
+        self.core
+            .webgl_contexts()
+            .clear_drawing_buffer(self.core.raster(), self.client_id, message.canvas_id);
+        Ok(())
+    }
+
+    fn webgl_sync_call(&mut self, message: WebglSyncCall) -> Result<WebglSyncCallResponse, Misbehavior> {
+        let reply = self
+            .core
+            .webgl_contexts()
+            .execute_sync_call(self.core.raster(), self.client_id, message.canvas_id, &message.request)
+            .map_err(misbehavior)?;
+        Ok(WebglSyncCallResponse { reply })
+    }
+
+    fn webgl_read_pixels(&mut self, message: WebglReadPixels) -> Result<WebglReadPixelsResponse, Misbehavior> {
+        let pixels = self.map_shared_memory(message.pixels)?;
+        let rect = IntRect {
+            x: message.x,
+            y: message.y,
+            width: message.width,
+            height: message.height,
+        };
+        let result = self
+            .core
+            .webgl_contexts()
+            .read_pixels(
+                self.core.raster(),
+                self.client_id,
+                message.canvas_id,
+                rect,
+                message.format,
+                message.r#type,
+                message.buf_size,
+                pixels.as_ref().map(|memory| memory as &dyn MappedMemory),
+            )
+            .map_err(misbehavior)?;
+        Ok(WebglReadPixelsResponse {
+            length: result.length,
+            columns: result.columns,
+            rows: result.rows,
+        })
+    }
+
+    fn webgl_read_buffer_sub_data(
+        &mut self,
+        message: WebglReadBufferSubData,
+    ) -> Result<WebglReadBufferSubDataResponse, Misbehavior> {
+        let data = self.map_shared_memory(message.data)?;
+        let success = self
+            .core
+            .webgl_contexts()
+            .read_buffer_sub_data(
+                self.core.raster(),
+                self.client_id,
+                message.canvas_id,
+                message.target,
+                message.offset,
+                message.size,
+                data.as_ref().map(|memory| memory as &dyn MappedMemory),
+            )
+            .map_err(misbehavior)?;
+        Ok(WebglReadBufferSubDataResponse { success })
+    }
+
+    fn read_back_canvas_2d_pixels(
+        &mut self,
+        message: ReadBackCanvas2dPixels,
+    ) -> Result<ReadBackCanvas2dPixelsResponse, Misbehavior> {
+        let pixels = self.map_shared_memory(message.pixels)?;
+        let size = pixels.and_then(|pixels| {
+            self.core.raster().read_back_canvas_2d_pixels(
+                self.client_id.0,
+                message.canvas_id,
+                message.rect,
+                message.alpha_type,
+                message.color_space,
+                &pixels,
+            )
+        });
+        Ok(ReadBackCanvas2dPixelsResponse {
+            size: size.unwrap_or_default(),
+        })
+    }
+
+    fn webgl_read_back_drawing_buffer(
+        &mut self,
+        message: WebglReadBackDrawingBuffer,
+    ) -> Result<WebglReadBackDrawingBufferResponse, Misbehavior> {
+        let pixels = self.map_shared_memory(message.pixels)?;
+        let size = self
+            .core
+            .webgl_contexts()
+            .read_back_drawing_buffer(
+                self.core.raster(),
+                self.client_id,
+                message.canvas_id,
+                message.rect,
+                pixels.as_ref().map(|memory| memory as &dyn MappedMemory),
+            )
+            .map_err(misbehavior)?;
+        Ok(WebglReadBackDrawingBufferResponse { size })
+    }
+
     fn update_display_list(&mut self, message: UpdateDisplayList) -> Result<(), Misbehavior> {
         let started_at = std::time::Instant::now();
         let SharedDisplayList {
@@ -309,7 +582,8 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
             Ok(None) => return Ok(()),
             Err(error) => return Err(Misbehavior(error)),
         };
-        let storage = match DisplayListStorage::of_received_chunks(&chunks) {
+        let chunk_count = chunks.len();
+        let storage = match DisplayListStorage::of_chunks(chunks) {
             Ok(storage) => storage,
             Err(error) => {
                 let _ = writeln!(
@@ -324,6 +598,7 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
         if !self.context_is_owned_by_sender(message.context_id)? {
             return Ok(());
         }
+        self.core.forget_layer_plan(message.context_id);
         if properties.compatible_visual_context_tree_structural_epoch != tree.structural_epoch {
             let _ = writeln!(
                 std::io::stderr(),
@@ -333,7 +608,7 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
             );
             return Ok(());
         }
-        if !tree.display_list_references_only_live_nodes(storage.command_runs()) {
+        if !tree.display_list_references_only_live_nodes(storage.runs()) {
             let _ = writeln!(
                 std::io::stderr(),
                 "Compositor: Dropping display list update that names nodes its visual context tree does not hold"
@@ -375,7 +650,7 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
             window => window.flatten(),
         };
         let scroll_state_snapshot = message.scroll_state;
-        let storage_size = storage.bytes().len();
+        let storage_size = storage.byte_size();
         let display_list = DisplayList::new(
             storage,
             properties.id,
@@ -394,13 +669,19 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
         ) {
             return Err(Misbehavior(DISPLAY_LIST_WITH_UNUSABLE_SCROLLING_STATE));
         }
+        self.core
+            .take_layer_plan_of_installed_update(
+                message.context_id,
+                message.layer_plan.map(LayerPlanOnWire::into_received),
+            )
+            .map_err(misbehavior_of_layer_plan)?;
         self.core.keep_only_drawn_resources(message.context_id);
         if display_list_timing_enabled() {
             let _ = writeln!(
                 std::io::stderr(),
                 "DISPLAY_LIST_RECEIVE bytes={} chunks={} sent={sent_chunk_count} adopt={} µs install={} µs",
                 storage_size,
-                chunks.len(),
+                chunk_count,
                 adopt_time.as_micros(),
                 (started_at.elapsed() - adopt_time).as_micros()
             );
@@ -419,6 +700,7 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
         if !self.context_is_owned_by_sender(message.context_id)? {
             return Ok(());
         }
+        self.core.forget_layer_plan(message.context_id);
         let mut image_frame_ids = Vec::new();
         tree.for_each_effects_filter_image_frame_id(&mut |id| image_frame_ids.push(id));
         if !self
@@ -440,18 +722,24 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
             self.now,
         );
         if tree_was_replaced {
+            self.core
+                .take_layer_plan_of_installed_update(
+                    message.context_id,
+                    message.layer_plan.map(LayerPlanOnWire::into_received),
+                )
+                .map_err(misbehavior_of_layer_plan)?;
             self.core.keep_only_drawn_resources(message.context_id);
         }
         Ok(())
     }
 
-    fn rasterize_display_list(&mut self, message: RasterizeDisplayList) -> Result<(), Misbehavior> {
-        let token = message.token;
-        let success = self.rasterize_staged_display_list(message)?;
-        self.core
-            .host
-            .post_to_web_content(self.client_id, DidRasterizeDisplayList { token, success });
-        Ok(())
+    fn rasterize_display_list(
+        &mut self,
+        message: RasterizeDisplayList,
+    ) -> Result<RasterizeDisplayListResponse, Misbehavior> {
+        Ok(RasterizeDisplayListResponse {
+            success: self.rasterize_staged_display_list(message)?,
+        })
     }
 
     fn update_scroll_state(&mut self, message: UpdateScrollState) -> Result<(), Misbehavior> {
@@ -462,6 +750,12 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
         if self.context_is_owned_by_sender(message.context_id)? {
             self.core
                 .update_scroll_state(message.context_id, scroll_state_snapshot, message.keyboard_scroll_state);
+            self.core
+                .take_layer_plan_of_scroll_state(
+                    message.context_id,
+                    message.layer_plan.map(LayerPlanOnWire::into_received),
+                )
+                .map_err(misbehavior_of_layer_plan)?;
         }
         Ok(())
     }
@@ -685,6 +979,70 @@ impl compositor_presentation_server::Stub for MessagesFromPresentation<'_> {
             self.core
                 .handle_and_dispatch_mouse_event(message.context_id, message.event, self.now);
         }
+        Ok(())
+    }
+}
+
+pub struct MessagesFromControl<'a> {
+    pub core: &'a CompositorCore,
+    pub now: MonotonicTime,
+}
+
+impl compositor_control_server::Stub for MessagesFromControl<'_> {
+    fn create_remote_layer(&mut self, message: CreateRemoteLayer) -> Result<CreateRemoteLayerResponse, Misbehavior> {
+        let host_handle = self
+            .core
+            .create_remote_layer(PresentationId(message.presentation_id), message.remote_layer_id)
+            .unwrap_or_else(|| {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Compositor: Ignoring remote layer {} for presentation {}, which is already gone",
+                    message.remote_layer_id,
+                    message.presentation_id
+                );
+                Compositing_RemoteLayerHostHandle {
+                    kind: Compositing_RemoteLayerHostKind::None,
+                    id: 0,
+                }
+            });
+        Ok(CreateRemoteLayerResponse { host_handle })
+    }
+
+    fn destroy_remote_layer(&mut self, message: DestroyRemoteLayer) -> Result<(), Misbehavior> {
+        self.core.destroy_remote_layer(message.remote_layer_id, self.now);
+        Ok(())
+    }
+
+    fn show_context_in_remote_layer(&mut self, message: ShowContextInRemoteLayer) -> Result<(), Misbehavior> {
+        self.core
+            .show_context_in_remote_layer(message.remote_layer_id, message.context_id, self.now);
+        Ok(())
+    }
+
+    fn set_remote_layer_fit(&mut self, message: SetRemoteLayerFit) -> Result<(), Misbehavior> {
+        if message.fit_within.is_some_and(IntSize::is_empty) {
+            return Err(Misbehavior("Empty size for a remote layer to fit frames within"));
+        }
+        self.core
+            .set_remote_layer_fit(message.remote_layer_id, message.fit_within);
+        Ok(())
+    }
+
+    fn begin_synchronized_resize(&mut self, message: BeginSynchronizedResize) -> Result<(), Misbehavior> {
+        self.core
+            .begin_synchronized_resize(message.remote_layer_id, message.token);
+        Ok(())
+    }
+
+    fn await_synchronized_resize_frame(&mut self, message: AwaitSynchronizedResizeFrame) -> Result<(), Misbehavior> {
+        self.core
+            .await_synchronized_resize_frame(message.remote_layer_id, message.token, message.size);
+        Ok(())
+    }
+
+    fn commit_synchronized_resize(&mut self, message: CommitSynchronizedResize) -> Result<(), Misbehavior> {
+        self.core
+            .commit_synchronized_resize(message.remote_layer_id, message.token);
         Ok(())
     }
 }

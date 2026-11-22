@@ -85,6 +85,14 @@ struct ContentSettings {
     HashMap<String, bool> force_dark_per_host;
 };
 
+// Which tabs may share a WebContent process. Sharing one uses less memory, but a crash then takes all its tabs down.
+enum class TabProcesses : u8 {
+    PerTab,
+    PerOrigin,
+    PerSite,
+    PerTabWithoutSiteIsolation,
+};
+
 enum class VerticalTabsPosition : u8 {
     Left,
     Right,
@@ -99,6 +107,10 @@ struct TabSettings {
     // buttons, and there is no toolbar row. The sidebar is then always on the left.
     bool everything_in_sidebar { false };
     Optional<u16> vertical_tabs_expanded_width;
+    // A tab that was hidden for this many minutes is discarded, unless it does something the user would notice. Zero
+    // means that tabs are kept however long they are hidden.
+    u32 discard_hidden_tabs_after_minutes { 120 };
+    TabProcesses tab_processes { TabProcesses::PerOrigin };
 };
 
 struct SearchEngineSettings {
@@ -155,7 +167,9 @@ enum class ConfigVariableID : u8 {
     SplitDownloadsWithoutValidators,
     RestartStalledConnections,
     DisableHighDynamicRangeSurfaces,
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     UpdateCheckInterval,
+#endif
 
     Count,
 };
@@ -227,7 +241,9 @@ struct WEBVIEW_API SettingsData {
 
     bool m_background_networking_enabled { true };
     bool m_filter_list_updates_enabled { false };
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     bool m_update_checks_enabled { true };
+#endif
     bool m_content_blocker_enabled { false };
     HashTable<String> m_content_blocker_disabled_sites;
     Vector<ContentBlockerList> m_content_blocker_lists;
@@ -342,9 +358,11 @@ public:
     bool filter_list_updates_enabled() const { return m_filter_list_updates_enabled; }
     bool automatic_filter_list_updates_allowed() const { return m_background_networking_enabled && m_filter_list_updates_enabled; }
     void set_filter_list_updates_enabled(bool);
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     bool update_checks_enabled() const { return m_update_checks_enabled; }
     bool automatic_update_checks_allowed() const { return m_background_networking_enabled && m_update_checks_enabled; }
     void set_update_checks_enabled(bool);
+#endif
 
     bool content_blocker_enabled() const { return m_content_blocker_enabled; }
     void set_content_blocker_enabled(bool);

@@ -22,7 +22,7 @@ use crate::painting::paintable_geometry;
 use crate::painting::record::PaintPhase;
 use crate::painting::style_queries;
 use crate::painting::text_fragment;
-use libgfx_rust::WindingRule;
+use libgfx_rust::{FloatPoint, WindingRule};
 
 /// A fragment of a row's inline content, read through whatever holds the row's committed side
 /// data.
@@ -419,7 +419,10 @@ impl<'a, R: PaintRead, S: HitTestItemSink> HitTestItems<'a, R, S> {
                 .committed_side_data(root)
                 .inline_box_piece_indices(paintable)
                 .iter()
-                .any(|piece_index| !self.piece_of(root, *piece_index).is_geometry_only_placeholder)
+                .any(|piece_index| {
+                    let piece = self.piece_of(root, *piece_index);
+                    !piece.is_geometry_only_placeholder && piece.fragment_count != 0
+                })
         });
         has_content_pieces || crate::painting::paint_order::first_paint_child(self.rows, paintable).is_some()
     }
@@ -448,13 +451,23 @@ impl<'a, R: PaintRead, S: HitTestItemSink> HitTestItems<'a, R, S> {
         if phase != PaintPhase::Foreground {
             return;
         }
-        let Some(path) = paintable_geometry::committed_svg_path(self.rows, paintable) else {
+        let Some(mut path) = paintable_geometry::committed_svg_path(self.rows, paintable) else {
             return;
         };
-        if !self.sink.hit_test_facts(paintable).visible_for_hit_testing {
+        // OPTIMIZATION: The facts are computed afresh from the box's style each time they're asked for, so they're asked
+        //               for once.
+        let facts = self.sink.hit_test_facts(paintable);
+        if !facts.visible_for_hit_testing {
             return;
         }
-        let facts = self.sink.hit_test_facts(paintable);
+        // https://svgwg.org/svg2-draft/interact.html#PointerEventsProperty
+        // For text elements, hit-testing is performed on a character cell basis
+        let mut winding_rule = facts.svg_path_winding_rule;
+        if let Some(cells_path) = self.svg_text_character_cells_path(paintable) {
+            path = std::sync::Arc::new(crate::layout::fragment_tree::CommittedSvgPath::new(cells_path));
+            // NB: Every point of a cell is in it, even where cells overlap, whatever the text's fill-rule.
+            winding_rule = WindingRule::Nonzero;
+        }
         if facts.svg_hit_areas == 0 {
             return;
         }
@@ -500,12 +513,51 @@ impl<'a, R: PaintRead, S: HitTestItemSink> HitTestItems<'a, R, S> {
         let item = HitTestItem {
             rect: bounding_box,
             path: Some(path),
-            winding_rule: facts.svg_path_winding_rule,
+            winding_rule,
             svg_hit_areas: facts.svg_hit_areas,
             svg_stroke: stroke,
             ..self.base_hit_test_item(HitTestItemKind::SvgPath, paintable, context)
         };
         self.sink.append(item);
+    }
+
+    /// The character cells of a text element, as one path, which it's hit-tested by rather than by its glyphs.
+    /// FIXME: The cells of text on a path aren't laid along the path, so text on a path, a <text> with a <textPath> in
+    ///        it, and a <tspan> in a <textPath> are still hit-tested by their glyphs.
+    fn svg_text_character_cells_path(&self, paintable: NodeSlotId) -> Option<libgfx_rust::path::Path> {
+        if self.rows.node_kind_if_live(paintable) != Some(NodeKind::SVGTextBox)
+            || self
+                .rows
+                .children(paintable)
+                .any(|child| self.rows.node_kind_if_live(child) == Some(NodeKind::SVGTextPathBox))
+        {
+            return None;
+        }
+        let mut ancestor = self.rows.node_parent_if_live(paintable);
+        while let Some(element) = ancestor {
+            match self.rows.node_kind_if_live(element) {
+                Some(NodeKind::SVGTextPathBox) => return None,
+                Some(NodeKind::SVGTextBox) => ancestor = self.rows.node_parent_if_live(element),
+                _ => break,
+            }
+        }
+        // NB: Each element is hit-tested by its own characters, so that the elements inside it keep their own visibility and
+        //     pointer-events.
+        let cells = paintable_geometry::committed_svg_text_own_character_cells(self.rows, paintable)?;
+        let mut path = libgfx_rust::path::Path::new();
+        for cell in cells.iter().filter(|cell| cell.starts_typographic_character) {
+            if cell.width <= 0.0 || cell.height <= 0.0 {
+                continue;
+            }
+            let (left, top) = (cell.x, cell.y);
+            let (right, bottom) = (cell.x + cell.width, cell.y + cell.height);
+            path.move_to(FloatPoint { x: left, y: top });
+            path.line_to(FloatPoint { x: right, y: top });
+            path.line_to(FloatPoint { x: right, y: bottom });
+            path.line_to(FloatPoint { x: left, y: bottom });
+            path.close();
+        }
+        (!path.is_empty()).then_some(path)
     }
 
     fn svg_box_items(&mut self, paintable: NodeSlotId, phase: PaintPhase) {
@@ -605,6 +657,8 @@ impl<'a, R: PaintRead, S: HitTestItemSink> HitTestItems<'a, R, S> {
     fn hit_node_for_text_fragment(&mut self, fragment: &FragmentRecord) -> Option<NodeSlotId> {
         let node = fragment.layout_node;
         let row = self.rows.node(node)?;
+        // https://drafts.csswg.org/css-overflow-4/#ellipsing-details
+        // "The UA should dispatch any pointer event on the ellipsis to the elided element"
         if fragment.is_block_ellipsis || !node_facts::kind_is_text(row.kind()) {
             return None;
         }
