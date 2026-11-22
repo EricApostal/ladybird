@@ -7,6 +7,7 @@
 
 #include <AK/LexicalPath.h>
 #include <AK/Platform.h>
+#include <LibCore/Environment.h>
 #include <LibCore/Process.h>
 #include <LibCore/Resource.h>
 #include <LibCore/ResourceImplementationFile.h>
@@ -74,6 +75,13 @@ void platform_init(Optional<ByteString> ladybird_binary_path)
     s_ladybird_binary_path = move(ladybird_binary_path);
 
     s_ladybird_resource_root = [] {
+#if defined(AK_OS_ANDROID)
+        // Android has no install prefix to find the resources relative to: the helpers are libraries in the app's
+        // native library directory, and the resources are files the app unpacked into its own storage. The app
+        // process says where, and its helpers inherit that.
+        if (auto root = Core::Environment::get("LADYBIRD_RESOURCE_ROOT"sv); root.has_value() && !root->is_empty())
+            return ByteString(*root);
+#endif
         auto app_dir = MUST(application_directory());
 #ifdef AK_OS_MACOS
         return LexicalPath(app_dir).parent().append("Resources"sv).string();
