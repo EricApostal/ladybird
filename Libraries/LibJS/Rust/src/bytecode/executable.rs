@@ -2045,6 +2045,7 @@ impl Executable {
         self.feedback().map_or(&[], ExecutableFeedback::call_caches)
     }
 
+    #[cfg(feature = "jit")]
     fn clear_call_caches(&self) {
         for cache in self.call_caches() {
             cache.clear();
