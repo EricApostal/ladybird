@@ -25,13 +25,11 @@ use crate::display_list::window_server_placement::RoundedRect;
 use libgfx_rust::{Color, CompositingAndBlendingOperator, CornerRadii, IntRect};
 use std::sync::Arc;
 
-pub(super) const FRAME_STATE_CARET_BLINK_PHASE: u8 = 1 << 0;
-pub(super) const FRAME_STATE_SCROLL_BAR: u8 = 1 << 1;
-pub(super) const FRAME_STATE_LIVE_CONTENT: u8 = 1 << 2;
-pub(super) const FRAME_STATE_SPACES_OF_INLINE_CLIPS: u8 = 1 << 3;
-pub(super) const FRAME_STATE_SAMPLED_BACKGROUND_COLOR: u8 = 1 << 4;
-const FRAME_STATE_HASHED_FOR_THE_LIST: u8 =
-    FRAME_STATE_CARET_BLINK_PHASE | FRAME_STATE_SCROLL_BAR | FRAME_STATE_LIVE_CONTENT;
+/// The record draws live content, such as a caret or a scroll bar, itself or in a record nested in it, whose look the
+/// frame decides. The frame state of the list hashes that of every such record that is in a band.
+pub(super) const FRAME_STATE_LIVE_CONTENT: u8 = 1 << 0;
+pub(super) const FRAME_STATE_SPACES_OF_INLINE_CLIPS: u8 = 1 << 1;
+pub(super) const FRAME_STATE_SAMPLED_BACKGROUND_COLOR: u8 = 1 << 2;
 
 /// A top-level record of a chunk, with what placing it and hashing tile content read of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +47,7 @@ pub(crate) struct ChunkRecord {
 
 impl ChunkRecord {
     pub(super) fn reads_frame_state_hashed_for_the_list(&self) -> bool {
-        self.frame_state_read_flags & FRAME_STATE_HASHED_FOR_THE_LIST != 0
+        self.frame_state_read_flags & FRAME_STATE_LIVE_CONTENT != 0
     }
 }
 
@@ -70,11 +68,7 @@ fn frame_state_read_flags_of_record(
     payload: &[u8],
     record_bytes: &[u8],
 ) -> u8 {
-    let mut flags = match header.command_type {
-        DisplayListCommandType::PaintCaret => FRAME_STATE_CARET_BLINK_PHASE,
-        DisplayListCommandType::PaintScrollBar => FRAME_STATE_SCROLL_BAR,
-        _ => 0,
-    };
+    let mut flags = 0;
     if header.inline_clip_count != 0 && has_inline_clip_in_its_own_space(header, payload) {
         flags |= FRAME_STATE_SPACES_OF_INLINE_CLIPS;
     }
@@ -308,25 +302,10 @@ impl TileKeyingOfRasterSpace<'_> {
                 hasher.write_u32(ring.color.0);
                 color = ring.color;
                 draws_recorded_color_with_source_over = true;
-                let top_width = ring.top_width.clamp(0, ring.rect.height.max(0));
-                let bottom_width = ring.bottom_width.clamp(0, (ring.rect.height - top_width).max(0));
-                let left_width = ring.left_width.clamp(0, ring.rect.width.max(0));
-                let right_width = ring.right_width.clamp(0, (ring.rect.width - left_width).max(0));
-                for width in [top_width, right_width, bottom_width, left_width] {
+                for width in ring.widths_within_rect() {
                     hasher.write_i32(width);
                 }
-                let (Some(unfilled_inner_x), Some(unfilled_inner_y)) =
-                    (ring.rect.x.checked_add(left_width), ring.rect.y.checked_add(top_width))
-                else {
-                    return None;
-                };
-                let unfilled_inner_rect = IntRect::new(
-                    unfilled_inner_x,
-                    unfilled_inner_y,
-                    ring.rect.width - left_width - right_width,
-                    ring.rect.height - top_width - bottom_width,
-                );
-                (ring.rect, ring.corner_radii, Some(unfilled_inner_rect))
+                (ring.rect, ring.corner_radii, Some(ring.unfilled_inner_rect()?))
             }
             _ => return None,
         };

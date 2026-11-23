@@ -94,13 +94,16 @@ impl DisplayListCommandType {
         )
     }
 
-    /// A top-level record of this command is the only record of its run: a canvas, video or nested context, which the
-    /// compositor can give a layer of its own between the records around it, and a scroll bar, which draws what the
-    /// frame shows of its scroller rather than what the list holds.
+    /// A top-level record of this command is the only record of its run: a canvas, video, nested context, caret or
+    /// scroll bar, which the compositor can give a layer of its own between the records around it.
     pub const fn is_alone_in_its_run(self) -> bool {
         matches!(
             self,
-            Self::DrawCanvas | Self::DrawVideoFrame | Self::DrawCompositedContext | Self::PaintScrollBar
+            Self::DrawCanvas
+                | Self::DrawVideoFrame
+                | Self::DrawCompositedContext
+                | Self::PaintCaret
+                | Self::PaintScrollBar
         )
     }
 
@@ -1265,6 +1268,30 @@ display_list_record_fields!(FillRoundedRectRing {
     color
 });
 
+impl FillRoundedRectRing {
+    /// The widths of the top, right, bottom and left edges, each cut to what the rect holds besides the edge across from
+    /// it.
+    pub fn widths_within_rect(&self) -> [i32; 4] {
+        let top = self.top_width.clamp(0, self.rect.height.max(0));
+        let bottom = self.bottom_width.clamp(0, (self.rect.height - top).max(0));
+        let left = self.left_width.clamp(0, self.rect.width.max(0));
+        let right = self.right_width.clamp(0, (self.rect.width - left).max(0));
+        [top, right, bottom, left]
+    }
+
+    /// The rect inside the inner edge of the ring as if its corners were square, which the ring leaves unfilled. None
+    /// where it lies past the coordinates a rect holds.
+    pub fn unfilled_inner_rect(&self) -> Option<IntRect> {
+        let [top, right, bottom, left] = self.widths_within_rect();
+        Some(IntRect::new(
+            self.rect.x.checked_add(left)?,
+            self.rect.y.checked_add(top)?,
+            self.rect.width - left - right,
+            self.rect.height - top - bottom,
+        ))
+    }
+}
+
 impl DisplayListCommand for FillRoundedRectRing {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::FillRoundedRectRing;
     fn bounding_rect(&self) -> Option<IntRect> {
@@ -1472,6 +1499,8 @@ pub struct PaintConicGradient {
     pub rect: IntRect,
     pub start_angle: f32,
     pub color_stops: DisplayListGradientColorStops,
+    pub first_stop_position: f32,
+    pub repeat_length: f32,
     pub interpolation_method: GradientInterpolationMethod,
     pub position: IntPoint,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
@@ -1480,6 +1509,8 @@ display_list_record_fields!(PaintConicGradient {
     rect,
     start_angle,
     color_stops,
+    first_stop_position,
+    repeat_length,
     interpolation_method,
     position,
     compositing_and_blending_operator
@@ -1648,7 +1679,6 @@ impl DisplayListCommand for CompositorMainThreadWheelEventRegion {
 #[repr(C)]
 pub struct CompositorScrollbar {
     pub scroll_node_index: SpatialNodeIndex,
-    pub gutter_rect: IntRect,
     pub thumb_rect: IntRect,
     pub track_rect: IntRect,
     pub expanded_gutter_rect: IntRect,
@@ -1657,15 +1687,10 @@ pub struct CompositorScrollbar {
     pub expanded_scroll_size: f64,
     pub min_scroll_offset: f32,
     pub max_scroll_offset: f32,
-    pub thumb_color: Color,
-    pub thumb_outline_color: Color,
-    pub track_color: Color,
     pub vertical: bool,
-    pub is_painted_by_compositor: bool,
 }
 display_list_record_fields!(CompositorScrollbar {
     scroll_node_index,
-    gutter_rect,
     thumb_rect,
     track_rect,
     expanded_gutter_rect,
@@ -1674,11 +1699,7 @@ display_list_record_fields!(CompositorScrollbar {
     expanded_scroll_size,
     min_scroll_offset,
     max_scroll_offset,
-    thumb_color,
-    thumb_outline_color,
-    track_color,
-    vertical,
-    is_painted_by_compositor
+    vertical
 });
 
 impl DisplayListCommand for CompositorScrollbar {

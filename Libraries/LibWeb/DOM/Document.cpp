@@ -34,6 +34,7 @@
 #include <LibJS/Console.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Iterator.h>
+#include <LibJS/Runtime/NativeFunction.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/Origin.h>
 #include <LibURL/Parser.h>
@@ -1064,6 +1065,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_first_base_element_with_target_in_tree_order);
     visitor.visit(m_parser);
     visitor.visit(m_lazy_load_intersection_observer);
+    visitor.visit(m_video_viewport_intersection_observer);
     visitor.visit(m_visual_viewport);
     visitor.visit(m_named_timelines);
     visitor.visit(m_scripts_to_execute_when_parsing_has_finished);
@@ -1203,10 +1205,17 @@ void Document::invalidate_content_blocker_style_sheet()
 
 bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names)
 {
-    if (is_decoded_svg() || !content_blocking_enabled())
+    if (is_decoded_svg() || !m_content_blocker_style_sheet.has_value())
         return false;
 
-    if (!m_content_blocker_style_sheet.has_value())
+    // OPTIMIZATION: Most tokens have been checked already, which is cheaper to tell than whether content blocking is
+    //               enabled, so the policy is asked only once a token turns out to be new.
+    auto is_new_token = [](Utf16FlyString const& token, HashTable<Utf16FlyString> const& checked_tokens) {
+        return !token.is_empty() && !checked_tokens.contains(token);
+    };
+    auto has_new_token = (id && is_new_token(*id, m_content_blocker_style_sheet_checked_ids))
+        || any_of(class_names, [&](auto const& class_name) { return is_new_token(class_name, m_content_blocker_style_sheet_checked_classes); });
+    if (!has_new_token || !content_blocking_enabled())
         return false;
 
     Vector<Utf16FlyString> classes_to_check;
@@ -1221,9 +1230,6 @@ bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf1
 
     for (auto const& class_name : class_names)
         append_new_token(class_name, m_content_blocker_style_sheet_checked_classes, classes_to_check);
-
-    if (classes_to_check.is_empty() && ids_to_check.is_empty())
-        return false;
 
     return ContentBlocker::the().has_generic_cosmetic_selectors_for_url(fallback_base_url(), classes_to_check, ids_to_check);
 }
@@ -2386,6 +2392,7 @@ void Document::begin_style_stabilization_epoch()
     m_style_stabilization_has_style_reactions = false;
     m_animated_custom_property_changes_in_stabilization_epoch.clear();
     m_animated_custom_property_moves_in_stabilization_epoch = 0;
+    m_size_container_moves_in_stabilization_epoch.clear();
     HTML::note_rendering_trace_event("style stabilization epoch"sv);
     ++m_transition_generation;
 }
@@ -2420,6 +2427,23 @@ u64 Document::note_animated_custom_properties_moved_in_stabilization_epoch(CSS::
 {
     ++m_animated_custom_property_moves_in_stabilization_epoch;
     return ++m_animated_custom_property_changes_in_stabilization_epoch.ensure(style_node);
+}
+
+bool Document::note_size_container_moved_in_stabilization_epoch(CSS::StyleNodeID style_node)
+{
+    if (!is_in_style_stabilization_epoch())
+        return true;
+
+    // Inline-size containment keeps a container's content out of its intrinsic inline size, but the content can still
+    // move its inline size through its block size: a grid item with a preferred aspect ratio stretched in its row has
+    // its column sized from the row again, and the row grows to fit the content. Content sized in container-relative
+    // units then grows with the container, and the container with it, without ever settling. Such a container's
+    // dependents keep the style they computed against its box from the moves before.
+    constexpr u64 MOVES_OF_A_SIZE_CONTAINER_IN_AN_EPOCH = 8;
+    auto moves = ++m_size_container_moves_in_stabilization_epoch.ensure(style_node);
+    if (moves == MOVES_OF_A_SIZE_CONTAINER_IN_AN_EPOCH + 1)
+        HTML::note_rendering_trace_event("size container move guard"sv);
+    return moves <= MOVES_OF_A_SIZE_CONTAINER_IN_AN_EPOCH;
 }
 
 bool Document::is_at_style_stabilization_bound(Layout::BegunRead const& read) const
@@ -3909,7 +3933,7 @@ WebIDL::ExceptionOr<GC::Ref<Event>> Document::create_event(Utf16FlyString const&
     } else if (interface.equals_ignoring_ascii_case("compositionevent"sv)) {
         event = UIEvents::CompositionEvent::create(String {}, {}, time_stamp);
     } else if (interface.equals_ignoring_ascii_case("customevent"sv)) {
-        event = CustomEvent::create(FlyString {}, {}, time_stamp);
+        event = create_custom_event(realm);
     } else if (interface.equals_ignoring_ascii_case("devicemotionevent"sv)) {
         event = Event::create(FlyString {}, time_stamp); // FIXME: Create DeviceMotionEvent
     } else if (interface.equals_ignoring_ascii_case("deviceorientationevent"sv)) {
@@ -7909,6 +7933,42 @@ void Document::stop_intersection_observing_a_lazy_loading_element(Element& eleme
 
     // 3. Call doc's lazy load intersection observer unobserve method with element as the argument.
     m_lazy_load_intersection_observer->unobserve(element);
+}
+
+void Document::start_observing_video_viewport_intersection(HTML::HTMLVideoElement& video)
+{
+    VERIFY(&video.document() == this);
+    if (!m_video_viewport_intersection_observer) {
+        auto options = IntersectionObserver::IntersectionObserverOptions {};
+        // Videos start decoding a little before they scroll into view, so that their frames are ready when they do.
+        options.root_margin = "250px"_utf16;
+
+        // The sinks read the observations themselves, in the rendering update that made them.
+        auto& realm = relevant_settings_object().realm();
+        auto callback = JS::NativeFunction::create(realm, Utf16FlyString {}, GC::create_function(GC::Heap::the(), [](JS::VM&) -> JS::ThrowCompletionOr<JS::Value> {
+            return JS::js_undefined();
+        }));
+        auto wrapped_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(callback, realm);
+        m_video_viewport_intersection_observer = IntersectionObserver::IntersectionObserver::create_with_implicit_root_document(wrapped_callback, options, *this).release_value_but_fixme_should_propagate_errors();
+    }
+    m_video_viewport_intersection_observer->observe(video);
+}
+
+void Document::stop_observing_video_viewport_intersection(HTML::HTMLVideoElement& video)
+{
+    if (m_video_viewport_intersection_observer)
+        m_video_viewport_intersection_observer->unobserve(video);
+}
+
+bool Document::video_intersects_viewport(HTML::HTMLVideoElement const& video) const
+{
+    if (!m_video_viewport_intersection_observer)
+        return false;
+    for (auto const& observation_target : m_video_viewport_intersection_observer->observation_targets()) {
+        if (observation_target.target.ptr().ptr() == &video)
+            return observation_target.previous_is_intersecting;
+    }
+    return false;
 }
 
 void Document::process_lazy_load_intersection_observer_entries(ReadonlySpan<GC::Ref<IntersectionObserver::IntersectionObserverEntry>> entries)

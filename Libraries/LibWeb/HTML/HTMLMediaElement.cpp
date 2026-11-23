@@ -118,6 +118,20 @@ public:
         m_hold_for_video_frame_callbacks = nullptr;
     }
 
+    bool frame_is_up_to_date() const
+    {
+        if (!m_presentation_page)
+            return true;
+        auto presented_frame = m_presentation_page->presented_frame();
+        return presented_frame.has_value() && presented_frame->frame_is_up_to_date;
+    }
+
+    void bring_frame_up_to_date(Optional<MonotonicTime> deadline)
+    {
+        if (m_compositor_host)
+            m_compositor_host->bring_video_sink_up_to_date(m_handle, deadline);
+    }
+
     Optional<Compositing::CapturedVideoFrame> capture_current_frame()
     {
         if (!m_compositor_host || !m_presentation_page)
@@ -276,6 +290,12 @@ void HTMLMediaElement::initialize_element()
         auto sink_predicate_may_query_layout_node = visibility_state == VisibilityState::Hidden || self.document().layout_is_up_to_date();
         if (sink_predicate_may_query_layout_node)
             self.sync_video_sink_ticking();
+    }));
+
+    static constexpr int capture_keepalive_timeout_ms = 5000;
+    m_video_frame_capture_keepalive_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(capture_keepalive_timeout_ms), GC::weak_callback(*this, [](auto& self) {
+        self.m_video_frame_was_recently_captured = false;
+        self.video_sink_ticking_inputs_changed();
     }));
 
     document().page().register_media_element({}, unique_id());
@@ -467,6 +487,11 @@ void HTMLMediaElement::adopted_from(DOM::Document& old_document)
     Base::adopted_from(old_document);
 
     old_document.page().active_media_session_tracker().media_element_removed(*this);
+
+    if (auto* video_element = as_if<HTMLVideoElement>(this); video_element && m_active_video_sink) {
+        old_document.stop_observing_video_viewport_intersection(*video_element);
+        document().start_observing_video_viewport_intersection(*video_element);
+    }
 
     // NB: The element's relevant global follows its node document, so the old document's global stops keeping it alive.
     relevant_window_or_worker_global_scope(old_document).set_has_pending_activity(*this, false);
@@ -2259,6 +2284,19 @@ Optional<Compositing::CapturedVideoFrame> HTMLMediaElement::capture_current_vide
     if (!m_active_video_sink)
         return {};
     note_frame_captured();
+
+    // NB: If the sink doesn't have an up-to-date frame, give it some time to catch up before capturing a stale or
+    //     missing one instead. This blocks the main thread, so it must be bounded. After this initial wait, the
+    //     sink will be kept ticking for a certain time, so subsequent captures won't block. Tests wait without a
+    //     bound, so that a sink that never catches up times the test out rather than depending on load.
+    static constexpr auto capture_catch_up_limit = AK::Duration::from_milliseconds(500);
+    if (m_ready_state >= ReadyState::HaveCurrentData && !m_active_video_sink->frame_is_up_to_date()) {
+        sync_video_sink_ticking();
+        Optional<MonotonicTime> deadline;
+        if (!Window::in_test_mode())
+            deadline = MonotonicTime::now() + capture_catch_up_limit;
+        m_active_video_sink->bring_frame_up_to_date(deadline);
+    }
     return m_active_video_sink->capture_current_frame();
 }
 
@@ -2296,8 +2334,12 @@ void HTMLMediaElement::attach_selected_video_track_sink(Media::Track const& trac
             video_element->set_intrinsic_video_dimensions(size);
     }));
     m_active_video_sink = make<ActiveVideoSink>(handle);
-    m_video_sink_is_ticking = true;
+    m_video_sink_is_ticking = {};
+    if (auto* video_element = as_if<HTMLVideoElement>(this))
+        document().start_observing_video_viewport_intersection(*video_element);
     add_current_video_sink(handle);
+    // NB: The input is not started until the sink's ticking state is decided, which a visible document does in the next
+    //     rendering update.
     video_sink_ticking_inputs_changed();
     if (auto* video_element = as_if<HTMLVideoElement>(this))
         Painting::push_video_paint_facts(*video_element);
@@ -2332,8 +2374,10 @@ void HTMLMediaElement::release_active_video_sink()
     m_active_video_sink.clear();
     if (m_playback_manager && handle.has_value())
         m_playback_manager->disable_video_sink_by_handle(*handle);
-    if (auto* video_element = as_if<HTMLVideoElement>(this))
+    if (auto* video_element = as_if<HTMLVideoElement>(this)) {
+        document().stop_observing_video_viewport_intersection(*video_element);
         Painting::push_video_paint_facts(*video_element);
+    }
 }
 
 void HTMLMediaElement::set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML::VideoTrack> video_track)
@@ -3227,7 +3271,12 @@ bool HTMLMediaElement::video_sink_should_tick(DocumentWasLaidOut document_was_la
     if (document_was_laid_out == DocumentWasLaidOut::No)
         return false;
     auto const* layout_node = this->layout_node(read);
-    return layout_node && Painting::has_committed_box(*layout_node) && Painting::is_visible(*layout_node);
+    if (!layout_node || !Painting::has_committed_box(*layout_node) || !Painting::is_visible(*layout_node))
+        return false;
+    // A video far enough outside the viewport isn't decoded, and resumes from the current time as it comes back.
+    if (auto const* video_element = as_if<HTMLVideoElement>(*this))
+        return document().video_intersects_viewport(*video_element);
+    return true;
 }
 
 void HTMLMediaElement::sync_video_sink_ticking(DocumentWasLaidOut document_was_laid_out) const
@@ -3243,27 +3292,22 @@ void HTMLMediaElement::sync_video_sink_ticking(DocumentWasLaidOut document_was_l
 
     if (m_playback_manager)
         m_playback_manager->set_video_sink_ticking(*handle, should_tick);
-    if (auto navigable = document().navigable(); navigable && navigable->has_compositor_context())
-        navigable->compositor_context().set_video_sink_ticking(*handle, should_tick);
 }
 
-// Visible documents re-evaluate sink ticking in each rendering update, once layout has settled. Hidden documents skip
+// Visible documents re-evaluate sink ticking in a rendering update, once layout has settled. Hidden documents skip
 // that update, but decide without layout, so they re-evaluate right away.
-void HTMLMediaElement::video_sink_ticking_inputs_changed() const
+void HTMLMediaElement::video_sink_ticking_inputs_changed()
 {
-    if (document().hidden())
+    if (document().hidden()) {
         sync_video_sink_ticking();
+        return;
+    }
+    document().page().client().request_frame();
 }
 
 void HTMLMediaElement::note_frame_captured() const
 {
-    static constexpr int capture_keepalive_timeout_ms = 5000;
     m_video_frame_was_recently_captured = true;
-    if (!m_video_frame_capture_keepalive_timer) {
-        m_video_frame_capture_keepalive_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(capture_keepalive_timeout_ms), GC::weak_callback(*this, [](auto& self) {
-            self.m_video_frame_was_recently_captured = false;
-        }));
-    }
     m_video_frame_capture_keepalive_timer->restart();
 }
 

@@ -10,11 +10,12 @@
 
 use super::{
     BandOfPlan, BarrierOfPlan, COORDINATE_LIMIT_IN_DEVICE_PIXELS, CutOfPlan, LayerContent, LayerIdentity, LayerStack,
-    LayeredPlan, LayeringObstacles, MAXIMUM_MEDIA_LAYER_COUNT, MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeOfPlan,
-    PlacementNodeIndex, StackLayer, WhyCompositorCannotCompositeEffect, WhyListIsOneLayer, anchors_of_layer_plans,
+    LayeredPlan, LayeringObstacles, MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeOfPlan, PlacementNodeIndex, StackLayer,
+    WhyCompositorCannotCompositeEffect, WhyListIsOneLayer, anchors_of_layer_plans,
+    maximum_layer_count_of_live_content_like,
 };
 use crate::display_list::commands::{
-    CanvasId, CompositorContextId, EffectNodeIndex, ImageFrameResourceId, VideoSinkHandle,
+    CanvasId, CompositorContextId, EffectNodeIndex, ImageFrameResourceId, SpatialNodeIndex, VideoSinkHandle,
 };
 use crate::display_list::placement::{
     CompositeClip, MAXIMUM_RASTER_SPACE_COUNT, RasterSpace, RasterSpaceAnchorKind, RasterSpaceIndex, RasterSpaces,
@@ -186,6 +187,8 @@ const LIVE_CONTENT_KIND_CANVAS: u8 = 0;
 const LIVE_CONTENT_KIND_VIDEO_FRAME: u8 = 1;
 const LIVE_CONTENT_KIND_IMAGE_FRAME: u8 = 2;
 const LIVE_CONTENT_KIND_COMPOSITED_CONTEXT: u8 = 3;
+const LIVE_CONTENT_KIND_CARET: u8 = 4;
+const LIVE_CONTENT_KIND_SCROLL_BAR: u8 = 5;
 
 impl Encode for LiveContent {
     fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
@@ -194,6 +197,11 @@ impl Encode for LiveContent {
             LiveContent::VideoFrame(id) => (LIVE_CONTENT_KIND_VIDEO_FRAME, id.0),
             LiveContent::ImageFrame(id) => (LIVE_CONTENT_KIND_IMAGE_FRAME, id.0),
             LiveContent::CompositedContext(id) => (LIVE_CONTENT_KIND_COMPOSITED_CONTEXT, id.0),
+            LiveContent::Caret => (LIVE_CONTENT_KIND_CARET, 0),
+            LiveContent::ScrollBar { scroll_node, vertical } => (
+                LIVE_CONTENT_KIND_SCROLL_BAR,
+                (u64::from(scroll_node.0) << 1) | u64::from(*vertical),
+            ),
         };
         encoder.encode(&kind)?;
         encoder.encode(&id)
@@ -211,6 +219,11 @@ impl Decode for LiveContent {
             LIVE_CONTENT_KIND_VIDEO_FRAME => LiveContent::VideoFrame(VideoSinkHandle(id)),
             LIVE_CONTENT_KIND_IMAGE_FRAME => LiveContent::ImageFrame(ImageFrameResourceId(id)),
             LIVE_CONTENT_KIND_COMPOSITED_CONTEXT => LiveContent::CompositedContext(CompositorContextId(id)),
+            LIVE_CONTENT_KIND_CARET if id == 0 => LiveContent::Caret,
+            LIVE_CONTENT_KIND_SCROLL_BAR if id >> 33 == 0 => LiveContent::ScrollBar {
+                scroll_node: SpatialNodeIndex((id >> 1) as u32),
+                vertical: id & 1 != 0,
+            },
             _ => return Err(DecodeError::InvalidValue("LiveContent")),
         })
     }
@@ -268,6 +281,7 @@ impl Decode for CutOfPlan {
                 ordinal: decoder.decode()?,
                 record_span: decoder.decode()?,
                 reach: decoder.decode()?,
+                cuts_band: decoder.decode()?,
             },
             BARRIER_KIND_NESTED_BAND => BarrierOfPlan::NestedBand,
             _ => return Err(DecodeError::InvalidValue("BarrierOfPlan")),
@@ -386,8 +400,8 @@ impl Decode for StackOnWire {
 
 // A stack of one layer that replays the whole list goes as why it is one layer. A stack of more layers goes as its
 // plan: its nodes without their identities, and its bands in the order of the walk that its layers are in, each with
-// what only it knows of its layers. In that order, the layer of a canvas, video or nested context comes right below the
-// layer above its cut, and the last layer of a nested band comes right below the layer above the cut that enters it.
+// what only it knows of its layers. In that order, the layer of live content comes right below the layer above its cut,
+// and the last layer of a nested band comes right below the layer above the cut that enters it.
 impl Encode for LayerStack {
     fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
         if let Some(why_list_is_one_layer) = self.why_list_is_one_layer {
@@ -413,7 +427,7 @@ impl Encode for LayerStack {
                 match &self.layers[cut.layer_above_cut.0 - 1] {
                     StackLayer {
                         identity: LayerIdentity::Media { content, ordinal },
-                        content: LayerContent::Media { record_span },
+                        content: LayerContent::Media { record_span } | LayerContent::OwnSurface { record_span },
                         reach,
                         ..
                     } => {
@@ -422,6 +436,7 @@ impl Encode for LayerStack {
                         encoder.encode(ordinal)?;
                         encoder.encode(record_span)?;
                         encoder.encode(reach)?;
+                        encoder.encode(&(cut.cut_reach != Reach::Nothing))?;
                     }
                     _ => encoder.encode(&BARRIER_KIND_NESTED_BAND)?,
                 }
@@ -508,8 +523,7 @@ fn span_is_of_whole_runs(list: &DisplayListStorage, span: ListSpan) -> bool {
     span.begin <= span.end && position_starts_run(list, span.begin) && position_ends_run(list, span.end)
 }
 
-// The span of a canvas, video or nested context with a layer is one run of the list, which starts with a record that
-// draws that content.
+// The span of live content with a layer is one run of the list, which starts with a record that draws that content.
 fn span_is_run_drawing_content(list: &DisplayListStorage, span: ListSpan, content: LiveContent) -> bool {
     if matches!(content, LiveContent::ImageFrame(_)) {
         return false;
@@ -611,16 +625,18 @@ fn check_nodes(
         if node.parent_index.is_some_and(|parent_index| parent_index.0 >= index) {
             return Err("a node is not after the node it is in");
         }
-        // A node that is not composited is in the node of the space its space is in, and a composited node is in a node
-        // of its own space. So nodes nest no deeper than spaces, plus composited effects, which nest as the tree nests
-        // them.
+        // A node that is not composited is in the node of the space its space is in, or in a composited node of its own
+        // space, composited within clips the composited node is not. A composited node is in a node of its own space.
+        // So nodes nest no deeper than twice the spaces, plus composited effects, which nest as the tree nests them.
         let parent = node.parent_index.map(|parent_index| &nodes[parent_index.0]);
         let is_in_node_a_plan_puts_it_in = match (node.composited_effect, parent) {
             (None, None) => node.raster_space_index == RasterSpaceIndex::VIEWPORT,
             (None, Some(parent)) => {
-                node.raster_space_index != RasterSpaceIndex::VIEWPORT
-                    && parent.composited_effect.is_none()
-                    && parent.raster_space_index == spaces[node.raster_space_index.0].parent_index
+                (node.raster_space_index != RasterSpaceIndex::VIEWPORT
+                    && parent.raster_space_index == spaces[node.raster_space_index.0].parent_index)
+                    || (parent.composited_effect.is_some()
+                        && parent.raster_space_index == node.raster_space_index
+                        && parent.composite_clips != node.composite_clips)
             }
             (Some(_), Some(parent)) => parent.raster_space_index == node.raster_space_index,
             (Some(_), None) => return Err("a composited node is in no other node"),
@@ -732,10 +748,14 @@ fn check_bands(plan: &LayeredPlan, list: &DisplayListStorage) -> Result<(), &'st
                     ..
                 } => {
                     if !span_is_run_drawing_content(list, record_span, content) {
-                        return Err("a canvas, video or nested context is not a run of the list that draws it");
+                        return Err("live content is not a run of the list that draws it");
                     }
-                    if media_of_layers.len() == MAXIMUM_MEDIA_LAYER_COUNT {
-                        return Err("the stack holds more canvas, video and nested context layers than a plan makes");
+                    let layer_count_of_its_kind = media_of_layers
+                        .iter()
+                        .filter(|(_, earlier, _)| earlier.is_drawn_by_its_record() == content.is_drawn_by_its_record())
+                        .count();
+                    if layer_count_of_its_kind == maximum_layer_count_of_live_content_like(content) {
+                        return Err("the stack holds more layers of a kind of live content than a plan makes");
                     }
                     media_of_layers.push((record_span.begin, content, ordinal));
                 }
@@ -749,8 +769,8 @@ fn check_bands(plan: &LayeredPlan, list: &DisplayListStorage) -> Result<(), &'st
     check_ordinals_of_media(media_of_layers)
 }
 
-// A plan numbers the drawings of a canvas, video or nested context that have layers in paint order: each has as its
-// ordinal how many of them with the same content are painted before it. The window server tells the media apart by
+// A plan numbers the drawings of live content that have layers in paint order: each has as its ordinal how many of them
+// with the same content are painted before it. The window server tells the media apart by
 // their ordinals.
 fn check_ordinals_of_media(mut media_of_layers: Vec<(ListPosition, LiveContent, u32)>) -> Result<(), &'static str> {
     media_of_layers.sort_unstable_by_key(|(position, _, _)| *position);
@@ -760,15 +780,15 @@ fn check_ordinals_of_media(mut media_of_layers: Vec<(ListPosition, LiveContent, 
             .filter(|(_, earlier_content, _)| earlier_content == content)
             .count();
         if *ordinal as usize != count_of_same_content_painted_before {
-            return Err("a canvas, video or nested context is not numbered by the drawings of it painted before it");
+            return Err("live content is not numbered by the drawings of it painted before it");
         }
     }
     Ok(())
 }
 
-// A plan puts each stretch of records into one band, or for a canvas, video or nested context with a layer, into that
-// layer, and a stretch holds at least one run. So no record is in two spans, and a stack holds no more spans than the
-// list holds runs.
+// A plan puts each stretch of records into one band, or for live content with a layer, into that layer, and a stretch
+// holds at least one run. So no record is in two spans, and a stack holds no more spans than
+// the list holds runs.
 fn check_no_record_is_held_twice(plan: &LayeredPlan) -> Result<(), &'static str> {
     let spans_of_media_layers = plan
         .bands
@@ -836,7 +856,7 @@ fn check_stack_of_plan(stack: &LayerStack) -> Result<(), &'static str> {
 /// without a bound. Each index names an item of the stack, the list or the tree, and each rect lies within twice the
 /// extent limit of a plan. The nodes, bands, cuts and spans nest and follow each other as a plan makes them, the spans
 /// are of whole runs, and no record is in two spans. So the stack holds no more spans than the list holds runs, no
-/// more canvas, video and nested context layers than a plan makes, and its nodes nest no deeper than its spaces plus
+/// more layers of each kind of live content than a plan makes, and its nodes nest no deeper than its spaces plus
 /// `MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS`. The layers of a band are next to each other, so a frame that composites
 /// the layers in order enters each composited band once. The base layer is never of a space whose anchor the
 /// compositor animates, and no two layers share an identity.
@@ -917,14 +937,14 @@ mod tests {
     use crate::display_list::layers::planning::{LayerStackInputs, PlannedLayers, plan_layer_stack};
     use crate::display_list::layers::{
         BandIndex, CutsOfCell, LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS, LayerIndex,
-        MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeNamesFromIndices, PlacementNodeBand, WhatWindowServerShowsOfFrame,
-        WindowServerCompositing, WindowServerPresentationOfMedia,
+        MAXIMUM_MEDIA_LAYER_COUNT, MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeNamesFromIndices, PlacementNodeBand,
+        WhatWindowServerShowsOfFrame, WhyFrameHoldsLayer, WindowServerCompositing, WindowServerPresentationOfMedia,
     };
     use crate::display_list::placement::{RasterSpace, RasterSpaceGeometry, WhatEverySpaceOfTreeShares};
     use crate::display_list::test_fixtures::{
-        GREEN, ListOfOneChunk, NO_FRAME_STATE, VIEWPORT, canvas, chunk_of, effects, fill, frosted_glass,
-        opacity_animation_of, raster_settings_hash_by_layer, scroll_node, scroll_record, spinning, transform,
-        tree_with_document_scroller, tree_with_root_isolation_effect,
+        GREEN, ListOfOneChunk, NO_FRAME_STATE, VIEWPORT, canvas, caret, chunk_of, effects, fill, frosted_glass,
+        opacity_animation_of, raster_settings_hash_by_layer, scroll_bar, scroll_node, scroll_record, spinning,
+        transform, tree_with_document_scroller, tree_with_root_isolation_effect,
     };
     use crate::display_list::tile_keys::{TileKeyingOfList, TileKeyingOfRasterSpace};
     use crate::node_slot_id::NodeSlotId;
@@ -1236,6 +1256,35 @@ mod tests {
         }
     }
 
+    // Two carets, the first under a box painted over it.
+    fn page_with_carets() -> Page {
+        let (tree, _, contexts) = tree_with_document_scroller(&[]);
+        let document = contexts[0];
+        let list = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(caret(IntRect::new(20, 420, 2, 16)), document)
+            .with(caret(IntRect::new(20, 1420, 2, 16)), document)
+            .with(fill(IntRect::new(0, 400, 800, 50), GREEN), document);
+        Page {
+            tree,
+            list: list.storage(),
+        }
+    }
+
+    // A nested scroller with its vertical scroll bar.
+    fn page_with_scroll_bar() -> Page {
+        let (tree, _, contexts) = tree_with_document_scroller(&[IntRect::new(100, 100, 300, 200)]);
+        let (document, nested) = (contexts[0], contexts[1]);
+        let list = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(fill(IntRect::new(100, 100, 300, 700), GREEN), nested)
+            .with(scroll_bar(nested.spatial, IntRect::new(390, 100, 10, 200)), document);
+        Page {
+            tree,
+            list: list.storage(),
+        }
+    }
+
     // A spinner in a group scaled up eighty times, whose space a plan rasters at that scale.
     fn page_with_spinner_in_large_scale() -> Page {
         let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
@@ -1300,6 +1349,8 @@ mod tests {
             ("no records", page_without_records()),
             ("records that draw nothing", page_whose_records_draw_nothing()),
             ("frosted glass", page_with_frosted_glass()),
+            ("carets", page_with_carets()),
+            ("scroll bar", page_with_scroll_bar()),
         ]
     }
 
@@ -1401,6 +1452,37 @@ mod tests {
         assert!(nothing_drawn.why_list_is_one_layer.is_none());
         assert_eq!(nothing_drawn.bands.len(), 1);
         assert!(nothing_drawn.bands[0].record_spans.is_empty() && nothing_drawn.bands[0].cuts.is_empty());
+        let carets = stack_of(page_with_carets());
+        let caret_layers: Vec<(LayerIdentity, bool)> = carets
+            .bands
+            .iter()
+            .flat_map(|band| &band.cuts)
+            .map(|cut| {
+                (
+                    carets.layers[cut.layer_above_cut.0 - 1].identity,
+                    cut.cut_reach != Reach::Nothing,
+                )
+            })
+            .filter(|(identity, _)| matches!(identity, LayerIdentity::Media { .. }))
+            .collect();
+        let caret = |ordinal| LayerIdentity::Media {
+            content: LiveContent::Caret,
+            ordinal,
+        };
+        assert_eq!(caret_layers, [(caret(0), true), (caret(1), false)]);
+        let scroll_bar_layers: Vec<LayerIdentity> = stack_of(page_with_scroll_bar())
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.content, LayerContent::OwnSurface { .. }))
+            .map(|layer| layer.identity)
+            .collect();
+        assert!(matches!(
+            scroll_bar_layers[..],
+            [LayerIdentity::Media {
+                content: LiveContent::ScrollBar { vertical: true, .. },
+                ordinal: 0
+            }]
+        ));
         let crowded = stack_of(page_with_many_nested_scrollers());
         assert_eq!(kinds_of_anchors(&crowded)[2..], ["scroller"; 6]);
         let nested_scrollers_without_spaces = NESTED_SCROLLER_COUNT_OF_CROWDED_PAGE as usize - 6;
@@ -1757,6 +1839,7 @@ mod tests {
             ordinal,
             record_span,
             reach,
+            ..
         } = &mut plan.bands[band_index].cuts[cut_index].barrier
         else {
             unreachable!()
@@ -1820,6 +1903,7 @@ mod tests {
                 ordinal: 0,
                 record_span: span_of_last_canvas,
                 reach,
+                cuts_band: true,
             },
             reach_of_layer_above_cut: IntRect::default(),
         });
@@ -2185,6 +2269,41 @@ mod tests {
     }
 
     // Reads the stack as the compositor reads it for a frame over the whole viewport, and as the dump reads it.
+    // A window server that shows tiles shows a caret from a surface of its own, as it shows a tile, and the base layer
+    // with it. Any other leaves the caret to the frame.
+    #[test]
+    fn only_a_window_server_that_shows_tiles_shows_a_caret() {
+        let stack = page_with_carets().planned().stack;
+        let composite_offsets = stack.composite_offsets(&[FloatPoint::default(); 4]);
+        let window_server = |shows_tiles_of_painted_layers| WhatWindowServerShowsOfFrame {
+            compositing: WindowServerCompositing {
+                shows_tiles_of_painted_layers,
+                filters_what_is_below_layers: shows_tiles_of_painted_layers,
+            },
+            can_show_media_of_layer: &|_| true,
+            can_composite_effect_of_node: &|_| true,
+        };
+        let caret_layers: Vec<LayerIndex> = (0..stack.layers.len())
+            .map(LayerIndex)
+            .filter(|layer| matches!(stack.layers[layer.0].content, LayerContent::OwnSurface { .. }))
+            .collect();
+        assert_eq!(caret_layers.len(), 2);
+        let shown_by_window_server_that_shows_tiles =
+            stack.layers_the_window_server_shows(&composite_offsets, &window_server(true));
+        assert!(shown_by_window_server_that_shows_tiles[stack.base_layer.0]);
+        assert!(
+            caret_layers
+                .iter()
+                .all(|layer| shown_by_window_server_that_shows_tiles[layer.0])
+        );
+        for layer in caret_layers {
+            assert_eq!(
+                stack.why_frame_holds_layer(layer, &window_server(false)),
+                WhyFrameHoldsLayer::WindowServerCannotShowItsContent
+            );
+        }
+    }
+
     fn read_as_consumers_do(page: &Page, frame_tree: &VisualContextTree, planned: &PlannedLayers, stack: &LayerStack) {
         let list = &page.list;
         let scroll_offsets = [FloatPoint { x: 0.0, y: 300.0 }; 4];

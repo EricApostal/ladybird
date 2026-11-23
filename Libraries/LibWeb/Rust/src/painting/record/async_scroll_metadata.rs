@@ -8,10 +8,8 @@ use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::record::trace::Observer;
 
 use crate::css::css_pixels::{CssPixelRect, CssPixelSize};
-use crate::layout::node_data::{DomPaintFact, NodeKind, NodeSlotId};
-use crate::painting::chrome_geometry::{
-    ChromeGeometry, ScrollbarColors, maximum_scroll_offset, minimum_scroll_offset, scrollbar_colors_for_paint,
-};
+use crate::layout::node_data::{DomPaintFact, NodeSlotId};
+use crate::painting::chrome_geometry::{ChromeGeometry, maximum_scroll_offset, minimum_scroll_offset};
 use crate::painting::display_list::commands::*;
 use crate::painting::ffi::ScrollDirection;
 use crate::painting::paintable_geometry;
@@ -175,8 +173,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
         &self,
         paintable: NodeSlotId,
         direction: ScrollDirection,
-        colors: ScrollbarColors,
-        is_painted_by_compositor: bool,
     ) -> Option<CompositorScrollbar> {
         let chrome_geometry = ChromeGeometry::for_recording(self.source, self.inputs);
         let scrollbar = chrome_geometry.compute_scrollbar_data(paintable, direction, false)?;
@@ -189,7 +185,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
         let vertical = direction == ScrollDirection::Vertical;
         Some(CompositorScrollbar {
             scroll_node_index: self.data(paintable).own_scroll_node_index,
-            gutter_rect: self.converter.rounded_device_rect(scrollbar.gutter_rect),
             thumb_rect: self.converter.rounded_device_rect(scrollbar.thumb_rect),
             track_rect: self.converter.rounded_device_rect(scrollbar.track_rect),
             expanded_gutter_rect: self.converter.rounded_device_rect(expanded.gutter_rect),
@@ -206,50 +201,14 @@ impl<O: Observer> PaintRecorder<'_, O> {
             } else {
                 max_scroll_offset.x
             },
-            thumb_color: colors.thumb,
-            thumb_outline_color: colors.thumb_outline,
-            track_color: colors.track,
             vertical,
-            is_painted_by_compositor,
         })
     }
 
-    fn record_viewport_scrollbar_state(&mut self, paintable: NodeSlotId) {
-        let records_viewport_scrollbars = self.source.node_kind_if_live(paintable) == Some(NodeKind::Viewport)
-            && self.inputs.uncaptured.paint_viewport_scrollbars
-            && self.source.node_style_if_live(paintable).is_some_and(|style| {
-                style.misc_interaction().scrollbar_width != crate::css::css_enums::scrollbar_width::NONE
-            });
-        if !records_viewport_scrollbars {
-            return;
-        }
-        let colors = scrollbar_colors_for_paint(
-            self.source,
-            paintable,
-            self.inputs.uncaptured.root_background_source,
-            self.inputs
-                .uncaptured
-                .canvas_color
-                .blend(self.inputs.uncaptured.background_color),
-        );
-        for direction in [ScrollDirection::Vertical, ScrollDirection::Horizontal] {
-            if let Some(scrollbar) = self.compositor_scrollbar_for(paintable, direction, colors, true) {
-                self.recorder.compositor_scrollbar(scrollbar);
-            }
-        }
-    }
-
-    // The compositor may drag a scrollbar the display list paints only where the main thread would
-    // hit test that scrollbar, so this mirrors the conditions its chrome widget hit test items are
-    // recorded under.
-    pub(crate) fn record_compositor_scrollbar_painted_by_display_list(
-        &mut self,
-        paintable: NodeSlotId,
-        direction: ScrollDirection,
-        colors: ScrollbarColors,
-    ) {
-        if self.source.node_kind_if_live(paintable) == Some(NodeKind::Viewport)
-            || !self.has_compositor_scroll_node(paintable)
+    // The compositor may drag a scrollbar only where the main thread would hit test that scrollbar, so
+    // this mirrors the conditions its chrome widget hit test items are recorded under.
+    pub(crate) fn record_compositor_scrollbar(&mut self, paintable: NodeSlotId, direction: ScrollDirection) {
+        if !self.has_compositor_scroll_node(paintable)
             || !self.visibility_is_visible(paintable)
             || !self.visible_for_hit_testing(paintable)
         {
@@ -263,7 +222,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if !could_be_scrolled_along_direction {
             return;
         }
-        if let Some(scrollbar) = self.compositor_scrollbar_for(paintable, direction, colors, false) {
+        if let Some(scrollbar) = self.compositor_scrollbar_for(paintable, direction) {
             self.recorder.compositor_scrollbar(scrollbar);
         }
     }
@@ -286,6 +245,5 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 self.record_main_thread_wheel_event_region(paintable);
             }
         }
-        self.record_viewport_scrollbar_state(paintable);
     }
 }

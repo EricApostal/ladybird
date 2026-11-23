@@ -354,13 +354,6 @@ void CompositorConnection::release_video_frame_hold(Media::VideoSinkHandle video
     async_release_video_frame_hold(video_sink_handle, generation);
 }
 
-void CompositorConnection::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
-{
-    if (!can_send_message_to_compositor())
-        return;
-    async_set_video_sink_ticking(video_sink_handle, should_tick);
-}
-
 RefPtr<IPC::ThreadSafeMessagePoster> CompositorConnection::poster_while_compositor_is_reachable()
 {
     if (!can_send_message_to_compositor())
@@ -471,6 +464,33 @@ bool CompositorConnection::did_rasterize(Layout::RustFFI::RasterizationOutcome o
         return false;
     }
     VERIFY_NOT_REACHED();
+}
+
+void CompositorConnection::bring_video_sink_up_to_date(Media::VideoSinkHandle video_sink_handle, Optional<MonotonicTime> deadline)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    auto token = m_next_video_sink_up_to_date_token++;
+    async_bring_video_sink_up_to_date(video_sink_handle, token);
+    while (true) {
+        OwnPtr<Messages::CompositorWebContentClient::VideoSinkIsUpToDate> answer;
+        if (deadline.has_value())
+            answer = wait_for_specific_endpoint_message_until<Messages::CompositorWebContentClient::VideoSinkIsUpToDate>(deadline.value());
+        else
+            answer = wait_for_specific_endpoint_message<Messages::CompositorWebContentClient::VideoSinkIsUpToDate>();
+        if (!answer) {
+            if (!is_open())
+                did_lose_compositor();
+            return;
+        }
+        if (answer->token() == token)
+            return;
+    }
+}
+
+void CompositorConnection::video_sink_is_up_to_date(u64)
+{
+    // CompositorConnection::bring_video_sink_up_to_date() waits for its answer, and an answer it gave up on goes nowhere.
 }
 
 void CompositorConnection::invalidate_keyboard_scroll_state(Web::CompositorContextId context_id, u64 generation)

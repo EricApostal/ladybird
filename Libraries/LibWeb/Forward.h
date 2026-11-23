@@ -219,7 +219,6 @@ namespace Web::ContentSecurityPolicy {
 
 class Policy;
 class PolicyList;
-class SecurityPolicyViolationEvent;
 class Violation;
 
 }
@@ -462,7 +461,6 @@ class CaretPosition;
 class CharacterData;
 class Comment;
 class CommitMessages;
-class CustomEvent;
 class Document;
 class DocumentFragment;
 class DocumentLoadEventDelayer;
@@ -947,7 +945,6 @@ class MediaSession;
 
 namespace Web::MediaSourceExtensions {
 
-class BufferedChangeEvent;
 class ManagedMediaSource;
 class ManagedSourceBuffer;
 class MediaSource;
@@ -1008,7 +1005,6 @@ class Permissions;
 namespace Web::PictureInPicture {
 
 class PictureInPictureController;
-class PictureInPictureEvent;
 class PictureInPictureWindow;
 
 }

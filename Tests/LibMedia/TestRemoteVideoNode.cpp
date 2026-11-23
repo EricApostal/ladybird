@@ -59,6 +59,45 @@ NonnullRefPtr<DecodedVideoProducer> make_decoder(Core::EventLoop& loop, StringVi
     return MUST(DecodedVideoProducer::try_create(loop, demuxer, tracks[0]));
 }
 
+// Forwards to another producer, recording what the first peek of it saw.
+class FirstPeekRecordingVideoProducer final : public VideoProducer {
+public:
+    static NonnullRefPtr<FirstPeekRecordingVideoProducer> create(NonnullRefPtr<VideoProducer> inner)
+    {
+        return adopt_ref(*new FirstPeekRecordingVideoProducer(move(inner)));
+    }
+
+    virtual void start() override { m_inner->start(); }
+    virtual void suspend() override { m_inner->suspend(); }
+    virtual VideoProducerOutput peek() override
+    {
+        auto output = m_inner->peek();
+        MutexLocker locker { m_mutex };
+        if (!m_first_peeked_status.has_value())
+            m_first_peeked_status = output.status;
+        return output;
+    }
+    virtual void consume() override { m_inner->consume(); }
+    virtual void set_wake_handler(PipelineWakeHandler handler) override { m_inner->set_wake_handler(move(handler)); }
+    virtual void seek(AK::Duration timestamp, InvalidateHeldData invalidate_held_data) override { m_inner->seek(timestamp, invalidate_held_data); }
+
+    Optional<PipelineStatus> first_peeked_status() const
+    {
+        MutexLocker locker { m_mutex };
+        return m_first_peeked_status;
+    }
+
+private:
+    explicit FirstPeekRecordingVideoProducer(NonnullRefPtr<VideoProducer> inner)
+        : m_inner(move(inner))
+    {
+    }
+
+    NonnullRefPtr<VideoProducer> m_inner;
+    mutable Mutex m_mutex;
+    Optional<PipelineStatus> m_first_peeked_status;
+};
+
 bool spin_until(Core::EventLoop& loop, Function<bool()> condition, AK::Duration timeout = AK::Duration::from_seconds(2))
 {
     auto deadline = MonotonicTime::now_coarse() + timeout;
@@ -119,6 +158,9 @@ struct VideoEdgeTestHarness
     bool signaled { false };
     // Messages are delivered only once they are this old, the way they take a while to cross between processes.
     AK::Duration delivery_delay;
+    // Holds the consumer's suspension back from the pump until the test sends it, as it would be crossing processes.
+    bool holds_suspension_requests { false };
+    bool has_held_suspension_request { false };
 
     void post(Message message)
     {
@@ -165,7 +207,12 @@ struct VideoEdgeTestHarness
     }
 };
 
-void wire_full_node(VideoEdgeTestHarness& harness, NonnullRefPtr<VideoProducer> const& decoder)
+enum class ConsumerStart : u8 {
+    Running,
+    Suspended,
+};
+
+void wire_full_node(VideoEdgeTestHarness& harness, NonnullRefPtr<VideoProducer> const& decoder, ConsumerStart start = ConsumerStart::Running)
 {
     // The detached pump thread can invoke these delegates while the test scope is being torn down,
     // so they promote a weak reference to keep the harness alive for the duration of the call.
@@ -181,10 +228,18 @@ void wire_full_node(VideoEdgeTestHarness& harness, NonnullRefPtr<VideoProducer> 
     sink_delegates.notify_clock_resumed = [] { };
     sink_delegates.transmit_seek = [](InvalidateHeldData) { };
     sink_delegates.transmit_time_reader = [](MediaTimeReader const&) { };
+    sink_delegates.transmit_ticking = [](bool) { };
     harness.sink = MUST(RemoteVideoSink::create(move(sink_delegates)));
 
     RemoteVideoProducer::Delegates consumer_delegates;
     consumer_delegates.request_start = [&harness] { harness.sink->start_input(); };
+    consumer_delegates.request_suspend = [&harness] {
+        if (harness.holds_suspension_requests) {
+            harness.has_held_suspension_request = true;
+            return;
+        }
+        harness.sink->suspend_input();
+    };
     consumer_delegates.request_seek = [&harness](AK::Duration timestamp, InvalidateHeldData invalidate_held_data, u64 newest_received_lend_id) {
         harness.sink->seek_upstream(timestamp, invalidate_held_data, newest_received_lend_id);
     };
@@ -194,7 +249,10 @@ void wire_full_node(VideoEdgeTestHarness& harness, NonnullRefPtr<VideoProducer> 
     // harness.consumer is set before connect_input, whose lock publishes it to the pump before the
     // pump can send anything to the consumer.
     MUST(harness.sink->connect_input(decoder));
-    harness.consumer->start();
+    if (start == ConsumerStart::Suspended)
+        harness.consumer->suspend();
+    else
+        harness.consumer->start();
 }
 
 NonnullRefPtr<VideoFrame> create_pooled_frame(VideoFramePool& pool, AK::Duration timestamp, AK::Duration duration = AK::Duration::from_milliseconds(33))
@@ -219,6 +277,7 @@ RemoteVideoProducer::Delegates make_consumer_delegates(size_t& upstream_seeks)
 {
     RemoteVideoProducer::Delegates delegates;
     delegates.request_start = [] { };
+    delegates.request_suspend = [] { };
     delegates.request_seek = [&upstream_seeks](AK::Duration, InvalidateHeldData, u64) { upstream_seeks++; };
     return delegates;
 }
@@ -239,6 +298,7 @@ void give_lookahead(RemoteVideoProducer& consumer, VideoFramePool& pool, Functio
 struct LentFrameRecorder : public AtomicRefCounted<LentFrameRecorder> {
     Mutex mutex;
     Vector<RemoteVideoSink::LentFrame> lent_frames;
+    Vector<bool> transmitted_ticking;
 
     size_t count()
     {
@@ -264,7 +324,14 @@ NonnullRefPtr<RemoteVideoSink> make_recorded_sink(LentFrameRecorder& recorder)
     delegates.notify_clock_resumed = [] { };
     delegates.transmit_seek = [](InvalidateHeldData) { };
     delegates.transmit_time_reader = [](MediaTimeReader const&) { };
-    return MUST(RemoteVideoSink::create(move(delegates)));
+    delegates.transmit_ticking = [recorder = NonnullRefPtr { recorder }](bool ticking) {
+        MutexLocker locker { recorder->mutex };
+        recorder->transmitted_ticking.append(ticking);
+    };
+    auto sink = MUST(RemoteVideoSink::create(move(delegates)));
+    // The consumer these sinks stand in for ticks.
+    sink->set_ticking(true);
+    return sink;
 }
 
 NonnullRefPtr<RemoteVideoSink> make_sink_with_inert_delegates()
@@ -302,6 +369,82 @@ TEST_CASE(remote_video_node_delivers_every_frame_in_order)
     }
 
     EXPECT_EQ(delivered, reference);
+}
+
+TEST_CASE(remote_video_node_suspended_before_starting_delivers_nothing_until_a_seek)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto decoder = make_decoder(loop, TEST_CLIP);
+    auto harness = make_ref_counted<VideoEdgeTestHarness>();
+    wire_full_node(*harness, decoder, ConsumerStart::Suspended);
+
+    auto pump_until_consumer_reports = [&](PipelineStatus status) {
+        auto deadline = MonotonicTime::now_coarse() + AK::Duration::from_seconds(10);
+        while (MonotonicTime::now_coarse() < deadline) {
+            loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+            harness->deliver_messages();
+            auto reported_status = harness->consumer->peek().status;
+            if (reported_status == status)
+                return true;
+            if (reported_status == PipelineStatus::HaveData)
+                return false;
+        }
+        return false;
+    };
+    EXPECT(pump_until_consumer_reports(PipelineStatus::Suspended));
+
+    harness->consumer->seek(AK::Duration::zero());
+    EXPECT(pump_until_consumer_reports(PipelineStatus::HaveData));
+}
+
+// A producer that played to its end before its sink attached still reports that end. Until the consumer's suspension
+// reaches the pump, the pump must not pass it on, or the consumer would see an end that the clock may be far from.
+TEST_CASE(remote_video_node_attached_suspended_to_an_ended_producer_reports_no_end_of_stream)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto decoder = make_decoder(loop, TEST_CLIP);
+    decoder->start();
+    EXPECT(pump_until(loop, [&] {
+        auto output = decoder->peek();
+        if (output.frame != nullptr)
+            decoder->consume();
+        return output.status == PipelineStatus::EndOfStream;
+    }));
+
+    auto input = FirstPeekRecordingVideoProducer::create(decoder);
+    auto harness = make_ref_counted<VideoEdgeTestHarness>();
+    harness->holds_suspension_requests = true;
+    wire_full_node(*harness, input, ConsumerStart::Suspended);
+    EXPECT(harness->has_held_suspension_request);
+
+    bool consumer_saw_end_of_stream = false;
+    auto pump_until_consumer_reports = [&](PipelineStatus status) {
+        return pump_until(loop, [&] {
+            harness->deliver_messages();
+            auto reported_status = harness->consumer->peek().status;
+            if (reported_status == PipelineStatus::EndOfStream)
+                consumer_saw_end_of_stream = true;
+            return reported_status == status;
+        });
+    };
+
+    // Give a pump that peeks too early the time to do so. Whether it does is checked from what it first saw.
+    auto deadline = MonotonicTime::now_coarse() + AK::Duration::from_milliseconds(100);
+    while (MonotonicTime::now_coarse() < deadline) {
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        harness->deliver_messages();
+    }
+
+    harness->sink->suspend_input();
+    EXPECT(pump_until_consumer_reports(PipelineStatus::Suspended));
+    auto first_peeked_status = input->first_peeked_status();
+    EXPECT(first_peeked_status.has_value());
+    if (first_peeked_status.has_value())
+        EXPECT_EQ(*first_peeked_status, PipelineStatus::Suspended);
+
+    harness->consumer->seek(AK::Duration::zero());
+    EXPECT(pump_until_consumer_reports(PipelineStatus::HaveData));
+    EXPECT(!consumer_saw_end_of_stream);
 }
 
 // Stress the boundary under genuine concurrency: the pump thread and the draining thread race while
@@ -529,6 +672,49 @@ TEST_CASE(video_presentation_server_releases_playback_edge_when_connection_dies)
     EXPECT(!manager->track_is_enabled(track));
 }
 
+// The playback manager decides on ticking for a sink, and the sink hears of it across its edge, both of a decision made
+// before the edge existed and of later ones.
+TEST_CASE(video_presentation_edge_carries_the_ticking_decision_to_its_sink)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto manager = PlaybackManager::create(Media::AudioOutputFactory::create_null());
+    bool metadata_parsed = false;
+    manager->add_media_source(create_demuxer(load_test_file(TEST_CLIP)))->when_resolved([&](auto&) {
+        metadata_parsed = true;
+    });
+    if (!spin_until(loop, [&] { return metadata_parsed; })) {
+        FAIL("Timed out waiting for metadata");
+        return;
+    }
+    if (manager->video_tracks().is_empty()) {
+        FAIL("Expected a video track");
+        return;
+    }
+
+    auto handle = manager->reserve_video_sink_handle(manager->video_tracks()[0]);
+    PlaybackManager::set_video_sink_ticking(handle, true);
+
+    auto paired = MUST(IPC::Transport::create_paired());
+    auto server = VideoPresentationServerConnection::construct(move(paired.local));
+    auto client = adopt_ref(*new VideoPresentationClientConnection(MUST(paired.remote_handle.create_transport())));
+    RefPtr<DisplayingVideoSink> sink;
+    MUST(client->create_edge(handle, [&](NonnullRefPtr<DisplayingVideoSink> ready_sink) {
+        sink = move(ready_sink);
+    }));
+    if (!spin_until(loop, [&] { return sink && sink->is_ticking(); })) {
+        FAIL("Timed out waiting for a ticking video edge");
+        return;
+    }
+
+    PlaybackManager::set_video_sink_ticking(handle, false);
+    EXPECT(spin_until(loop, [&] { return !sink->is_ticking(); }));
+    PlaybackManager::set_video_sink_ticking(handle, true);
+    EXPECT(spin_until(loop, [&] { return sink->is_ticking(); }));
+
+    server->shutdown();
+}
+
 // Each edge keeps the frames it is lent, so a client that asks for edges without end is refused past the limit, until
 // it releases one.
 TEST_CASE(video_presentation_client_limits_its_edges)
@@ -585,6 +771,7 @@ TEST_CASE(consumer_requests_seeks_before_releasing_stale_frames)
     RefPtr<RemoteVideoProducer> consumer;
     RemoteVideoProducer::Delegates delegates;
     delegates.request_start = [] { };
+    delegates.request_suspend = [] { };
     delegates.request_seek = [&](AK::Duration, InvalidateHeldData, u64 newest_received_lend_id) {
         events.append("seek"sv);
         requested_newest_received_lend_id = newest_received_lend_id;
@@ -651,6 +838,7 @@ TEST_CASE(sink_resumes_a_suspended_consumer_when_the_clock_resumes)
     auto clock = MUST(MonotonicMediaClock::try_create());
     auto sink = MUST(DisplayingVideoSink::try_create(clock->time_reader()));
     MUST(sink->connect_input(consumer));
+    sink->set_ticking(true);
     EXPECT_EQ(upstream_seeks, 1u);
 
     consumer->receive_frame(1, 1, create_received_frame(*pool, AK::Duration::zero()));
@@ -757,6 +945,26 @@ TEST_CASE(sink_seeks_its_input_directly_when_the_consumer_holds_nothing_for_the_
 
     sink->seek_upstream(AK::Duration::from_seconds(2), InvalidateHeldData::No, 0);
     EXPECT_EQ(producer->seek_count(), 2u);
+}
+
+// A consumer that doesn't tick may leave its suspended input be for a seek, so the seek waits for its request. The sink
+// passes the ticking on to the consumer.
+TEST_CASE(sink_leaves_seeks_to_a_consumer_that_does_not_tick)
+{
+    auto recorder = make_ref_counted<LentFrameRecorder>();
+    auto sink = make_recorded_sink(*recorder);
+    sink->set_ticking(false);
+    {
+        MutexLocker locker { recorder->mutex };
+        EXPECT_EQ(recorder->transmitted_ticking, (Vector { true, false }));
+    }
+    auto producer = ScriptedVideoProducer::create();
+    MUST(sink->connect_input(producer));
+
+    sink->seek(AK::Duration::from_seconds(1));
+    EXPECT_EQ(producer->seek_count(), 0u);
+    sink->seek_upstream(AK::Duration::from_seconds(1), InvalidateHeldData::No, 0);
+    EXPECT_EQ(producer->seek_count(), 1u);
 }
 
 // The consumer may seek on its own while a direct seek awaits its request, as when it starts ticking again. Its

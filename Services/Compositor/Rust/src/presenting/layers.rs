@@ -11,7 +11,9 @@ use super::layer_overlay::{
     FrameWorkCounts, LayerOverlayModel, MediaPresentation, ModelLayer, ModelLayerContent, NamedVisualContextNode,
     PaintedLayerPresentation, RasterCountsByCause, layers_whose_names_are_shown,
 };
-use super::tiles::{LayerTiles, LayerToRaster, TileDraw, TileShownInFrame, joined_rects_of_grid_given_row_by_row};
+use super::tiles::{
+    LayerTiles, LayerToRaster, OwnSurfacePainting, TileDraw, TileShownInFrame, joined_rects_of_grid_given_row_by_row,
+};
 use super::window_server::{WhyMediaIsReplayed, WindowServerLayers};
 use super::{
     ContextPresenting, FrameToPaint, NestedContexts, PresentingEnvironment, apply_raster_transform,
@@ -37,6 +39,7 @@ use libcompositing_rust::display_list::placement::{
 };
 use libcompositing_rust::display_list::reach::Reach;
 use libcompositing_rust::display_list::replay::{CompositeClipsOfRaster, ReplaySelection};
+use libcompositing_rust::display_list::storage::ListSpan;
 use libcompositing_rust::display_list::tile_keys::{
     BandTileKeys, ContentHash, FrameStateReadByReplay, LayerRasterSettings, LiveContentVersions, TileCoverage,
     TileKeyingOfList, TileKeyingOfRasterSpace,
@@ -1110,7 +1113,6 @@ impl ContextPresenting {
                 ..compositing_of_layer(stack, layer_index, &composite_offsets, &spaces_to_frame)
             })
             .collect();
-        let scrollbars = frame.frame_inputs.scrollbars_shown_for_the_page();
         let live_content_versions = LiveContentVersionsOfFrame {
             live_content,
             nested_contexts: env.nested_contexts,
@@ -1120,7 +1122,7 @@ impl ContextPresenting {
             tree,
             stack,
             FrameStateReadByReplay {
-                scrollbars: &scrollbars,
+                scrollbars: &frame.frame_inputs.scrollbars,
                 time_ns: frame.frame_inputs.painted_at.nanoseconds(),
                 live_content: &live_content_versions,
             },
@@ -1278,7 +1280,7 @@ impl ContextPresenting {
         for compositing in &compositing_of_layers {
             let layer_index = compositing.layer_index;
             let layer = &stack.layers[layer_index.0];
-            if let LayerContent::Media { record_span } = &layer.content {
+            if let LayerContent::Media { record_span } | LayerContent::OwnSurface { record_span } = &layer.content {
                 let raster_space_index = stack.space_of_layer(layer_index);
                 let media_replayed = MediaRecordsReplayedInFrame {
                     content_hash: tile_keying_by_raster_space[raster_space_index.0]
@@ -1387,29 +1389,36 @@ impl ContextPresenting {
                             PaintedLayerPresentation::HeldByFrame { why }
                         },
                     },
-                    LayerContent::Media { .. } => ModelLayerContent::Media {
+                    LayerContent::Media { .. } | LayerContent::OwnSurface { .. } => ModelLayerContent::Media {
                         reach: layer.reach,
                         presentation: if window_server_shows_layers && compositing.shown_by_window_server {
                             MediaPresentation::ShownByWindowServer
                         } else {
-                            let why = why_context_shows_no_media
-                                .or_else(|| {
-                                    self.why_window_server_does_not_show_media_layer(
+                            let why = match why_context_shows_no_media {
+                                Some(why_context_shows_no_media) => why_context_shows_no_media.to_string(),
+                                // The compositor paints the surface of a caret or scroll bar, which the frame holds only
+                                // as it holds a painted layer.
+                                None if matches!(layer.content, LayerContent::OwnSurface { .. }) => self
+                                    .why_frame_holds_layer(env, &layer_update.layers, layer_index, live_content)
+                                    .to_string(),
+                                None => self
+                                    .why_window_server_does_not_show_media_layer(
                                         env,
                                         &layer_update.layers.window_server_placements_of_media,
                                         layer_index,
                                         layer,
                                         live_content,
                                     )
-                                })
-                                .unwrap_or(if some_tiles_were_painted_straight {
-                                    WhyMediaIsReplayed::TilesWerePaintedStraightIntoTheFrame
-                                } else if stack.layer_is_inside_composited_effects(layer_index) {
-                                    WhyMediaIsReplayed::InsideAnEffectTheCompositorComposites
-                                } else {
-                                    WhyMediaIsReplayed::UnderALayerTheFrameHolds
-                                });
-                            MediaPresentation::Replayed { why: why.to_string() }
+                                    .unwrap_or(if some_tiles_were_painted_straight {
+                                        WhyMediaIsReplayed::TilesWerePaintedStraightIntoTheFrame
+                                    } else if stack.layer_is_inside_composited_effects(layer_index) {
+                                        WhyMediaIsReplayed::InsideAnEffectTheCompositorComposites
+                                    } else {
+                                        WhyMediaIsReplayed::UnderALayerTheFrameHolds
+                                    })
+                                    .to_string(),
+                            };
+                            MediaPresentation::Replayed { why }
                         },
                     },
                 };
@@ -1670,26 +1679,20 @@ impl ContextPresenting {
                 compositing.space_to_frame,
                 viewport_rect,
             );
-            let replay_tiles = |target: &Rc<PaintingSurface>, tiles_replayed: &[&TileShownInFrame]| {
-                let band_tile_keys = stack_of_frames.band_tile_keys[layer.band_index.0]
+            let band_tile_keys = || {
+                stack_of_frames.band_tile_keys[layer.band_index.0]
                     .as_ref()
-                    .expect("a band with shown tiles has tile keys");
-                let geometry = &band_tile_keys.geometry;
-                let record_spans = (!tiles_replay_the_whole_list).then(|| {
-                    band_tile_keys
-                        .tile_keys
-                        .record_spans_of_tiles(tiles_replayed.iter().map(|tile| {
-                            band_tile_keys
-                                .tile_keys
-                                .tile(tile.coord, layer_index)
-                                .expect("a shown tile is keyed")
-                        }))
-                });
+                    .expect("a band with a layer the frame shows has tile keys")
+            };
+            // Replays the records within `record_spans`, or the whole list, into a target whose origin is that of the
+            // layer's space.
+            let replay = |target: &Rc<PaintingSurface>, record_spans: Option<&[ListSpan]>| {
+                let geometry = &band_tile_keys().geometry;
                 let selection = ReplaySelection {
-                    record_spans: record_spans.as_deref(),
+                    record_spans,
                     clips_left_to_composite: (!geometry.clips_left_to_composite.is_empty())
                         .then_some(&geometry.clips_left_to_composite[..]),
-                    composited_effect: stack.nodes[layer.placement_node_index.0].composited_effect,
+                    composited_effect: stack.innermost_composited_effect_at_or_around_band(layer.band_index),
                     allows_lcd_text,
                     frame_edge_backdrop_blurs_mirror_at: frame_rect_in_layer_space.map(IntRect::to_float),
                     raster_root: stack.spaces[raster_space_index.0].raster_root(),
@@ -1697,6 +1700,36 @@ impl ContextPresenting {
                 };
                 apply_raster_transform(raster, target, raster_scale, raster_translation);
                 replay_with_scroll_offsets(env, target, frame, selection, &geometry.raster_scroll_offsets);
+            };
+            if let LayerContent::OwnSurface { record_span } = layer.content {
+                if layer_update.layers.window_server_shows_tiles_of(compositing) {
+                    let painting = OwnSurfacePainting {
+                        content_hash: layer_update.layers.media_replayed_by_identity[&compositing.identity]
+                            .content_hash,
+                        rect: layer.reach,
+                        raster_scale,
+                        raster_translation,
+                    };
+                    let painted =
+                        self.layers
+                            .tiles
+                            .paint_own_surface(env, like, compositing.identity, painting, |target| {
+                                replay(target, Some(std::slice::from_ref(&record_span)));
+                            });
+                    layer_update.work_counts.tiles_rastered += u64::from(painted);
+                }
+                continue;
+            }
+            let replay_tiles = |target: &Rc<PaintingSurface>, tiles_replayed: &[&TileShownInFrame]| {
+                let tile_keys = &band_tile_keys().tile_keys;
+                let record_spans = (!tiles_replay_the_whole_list).then(|| {
+                    tile_keys.record_spans_of_tiles(
+                        tiles_replayed
+                            .iter()
+                            .map(|tile| tile_keys.tile(tile.coord, layer_index).expect("a shown tile is keyed")),
+                    )
+                });
+                replay(target, record_spans.as_deref());
             };
             let rastered = self.layers.tiles.raster_layer(
                 env,
@@ -1797,8 +1830,10 @@ impl ContextPresenting {
                 replay_into(env, surface, frame, selection_painting_straight);
                 raster.restore_to_count(surface, save_count);
             }
-            self.apply_raster_transform(raster, surface);
-            self.paint_overlays(env, surface, frame.frame_inputs, paints_ui_overlays);
+            if paints_ui_overlays {
+                self.apply_raster_transform(raster, surface);
+                self.paint_overlays(env, surface, frame.frame_inputs);
+            }
         }
         raster.restore_to_count(surface, save_count);
     }
@@ -1894,7 +1929,7 @@ impl ContextPresenting {
                     compositing_session.enter_effect(effect);
                     entered_composited_bands.push(band_index);
                 }
-                if let LayerContent::Media { record_span } = &layer.content {
+                if let LayerContent::Media { record_span } | LayerContent::OwnSurface { record_span } = &layer.content {
                     if !compositing
                         .rect_in_frame(layer.reach, damage_grown_by_filter_reads)
                         .is_empty()

@@ -43,11 +43,6 @@ bool CompositorContextHandle::ready_for_frame()
     return m_host.compositor_connection();
 }
 
-void CompositorContextHandle::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
-{
-    m_host.set_video_sink_ticking(video_sink_handle, should_tick);
-}
-
 void CompositorContextHandle::invalidate_keyboard_scroll_state(u64 generation)
 {
     m_host.invalidate_keyboard_scroll_state(m_context_id, generation);
@@ -304,10 +299,10 @@ void CompositorHost::remove_video_sink(Media::VideoSinkHandle video_sink_handle)
         connection->remove_video_sink(video_sink_handle);
 }
 
-void CompositorHost::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
+void CompositorHost::bring_video_sink_up_to_date(Media::VideoSinkHandle video_sink_handle, Optional<MonotonicTime> deadline)
 {
     if (auto* connection = compositor_connection())
-        connection->set_video_sink_ticking(video_sink_handle, should_tick);
+        connection->bring_video_sink_up_to_date(video_sink_handle, deadline);
 }
 
 Compositing::VideoFrameHold::ReleaseThroughCompositor CompositorHost::video_frame_hold_releaser_for_current_connection() const

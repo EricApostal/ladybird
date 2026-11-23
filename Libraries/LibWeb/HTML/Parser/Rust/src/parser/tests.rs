@@ -19,6 +19,7 @@ use crate::RustFfiTokenizerHandle;
 use crate::make_handle;
 use crate::rust_html_tokenizer_destroy;
 use crate::tokenizer::HtmlTokenizer;
+use ak::Utf16View;
 
 const HTML_ELEMENT: FakeNodeKind = FakeNodeKind::Element(RustFfiHtmlNamespace::Html);
 
@@ -32,7 +33,7 @@ impl ScriptCreatedParser {
         test_host::reset();
         let mut parser = Self {
             parser: rust_html_parser_create(),
-            tokenizer: make_handle(HtmlTokenizer::new(Vec::new())),
+            tokenizer: make_handle(HtmlTokenizer::new(Vec::<u8>::new())),
         };
         parser.tokenizer().set_input_stream_closed(false);
         parser.tokenizer().update_insertion_point();
@@ -59,8 +60,21 @@ impl ScriptCreatedParser {
 
     fn write(&mut self, markup: &str) {
         let code_units: Vec<u16> = markup.encode_utf16().collect();
-        self.tokenizer().insert_input_at_insertion_point(&code_units);
+        self.tokenizer()
+            .insert_input_at_insertion_point(Utf16View::Utf16(&code_units));
         self.run(true);
+    }
+
+    /// Gives the parser the rest of its input from the network rather than from a script.
+    fn append_and_close(&mut self, markup: &str) {
+        let code_units: Vec<u16> = markup.encode_utf16().collect();
+        if code_units.iter().all(|code_unit| *code_unit <= 0xff) {
+            let bytes: Vec<u8> = code_units.iter().map(|code_unit| *code_unit as u8).collect();
+            self.tokenizer().append_input(Utf16View::Latin1(&bytes));
+        } else {
+            self.tokenizer().append_input(Utf16View::Utf16(&code_units));
+        }
+        self.close();
     }
 
     fn close(&mut self) {
@@ -167,4 +181,48 @@ fn foster_parented_text_is_inserted_before_the_table_at_an_explicit_offset() {
         [FakeNodeKind::Text("fostered".to_string()), HTML_ELEMENT]
     );
     assert!(test_host::children(body_children[1]).is_empty());
+}
+
+fn text_of_each_paragraph(markup: &str) -> Vec<String> {
+    let mut parser = ScriptCreatedParser::open();
+    parser.append_and_close(markup);
+    test_host::children(body_element())
+        .into_iter()
+        .map(|paragraph| match &test_host::children(paragraph)[..] {
+            [text] => match test_host::kind(*text) {
+                FakeNodeKind::Text(text) => text,
+                kind => panic!("expected text in the paragraph, not {kind:?}"),
+            },
+            children => panic!("expected one text node in the paragraph, not {} nodes", children.len()),
+        })
+        .collect()
+}
+
+#[test]
+fn text_is_inserted_as_one_node_however_the_tokenizer_emits_it() {
+    // Text that is taken straight from the input, in both forms the input is stored in.
+    assert_eq!(
+        text_of_each_paragraph("<p>plain<p>caf\u{e9}\nau lait"),
+        ["plain", "caf\u{e9}\nau lait"]
+    );
+    assert_eq!(
+        text_of_each_paragraph("<p>plain<p>wide \u{2014} \u{1f600}!"),
+        ["plain", "wide \u{2014} \u{1f600}!"]
+    );
+    // Text that is put together from runs of input and the characters between them that the tokenizer changes.
+    assert_eq!(
+        text_of_each_paragraph("<p>a &amp; b &lt;<p>x\r\ny\rz<p>&amp;<p>\u{1f600} first"),
+        ["a & b <", "x\ny\nz", "&", "\u{1f600} first"]
+    );
+    // A surrogate without its other half becomes U+FFFD.
+    let mut parser = ScriptCreatedParser::open();
+    parser
+        .tokenizer()
+        .append_input(Utf16View::Utf16(&[0x3C, 0x70, 0x3E, 0x61, 0xD83D, 0x62]));
+    parser.close();
+    let paragraph = test_host::children(body_element())[0];
+    assert_eq!(
+        kinds_of(&test_host::children(paragraph)),
+        [FakeNodeKind::Text("a\u{fffd}b".to_string())]
+    );
 }

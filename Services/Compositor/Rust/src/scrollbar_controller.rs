@@ -4,15 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::frame_inputs::{ScrollbarOfFrame, thumb_rect_kept_inside_track};
+use libcompositing_rust::display_list::replay::{ScrollbarShownByFrame, thumb_rect_kept_inside_track};
 use libcompositing_rust::scrolling::overlay_fade::OverlayFade;
 use libcompositing_rust::scrolling::{
     AccumulatedVisualContextTree, AsyncScrollNodeStableID, AsyncScrollTree, AsyncScrollbar, ClipBehavior,
-    CompositorContextId, IncludeVisualViewportTransform, OverlayScrollbarVisibility, ScrollStateSnapshot,
-    ScrollbarDraggedByCompositor, SpatialNodeIndex,
+    CompositorContextId, OverlayScrollbarVisibility, ScrollStateSnapshot, ScrollbarDraggedByCompositor,
+    SpatialNodeIndex,
 };
 use libcompositing_rust::time::{Duration, MonotonicTime};
-use libgfx_rust::{FloatPoint, FloatRect, IntRect, Orientation, enclosing_int_rect};
+use libgfx_rust::{FloatPoint, FloatRect, IntRect, Orientation};
 
 #[derive(Default)]
 pub struct ScrollbarController {
@@ -111,7 +111,7 @@ fn find_scrollbar_index(scrollbars: &[AsyncScrollbar], identity: &ScrollbarIdent
         .position(|scrollbar| scrollbar_has_identity(scrollbar, identity))
 }
 
-// The rects of a scrollbar the compositor paints are in the viewport's space already.
+// The rects of a scrollbar are in the space of the context it is painted in.
 fn position_in_space_of_scrollbar(
     scrollbar: &AsyncScrollbar,
     visual_context_tree: &AccumulatedVisualContextTree,
@@ -119,21 +119,10 @@ fn position_in_space_of_scrollbar(
     position: FloatPoint,
     clip_behavior: ClipBehavior,
 ) -> Option<FloatPoint> {
-    if scrollbar.is_painted_by_compositor {
-        return Some(position);
-    }
     if !visual_context_tree.context_is_valid(scrollbar.context) {
         return None;
     }
     visual_context_tree.transform_point_for_hit_test(scrollbar.context, position, scroll_state_snapshot, clip_behavior)
-}
-
-fn scrollbar_gutter_rect(scrollbar: &AsyncScrollbar, expanded: bool) -> IntRect {
-    if expanded {
-        scrollbar.expanded_gutter_rect
-    } else {
-        scrollbar.gutter_rect
-    }
 }
 
 fn scrollbar_scroll_size(scrollbar: &AsyncScrollbar, expanded: bool) -> f64 {
@@ -177,20 +166,6 @@ fn translated_thumb_rect_with_snapshot(
         thumb_rect.x += ((-device_offset.x) as f64 * scroll_size) as i32;
     }
     thumb_rect
-}
-
-fn scrollbar_hit_rect(scrollbar: &AsyncScrollbar, scroll_offset: FloatPoint) -> IntRect {
-    const SCROLLBAR_HIT_SLOP: i32 = 4;
-    let mut rect = translated_thumb_rect(scrollbar, scroll_offset, false).united(translated_thumb_rect(
-        scrollbar,
-        scroll_offset,
-        true,
-    ));
-    let expanded_gutter_rect = scrollbar_gutter_rect(scrollbar, true);
-    if !expanded_gutter_rect.is_empty() {
-        rect = rect.united(expanded_gutter_rect);
-    }
-    rect.inflated(SCROLLBAR_HIT_SLOP, SCROLLBAR_HIT_SLOP)
 }
 
 impl ScrollbarController {
@@ -254,14 +229,14 @@ impl ScrollbarController {
         self.opacity(scrollbar_index) > 0.0
     }
 
-    // The main thread still takes the mouse events of a drag that holds a scrollbar the display list paints. The
-    // context is the one this controller belongs to.
-    pub fn captured_scrollbar_painted_by_display_list(
+    // The main thread still takes the mouse events of a drag that holds a scrollbar of an element, but none of a drag that
+    // holds a scrollbar of the viewport. The context is the one this controller belongs to.
+    pub fn captured_scrollbar_the_page_takes(
         &self,
         context_id: CompositorContextId,
     ) -> Option<ScrollbarDraggedByCompositor> {
         let scrollbar = self.scrollbars.get(self.captured_scrollbar_index?)?;
-        if scrollbar.is_painted_by_compositor || scrollbar.scroller_stable_node_id.is_none() {
+        if scrollbar.scrolls_viewport || scrollbar.scroller_stable_node_id.is_none() {
             return None;
         }
         Some(ScrollbarDraggedByCompositor {
@@ -270,37 +245,10 @@ impl ScrollbarController {
         })
     }
 
-    pub fn hit_test_scrollbar_painted_by_compositor(
-        &self,
-        async_scroll_tree: &AsyncScrollTree,
-        scroll_state_snapshot: &ScrollStateSnapshot,
-        position: FloatPoint,
-    ) -> Option<usize> {
-        for (i, scrollbar) in self.scrollbars.iter().enumerate() {
-            if !scrollbar.is_painted_by_compositor {
-                continue;
-            }
-            let Some(scroll_offset) =
-                async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_index, scroll_state_snapshot)
-            else {
-                continue;
-            };
-            if scrollbar_hit_rect(scrollbar, scroll_offset)
-                .to_float()
-                .contains_point(position)
-            {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    // A scrollbar the display list paints takes the pointer inside the rect of the scrollbar as it is presented now, and only
-    // with nothing that takes pointer input painted over it there. A scrollbar that has faded out takes none, as the main
-    // thread passes it by.
-    // A scrollbar the display list paints takes the pointer where it is presented, unless something that takes pointer
-    // input is painted over it there.
-    pub fn hit_test_scrollbar_painted_by_display_list(
+    // A scrollbar takes the pointer inside the rect of the scrollbar as it is presented now, and only with nothing that
+    // takes pointer input painted over it there. A scrollbar that has faded out takes none, as the main thread passes it
+    // by.
+    pub fn hit_test_scrollbar(
         &self,
         async_scroll_tree: &AsyncScrollTree,
         visual_context_tree: &AccumulatedVisualContextTree,
@@ -308,7 +256,7 @@ impl ScrollbarController {
         position: FloatPoint,
     ) -> Option<usize> {
         for (i, scrollbar) in self.scrollbars.iter().enumerate().rev() {
-            if scrollbar.is_painted_by_compositor || scrollbar.scroller_stable_node_id.is_none() || !self.is_shown(i) {
+            if scrollbar.scroller_stable_node_id.is_none() || !self.is_shown(i) {
                 continue;
             }
             if async_scroll_tree
@@ -358,18 +306,9 @@ impl ScrollbarController {
         scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
     ) -> Option<Drag> {
-        let mut scrollbar_index =
-            self.hit_test_scrollbar_painted_by_compositor(async_scroll_tree, scroll_state_snapshot, position);
-        if scrollbar_index.is_none() {
-            scrollbar_index = self.hit_test_scrollbar_painted_by_display_list(
-                async_scroll_tree,
-                visual_context_tree,
-                scroll_state_snapshot,
-                position,
-            );
-        }
+        let scrollbar_index =
+            self.hit_test_scrollbar(async_scroll_tree, visual_context_tree, scroll_state_snapshot, position)?;
         // INTEROP: A scrollbar that has faded out takes no press, as in Chromium.
-        let scrollbar_index = scrollbar_index?;
         if self.opacity(scrollbar_index) <= 0.0 {
             return None;
         }
@@ -404,7 +343,7 @@ impl ScrollbarController {
         let thumb_grab_position = if position_is_along_thumb {
             primary_position - thumb_rect.primary_offset_for_orientation(orientation) as f32
         } else {
-            let gutter_rect = scrollbar_gutter_rect(scrollbar, true);
+            let gutter_rect = scrollbar.expanded_gutter_rect;
             let thumb_size = thumb_rect.primary_size_for_orientation(orientation) as f32;
             let gutter_start = gutter_rect.primary_offset_for_orientation(orientation) as f32;
             let gutter_size = gutter_rect.primary_size_for_orientation(orientation) as f32;
@@ -644,16 +583,11 @@ impl ScrollbarController {
         false
     }
 
-    // Returns the rect in the viewport of the scrollbars whose opacity or geometry changed.
-    pub fn advance_fades(
-        &mut self,
-        visual_context_tree: &AccumulatedVisualContextTree,
-        scroll_state_snapshot: &ScrollStateSnapshot,
-        frame_time: MonotonicTime,
-    ) -> IntRect {
-        let mut damage_rect = IntRect::default();
-        for i in 0..self.scrollbars.len() {
-            let visibility = &mut self.visibilities[i];
+    // Advances the fades to a frame, and answers whether any scrollbar changed. The frame finds what changed in the
+    // content hashes of the records of the scrollbars.
+    pub fn advance_fades(&mut self, frame_time: MonotonicTime) -> bool {
+        let mut some_scrollbar_changed = false;
+        for visibility in &mut self.visibilities {
             if visibility.fade_out_time.is_some_and(|time| time <= frame_time) {
                 visibility.fade_out_time = None;
                 visibility.fade.fade_to(0.0, frame_time);
@@ -664,47 +598,9 @@ impl ScrollbarController {
                 visibility.expansion.jump_to(0.0);
             }
             changed |= visibility.expansion.advance_to(frame_time);
-            if !changed {
-                continue;
-            }
-            if let Some(rect) = self.rect_in_viewport(i, visual_context_tree, scroll_state_snapshot) {
-                damage_rect = damage_rect.united(rect);
-            }
+            some_scrollbar_changed |= changed;
         }
-        damage_rect
-    }
-
-    fn rect_in_viewport(
-        &self,
-        scrollbar_index: usize,
-        visual_context_tree: &AccumulatedVisualContextTree,
-        scroll_state_snapshot: &ScrollStateSnapshot,
-    ) -> Option<IntRect> {
-        let scrollbar = self.scrollbars.get(scrollbar_index)?;
-        let rect = scrollbar
-            .gutter_rect
-            .united(scrollbar.track_rect)
-            .united(scrollbar.expanded_gutter_rect);
-        if scrollbar.is_painted_by_compositor {
-            return Some(rect.inflated(2, 2));
-        }
-        if !visual_context_tree.context_is_valid(scrollbar.context) {
-            return None;
-        }
-        let rect_in_viewport = visual_context_tree.transform_rect_to_viewport(
-            scrollbar.context.spatial,
-            rect.to_float(),
-            scroll_state_snapshot,
-            IncludeVisualViewportTransform::Yes,
-        );
-        if !rect_in_viewport.x.is_finite()
-            || !rect_in_viewport.y.is_finite()
-            || !rect_in_viewport.width.is_finite()
-            || !rect_in_viewport.height.is_finite()
-        {
-            return None;
-        }
-        Some(enclosing_int_rect(rect_in_viewport).inflated(2, 2))
+        some_scrollbar_changed
     }
 }
 
@@ -719,7 +615,7 @@ fn interpolated_rect(from: IntRect, to: IntRect, progress: f32) -> FloatRect {
 }
 
 impl ScrollbarController {
-    pub fn scrollbars_of_frame(&self, scroll_state_snapshot: &ScrollStateSnapshot) -> Vec<ScrollbarOfFrame> {
+    pub fn scrollbars_of_frame(&self, scroll_state_snapshot: &ScrollStateSnapshot) -> Vec<ScrollbarShownByFrame> {
         let mut scrollbars_of_frame = Vec::with_capacity(self.scrollbars.len());
         for (i, scrollbar) in self.scrollbars.iter().enumerate() {
             let progress = self.expansion(i);
@@ -741,18 +637,13 @@ impl ScrollbarController {
                 expanded_thumb_rect = thin_thumb_rect;
             }
 
-            scrollbars_of_frame.push(ScrollbarOfFrame {
+            scrollbars_of_frame.push(ScrollbarShownByFrame {
                 scroll_node_index: scrollbar.scroll_node_index,
                 vertical: scrollbar.vertical,
-                is_painted_by_compositor: scrollbar.is_painted_by_compositor,
                 gutter_rect: interpolated_rect(scrollbar.track_rect, scrollbar.expanded_gutter_rect, progress),
                 thumb_rect: interpolated_rect(thin_thumb_rect, expanded_thumb_rect, progress),
                 expansion: progress,
                 opacity: self.opacity(i),
-                thumb_color: scrollbar.thumb_color,
-                thumb_outline_color: scrollbar.thumb_outline_color,
-                track_color: scrollbar.track_color,
-                thin_and_expanded_gutter_rect: scrollbar.gutter_rect.united(scrollbar.expanded_gutter_rect),
             });
         }
         scrollbars_of_frame

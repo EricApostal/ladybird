@@ -104,6 +104,14 @@ void VideoPresentationServerConnection::create_registered_video_edge(VideoSinkHa
             connection.async_update_edge_time_reader(edge_id, time_reader);
         });
     };
+    delegates.transmit_ticking = [weak_connection, edge_id](bool ticking) {
+        weak_connection.with_target([&](auto& connection) {
+            VERIFY(connection.m_owner_thread_id.is_current_thread());
+            if (!connection.m_edge_states.contains(edge_id))
+                return;
+            connection.async_set_sink_ticking(edge_id, ticking);
+        });
+    };
 
     auto remote_edge_or_error = PlaybackManager::create_video_edge({}, video_sink_handle, move(delegates));
     if (remote_edge_or_error.is_error()) {
@@ -137,6 +145,12 @@ void VideoPresentationServerConnection::request_start(u64 edge_id)
 {
     if (auto it = m_edge_states.find(edge_id); it != m_edge_states.end())
         it->value.pump->start_input();
+}
+
+void VideoPresentationServerConnection::request_suspend(u64 edge_id)
+{
+    if (auto it = m_edge_states.find(edge_id); it != m_edge_states.end())
+        it->value.pump->suspend_input();
 }
 
 void VideoPresentationServerConnection::request_seek(u64 edge_id, AK::Duration timestamp, InvalidateHeldData invalidate_held_data, u64 newest_received_lend_id)

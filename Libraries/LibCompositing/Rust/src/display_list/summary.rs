@@ -33,13 +33,29 @@ impl IndexedRecord {
     }
 }
 
-/// Content that changes under the list's immutable commands.
+/// Content that changes under the list's immutable commands. A record that draws it can be a layer of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LiveContent {
     Canvas(CanvasId),
     VideoFrame(VideoSinkHandle),
     ImageFrame(ImageFrameResourceId),
     CompositedContext(CompositorContextId),
+    /// A caret, which blinks.
+    Caret,
+    /// The vertical or horizontal scroll bar of the scroller of `scroll_node`, which draws what the frame shows of the
+    /// scroller.
+    ScrollBar {
+        scroll_node: SpatialNodeIndex,
+        vertical: bool,
+    },
+}
+
+impl LiveContent {
+    /// Whether its record draws all of it, as that of a caret or a scroll bar does, rather than pixels from outside the
+    /// list.
+    pub fn is_drawn_by_its_record(self) -> bool {
+        matches!(self, LiveContent::Caret | LiveContent::ScrollBar { .. })
+    }
 }
 
 /// A top-level record that draws live content, itself or in a record nested in it.
@@ -64,7 +80,6 @@ pub struct DisplayListSummary {
     pub vector_image_ids: Vec<u64>,
     pub canvas_ids: Vec<u64>,
     pub composited_context_ids: Vec<u64>,
-    pub carets: Vec<IndexedRecord>,
     pub live_content_records: Vec<LiveContentRecord>,
     pub destination_blending_records: Vec<IndexedRecord>,
     pub mask_declarations: Vec<MaskDeclarationRecord>,
@@ -99,6 +114,14 @@ pub(crate) fn live_content_of(command_type: DisplayListCommandType, payload: &[u
         T::DrawCompositedContext => Some(LiveContent::CompositedContext(
             read_command::<DrawCompositedContext>(payload).child_context_id,
         )),
+        T::PaintCaret => Some(LiveContent::Caret),
+        T::PaintScrollBar => {
+            let scroll_bar = read_command::<PaintScrollBar>(payload);
+            Some(LiveContent::ScrollBar {
+                scroll_node: scroll_bar.scroll_node_index,
+                vertical: scroll_bar.vertical,
+            })
+        }
         _ => None,
     }
 }
@@ -218,13 +241,11 @@ pub fn summarize(tape: &[u8], command_runs: &[DisplayListCommandRun]) -> Display
                 run_index: run_index as u32,
                 position: ListPosition::new(ChunkIndexInList(0), (run_start + offset_in_run) as u32),
             };
-            match header.command_type {
-                DisplayListCommandType::PaintCaret => summary.carets.push(indexed_record),
-                DisplayListCommandType::DeclareMaskContent => summary.mask_declarations.push(MaskDeclarationRecord {
+            if header.command_type == DisplayListCommandType::DeclareMaskContent {
+                summary.mask_declarations.push(MaskDeclarationRecord {
                     record: indexed_record,
                     mask_effect: read_command::<DeclareMaskContent>(payload).effect,
-                }),
-                _ => {}
+                });
             }
             if let Some((blend, blends_with_isolated_backdrop_color)) = command_blend(header.command_type, payload)
                 && blend != CompositingAndBlendingOperator::Normal
@@ -267,7 +288,6 @@ pub fn summary_of_pieces<'a>(
     let mut summary = DisplayListSummary::default();
     for (chunk_summary, first_run_index_of_chunk, chunk_index) in pieces {
         let shift_into_list = |record: &IndexedRecord| record.shifted_into_list(first_run_index_of_chunk, chunk_index);
-        summary.carets.extend(chunk_summary.carets.iter().map(shift_into_list));
         summary
             .live_content_records
             .extend(

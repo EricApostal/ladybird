@@ -154,7 +154,11 @@ pub(crate) fn hyphen_glyph_run(
 pub(crate) fn soft_hyphen_hyphenates(style: StyleValues<'_>) -> bool {
     // https://drafts.csswg.org/css-text-3/#valdef-word-break-break-all
     // Hyphenation is not applied.
-    style.hyphens() != hyphens::NONE && style.word_break() != word_break::BREAK_ALL
+    // https://drafts.csswg.org/css-text-3/#valdef-line-break-anywhere
+    // Hyphenation is not applied.
+    style.hyphens() != hyphens::NONE
+        && style.word_break() != word_break::BREAK_ALL
+        && style.line_break() != line_break::ANYWHERE
 }
 
 /// The inline size of the hyphen that a line ends in if it breaks right after `item`: none, unless the item's text ends
@@ -727,12 +731,20 @@ impl Item {
         take_first_grapheme_when_none_fits: bool,
     ) -> Option<Item> {
         let run = self.glyph_run(prepared)?;
-        if run.text_type == line_box_fragment::GLYPH_TEXT_TYPE_RTL || run.glyphs.len() < 2 {
+        if run.glyphs.len() < 2 {
             return None;
         }
         let shaped_length_in_code_units: usize = run.glyphs.iter().map(|glyph| glyph.length_in_code_units()).sum();
         if shaped_length_in_code_units != self.length_in_node {
             return None;
+        }
+        if run.text_type == line_box_fragment::GLYPH_TEXT_TYPE_RTL {
+            return self.split_right_to_left_at_shaped_glyph(
+                prepared,
+                segmenter,
+                max_border_box_inline_size,
+                take_first_grapheme_when_none_fits,
+            );
         }
 
         let leading_edge_inline_size = self.margin_start + self.border_start + self.padding_start;
@@ -771,6 +783,79 @@ impl Item {
         Some(self.take_prefix_before(self.offset_in_node + split_code_units, prefix, remainder))
     }
 
+    /// Splits off the longest logical prefix of a right-to-left run that fits `max_border_box_inline_size`, from its
+    /// shaped glyphs. Those are in visual order, so the logical prefix is the glyphs at the right end of the run.
+    fn split_right_to_left_at_shaped_glyph(
+        &mut self,
+        prepared: &PreparedInlineContent,
+        segmenter: &text_chunker::GraphemeSegmenter,
+        max_border_box_inline_size: CssPixels,
+        take_first_grapheme_when_none_fits: bool,
+    ) -> Option<Item> {
+        let run = self.glyph_run(prepared)?;
+        let placed: Vec<_> = run.glyphs.placed().collect();
+        // NB: The spacer glyphs of leading tabs come first, with ascending clusters, so in a run that has them, the
+        //     logical prefix isn't the glyphs at the right end. Leave such a run to reshaping.
+        if placed
+            .windows(2)
+            .any(|pair| pair[0].cluster_start < pair[1].cluster_start)
+        {
+            return None;
+        }
+        let leading_edge_inline_size = self.margin_start + self.border_start + self.padding_start;
+        // NB: The prefix is the glyphs from the split on, and the cluster just left of the split starts where it ends.
+        let mut split: Option<(usize, usize)> = None;
+        for glyph_index in (1..placed.len()).rev() {
+            let (left, right) = (&placed[glyph_index - 1], &placed[glyph_index]);
+            if left.cluster_start <= right.cluster_start {
+                continue;
+            }
+            let prefix_length = left.cluster_start as usize;
+            let offset = self.offset_in_node + prefix_length;
+            if segmenter.next_boundary(offset, true) != Some(offset) {
+                continue;
+            }
+            let prefix_inline_size = CssPixels::nearest_value_for_f32(run.width - right.x);
+            if leading_edge_inline_size + prefix_inline_size > max_border_box_inline_size {
+                if split.is_none() && take_first_grapheme_when_none_fits {
+                    split = Some((glyph_index, prefix_length));
+                }
+                break;
+            }
+            split = Some((glyph_index, prefix_length));
+        }
+        let (split_glyph_index, prefix_length) = split?;
+
+        let run = self.take_owned_glyph_run(prepared);
+        let split_x = run.glyphs.placed().nth(split_glyph_index)?.x;
+        let mut prefix_glyphs = libgfx_rust::text_layout::GlyphBuffer::default();
+        let mut remainder_glyphs = libgfx_rust::text_layout::GlyphBuffer::default();
+        for (glyph_index, placed) in run.glyphs.placed().enumerate() {
+            if glyph_index >= split_glyph_index {
+                prefix_glyphs.push_placed(libgfx_rust::text_layout::PlacedGlyph {
+                    x: placed.x - split_x,
+                    ..placed
+                });
+            } else {
+                remainder_glyphs.push_placed(libgfx_rust::text_layout::PlacedGlyph {
+                    cluster_start: placed.cluster_start - prefix_length as u32,
+                    ..placed
+                });
+            }
+        }
+        let prefix = OwnedGlyphRun {
+            glyphs: prefix_glyphs,
+            width: run.width - split_x,
+            is_upright: run.is_upright,
+        };
+        let remainder = OwnedGlyphRun {
+            glyphs: remainder_glyphs,
+            width: split_x,
+            is_upright: run.is_upright,
+        };
+        Some(self.take_prefix_before(self.offset_in_node + prefix_length, prefix, remainder))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn split_by_reshaping(
         &mut self,
@@ -787,9 +872,8 @@ impl Item {
         }
         let prepared_item = self.prepared_item(prepared);
         let text_type = prepared_item.text_type();
-        if text_type == line_box_fragment::GLYPH_TEXT_TYPE_RTL {
-            return None;
-        }
+        // NB: A right-to-left run splits at a grapheme boundary from its logical start too, so the part that fits is the
+        //     run's logical beginning, which the line then draws at its right end.
         let font = prepared.font_of(prepared_item);
         let start = self.offset_in_node;
         let end = start + self.length_in_node;
@@ -1861,19 +1945,27 @@ impl<'pass> InlineContentPreparer<'pass> {
             // NO-BREAK SPACE. However, with the exception of U+00A0 NO-BREAK SPACE, there must be no soft wrap
             // opportunity between atomic inlines and adjacent characters belonging to the Unicode GL, WJ, or ZWJ line
             // breaking classes."
-            // NB: The line breaker allows the break before the box, and the text after it looks for the one after it.
+            // https://drafts.csswg.org/css-text-3/#valdef-white-space-nowrap
+            // "For soft wrap opportunities defined by the boundary between two characters or atomic inlines, the
+            // white-space property on the nearest common ancestor of the two characters controls breaking"
+            // NB: The opportunity before the box is decided here, and the text after it looks for the one after it.
             //     The box stands in the text before that text as U+FFFC OBJECT REPLACEMENT CHARACTER.
+            let can_break_before = self.previous_node.is_some_and(|previous_node| {
+                self.style(self.nearest_common_ancestor(previous_node, node))
+                    .text_wrap_mode()
+                    == text_wrap_mode::WRAP
+            });
             self.previous_text = Some(&OBJECT_REPLACEMENT_CHARACTER);
             self.previous_node = Some(node);
             self.previous_text_breaks_all = false;
             self.previous_text_regional_indicators = 0;
             self.code_unit_before_previous_text = None;
             self.skip_to_next_within_item();
-            return Some(PreparedItem::new(
-                ItemType::Element,
-                node,
-                PreparedItem::TAKES_LEADING_EDGES | PreparedItem::TAKES_TRAILING_EDGES,
-            ));
+            let mut flags = PreparedItem::TAKES_LEADING_EDGES | PreparedItem::TAKES_TRAILING_EDGES;
+            if can_break_before {
+                flags |= PreparedItem::CAN_BREAK_BEFORE;
+            }
+            return Some(PreparedItem::new(ItemType::Element, node, flags));
         }
     }
 }
@@ -2379,6 +2471,7 @@ impl<'context> RunItemResolver<'_, 'context> {
     fn resolve_element_item(&mut self, item_index: usize, prepared_item: &PreparedItem) -> Item {
         let node = prepared_item.node();
         let mut item = Item::new(ItemType::Element, node, item_index);
+        item.can_break_before = prepared_item.has(PreparedItem::CAN_BREAK_BEFORE);
         if self.atomic_sizing == AtomicInlineSizing::Contributions {
             self.size_item_by_outer_inline_contributions(&mut item);
         } else {
@@ -2728,6 +2821,26 @@ impl InlineLevelIterator {
         edges + content
     }
 
+    /// Whether the next text or atomic inline is part of the same unbreakable run as the item before it.
+    pub(crate) fn next_line_content_continues_run(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> bool {
+        self.items()
+            .iter()
+            .find(|item| !sits_between_line_content(item))
+            .is_some_and(|next| match next.type_ {
+                ItemType::Element => !next.can_break_before,
+                // NB: White space ends the run only where it wraps.
+                ItemType::Text => {
+                    !next.can_break_before
+                        && (!(next.is_collapsible_whitespace || next.is_ascii_whitespace(context))
+                            || context.style(context.parent_node(next.node)).text_wrap_mode() != text_wrap_mode::WRAP)
+                }
+                _ => false,
+            })
+    }
+
     pub(crate) fn unbreakable_run_inline_size(
         &self,
         context: &inline_formatting_context::InlineFormattingContext<'_>,
@@ -2849,6 +2962,15 @@ pub(crate) fn whitespace_and_sequence_inline_size(
     whitespace: &Item,
     items: &[Item],
 ) -> Option<CssPixels> {
+    // NB: An atomic inline that a line can break before decides that break itself when the line builder comes to it, so
+    //     the white space before it stays on the line, as it would before a line break there.
+    if items
+        .iter()
+        .find(|item| !sits_between_line_content(item))
+        .is_some_and(|item| item.type_ == ItemType::Element && item.can_break_before)
+    {
+        return None;
+    }
     let (length, end) = sequence_length(context, prepared, items, false, false);
     let prefix =
         (end == SequenceEnd::SoftWrapInText).then(|| first_breakable_segment(context, prepared, &items[length], end));
@@ -2921,8 +3043,7 @@ fn starts_line_content<'item>(mut items: impl Iterator<Item = &'item Item>) -> b
     items
         .find(|item| !sits_between_line_content(item))
         .is_some_and(|item| match item.type_ {
-            ItemType::Text => item.can_break_before,
-            ItemType::Element => true,
+            ItemType::Text | ItemType::Element => item.can_break_before,
             _ => false,
         })
 }
@@ -2983,16 +3104,23 @@ fn sequence_length<'item>(
         if length > 0 && item.can_break_before {
             break;
         }
-        let style = context.style(context.style_source(item.node));
-        if style.text_wrap_mode() == text_wrap_mode::WRAP {
-            if item.type_ != ItemType::Text {
-                break;
+        match item.type_ {
+            ItemType::Text => {
+                if context.style(context.style_source(item.node)).text_wrap_mode() == text_wrap_mode::WRAP {
+                    if item.is_collapsible_whitespace || item.is_ascii_whitespace(context) {
+                        return (length, SequenceEnd::Whitespace);
+                    }
+                    if stop_at_overflow_breakable_text && context.overflow_break_applies(item.node) {
+                        return (length, SequenceEnd::OverflowBreakableText);
+                    }
+                }
             }
-            if item.is_collapsible_whitespace || item.is_ascii_whitespace(context) {
-                return (length, SequenceEnd::Whitespace);
-            }
-            if stop_at_overflow_breakable_text && context.overflow_break_applies(item.node) {
-                return (length, SequenceEnd::OverflowBreakableText);
+            // NB: Whether a line can break before an atomic inline is what its item records, as checked above.
+            ItemType::Element => {}
+            _ => {
+                if context.style(context.style_source(item.node)).text_wrap_mode() == text_wrap_mode::WRAP {
+                    break;
+                }
             }
         }
         if !(length == 0 && include_first_whole_item) && item.has_soft_wraps(prepared) {

@@ -909,12 +909,11 @@ impl CompositorCore {
                 }
             }
             _ => {
-                let caret_damage_rect = context.borrow_mut().timer_fired(timer, now);
-                if let Some(caret_damage_rect) = caret_damage_rect {
+                if context.borrow_mut().timer_fired(timer, now) {
                     self.present_requests.borrow_mut().push(PresentRequest {
                         context_id,
                         viewport_rect: None,
-                        forced_damage_rect: caret_damage_rect,
+                        forced_damage_rect: Default::default(),
                         scheduling: PresentScheduling::OnNextDisplayTick,
                     });
                 }
@@ -1016,14 +1015,11 @@ impl CompositorCore {
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }
-            let damage_rect = context
-                .borrow_mut()
-                .advance_scrollbar_fades_and_return_damage_rect(frame_time);
-            if !damage_rect.is_empty() {
+            if context.borrow_mut().advance_scrollbar_fades(frame_time) {
                 self.present_requests.borrow_mut().push(PresentRequest {
                     context_id,
                     viewport_rect: None,
-                    forced_damage_rect: damage_rect,
+                    forced_damage_rect: Default::default(),
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }

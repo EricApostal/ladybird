@@ -1191,19 +1191,20 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             if !self.line(line_index).fragments[fragment_index].takes_part_in_line_alignment() {
                 continue;
             }
-            let (node, style_source, content_baselines, box_cells, is_block_ellipsis) = {
+            // NB: An ellipsis is text in the block's style, whichever node it stands at.
+            let (node, style_source, content_baselines, box_cells, is_ellipsis) = {
                 let fragment = &self.line(line_index).fragments[fragment_index];
                 (
                     fragment.layout_node,
                     fragment.style_source,
                     fragment.content_baselines,
                     fragment.box_cells,
-                    fragment.is_block_ellipsis,
+                    fragment.is_block_ellipsis || fragment.is_text_overflow_ellipsis,
                 )
             };
             let style = self.style(style_source);
             let fragment_baseline =
-                if is_block_ellipsis || self.facts(node).is_text_node() || self.facts(node).is_fragmented_inline() {
+                if is_ellipsis || self.facts(node).is_text_node() || self.facts(node).is_fragmented_inline() {
                     self.text_fragment_layout_bounds(line_index, fragment_index, style)
                         .ascent
                 } else {
@@ -1577,10 +1578,11 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             );
         }
 
-        // Mirroring must use the retained line width, so discarded trailing spaces don't become leading gaps.
-        if self.context().atomic_items_are_right_to_left
-            && self.line(line_index).inline_length_before_block_ellipsis.is_none()
-        {
+        // https://drafts.csswg.org/css-text-3/#white-space-phase-2
+        // "A sequence of collapsible spaces at the end of a line is removed"
+        // NB: That happens before the line is aligned, so that its alignment doesn't count the spaces, and mirroring
+        //     uses the retained line width, so that discarded trailing spaces don't become leading gaps.
+        if self.line(line_index).inline_length_before_block_ellipsis.is_none() {
             self.line_mut(line_index).trim_trailing_whitespace();
         }
 
@@ -2102,6 +2104,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             }
 
             let is_text_node = self.line(line_index).fragments[fragment_index].is_block_ellipsis
+                || self.line(line_index).fragments[fragment_index].is_text_overflow_ellipsis
                 || self.facts(snapshot.layout_node).is_text_node()
                 || self.facts(snapshot.layout_node).is_fragmented_inline();
             if is_text_node {

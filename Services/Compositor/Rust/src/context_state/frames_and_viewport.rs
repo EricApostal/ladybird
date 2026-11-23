@@ -292,7 +292,6 @@ impl ContextState {
             .scrollbar_controller
             .scrollbars_of_frame(&presented_scroll_state_snapshot);
         let overlays = self.overlays.picture_of_frame(
-            &scrollbars,
             self.viewport_size,
             self.device_pixel_ratio,
             &self.host.overlay_label_shaper(self.context_id),
@@ -345,21 +344,15 @@ impl ContextState {
         }
     }
 
-    pub fn advance_scrollbar_fades_and_return_damage_rect(&mut self, frame_time: MonotonicTime) -> IntRect {
+    /// Advances the fades of the scrollbars to a frame, and answers whether any of them changed. The frame finds what
+    /// changed in the content hashes of their records.
+    pub fn advance_scrollbar_fades(&mut self, frame_time: MonotonicTime) -> bool {
         if self.scene.visual_context_tree().is_none() {
-            return Default::default();
+            return false;
         }
-        let stretched_scroll_state_snapshot = self.scroll_state_snapshot_stretched_by_elastic_overscrolls();
-        let presented_scroll_state_snapshot = stretched_scroll_state_snapshot
-            .as_ref()
-            .unwrap_or(&self.scroll_state_snapshot);
-        let damage_rect = self.scrollbar_controller.advance_fades(
-            self.scene.visual_context_tree_for_compositing(),
-            presented_scroll_state_snapshot,
-            frame_time,
-        );
+        let some_scrollbar_changed = self.scrollbar_controller.advance_fades(frame_time);
         self.report_scrollbar_visibility_changes();
-        damage_rect
+        some_scrollbar_changed
     }
 
     /// Each frame shows the scrollbars as of when it is painted, so this updates which of them are shown. Empty until a
@@ -410,10 +403,10 @@ impl ContextState {
         let capture_time = now;
         self.advance_visual_animations(capture_time);
         self.update_scrollbar_visibility(now);
-        let scrollbar_fade_damage_rect = self.advance_scrollbar_fades_and_return_damage_rect(capture_time);
+        let scrollbar_fades_changed = self.advance_scrollbar_fades(capture_time);
         ScreenshotInputs {
             frame_inputs: self.frame_inputs_as_presented_now(capture_time),
-            scrollbar_fade_damage_rect,
+            scrollbar_fades_changed,
         }
     }
 

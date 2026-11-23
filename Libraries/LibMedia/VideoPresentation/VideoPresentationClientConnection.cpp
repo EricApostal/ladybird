@@ -40,7 +40,7 @@ ErrorOr<void> VideoPresentationClientConnection::create_edge(VideoSinkHandle han
     if (m_edge_states.size() >= MAX_EDGE_COUNT)
         return Error::from_string_literal("Too many video edges");
     auto edge_id = m_next_edge_id++;
-    m_edge_states.set(edge_id, EdgeState { .handle = handle, .on_ready = move(on_ready), .consumer = nullptr, .sink = nullptr, .time_reader = {}, .sender_id = allocate_sender_id(), .expected_requested_seek_id = 0 });
+    m_edge_states.set(edge_id, EdgeState { .handle = handle, .on_ready = move(on_ready), .consumer = nullptr, .sink = nullptr, .time_reader = {}, .sender_id = allocate_sender_id(), .expected_requested_seek_id = 0, .ticking = {} });
     async_create_video_edge(handle, edge_id);
     return {};
 }
@@ -75,6 +75,11 @@ void VideoPresentationClientConnection::video_edge_ready(u64 edge_id, MediaTimeR
             connection.async_request_start(edge_id);
         });
     };
+    consumer_delegates.request_suspend = [weak_connection, edge_id] {
+        weak_connection.with_target([&](auto& connection) {
+            connection.async_request_suspend(edge_id);
+        });
+    };
     consumer_delegates.request_seek = [weak_connection, edge_id](AK::Duration timestamp, InvalidateHeldData invalidate_held_data, u64 newest_received_lend_id) {
         weak_connection.with_target([&](auto& connection) {
             connection.async_request_seek(edge_id, timestamp, invalidate_held_data, newest_received_lend_id);
@@ -102,9 +107,22 @@ void VideoPresentationClientConnection::video_edge_ready(u64 edge_id, MediaTimeR
 
     edge_state->consumer = consumer;
     edge_state->sink = sink;
+    auto ticking = edge_state->ticking;
     auto on_ready = move(edge_state->on_ready);
     if (on_ready)
         on_ready(sink);
+    if (ticking.has_value())
+        sink->set_ticking(*ticking);
+}
+
+void VideoPresentationClientConnection::set_sink_ticking(u64 edge_id, bool ticking)
+{
+    auto edge_state = m_edge_states.get(edge_id);
+    if (!edge_state.has_value())
+        return;
+    edge_state->ticking = ticking;
+    if (edge_state->sink)
+        edge_state->sink->set_ticking(ticking);
 }
 
 void VideoPresentationClientConnection::update_edge_time_reader(u64 edge_id, MediaTimeReader time_reader)

@@ -47,12 +47,18 @@ ALLOWED_REALM_MENTIONS = {
         "CSS Typed OM, parser-facing reification, style-value JS materialization, setlike/maplike glue, and wrappers of declaration blocks owned by Rust objects",
     ),
     "Clipboard": (4, 8, "the C++ facades create the Rust objects and wrap DataTransfers in a given realm"),
-    "ContentSecurityPolicy": (4, 10, "CSP violation/report objects and callbacks still materialize JS-facing values"),
+    "ContentSecurityPolicy": (
+        6,
+        13,
+        "CSP violation/report objects and callbacks still materialize JS-facing values; "
+        "the C++ glue of the Rust SecurityPolicyViolationEvent creates it in a given realm",
+    ),
     "CookieStore": (2, 3, "the C++ facade creates the Rust CookieStore in a given realm"),
     "DOM": (
-        9,
-        30,
-        "The AbortSignal and AbortController facades and node helpers use callback/materialization realms",
+        11,
+        35,
+        "The AbortSignal and AbortController facades and node helpers use callback/materialization realms; "
+        "the C++ glue of the Rust CustomEvent creates it in a given realm",
     ),
     "Fetch": (
         22,
@@ -77,11 +83,21 @@ ALLOWED_REALM_MENTIONS = {
     ),
     "Infra": (2, 13, "JSON parse/serialization helpers still expose JS values in selected realms"),
     "Internals": (1, 1, "test-only internals still expose JS-facing helper objects and promises"),
+    "MediaCapture": (
+        2,
+        5,
+        "the C++ glue of the Rust MediaStreamTrackEvent creates it and wraps tracks in a given realm",
+    ),
     "MediaSession": (
         4,
         10,
         "MediaMetadata and ChapterInformation build the frozen arrays their [SameObject] FrozenArray attributes return, "
         "freezing the elements too, which the generated conversion doesn't do",
+    ),
+    "PictureInPicture": (
+        2,
+        5,
+        "the C++ glue of the Rust PictureInPictureEvent creates it and wraps windows in a given realm",
     ),
     "SVG": (2, 8, "SVG length objects still store/use realms for detached/reflected JS/CSS materialization"),
     "ServiceWorker": (

@@ -22,6 +22,7 @@ use libcompositing_rust::display_list::layers::{
     WindowServerPlacementsOfMedia,
 };
 use libcompositing_rust::display_list::summary::LiveContent as LiveMedia;
+use libcompositing_rust::display_list::tiles::TileCoord;
 use libcompositing_rust::display_list::window_server_placement::{
     WhyWindowServerCannotShowMedia, WindowServerPlacement,
 };
@@ -297,7 +298,10 @@ impl ContextPresenting {
                 }
                 (MediaKind::Video, id.0)
             }
-            LiveMedia::ImageFrame(_) | LiveMedia::CompositedContext(_) => {
+            LiveMedia::ImageFrame(_)
+            | LiveMedia::CompositedContext(_)
+            | LiveMedia::Caret
+            | LiveMedia::ScrollBar { .. } => {
                 return Some(WhyMediaIsReplayed::NoPlacement(*content));
             }
         };
@@ -448,7 +452,7 @@ impl ContextPresenting {
         raster.clear(target, Color::TRANSPARENT);
         let save_count = raster.save(target);
         raster.translate(target, -overlays_rect.x as f32, -overlays_rect.y as f32);
-        self.paint_overlays(env, target, frame.frame_inputs, true);
+        self.paint_overlays(env, target, frame.frame_inputs);
         raster.restore_to_count(target, save_count);
         self.layers.window_server.latest_compositor_overlays_surface_and_rect = Some((presentable, overlays_rect));
         // An overlay of the layers shows what the frame did, which the next frame does not repeat.
@@ -484,16 +488,15 @@ impl ContextPresenting {
 
     /// Appends the sublayers of a painted layer the window server shows tile by tile, in the group of `group_index`,
     /// whose pixels are the frame's: a group per clip the layer is composited within, each in the one before, and in
-    /// the innermost, the group of the layer's space, which holds the tiles of the layer that reach into the viewport,
-    /// and a fill per run of tiles of one color.
+    /// the innermost, the group of the layer's space, which holds `draws` of the layer: its tiles and a fill per run of
+    /// tiles of one color.
     fn append_sublayers_of_tiled_layer(
         &self,
         sublayers: &mut Vec<FfiSublayer>,
         compositing: &LayerCompositingInFrame,
-        viewport_rect: IntRect,
+        draws: Vec<TileDraw<'_>>,
         group_index: i32,
     ) {
-        let draws = self.layers.tiles.draws_reaching_into(compositing, viewport_rect);
         if draws.is_empty() {
             return;
         }
@@ -688,7 +691,9 @@ impl ContextPresenting {
             let group_index = entered_composited_bands_and_their_groups
                 .last()
                 .map_or(-1, |(_, group_index)| *group_index);
-            if let LayerIdentity::Media { content, ordinal } = layer.identity {
+            if let (LayerContent::Media { .. }, LayerIdentity::Media { content, ordinal }) =
+                (&layer.content, layer.identity)
+            {
                 let Some(Ok(placement)) = painted.window_server_placements_of_media.of_layer(layer_index) else {
                     continue;
                 };
@@ -711,7 +716,10 @@ impl ContextPresenting {
                             .get(&id.0)
                             .is_some_and(|sink| sink.has_frame && sink.frame_has_surface),
                     ),
-                    LiveMedia::ImageFrame(_) | LiveMedia::CompositedContext(_) => continue,
+                    LiveMedia::ImageFrame(_)
+                    | LiveMedia::CompositedContext(_)
+                    | LiveMedia::Caret
+                    | LiveMedia::ScrollBar { .. } => continue,
                 };
                 if !has_content {
                     continue;
@@ -728,8 +736,21 @@ impl ContextPresenting {
                 });
                 continue;
             }
+            if let LayerContent::OwnSurface { .. } = layer.content {
+                if let Some((surface, rect_in_layer_space)) = self.layers.tiles.own_surface_of(&compositing.identity) {
+                    let draw = TileDraw::TileSurface {
+                        coord: TileCoord::new(0, 0),
+                        surface,
+                        every_pixel_is_opaque: false,
+                        rect_in_layer_space,
+                    };
+                    self.append_sublayers_of_tiled_layer(&mut sublayers, compositing, vec![draw], group_index);
+                }
+                continue;
+            }
             if painted.window_server_compositing.shows_tiles_of_painted_layers {
-                self.append_sublayers_of_tiled_layer(&mut sublayers, compositing, viewport_rect, group_index);
+                let draws = self.layers.tiles.draws_reaching_into(compositing, viewport_rect);
+                self.append_sublayers_of_tiled_layer(&mut sublayers, compositing, draws, group_index);
                 continue;
             }
             let Some(presentation) = layers.presentation_by_layer.get(&compositing.identity) else {

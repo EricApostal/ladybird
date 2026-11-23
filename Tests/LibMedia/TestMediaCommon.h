@@ -158,10 +158,10 @@ public:
         append_output(move(frame), Media::PipelineStatus::HaveData);
     }
 
-    void append_output(RefPtr<Media::VideoFrame> frame, Media::PipelineStatus status)
+    void append_output(RefPtr<Media::VideoFrame> frame, Media::PipelineStatus status, Media::PipelineCheckpoint checkpoint = 0)
     {
         MutexLocker locker { m_mutex };
-        m_outputs.append({ move(frame), status });
+        m_outputs.append({ move(frame), status, checkpoint });
     }
 
     void wake()
@@ -170,7 +170,8 @@ public:
             m_wake_handler();
     }
 
-    virtual void start() override { }
+    virtual void start() override { m_start_count++; }
+    virtual void suspend() override { m_suspend_count++; }
     virtual Media::VideoProducerOutput peek() override
     {
         MutexLocker locker { m_mutex };
@@ -184,9 +185,16 @@ public:
         (void)m_outputs.take_first();
     }
     virtual void set_wake_handler(Media::PipelineWakeHandler handler) override { m_wake_handler = move(handler); }
-    virtual void seek(AK::Duration, Media::InvalidateHeldData = Media::InvalidateHeldData::No) override { m_seek_count++; }
+    virtual void seek(AK::Duration timestamp, Media::InvalidateHeldData = Media::InvalidateHeldData::No) override
+    {
+        m_seek_count++;
+        m_last_seek_timestamp = timestamp;
+    }
 
     size_t seek_count() const { return m_seek_count; }
+    Optional<AK::Duration> last_seek_timestamp() const { return m_last_seek_timestamp; }
+    size_t start_count() const { return m_start_count; }
+    size_t suspend_count() const { return m_suspend_count; }
 
 private:
     ScriptedVideoProducer() = default;
@@ -194,6 +202,9 @@ private:
     Mutex m_mutex;
     Vector<Media::VideoProducerOutput> m_outputs;
     size_t m_seek_count { 0 };
+    Optional<AK::Duration> m_last_seek_timestamp;
+    size_t m_start_count { 0 };
+    size_t m_suspend_count { 0 };
     Media::PipelineWakeHandler m_wake_handler;
 };
 
