@@ -2739,7 +2739,7 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
         auto page = fetch_params.controller()->page();
         auto http_request = http_fetch_params->request();
 
-        if (page && page->has_top_level_traversable() && http_request->current_url().scheme().is_one_of("http"sv, "https"sv)) {
+        if (page->has_top_level_traversable() && http_request->current_url().scheme().is_one_of("http"sv, "https"sv)) {
             auto returned_pending_response = PendingResponse::create(fetch_params);
 
             auto document_url = http_request->current_url();
