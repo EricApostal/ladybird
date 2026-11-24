@@ -389,6 +389,7 @@ set(SOURCES
     HTML/EventNames.cpp
     HTML/EventSource.cpp
     HTML/External.cpp
+    HTML/ExtensionHooks.cpp
     HTML/Focus.cpp
     HTML/FormAssociatedElement.cpp
     HTML/FormControlInfrastructure.cpp

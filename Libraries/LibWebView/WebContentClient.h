@@ -269,6 +269,11 @@ private:
     virtual void request_video_presentation_channel() override;
     virtual void gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect) override;
     virtual void gamepad_stop_effects(Web::Gamepad::GamepadHandle handle) override;
+    virtual void extension_context_created(Web::PageId page_id, u64 context_id, String extension_uuid, String url, bool is_top_level) override;
+    virtual void extension_context_destroyed(Web::PageId page_id, u64 context_id) override;
+    virtual void extension_message_from_context(Web::PageId page_id, u64 context_id, String payload) override;
+    virtual void request_extension_resource(Web::PageId page_id, u64 request_id, URL::URL url) override;
+    virtual void request_extension_intercept(Web::PageId page_id, u64 request_id, String details) override;
 
     void remember_compositor_context(Web::CompositorContextId, Optional<Web::PageId> page_id);
     void fail_renderer_owned_downloads();

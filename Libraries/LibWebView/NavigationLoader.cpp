@@ -30,6 +30,7 @@
 #include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CanonicalWindow.h>
+#include <LibWebView/ExtensionBridge.h>
 #include <LibWebView/NavigationLoader.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/RequestServerSiteBindings.h>
@@ -409,6 +410,15 @@ void NavigationLoader::acquire_response_body(WebContentClient const& population_
             read_local_file_for_response();
             return;
         }
+        if (response_url.scheme() == "moz-extension"sv) {
+            // NB: Only this process reads an extension's files, so a response for one that names a body is made up.
+            if (body_handle) {
+                did_acquire(false);
+                return;
+            }
+            read_extension_resource_for_response(response_url);
+            return;
+        }
     }
     if (!body_handle) {
         did_acquire(!reports_an_http_response_of_its_own());
@@ -471,6 +481,29 @@ void NavigationLoader::read_local_file_for_response()
                 loader->did_read_local_file_for_response(move(local_file));
         });
     });
+}
+
+// NB: An extension's files are small and read at most once per page, so they are read here rather than off the main
+//     thread. The process that fetched the navigation's response did not read the file either.
+void NavigationLoader::read_extension_resource_for_response(URL::URL const& url)
+{
+    if (!m_completion_steps)
+        return;
+
+    auto resource = ExtensionBridge::the().read_resource(url);
+
+    // NB: A file this process cannot read creates an error document, as a network error does.
+    if (resource.is_error()) {
+        m_result->navigation_params = Web::HTML::NavigationParamsNullOrError { Utf16String::formatted("{}", resource.error()) };
+        did_acquire(true);
+        return;
+    }
+
+    auto& response = m_result->navigation_params.get<Web::HTML::NavigationParamsDescriptor>().response;
+    auto header_list = Web::response_headers_for_file(resource.value().path, resource.value().data.size(), static_cast<time_t>(resource.value().modified_time));
+    response.headers = header_list->headers();
+    response.body = move(resource.value().data);
+    did_acquire(true);
 }
 
 Optional<LocalFileRoot> NavigationLoader::root_of_local_file(ByteString const& canonical_path) const

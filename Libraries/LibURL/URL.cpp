@@ -448,6 +448,13 @@ Origin URL::origin() const
     if (scheme() == "blob"sv && blob_url_entry().has_value())
         return blob_url_entry()->environment.origin;
 
+    // AD-HOC: A browser extension's pages and files have an origin of their own: the scheme and the host, which is an
+    //         identifier unique to that extension. The URL standard gives a non-special scheme an opaque origin.
+    if (scheme() == "moz-extension"sv && !serialized_host().is_empty()) {
+        if (auto extension_id = String::from_utf8(serialized_host()); !extension_id.is_error())
+            return Origin { "moz-extension"_string, Host { extension_id.release_value() }, {} };
+    }
+
     // NB: liburl_rust runs the remaining steps.
     auto rust_url = to_rust();
     Optional<Origin> origin;

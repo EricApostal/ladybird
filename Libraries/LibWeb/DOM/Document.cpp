@@ -149,6 +149,7 @@
 #include <LibWeb/HTML/DragEvent.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/ExtensionHooks.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/HTMLAllCollection.h>
 #include <LibWeb/HTML/HTMLAnchorElement.h>
@@ -720,6 +721,10 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     //        header given document and navigationParams's response .
 
     // FIXME: 21. Potentially free deferred fetch quota for document.
+
+    // AD-HOC: Let the embedder run content scripts now, with the document's URL known and before anything is parsed.
+    if (auto* hooks = HTML::ExtensionHooks::the())
+        hooks->document_did_start(*document);
 
     // 22. Return document.
     return document;
@@ -6403,6 +6408,10 @@ void Document::run_unloading_cleanup_steps()
 void Document::destroy()
 {
     page().active_media_session_tracker().document_became_inactive(*this);
+
+    // AD-HOC: Let the embedder release what it holds for this document, such as content script worlds.
+    if (auto* hooks = HTML::ExtensionHooks::the())
+        hooks->document_will_be_destroyed(*this);
 
     // FIXME: 1. Assert: this is running as part of a task queued on document's relevant agent's event loop.
 

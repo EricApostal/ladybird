@@ -333,6 +333,12 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     did_find_in_page(Web::PageId page_id, size_t current_match_index, Optional<size_t> total_match_count) =|
 
+    [NotRouted] extension_context_created(Web::PageId page_id, u64 context_id, String extension_uuid, String url, bool is_top_level) =|
+    [NotRouted] extension_context_destroyed(Web::PageId page_id, u64 context_id) =|
+    [NotRouted] extension_message_from_context(Web::PageId page_id, u64 context_id, String payload) =|
+    [NotRouted] request_extension_resource(Web::PageId page_id, u64 request_id, URL::URL url) =|
+    [NotRouted] request_extension_intercept(Web::PageId page_id, u64 request_id, String details) =|
+
     [NotRouted] start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id, Optional<IPC::TransportHandle> thread_transport, bool is_hosted_in_caller_process)
     [NotRouted] close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
     [NotRouted] register_dedicated_worker(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport) =|

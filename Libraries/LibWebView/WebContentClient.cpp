@@ -32,6 +32,7 @@
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CanonicalWindow.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/ExtensionBridge.h>
 #include <LibWebView/GamepadManager.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HelperProcess.h>
@@ -261,7 +262,58 @@ void WebContentClient::gamepad_stop_effects(Web::Gamepad::GamepadHandle handle)
 
 void WebContentClient::die()
 {
+    ExtensionBridge::the().client_did_close(*this);
     did_lose_process();
+}
+
+void WebContentClient::extension_context_created(Web::PageId page_id, u64 context_id, String extension_uuid, String url, bool is_top_level)
+{
+    if (may_act_for_page(page_id))
+        ExtensionBridge::the().context_created(*this, page_id, context_id, move(extension_uuid), move(url), is_top_level);
+}
+
+void WebContentClient::extension_context_destroyed(Web::PageId page_id, u64 context_id)
+{
+    // NB: A page's documents are destroyed as its tab closes, after the page has gone, so this is not checked against
+    //     the pages that remain; the bridge only forgets contexts that this process announced.
+    (void)page_id;
+    ExtensionBridge::the().context_destroyed(*this, context_id);
+}
+
+void WebContentClient::extension_message_from_context(Web::PageId page_id, u64 context_id, String payload)
+{
+    if (may_act_for_page(page_id))
+        ExtensionBridge::the().message_from_context(*this, context_id, move(payload));
+}
+
+void WebContentClient::request_extension_intercept(Web::PageId page_id, u64 request_id, String details)
+{
+    if (!may_act_for_page(page_id)) {
+        async_extension_intercept_verdict(request_id, "{}"_string);
+        return;
+    }
+    ExtensionBridge::the().intercept_requested(*this, page_id, request_id, move(details));
+}
+
+void WebContentClient::request_extension_resource(Web::PageId page_id, u64 request_id, URL::URL url)
+{
+    if (!may_act_for_page(page_id))
+        return;
+
+    // NB: The process may not read the extension's files, so this process does, and sends them.
+    auto resource = ExtensionBridge::the().read_resource(url);
+    if (resource.is_error()) {
+        async_extension_resource_loaded(request_id, false, {}, 0);
+        return;
+    }
+
+    auto buffer = Core::AnonymousBuffer::create_with_size(resource.value().data.size());
+    if (buffer.is_error()) {
+        async_extension_resource_loaded(request_id, false, {}, 0);
+        return;
+    }
+    resource.value().data.bytes().copy_to(Bytes { buffer.value().data<u8>(), buffer.value().size() });
+    async_extension_resource_loaded(request_id, true, buffer.release_value(), resource.value().modified_time);
 }
 
 // A tab the user left is likely to stay in the background for long, and its process keeps much that only makes it

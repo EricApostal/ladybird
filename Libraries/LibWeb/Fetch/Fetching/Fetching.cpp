@@ -59,6 +59,7 @@
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/ExtensionHooks.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
@@ -1743,6 +1744,31 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
 
         return nonstandard_resource_loader_file_or_http_network_fetch(realm, fetch_params);
     }
+    // -> "moz-extension"
+    // AD-HOC: The files of a browser extension.
+    else if (request->current_url().scheme() == "moz-extension"sv) {
+        auto error = PendingResponse::create(fetch_params, Infrastructure::Response::network_error("Request with 'moz-extension:' URL blocked"_string));
+
+        // A navigation of the browser's own, such as opening an extension's page, is allowed. Anything else is allowed
+        // for the extension's own documents, and for what the extension made available to web pages.
+        bool browser_initiated_navigation = !request->client_snapshot() && request->mode() == Infrastructure::Request::Mode::Navigate;
+        if (!browser_initiated_navigation) {
+            auto* hooks = HTML::ExtensionHooks::the();
+            auto const* origin = request->origin().get_pointer<URL::Origin>();
+            if (!hooks || !hooks->allows_extension_resource(request->current_url(), origin))
+                return error;
+        }
+
+        // NB: The browser process reads the file of a navigation and gives it to the process creating the document, as
+        //     it does for a file: URL.
+        if (request->mode() == Infrastructure::Request::Mode::Navigate && request->reserved_client_snapshot()) {
+            auto response = Infrastructure::Response::create();
+            response->set_status_message("OK"sv);
+            return PendingResponse::create(fetch_params, response);
+        }
+
+        return nonstandard_resource_loader_file_or_http_network_fetch(realm, fetch_params);
+    }
     // -> HTTP(S) scheme
     else if (Infrastructure::is_http_or_https_scheme(request->current_url().scheme())) {
         // Return the result of running HTTP fetch given fetchParams.
@@ -2707,6 +2733,57 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
     // 9. If aborted, then return the appropriate network error for fetchParams.
     if (aborted)
         return PendingResponse::create(fetch_params, Infrastructure::Response::appropriate_network_error(fetch_params));
+
+    // AD-HOC: A browser extension can block a request before it is sent, send it somewhere else, or change its headers.
+    if (auto* hooks = HTML::ExtensionHooks::the(); hooks && is_authentication_fetch == IsAuthenticationFetch::No && hooks->wants_request_interception()) {
+        auto page = fetch_params.controller()->page();
+        auto http_request = http_fetch_params->request();
+
+        if (page && page->has_top_level_traversable() && http_request->current_url().scheme().is_one_of("http"sv, "https"sv)) {
+            auto returned_pending_response = PendingResponse::create(fetch_params);
+
+            auto document_url = http_request->current_url();
+            if (auto const& client = http_request->client_snapshot())
+                document_url = client->content_blocker_source_url;
+
+            HTML::ExtensionHooks::InterceptedRequest intercepted {
+                .page_id = page->client().id(),
+                .request_id = MUST(String::formatted("{}", reinterpret_cast<uintptr_t>(http_request.ptr()))),
+                .url = http_request->current_url(),
+                .method = http_request->method(),
+                .resource_type = HTML::ExtensionHooks::resource_type_for(*http_request),
+                .document_url = move(document_url),
+                .is_top_level = http_request->destination() == Infrastructure::Request::Destination::Document,
+            };
+
+            auto continuation = GC::create_function(realm.heap(), GC::captures(realm, NonnullRefPtr { fetch_params }, http_fetch_params, response, stored_response, http_cache, is_authentication_fetch, is_new_connection_fetch, include_credentials, returned_pending_response), [](auto& realm, auto& fetch_params, auto& http_fetch_params, auto& response, auto& stored_response, auto& http_cache, auto& is_authentication_fetch, auto& is_new_connection_fetch, auto& include_credentials, auto& returned_pending_response, HTML::ExtensionHooks::InterceptVerdict verdict) {
+                // The fetch can be canceled while its request waits for the extensions.
+                if (fetch_params->is_canceled()) {
+                    returned_pending_response->resolve(Infrastructure::Response::appropriate_network_error(*fetch_params));
+                    return;
+                }
+                if (verdict.cancel) {
+                    returned_pending_response->resolve(Infrastructure::Response::network_error("The request was blocked by an extension"_string));
+                    return;
+                }
+
+                auto http_request = http_fetch_params->request();
+                if (verdict.redirect_url.has_value())
+                    http_request->url_list().last() = *verdict.redirect_url;
+                for (auto const& header : verdict.request_headers)
+                    http_request->header_list()->set(header);
+
+                auto pending_response = continue_http_network_or_cache_fetch(realm.global_object(), *fetch_params, *http_fetch_params, response, stored_response, http_cache, is_authentication_fetch, is_new_connection_fetch, include_credentials);
+                pending_response->when_loaded(GC::create_function(GC::Heap::the(), GC::captures(returned_pending_response), [](GC::Ref<PendingResponse>& returned_pending_response, NonnullRefPtr<Infrastructure::Response> response) { returned_pending_response->resolve(response); }));
+            });
+
+            // NB: The extensions answer from another process, so the continuation is held by a root until they do.
+            hooks->intercept_request(move(intercepted), [continuation = GC::make_root(continuation)](HTML::ExtensionHooks::InterceptVerdict verdict) {
+                continuation->function()(move(verdict));
+            });
+            return returned_pending_response;
+        }
+    }
 
     if (WebDriver::BiDi::network_events_enabled()) {
         auto intercepts = WebDriver::BiDi::get_network_intercepts(*http_fetch_params, "beforeRequestSent"sv);

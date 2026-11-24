@@ -30,6 +30,7 @@ set(SOURCES
     CrashReportSubmission.cpp
     DownloadSegmentation.cpp
     DownloadStore.cpp
+    ExtensionBridge.cpp
     ExternalURLHandler.cpp
     FaviconStore.cpp
     FileDownloader.cpp

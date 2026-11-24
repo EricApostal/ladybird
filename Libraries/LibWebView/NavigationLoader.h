@@ -125,6 +125,7 @@ private:
         ByteString canonical_path;
     };
     void read_local_file_for_response();
+    void read_extension_resource_for_response(URL::URL const&);
     Optional<LocalFileRoot> root_of_local_file(ByteString const& canonical_path) const;
     void did_read_local_file_for_response(ErrorOr<LocalFile>);
 

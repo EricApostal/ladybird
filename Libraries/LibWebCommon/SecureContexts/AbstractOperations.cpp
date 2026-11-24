@@ -43,6 +43,10 @@ Trustworthiness is_origin_potentially_trustworthy(URL::Origin const& origin)
     if (origin.scheme() == "file"sv || origin.scheme() == "resource"sv)
         return Trustworthiness::PotentiallyTrustworthy;
 
+    // AD-HOC: The files of a browser extension come from the browser itself.
+    if (origin.scheme() == "moz-extension"sv)
+        return Trustworthiness::PotentiallyTrustworthy;
+
     // 7. If origin’s scheme component is one which the user agent considers to be authenticated, return "Potentially Trustworthy".
     // Note: See § 7.1 Packaged Applications for detail here.
 

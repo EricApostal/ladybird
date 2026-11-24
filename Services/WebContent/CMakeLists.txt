@@ -4,6 +4,8 @@ set(SOURCES
     DevToolsConsoleClient.cpp
     DevToolsDebugger.cpp
     DevToolsIndexedDB.cpp
+    ExtensionMatching.cpp
+    ExtensionRuntime.cpp
     PageClient.cpp
     PageHost.cpp
     TestConnection.cpp

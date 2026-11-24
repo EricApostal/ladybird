@@ -111,6 +111,7 @@
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/DevToolsDebugger.h>
 #include <WebContent/DevToolsIndexedDB.h>
+#include <WebContent/ExtensionRuntime.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/PageHost.h>
 #include <WebContent/TestConnection.h>
@@ -3475,6 +3476,31 @@ void ConnectionFromClient::set_content_blockers(Core::AnonymousBuffer patterns_b
 
     if (had_cosmetic_rules || blocker.has_cosmetic_rules())
         m_page_host->invalidate_user_style();
+}
+
+void ConnectionFromClient::set_extension_state(Core::AnonymousBuffer state_buffer)
+{
+    auto& runtime = ExtensionRuntime::the();
+    runtime.set_connection(*this);
+    runtime.set_state(state_buffer.bytes());
+}
+
+void ConnectionFromClient::extension_message_to_context(u64 context_id, String payload)
+{
+    ExtensionRuntime::the().deliver_to_context(context_id, payload);
+}
+
+void ConnectionFromClient::extension_intercept_verdict(u64 request_id, String verdict)
+{
+    ExtensionRuntime::the().intercept_verdict(request_id, verdict);
+}
+
+void ConnectionFromClient::extension_resource_loaded(u64 request_id, bool success, Core::AnonymousBuffer data, i64 modified_time)
+{
+    // NB: A buffer's size is what its sender claims, so check the backing store before reading it.
+    if (success && data.validate_backing_size().is_error())
+        success = false;
+    ExtensionRuntime::the().resource_loaded(request_id, success, success ? data.bytes() : ReadonlyBytes {}, modified_time);
 }
 
 void ConnectionFromClient::set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host)

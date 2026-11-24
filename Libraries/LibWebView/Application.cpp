@@ -53,6 +53,7 @@
 #include <LibWebView/CrashReport.h>
 #include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportStore.h>
+#include <LibWebView/ExtensionBridge.h>
 #include <LibWebView/FontService.h>
 #include <LibWebView/FontServiceHost.h>
 #include <LibWebView/HSTSStore.h>
@@ -1208,6 +1209,8 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 
     if (m_content_blocker_list_buffer.has_value())
         client->async_set_content_blockers(*m_content_blocker_list_buffer);
+
+    ExtensionBridge::the().did_create_client(*client);
 
     m_web_content_clients.set(client);
     return client;
