@@ -73,10 +73,10 @@ bool ExtensionBridge::respond_to_intercept(u64 request_id, String const& verdict
     auto serial = static_cast<u32>(request_id >> 32);
     auto local_request_id = request_id & 0xFFFFFFFFu;
 
-    auto client = m_clients.get(serial);
-    if (!client.has_value())
+    auto client = m_clients.find(serial);
+    if (client == m_clients.end())
         return false;
-    auto strong = client->strong_ref();
+    auto strong = client->value.strong_ref();
     if (!strong)
         return false;
 
@@ -106,10 +106,10 @@ bool ExtensionBridge::send_to_context(u64 context_id, String const& payload)
     auto serial = static_cast<u32>(context_id >> 32);
     auto local_context_id = context_id & 0xFFFFFFFFu;
 
-    auto client = m_clients.get(serial);
-    if (!client.has_value())
+    auto client = m_clients.find(serial);
+    if (client == m_clients.end())
         return false;
-    auto strong = client->strong_ref();
+    auto strong = client->value.strong_ref();
     if (!strong)
         return false;
 
