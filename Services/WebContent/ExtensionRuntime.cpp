@@ -391,6 +391,9 @@ void ExtensionRuntime::start_context(Web::DOM::Document& document, ExtensionEntr
 
     auto& realm = world.realm();
 
+    // Native functions belong to the VM's current realm unless told otherwise, and nothing is running yet.
+    Web::HTML::TemporaryExecutionContext temporary_execution_context { realm };
+
     // The context's only way out is two functions: one that sends a string to the browser, and one that registers where
     // the browser's strings are delivered. Everything else an extension can do is built from them in the shim, which
     // removes them from the global again once it holds them.
