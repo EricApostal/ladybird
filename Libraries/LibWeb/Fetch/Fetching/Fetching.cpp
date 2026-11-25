@@ -741,8 +741,15 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
             && request->current_url().scheme() == "file"sv
             && request->destination() == Infrastructure::Request::Destination::Font;
 
+        // AD-HOC: A browser extension's own pages read from the hosts the extension was granted as if they were of the
+        //         same origin, without CORS, as in Firefox.
+        auto is_permitted_extension_request = false;
+        if (auto* hooks = HTML::ExtensionHooks::the(); hooks && origin && !origin->is_opaque() && origin->scheme() == "moz-extension"sv)
+            is_permitted_extension_request = hooks->allows_cross_origin_request(*origin, request->current_url());
+
         if (
             (origin && request->current_url().origin().is_same_origin(*origin) && request->response_tainting() == Infrastructure::Request::ResponseTainting::Basic)
+            || is_permitted_extension_request
             || is_file_to_file_font_load
             || request->current_url().scheme() == "data"sv
             || (request->mode() == Infrastructure::Request::Mode::Navigate || request->mode() == Infrastructure::Request::Mode::WebSocket)) {

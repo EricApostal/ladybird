@@ -227,6 +227,10 @@ void ExtensionRuntime::set_state(ReadonlyBytes bytes)
 
             ExtensionEntry entry;
             entry.uuid = *uuid;
+            for (auto const& source : read_strings(object, "hostPermissions"sv)) {
+                if (auto pattern = MatchPattern::parse(source); pattern.has_value())
+                    entry.host_permissions.append(pattern.release_value());
+            }
             entry.init = object.get_string("init"sv).value_or("{}"_string);
 
             if (auto scripts = object.get_array("contentScripts"sv); scripts.has_value()) {
@@ -569,6 +573,25 @@ void ExtensionRuntime::document_will_be_destroyed(Web::DOM::Document& document)
 }
 
 // MARK: Extension files
+
+bool ExtensionRuntime::allows_cross_origin_request(URL::Origin const& origin, URL::URL const& url)
+{
+    if (origin.is_opaque() || origin.scheme() != "moz-extension"sv)
+        return false;
+    if (!url.scheme().is_one_of("http"sv, "https"sv))
+        return false;
+
+    auto host = origin.host().serialize();
+    auto const* extension = find_extension(host);
+    if (!extension)
+        return false;
+
+    for (auto const& pattern : extension->host_permissions) {
+        if (pattern.matches(url))
+            return true;
+    }
+    return false;
+}
 
 bool ExtensionRuntime::allows_extension_resource(URL::URL const& url, URL::Origin const* requesting_origin)
 {

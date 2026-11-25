@@ -66,6 +66,7 @@ struct ExtensionEntry {
     String init;
     Vector<ExtensionContentScript> content_scripts;
     Vector<ExtensionWebAccessibleRule> web_accessible;
+    Vector<MatchPattern> host_permissions;
 };
 
 // One extension's JavaScript context in one document: the isolated world its content scripts run in, or the main world
@@ -132,6 +133,7 @@ public:
     virtual void document_did_start(Web::DOM::Document&) override;
     virtual void document_will_be_destroyed(Web::DOM::Document&) override;
     virtual bool allows_extension_resource(URL::URL const&, URL::Origin const*) override;
+    virtual bool allows_cross_origin_request(URL::Origin const&, URL::URL const&) override;
     virtual void load_extension_resource(URL::URL const&, Web::PageId, Function<void(Optional<ExtensionResource>)>) override;
     virtual bool wants_request_interception() override { return m_intercept_requests; }
     virtual void intercept_request(InterceptedRequest, Function<void(InterceptVerdict)>) override;

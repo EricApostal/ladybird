@@ -43,6 +43,10 @@ public:
     // that `url` names. An extension's own pages may; a web page may only reach what the extension made web accessible.
     virtual bool allows_extension_resource(URL::URL const& url, URL::Origin const* requesting_origin) = 0;
 
+    // Whether the extension whose pages have `origin` was granted the host of `url`, which lets those pages read
+    // from it without CORS.
+    virtual bool allows_cross_origin_request(URL::Origin const& origin, URL::URL const& url) = 0;
+
     // Reads the file that a `moz-extension:` URL names. The browser process does, because this process may not read
     // the extension's files, so the answer arrives later. The callback is given null when the file cannot be read.
     virtual void load_extension_resource(URL::URL const& url, PageId, Function<void(Optional<ExtensionResource>)> callback) = 0;
