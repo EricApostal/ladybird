@@ -164,7 +164,13 @@ static bool run_script(JS::Realm& realm, String const& source, String const& fil
 
     auto result = realm.vm().run(script.value());
     if (result.is_throw_completion()) {
-        dbgln("ExtensionRuntime: {} threw: {}", filename, result.throw_completion().value());
+        // The default formatting of an error object says only what class it is, which is no help for a DOMException.
+        auto thrown = result.throw_completion().value();
+        auto description = thrown.to_utf16_string(realm.vm());
+        if (description.is_error())
+            dbgln("ExtensionRuntime: {} threw: {}", filename, thrown);
+        else
+            dbgln("ExtensionRuntime: {} threw: {}", filename, description.value());
         return false;
     }
     return true;
