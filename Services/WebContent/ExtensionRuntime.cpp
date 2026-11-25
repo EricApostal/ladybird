@@ -288,12 +288,17 @@ void ExtensionRuntime::set_state(ReadonlyBytes bytes)
 
 void ExtensionRuntime::document_did_start(Web::DOM::Document& document)
 {
+    if (document.url().scheme() == "moz-extension"sv)
+        dbgln("ExtensionRuntime: extension document {} became active ({} extensions known)", document.url(), m_extensions.size());
+
     if (m_extensions.is_empty())
         return;
 
     auto* browsing_context = document.browsing_context().ptr();
-    if (!document.window() || !browsing_context)
+    if (!document.window() || !browsing_context) {
+        dbgln("ExtensionRuntime: {} has no window or browsing context", document.url());
         return;
+    }
 
     if (m_started_documents.set(&document) != HashSetResult::InsertedNewEntry)
         return;
@@ -304,6 +309,8 @@ void ExtensionRuntime::document_did_start(Web::DOM::Document& document)
     if (url.scheme() == "moz-extension"sv) {
         if (auto const* extension = find_extension(url.serialized_host()))
             inject_extension_page(document, *extension);
+        else
+            dbgln("ExtensionRuntime: no extension for host '{}'", url.serialized_host());
         return;
     }
 
@@ -383,8 +390,10 @@ void ExtensionRuntime::inject_content_scripts(Web::DOM::Document& document, Exte
 
 void ExtensionRuntime::inject_extension_page(Web::DOM::Document& document, ExtensionEntry const& extension)
 {
-    if (!m_connection.strong_ref())
+    if (!m_connection.strong_ref()) {
+        dbgln("ExtensionRuntime: no connection to the browser for {}", document.url());
         return;
+    }
 
     // An extension's page is the extension's own document, so it has no world of its own to protect from the page: its
     // scripts run in the document's world and the bridge is defined on that global.

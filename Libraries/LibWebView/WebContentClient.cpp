@@ -268,8 +268,11 @@ void WebContentClient::die()
 
 void WebContentClient::extension_context_created(Web::PageId page_id, u64 context_id, String extension_uuid, String url, bool is_top_level)
 {
-    if (may_act_for_page(page_id))
-        ExtensionBridge::the().context_created(*this, page_id, context_id, move(extension_uuid), move(url), is_top_level);
+    if (!may_act_for_page(page_id)) {
+        dbgln("ExtensionBridge: ignored a context for {} from a process that does not host its page", url);
+        return;
+    }
+    ExtensionBridge::the().context_created(*this, page_id, context_id, move(extension_uuid), move(url), is_top_level);
 }
 
 void WebContentClient::extension_context_destroyed(Web::PageId page_id, u64 context_id)
