@@ -3015,6 +3015,8 @@ static void create_navigation_params_for_population(
         //    sourceSnapshotParams, targetSnapshotParams, cspNavigationType, userInvolvement, navigationId, and
         //    navTimingType.
         else if (Fetch::Infrastructure::is_fetch_scheme(entry.url.scheme()) && (document_state.resource.has<Empty>() || allow_POST)) {
+            if (entry.url.scheme() == "moz-extension"sv)
+                dbgln("Navigate: fetching the document of {}", entry.url);
             create_navigation_params_by_fetching(
                 entry,
                 &navigable,

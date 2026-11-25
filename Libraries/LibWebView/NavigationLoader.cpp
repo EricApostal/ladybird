@@ -491,6 +491,7 @@ void NavigationLoader::read_extension_resource_for_response(URL::URL const& url)
         return;
 
     auto resource = ExtensionBridge::the().read_resource(url);
+    dbgln("NavigationLoader: read {}: {}", url, resource.is_error() ? "failed"sv : "ok"sv);
 
     // NB: A file this process cannot read creates an error document, as a network error does.
     if (resource.is_error()) {

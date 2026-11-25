@@ -203,6 +203,9 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
 {
     auto source_document = params.source_document;
 
+    if (params.url.scheme() == "moz-extension"sv)
+        dbgln("Navigate: {} is being navigated to ({})", params.url, is_top_level_traversable() ? "top level"sv : "a frame"sv);
+
     // 1. Let cspNavigationType be "form-submission" if formDataEntryList is non-null; otherwise "other".
     auto csp_navigation_type = params.form_data_entry_list.has_value()
         ? ContentSecurityPolicy::Directives::Directive::NavigationType::FormSubmission
