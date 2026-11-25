@@ -295,7 +295,7 @@ void ExtensionRuntime::document_did_start(Web::DOM::Document& document)
     if (!document.window() || !browsing_context)
         return;
 
-    if (m_started_documents.set(&document) != HashSetResult::InsertNewEntry)
+    if (m_started_documents.set(&document) != HashSetResult::InsertedNewEntry)
         return;
 
     auto const& url = document.url();
