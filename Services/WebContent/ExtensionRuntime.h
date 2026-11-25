@@ -8,6 +8,7 @@
 
 #include <AK/ByteString.h>
 #include <AK/HashMap.h>
+#include <AK/HashTable.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
@@ -149,6 +150,8 @@ private:
     String m_shim_source;
     Vector<ExtensionEntry> m_extensions;
     HashMap<u64, GC::Root<ExtensionWorld>> m_worlds;
+    // Documents that have had their scripts decided: a document becomes active again when history returns to it.
+    HashTable<Web::DOM::Document*> m_started_documents;
     u64 m_next_context_id { 1 };
 
     HashMap<u64, Function<void(Optional<ExtensionResource>)>> m_pending_resources;

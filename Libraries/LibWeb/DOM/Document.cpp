@@ -722,10 +722,6 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
 
     // FIXME: 21. Potentially free deferred fetch quota for document.
 
-    // AD-HOC: Let the embedder run content scripts now, with the document's URL known and before anything is parsed.
-    if (auto* hooks = HTML::ExtensionHooks::the())
-        hooks->document_did_start(*document);
-
     // 22. Return document.
     return document;
 }
@@ -7524,6 +7520,11 @@ void Document::make_active()
 
     // 4. Set window's relevant settings object's execution ready flag.
     HTML::relevant_settings_object(window).execution_ready = true;
+
+    // AD-HOC: Let the embedder run content scripts now. The document is the browsing context's active one, which what a
+    //         script sees of its window and location depends on, and it is ready to run script.
+    if (auto* hooks = HTML::ExtensionHooks::the())
+        hooks->document_did_start(*this);
 
     if (m_needs_to_call_page_did_load) {
         navigable()->page().client().page_did_finish_loading(navigable()->id(), id());

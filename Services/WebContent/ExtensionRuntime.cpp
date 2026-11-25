@@ -295,6 +295,9 @@ void ExtensionRuntime::document_did_start(Web::DOM::Document& document)
     if (!document.window() || !browsing_context)
         return;
 
+    if (m_started_documents.set(&document) != HashSetResult::InsertNewEntry)
+        return;
+
     auto const& url = document.url();
 
     // One of an extension's own pages, such as its background page or popup.
@@ -513,6 +516,8 @@ void ExtensionRuntime::deliver_to_context(u64 context_id, String const& payload)
 
 void ExtensionRuntime::document_will_be_destroyed(Web::DOM::Document& document)
 {
+    m_started_documents.remove(&document);
+
     if (m_worlds.is_empty())
         return;
 
