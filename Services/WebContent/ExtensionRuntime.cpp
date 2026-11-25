@@ -446,6 +446,24 @@ void ExtensionRuntime::start_context(Web::DOM::Document& document, ExtensionEntr
             1),
         JS::default_attributes);
 
+    // Runs code for tabs.executeScript. `eval` is not used for this, because the page's Content-Security-Policy applies
+    // to it and does not apply to an extension's scripts.
+    global.define_direct_property(
+        "__bird_eval"_utf16_fly_string,
+        JS::NativeFunction::create(
+            realm,
+            GC::create_function(GC::Heap::the(), GC::captures(world), [](auto& world, JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
+                auto source = TRY(vm.argument(0).to_utf16_string(vm));
+                auto script = JS::Script::parse(source.utf16_view(), world.realm(), "moz-extension://bird/executeScript.js"sv);
+                if (script.is_error()) {
+                    auto const& errors = script.error();
+                    return vm.throw_completion<JS::SyntaxError>(errors.is_empty() ? Utf16String::from_utf8("Syntax error"sv) : errors.first().message);
+                }
+                return vm.run(script.value());
+            }),
+            1),
+        JS::default_attributes);
+
     global.define_direct_property(
         "__bird_phase"_utf16_fly_string,
         JS::NativeFunction::create(
