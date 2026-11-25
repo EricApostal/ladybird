@@ -22,6 +22,10 @@ bool is_local_url(URL::URL const& url)
 bool is_fetch_scheme(StringView scheme)
 {
     // A fetch scheme is "about", "blob", "data", "file", or an HTTP(S) scheme.
+    // AD-HOC: "moz-extension" is one too, or a navigation to a browser extension's page would be handed to an external
+    //         handler instead of creating a document.
+    if (scheme == "moz-extension"sv)
+        return true;
     return any_of(FETCH_SCHEMES, [&](auto fetch_scheme) { return scheme == fetch_scheme; });
 }
 
