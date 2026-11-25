@@ -352,7 +352,11 @@ void ExtensionRuntime::inject_content_scripts(Web::DOM::Document& document, Exte
             return Web::Bindings::create_global_object_wrapper(realm, window);
         },
         [&](JS::Realm& realm) -> GC::Ref<JS::Object> {
-            return browsing_context->window_proxy_for(*extension_world, realm)->object();
+            // The document is not the browsing context's active one yet, so the world's proxy would still point at the
+            // window of the document before it, which is another origin to the proxy's access checks.
+            auto* proxy = browsing_context->window_proxy_for(*extension_world, realm);
+            proxy->set_window(window);
+            return proxy->object();
         });
 
     auto& realm = *execution_context->realm();
