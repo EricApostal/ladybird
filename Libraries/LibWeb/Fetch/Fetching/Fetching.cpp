@@ -1755,8 +1755,10 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
         if (!browser_initiated_navigation) {
             auto* hooks = HTML::ExtensionHooks::the();
             auto const* origin = request->origin().get_pointer<URL::Origin>();
-            if (!hooks || !hooks->allows_extension_resource(request->current_url(), origin))
+            if (!hooks || !hooks->allows_extension_resource(request->current_url(), origin)) {
+                dbgln("Fetch: a request for {} was not allowed (mode {}, origin {})", request->current_url(), to_underlying(request->mode()), origin ? origin->serialize() : "not an origin"_string);
                 return error;
+            }
         }
 
         // NB: The browser process reads the file of a navigation and gives it to the process creating the document, as

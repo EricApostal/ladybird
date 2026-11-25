@@ -494,6 +494,7 @@ void NavigationLoader::read_extension_resource_for_response(URL::URL const& url)
 
     // NB: A file this process cannot read creates an error document, as a network error does.
     if (resource.is_error()) {
+        dbgln("NavigationLoader: could not read {}: {}", url, resource.error());
         m_result->navigation_params = Web::HTML::NavigationParamsNullOrError { Utf16String::formatted("{}", resource.error()) };
         did_acquire(true);
         return;

@@ -584,8 +584,10 @@ bool ExtensionRuntime::allows_extension_resource(URL::URL const& url, URL::Origi
     }
 
     // Anything else may load only what the extension made web accessible, to origins it named.
-    if (!requesting_origin)
+    if (!requesting_origin) {
+        dbgln("ExtensionRuntime: {} has no requesting origin", url);
         return false;
+    }
 
     auto decoded = URL::percent_decode(url.serialize_path());
     auto path = decoded.view();
@@ -613,6 +615,7 @@ bool ExtensionRuntime::allows_extension_resource(URL::URL const& url, URL::Origi
                 return true;
         }
     }
+    dbgln("ExtensionRuntime: {} is not web accessible to {} ({} rules)", url, requesting_origin->serialize(), extension->web_accessible.size());
     return false;
 }
 
