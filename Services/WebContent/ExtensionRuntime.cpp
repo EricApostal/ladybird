@@ -374,6 +374,11 @@ void ExtensionRuntime::inject_content_scripts(Web::DOM::Document& document, Exte
     realm.set_host_defined(realm.heap().allocate<Web::Bindings::HostDefined>(intrinsics, *extension_world, window->principal_realm()));
     Web::Bindings::cache_global_object_wrapper(realm);
 
+    // Firefox gives a content script the page's own window, with the page's own objects rather than the script's view
+    // of them, as `wrappedJSObject`. Extensions use it to see what the page's scripts did.
+    if (auto* page_window_proxy = browsing_context->window_proxy())
+        realm.global_object().define_direct_property("wrappedJSObject"_utf16_fly_string, JS::Value { static_cast<JS::Object const*>(&page_window_proxy->object()) }, JS::Attribute::Configurable | JS::Attribute::Writable);
+
     if (Web::Bindings::initialize_window_web_interfaces(*window, realm).is_error()) {
         dbgln("ExtensionRuntime: could not set up a world for {}", extension.uuid);
         extension_world->detach();
