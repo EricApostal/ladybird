@@ -112,6 +112,7 @@
 #include <WebContent/DevToolsDebugger.h>
 #include <WebContent/DevToolsIndexedDB.h>
 #include <WebContent/ExtensionRuntime.h>
+#include <WebContent/IndexedDBPersistence.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/PageHost.h>
 #include <WebContent/TestConnection.h>
@@ -128,6 +129,7 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
     , m_enable_test_mode(enable_test_mode)
 {
     Web::StorageAPI::set_storage_area_mirror_client(this);
+    keep_indexed_databases_through(*this);
 }
 
 ConnectionFromClient::~ConnectionFromClient()

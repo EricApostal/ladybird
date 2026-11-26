@@ -211,6 +211,10 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     [NotRouted] did_request_storage_usage(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) => (u64 usage)
     [NotRouted] connect_to_storage_area(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id) => (Optional<Web::StorageAPI::StorageAreaId> area_id, Vector<Utf16String> keys, Vector<Utf16String> values, u64 usage)
+    // IndexedDB databases are kept by the browser process, as rows it does not look into. See LibWeb/IndexedDB/Persistence.h.
+    [NotRouted] load_indexed_database(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, ByteBuffer database_name, bool has_copy) => (u8 status, Vector<ByteBuffer> row_keys, Vector<ByteBuffer> row_values)
+    [NotRouted] list_indexed_databases(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) => (Vector<ByteBuffer> database_names)
+    [NotRouted] commit_indexed_database(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, ByteBuffer database_name, bool replaces_database, Vector<ByteBuffer> put_keys, Vector<ByteBuffer> put_values, Vector<ByteBuffer> deleted_keys) =|
     disconnect_from_storage_area(Web::StorageAPI::StorageAreaId area_id) =|
     set_storage_item(Web::StorageAPI::StorageAreaId area_id, Utf16String key, Utf16String value, String url) =|
     remove_storage_item(Web::StorageAPI::StorageAreaId area_id, Utf16String key, String url) =|

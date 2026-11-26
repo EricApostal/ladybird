@@ -13,6 +13,7 @@
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
+#include <LibWebCommon/IndexedDB/StoredDatabaseStatus.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/SecureContexts/AbstractOperations.h>
 #include <LibWebCommon/WebDriver/Error.h>
@@ -40,6 +41,7 @@
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
+#include <LibWebView/IndexedDBStore.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
 #include <LibWebView/WebContentTestClient.h>
@@ -1453,6 +1455,53 @@ Messages::WebContentClient::ConnectToStorageAreaResponse WebContentPage::connect
         values.unchecked_append(move(item.value));
     }
     return { connection->id, move(keys), move(values), connection->usage };
+}
+
+Messages::WebContentClient::LoadIndexedDatabaseResponse WebContentPage::load_indexed_database(Web::HTML::EnvironmentId environment_id, ByteBuffer const& database_name, bool has_copy)
+{
+    using LoadStatus = Web::IndexedDB::StoredDatabaseStatus;
+    Messages::WebContentClient::LoadIndexedDatabaseResponse unavailable { to_underlying(LoadStatus::Unavailable), {}, {} };
+
+    auto canonical_key = canonical_storage_key(environment_id);
+    auto& store = client().session().indexed_db_store;
+    if (!canonical_key.has_value() || !store)
+        return unavailable;
+
+    // NB: The client's address tells its copy of a database from those of other processes.
+    auto rows = store->load(reinterpret_cast<FlatPtr>(&client()), *canonical_key, database_name, has_copy);
+    if (rows.is_error()) {
+        dbgln("Unable to read an IndexedDB database: {}", rows.error());
+        return unavailable;
+    }
+    if (!rows.value().has_value())
+        return { to_underlying(LoadStatus::Current), {}, {} };
+    return { to_underlying(LoadStatus::Loaded), move(rows.value()->keys), move(rows.value()->values) };
+}
+
+Messages::WebContentClient::ListIndexedDatabasesResponse WebContentPage::list_indexed_databases(Web::HTML::EnvironmentId environment_id)
+{
+    auto canonical_key = canonical_storage_key(environment_id);
+    auto& store = client().session().indexed_db_store;
+    if (!canonical_key.has_value() || !store)
+        return Vector<ByteBuffer> {};
+
+    auto names = store->database_names(*canonical_key);
+    if (names.is_error()) {
+        dbgln("Unable to list IndexedDB databases: {}", names.error());
+        return Vector<ByteBuffer> {};
+    }
+    return names.release_value();
+}
+
+void WebContentPage::commit_indexed_database(Web::HTML::EnvironmentId environment_id, ByteBuffer const& database_name, bool replaces_database, Vector<ByteBuffer> const& put_keys, Vector<ByteBuffer> const& put_values, Vector<ByteBuffer> const& deleted_keys)
+{
+    auto canonical_key = canonical_storage_key(environment_id);
+    auto& store = client().session().indexed_db_store;
+    if (!canonical_key.has_value() || !store)
+        return;
+
+    if (auto result = store->commit(reinterpret_cast<FlatPtr>(&client()), *canonical_key, database_name, replaces_database, put_keys, put_values, deleted_keys); result.is_error())
+        warnln("Unable to save an IndexedDB database: {}", result.error());
 }
 
 void WebContentPage::did_change_needs_beforeunload_check(bool needs_beforeunload_check)

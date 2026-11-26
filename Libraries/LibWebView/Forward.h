@@ -42,6 +42,7 @@ class FaviconStore;
 class FontService;
 class FontServiceHost;
 class HistoryStore;
+class IndexedDBStore;
 class HSTSStore;
 class ImageDecoderControlClient;
 class ImageDecoderManager;

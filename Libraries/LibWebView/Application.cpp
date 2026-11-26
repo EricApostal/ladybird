@@ -59,6 +59,7 @@
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/IndexedDBStore.h>
 #include <LibWebView/ImageDecoderManager.h>
 #include <LibWebView/NoOpDefaultBrowser.h>
 #include <LibWebView/NoOpMicrophoneAuthorizer.h>
@@ -1952,6 +1953,11 @@ ErrorOr<void> Application::launch_services()
         else
             m_default_session->storage_jar = StorageJar::create();
 
+        if (auto indexed_db_store = IndexedDBStore::create(database_path); indexed_db_store.is_error())
+            warnln("IndexedDB databases will not be persisted this session: {}", indexed_db_store.error());
+        else
+            m_default_session->indexed_db_store = indexed_db_store.release_value();
+
         if (downloads_outcome == Database::MigrationOutcome::Success)
             m_download_store = TRY(DownloadStore::create(database));
         else
@@ -2900,6 +2906,10 @@ NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsi
     if (options.delete_site_data == ClearBrowsingDataOptions::Delete::Yes) {
         m_default_session->cookie_jar->expire_cookies_accessed_since(options.since);
         m_default_session->storage_jar->remove_items_accessed_since(options.since);
+        if (m_default_session->indexed_db_store) {
+            if (auto result = m_default_session->indexed_db_store->remove_databases_modified_since(options.since); result.is_error())
+                dbgln("Unable to remove IndexedDB databases: {}", result.error());
+        }
         m_default_session->hsts_store->remove_policies_observed_since(options.since);
 
         if (auto private_session = m_private_session.strong_ref()) {

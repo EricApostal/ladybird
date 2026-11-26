@@ -41,6 +41,14 @@ impl TransactionChanges {
     }
 }
 
+/// What a transaction changed in an object store, for writing to disk: the primary keys of the records it touched,
+/// in no order and with repeats, and whether the key generator moved.
+#[derive(Default)]
+pub(crate) struct LoggedChanges {
+    pub(crate) primary_keys: Vec<Rc<Key>>,
+    pub(crate) key_generator: bool,
+}
+
 #[derive(Trace)]
 #[gc(crate = libjs_rust)]
 enum Entry {
@@ -166,6 +174,35 @@ impl MutationLog {
 
     pub(crate) fn position(&self) -> usize {
         self.entries.borrow().len()
+    }
+
+    // NB: Changes to the schema are not among these, as only an upgrade makes them, which writes everything.
+    pub(crate) fn changes(&self) -> LoggedChanges {
+        let mut changes = LoggedChanges::default();
+        for entry in self.entries.borrow().iter() {
+            match entry {
+                Entry::RecordsDeleted { records } => {
+                    changes
+                        .primary_keys
+                        .extend(records.iter().map(|record| record.key.clone()));
+                }
+                Entry::RecordStored { key } => changes.primary_keys.push(key.clone()),
+                Entry::IndexRecordsDeleted { records, .. } => {
+                    changes
+                        .primary_keys
+                        .extend(records.iter().map(|record| record.value.clone()));
+                }
+                Entry::IndexRecordStored { record, .. } => changes.primary_keys.push(record.value.clone()),
+                Entry::KeyGeneratorChanged { .. } => changes.key_generator = true,
+                Entry::ObjectStoreCreated
+                | Entry::ObjectStoreDeleted
+                | Entry::ObjectStoreRenamed { .. }
+                | Entry::IndexCreated { .. }
+                | Entry::IndexDeleted { .. }
+                | Entry::IndexRenamed { .. } => {}
+            }
+        }
+        changes
     }
 
     pub(crate) fn append_changes(

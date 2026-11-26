@@ -619,6 +619,7 @@ set(SOURCES
     HTML/XMLSerializer.cpp
     IndexedDB/IDBFactory.cpp
     IndexedDB/Inspection.cpp
+    IndexedDB/Persistence.cpp
     IndexedDB/RustIntegration.cpp
     Infra/ByteSequences.cpp
     Infra/JSON.cpp

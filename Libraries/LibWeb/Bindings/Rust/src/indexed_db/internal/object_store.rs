@@ -253,6 +253,12 @@ impl ObjectStore {
         records.insert(position, record);
     }
 
+    /// Gives a store being read from disk its records, in whatever order they were kept in.
+    pub(crate) fn restore_records(&self, mut records: Vec<ObjectStoreRecord>) {
+        records.sort_by(|a, b| Key::ordering(&a.key, &b.key));
+        *self.records.borrow_mut() = records;
+    }
+
     pub(crate) fn count_records_in_range(&self, range: &IDBKeyRange) -> u64 {
         let records = self.records.borrow();
         let record_range = record_range_for_key_range(&records, range);

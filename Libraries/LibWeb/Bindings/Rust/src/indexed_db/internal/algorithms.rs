@@ -48,6 +48,7 @@ use crate::indexed_db::internal::function::{
 use crate::indexed_db::internal::index::{Index, IndexRef};
 use crate::indexed_db::internal::key::{Key, KeyType, code_unit_order};
 use crate::indexed_db::internal::object_store::{ObjectStore, ObjectStoreRef};
+use crate::indexed_db::internal::persistence;
 use crate::indexed_db::internal::storage::{ConnectionQueueRef, storage};
 use crate::storage_api::storage_key::StorageKey;
 
@@ -137,6 +138,9 @@ pub(crate) fn open_a_database_connection(
             on_complete,
         ),
         |vm, &(realm, queue, ref storage_key, ref name, maybe_version, request, on_complete), ()| {
+            // AD-HOC: The browser may have the database, or a newer copy of it than this process.
+            persistence::load_database_if_changed(vm, realm, &storage_key.0, name);
+
             // 4. Let db be the database named name in storageKey, or null otherwise.
             let maybe_db = Database::for_key_and_name(vm, &storage_key.0, name);
 
@@ -690,6 +694,9 @@ pub(crate) fn delete_a_database(
         vm,
         (realm, queue, NoCells(storage_key), name, request, on_complete),
         |vm, &(realm, queue, ref storage_key, ref name, request, on_complete), ()| {
+            // AD-HOC: The browser may have the database, or a newer copy of it than this process.
+            persistence::load_database_if_changed(vm, realm, &storage_key.0, name);
+
             // 4. Let db be the database named name in storageKey, if one exists. Otherwise, return 0 (zero).
             let Some(db) = Database::for_key_and_name(vm, &storage_key.0, name) else {
                 call_completion(vm, queue, on_complete, Ok(0));
@@ -766,13 +773,14 @@ pub(crate) fn delete_a_database(
                         &open_connections.0,
                         create_function(
                             vm,
-                            (queue, db, storage_key.clone(), name.clone(), on_complete),
-                            |vm, &(queue, db, ref storage_key, ref name, on_complete), ()| {
+                            (realm, queue, db, storage_key.clone(), name.clone(), on_complete),
+                            |vm, &(realm, queue, db, ref storage_key, ref name, on_complete), ()| {
                                 // 10. Let version be db’s version.
                                 let version = db.version();
 
                                 // 11. Delete db. If this fails for any reason, return an appropriate error (e.g. a QuotaExceededError, or an "UnknownError" DOMException).
                                 Database::delete_for_key_and_name(vm, &storage_key.0, name);
+                                persistence::save_database_deletion(realm, name);
 
                                 // 12. Return version.
                                 call_completion(vm, queue, on_complete, Ok(version));
@@ -1153,7 +1161,11 @@ pub(crate) fn commit_a_transaction(vm: &Vm, transaction: Ref<IDBTransaction>) {
                 return;
             }
 
-            // FIXME: 3. Attempt to write any outstanding changes made by transaction to the database, considering transaction’s durability hint.
+            // 3. Attempt to write any outstanding changes made by transaction to the database, considering transaction’s durability hint.
+            // NB: The changes are sent to the browser before the task below fires complete. The durability hint is not
+            //     considered.
+            persistence::save_committed_transaction(vm, transaction);
+
             // FIXME: 4. If an error occurs while writing the changes to the database, then run abort a transaction with transaction and an appropriate type for the error, for example a QuotaExceededError or an "UnknownError" DOMException, and terminate these steps.
 
             // 5. Queue a database task to run these steps:

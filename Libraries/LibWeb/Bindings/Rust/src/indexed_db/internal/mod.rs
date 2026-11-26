@@ -14,6 +14,8 @@ pub(crate) mod key;
 pub(crate) mod key_generator;
 pub(crate) mod mutation_log;
 pub(crate) mod object_store;
+mod persisted_format;
+pub(crate) mod persistence;
 pub(crate) mod record_range;
 pub(crate) mod request_list;
 pub(crate) mod storage;

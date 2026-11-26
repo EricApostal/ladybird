@@ -221,6 +221,12 @@ impl Index {
         (record_range.end - record_range.start) as u64
     }
 
+    /// Gives an index being read from disk its records, in whatever order they were kept in.
+    pub(crate) fn restore_records(&self, mut records: Vec<IndexRecord>) {
+        records.sort_by(compare_index_records);
+        *self.records.borrow_mut() = records;
+    }
+
     pub(crate) fn store_a_record(this: IndexRef, vm: &Vm, record: &IndexRecord) {
         if let Some(log) = this.object_store.mutation_log() {
             log.note_index_record_stored(vm, this, record.clone());

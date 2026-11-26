@@ -6,6 +6,7 @@ set(SOURCES
     DevToolsIndexedDB.cpp
     ExtensionMatching.cpp
     ExtensionRuntime.cpp
+    IndexedDBPersistence.cpp
     PageClient.cpp
     PageHost.cpp
     TestConnection.cpp

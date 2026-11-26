@@ -329,6 +329,19 @@ impl IDBTransaction {
         self.connection.set_version(self.original_version.get());
     }
 
+    /// The object stores the transaction logs changes of, with their logs.
+    pub(crate) fn changed_stores<'vm>(&self, vm: &'vm Vm) -> MarkedVec<'vm, (ObjectStoreRef, MutationLogRef)> {
+        let stores = MarkedVec::new(vm);
+        for entry in self.store_mutation_logs.borrow().iter() {
+            stores.push((entry.store, entry.log));
+        }
+        stores
+    }
+
+    pub(crate) fn transaction_mode(&self) -> IDBTransactionMode {
+        self.mode
+    }
+
     pub(crate) fn discard_mutation_logs(&self, vm: &Vm) {
         for entry in self.store_mutation_logs.borrow().iter() {
             entry.store.set_mutation_log(None);

@@ -41,6 +41,7 @@ set(SOURCES
     HelperProcess.cpp
     HistoryDebug.cpp
     HistoryStore.cpp
+    IndexedDBStore.cpp
     HSTSStore.cpp
     ImageDecoderControlClient.cpp
     ImageDecoderManager.cpp

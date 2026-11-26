@@ -42,6 +42,8 @@ public:
     // NB: Null for the ordinary session until Application fills these in during startup.
     OwnPtr<CookieJar> cookie_jar;
     OwnPtr<StorageJar> storage_jar;
+    // NB: Null for a session that keeps nothing on disk, whose databases live in the memory of its processes.
+    OwnPtr<IndexedDBStore> indexed_db_store;
     OwnPtr<BlobURLStore> blob_url_store;
     OwnPtr<HSTSStore> hsts_store;
     OwnPtr<PermissionManager> permission_manager;

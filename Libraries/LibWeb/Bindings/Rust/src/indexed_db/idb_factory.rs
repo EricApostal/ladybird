@@ -27,6 +27,7 @@ use crate::indexed_db::internal::algorithms::{
 use crate::indexed_db::internal::database::{Database, DatabaseRef};
 use crate::indexed_db::internal::function::{NoCells, create_function, create_function_with};
 use crate::indexed_db::internal::key::Key;
+use crate::indexed_db::internal::persistence;
 use crate::storage_api::storage_key::obtain_a_storage_key;
 
 /// The dictionary IDBDatabaseInfo of IndexedDB/IDBFactory.idl.
@@ -284,6 +285,9 @@ impl IDBFactory {
                 (realm, NoCells(storage_key), promise),
                 |vm, &(realm, ref storage_key, promise), ()| {
                     crate::bindings::interface::with_temporary_execution_context_and_callbacks(realm, || {
+                        // AD-HOC: The browser may have databases, or newer copies of them than this process.
+                        persistence::load_all_databases(vm, realm, &storage_key.0);
+
                         // 1. Let databases be the set of databases in storageKey.
                         //    If this cannot be determined for any reason, then queue a database task to reject p with an appropriate error (e.g. an "UnknownError" DOMException) and terminate these steps.
                         let databases = Database::for_key(vm, &storage_key.0);

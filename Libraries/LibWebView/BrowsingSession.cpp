@@ -8,6 +8,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HSTSStore.h>
+#include <LibWebView/IndexedDBStore.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/StorageJar.h>
 

@@ -20,6 +20,7 @@
 #include <LibRequests/Request.h>
 #include <LibURL/Site.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
+#include <LibWebCommon/IndexedDB/StoredDatabaseStatus.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/WebDriver/Error.h>
 #include <LibWebView/Application.h>
@@ -948,6 +949,28 @@ Messages::WebContentClient::DidRequestStorageUsageResponse WebContentClient::did
         return page->did_request_storage_usage(move(environment_id));
 
     return 0u;
+}
+
+Messages::WebContentClient::LoadIndexedDatabaseResponse WebContentClient::load_indexed_database(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, ByteBuffer database_name, bool has_copy)
+{
+    if (auto* page = this->page(page_id))
+        return page->load_indexed_database(move(environment_id), database_name, has_copy);
+
+    // A closed page has nothing kept for it, and nothing it makes is kept.
+    return { to_underlying(Web::IndexedDB::StoredDatabaseStatus::Unavailable), {}, {} };
+}
+
+Messages::WebContentClient::ListIndexedDatabasesResponse WebContentClient::list_indexed_databases(Web::PageId page_id, Web::HTML::EnvironmentId environment_id)
+{
+    if (auto* page = this->page(page_id))
+        return page->list_indexed_databases(move(environment_id));
+    return Vector<ByteBuffer> {};
+}
+
+void WebContentClient::commit_indexed_database(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, ByteBuffer database_name, bool replaces_database, Vector<ByteBuffer> put_keys, Vector<ByteBuffer> put_values, Vector<ByteBuffer> deleted_keys)
+{
+    if (auto* page = this->page(page_id))
+        page->commit_indexed_database(move(environment_id), database_name, replaces_database, put_keys, put_values, deleted_keys);
 }
 
 Messages::WebContentClient::ConnectToStorageAreaResponse WebContentClient::connect_to_storage_area(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id)

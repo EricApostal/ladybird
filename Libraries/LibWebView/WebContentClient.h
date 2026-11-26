@@ -239,6 +239,9 @@ private:
     virtual void did_close_browsing_context(Web::PageId page_id) override;
     virtual Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) override;
     virtual Messages::WebContentClient::ConnectToStorageAreaResponse connect_to_storage_area(Web::PageId page_id, Web::StorageAPI::StorageEndpointType, Web::HTML::EnvironmentId environment_id) override;
+    virtual Messages::WebContentClient::LoadIndexedDatabaseResponse load_indexed_database(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, ByteBuffer database_name, bool has_copy) override;
+    virtual Messages::WebContentClient::ListIndexedDatabasesResponse list_indexed_databases(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) override;
+    virtual void commit_indexed_database(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, ByteBuffer database_name, bool replaces_database, Vector<ByteBuffer> put_keys, Vector<ByteBuffer> put_values, Vector<ByteBuffer> deleted_keys) override;
     virtual void disconnect_from_storage_area(Web::StorageAPI::StorageAreaId) override;
     virtual void set_storage_item(Web::StorageAPI::StorageAreaId, Utf16String key, Utf16String value, String url) override;
     virtual void remove_storage_item(Web::StorageAPI::StorageAreaId, Utf16String key, String url) override;
