@@ -668,7 +668,14 @@ pub const BOX_PRESENCE_HAS_COMMITTED_BOX: u8 = 1 << 1;
 #[repr(C)]
 pub struct FfiStyleRecordHostCallbacks {
     pub context: *mut c_void,
-    pub shell_style_changed: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *const c_void, bool, bool),
+    pub shell_style_changed: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        u64,
+        *const crate::css::computed_value_views::StyleRecordGroups,
+        bool,
+        bool,
+    ),
     pub shell_style_damaged: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
 }
 
@@ -1226,7 +1233,6 @@ pub(crate) struct LayoutNodeArena {
     /// plan that follows it. A full layout pass covers every one of them, so its commit clears
     /// them.
     pending_rebuilt_subtree_roots: Vec<NodeSlotId>,
-    pending_layout_tree_update_escaped_rebuild_roots: bool,
     /// Every box must be recreated by the next layout tree build; set when the tree is torn down
     /// or a build finds a box it cannot place among rebuilt roots, cleared by the full pass.
     needs_full_layout_tree_update: bool,
@@ -1385,7 +1391,6 @@ impl LayoutNodeArena {
             active_layout_pass_depth: 0,
             layout_root: (NodeSlotId::INVALID),
             pending_rebuilt_subtree_roots: Vec::new(),
-            pending_layout_tree_update_escaped_rebuild_roots: false,
             needs_full_layout_tree_update: (false),
             forces_parallel_layout: false,
             layout_commit_count: 0,
@@ -1736,7 +1741,6 @@ impl LayoutNodeArena {
         if self.layout_root == root {
             self.layout_root = NodeSlotId::INVALID;
             self.pending_rebuilt_subtree_roots.clear();
-            self.pending_layout_tree_update_escaped_rebuild_roots = false;
             let overflow = &mut self.scrollable_overflow;
             overflow.recalculation_requests.clear();
             overflow.scroll_offset_clamp_candidates.clear();
@@ -3435,20 +3439,12 @@ impl LayoutNodeArena {
         self.layout_tree_update_marks().need_build()
     }
 
-    pub(crate) fn set_pending_rebuilt_subtree_roots(
-        &mut self,
-        roots: Vec<NodeSlotId>,
-        layout_tree_update_escaped_rebuild_roots: bool,
-    ) {
+    pub(crate) fn set_pending_rebuilt_subtree_roots(&mut self, roots: Vec<NodeSlotId>) {
         self.pending_rebuilt_subtree_roots = roots;
-        self.pending_layout_tree_update_escaped_rebuild_roots = layout_tree_update_escaped_rebuild_roots;
     }
 
-    pub(crate) fn take_pending_rebuilt_subtree_roots(&mut self) -> (Vec<NodeSlotId>, bool) {
-        (
-            std::mem::take(&mut self.pending_rebuilt_subtree_roots),
-            std::mem::replace(&mut self.pending_layout_tree_update_escaped_rebuild_roots, false),
-        )
+    pub(crate) fn take_pending_rebuilt_subtree_roots(&mut self) -> Vec<NodeSlotId> {
+        std::mem::take(&mut self.pending_rebuilt_subtree_roots)
     }
 
     /// The DOM nodes the subtrees the last build rebuilt and left live stand for. An anonymous root stands for none.
@@ -3462,7 +3458,6 @@ impl LayoutNodeArena {
 
     pub(crate) fn clear_pending_rebuilt_subtree_roots(&mut self) {
         self.pending_rebuilt_subtree_roots.clear();
-        self.pending_layout_tree_update_escaped_rebuild_roots = false;
     }
 
     pub(crate) fn needs_full_layout_tree_update(&self) -> bool {
@@ -4061,27 +4056,17 @@ impl LayoutNodeArena {
         self.update_layout_style(host_calls, node, LayoutStyle::reset_table_properties);
     }
 
-    pub(crate) fn make_display_contents_pseudo_element_box_inline(
-        &mut self,
-        host_calls: HostCalls<'_>,
-        node: NodeSlotId,
-    ) {
-        self.update_layout_style(host_calls, node, |style, _| {
-            style.set_display(crate::layout::FfiDisplay::outside_and_inside(
-                crate::css::css_enums::display_outside::INLINE,
-                crate::css::css_enums::display_inside::FLOW,
-                false,
-            ));
-        });
-    }
-
-    fn is_display_contents_pseudo_element_box_holding_its_published_display(&self, node: NodeSlotId) -> bool {
+    /// Gives `node` the display its box uses for the display it publishes, as building the box did: A replaced element
+    /// in a table display is inline, e.g., and a `display: contents` pseudo-element is an inline box.
+    fn rewrite_used_display(&mut self, host_calls: HostCalls<'_>, node: NodeSlotId) {
+        let Some(display) = self.style_view(node).map(|payloads| payloads.display()) else {
+            return;
+        };
         let data = self.data(node);
-        data.kind.get() == NodeKind::InlineNode
-            && super::node_facts::has_flag(data, NodeFlag::IsPseudoElementPrincipalBox)
-            && self
-                .style_view(node)
-                .is_some_and(|payloads| payloads.display().is_contents())
+        let used_display = super::tree_builder::used_display_of_box(data.kind.get(), data.flags.get(), display);
+        if used_display != display {
+            self.update_layout_style(host_calls, node, |style, _| style.set_display(used_display));
+        }
     }
 
     pub(crate) fn reinherit_anonymous_descendants(&mut self, host_calls: HostCalls<'_>, node: NodeSlotId) {
@@ -4094,9 +4079,7 @@ impl LayoutNodeArena {
             return;
         }
         self.reinherit_first_letter_box(host_calls, node);
-        if self.is_display_contents_pseudo_element_box_holding_its_published_display(node) {
-            self.make_display_contents_pseudo_element_box_inline(host_calls, node);
-        }
+        self.rewrite_used_display(host_calls, node);
         let parent = self.data(node).parent.get();
         let parent_is_table_wrapper_of_this_table_box = !parent.is_invalid()
             && self.data(parent).kind.get() == NodeKind::TableWrapper
@@ -6704,16 +6687,13 @@ pub(crate) struct NodeAllocation {
 /// Whether an element whose installed style is `style` has an innermost `list-item` counter of its own that counts
 /// forward, as the counters a layout tree build resolves for it from that style have: appending a last list item to
 /// such an element leaves the items before it as they are numbered.
-///
-/// # Safety
-///
-/// `style` must point at the groups of a live style record.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_resets_forward_list_item_counter(style: *const c_void) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    let style = unsafe { LayoutStyleRef::from_raw(style) }.expect("an element's style record is not null");
-    // SAFETY: Guaranteed by the caller.
-    super::counters::style_resets_forward_list_item_counter(unsafe { style.view() })
+pub extern "C" fn style_resets_forward_list_item_counter(
+    style: &crate::css::computed_value_views::StyleRecordGroups,
+) -> bool {
+    super::counters::style_resets_forward_list_item_counter(
+        crate::css::computed_value_views::ComputedValuesView::of_record_groups(style),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -7492,21 +7472,21 @@ mod tests {
         let viewport = arena.allocate_unbound();
         let rebuilt = arena.allocate_unbound();
         arena.set_layout_root(viewport);
-        arena.set_pending_rebuilt_subtree_roots(vec![rebuilt], true);
+        arena.set_pending_rebuilt_subtree_roots(vec![rebuilt]);
         assert_eq!(arena.layout_root(), viewport);
 
         arena
             .free_subtree(rebuilt)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
         assert_eq!(arena.layout_root(), viewport);
-        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), (vec![rebuilt], true));
+        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), vec![rebuilt]);
 
-        arena.set_pending_rebuilt_subtree_roots(vec![viewport], false);
+        arena.set_pending_rebuilt_subtree_roots(vec![viewport]);
         arena
             .free_subtree(viewport)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
         assert!(arena.layout_root().is_invalid());
-        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), (Vec::new(), false));
+        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), Vec::new());
     }
 
     #[test]

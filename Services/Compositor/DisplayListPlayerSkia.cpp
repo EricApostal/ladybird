@@ -105,6 +105,7 @@ struct DisplayListPlayerSkia::PainterCallbacks {
             .canvas_matrix = [](void* context) -> Gfx::FloatMatrix4x4 { return PainterCallbacks::player(context).canvas_matrix(); },
             .set_matrix = [](void* context, Gfx::FloatMatrix4x4 const* matrix) { PainterCallbacks::player(context).set_matrix(*matrix); },
             .would_be_fully_clipped_by_painter = [](void* context, Gfx::IntRect rect) -> bool { return PainterCallbacks::player(context).would_be_fully_clipped_by_painter(rect); },
+            .device_clip_bounds = [](void* context) -> Gfx::IntRect { return PainterCallbacks::player(context).device_clip_bounds(); },
             .push_clip = [](void* context, ReplayClip const* clip) { PainterCallbacks::player(context).push_clip(*clip); },
             .push_clip_path = [](void* context, Gfx::FFI::PathGeometryData const* path, u64 path_identity, Gfx::WindingRule winding_rule) { PainterCallbacks::player(context).push_clip_path(Gfx::PathData::from_ffi(*path), path_identity, winding_rule); },
             .push_layer = [](void* context, ReplayLayer const* layer) { PainterCallbacks::player(context).push_layer(*layer); },
@@ -297,33 +298,38 @@ void DisplayListPlayerSkia::paint_scrollbar(PresentedScrollbar const& scrollbar)
     paint_scrollbar_into_surface(surface(), scrollbar);
 }
 
-static SkMatrix vertical_glyph_run_rotation(Gfx::IntRect const& rect)
+// The turn that sets a run laid out as horizontal text, from the top-left corner of rect, along a vertical line.
+static SkMatrix vertical_glyph_run_rotation(Gfx::IntRect const& rect, Gfx::GlyphRunOrientation orientation)
 {
+    if (orientation == Gfx::GlyphRunOrientation::VerticalCounterclockwise) {
+        // A quarter turn counterclockwise about the top-left corner, then down by the rect's height: The run starts at
+        // the bottom-left corner and runs upwards, with the tops of its glyphs facing left.
+        auto rotation = SkMatrix::Translate(0, rect.height());
+        rotation.preRotate(-90, rect.top_left().x(), rect.top_left().y());
+        return rotation;
+    }
     auto rotation = SkMatrix::Translate(rect.width(), 0);
     rotation.preRotate(90, rect.top_left().x(), rect.top_left().y());
     return rotation;
 }
 
-static void draw_glyph_run(SkCanvas& canvas, SkTextBlob const& blob, Gfx::IntRect const& rect, Gfx::FloatPoint translation, Gfx::Orientation orientation, SkPaint const& paint)
+static void draw_glyph_run(SkCanvas& canvas, SkTextBlob const& blob, Gfx::IntRect const& rect, Gfx::FloatPoint translation, Gfx::GlyphRunOrientation orientation, SkPaint const& paint)
 {
-    switch (orientation) {
-    case Gfx::Orientation::Horizontal:
+    if (orientation == Gfx::GlyphRunOrientation::Horizontal) {
         canvas.drawTextBlob(&blob, translation.x(), translation.y(), paint);
-        break;
-    case Gfx::Orientation::Vertical:
-        canvas.save();
-        canvas.concat(vertical_glyph_run_rotation(rect));
-        canvas.drawTextBlob(&blob, translation.x(), translation.y(), paint);
-        canvas.restore();
-        break;
+        return;
     }
+    canvas.save();
+    canvas.concat(vertical_glyph_run_rotation(rect, orientation));
+    canvas.drawTextBlob(&blob, translation.x(), translation.y(), paint);
+    canvas.restore();
 }
 
-static SkRect glyph_run_bounds_including_antialiasing(SkTextBlob const& blob, Gfx::IntRect const& rect, Gfx::FloatPoint translation, Gfx::Orientation orientation)
+static SkRect glyph_run_bounds_including_antialiasing(SkTextBlob const& blob, Gfx::IntRect const& rect, Gfx::FloatPoint translation, Gfx::GlyphRunOrientation orientation)
 {
     auto bounds = blob.bounds().makeOffset(translation.x(), translation.y());
-    if (orientation == Gfx::Orientation::Vertical)
-        bounds = vertical_glyph_run_rotation(rect).mapRect(bounds);
+    if (orientation != Gfx::GlyphRunOrientation::Horizontal)
+        bounds = vertical_glyph_run_rotation(rect, orientation).mapRect(bounds);
     bounds.outset(1, 1);
     return bounds;
 }
@@ -339,7 +345,7 @@ void DisplayListPlayerSkia::play_command(DrawGlyphRun const& command)
     bool uses_lcd_text = !opaque_background.isEmpty()
         && m_surfaces.size() == 1
         && command.stroke_width == 0
-        && command.orientation == Gfx::Orientation::Horizontal
+        && command.orientation == Gfx::GlyphRunOrientation::Horizontal
         && canvas.getTopProps().pixelGeometry() != kUnknown_SkPixelGeometry
         && canvas.getLocalToDeviceAs3x3().isTranslate();
     if (uses_lcd_text) {
@@ -426,8 +432,7 @@ void DisplayListPlayerSkia::draw_surface(RustFFI::SurfaceDraw const& draw)
         return;
     SkPaint paint;
     paint.setBlendMode(SkBlendMode::kSrcOver);
-    auto sampling = draw.filtered ? SkSamplingOptions { SkFilterMode::kLinear } : SkSamplingOptions {};
-    surface().canvas().drawImageRect(image.get(), to_skia_rect(draw.source_rect), to_skia_rect(draw.target_rect), sampling, &paint, SkCanvas::kStrict_SrcRectConstraint);
+    Gfx::draw_tile_image_rect(surface().canvas(), *image, to_skia_rect(draw.source_rect), to_skia_rect(draw.target_rect), draw.filtered, paint);
 }
 
 void DisplayListPlayerSkia::play_command(DrawCanvas const& command)
@@ -1218,7 +1223,7 @@ SkPaint DisplayListPlayerSkia::paint_style_to_skia_paint(DisplayListPaintStyle c
 
         matrix.preScale(tile_rect.width() / tile_size.width(), tile_rect.height() / tile_size.height());
         if (paint_style.pattern_transform.has_value())
-            matrix = matrix * to_skia_matrix(paint_style.pattern_transform.value());
+            matrix.postConcat(to_skia_matrix(paint_style.pattern_transform.value()));
 
         auto sampling = SkSamplingOptions(SkFilterMode::kLinear);
         auto shader = image->makeShader(SkTileMode::kRepeat, SkTileMode::kRepeat, sampling, &matrix);
@@ -1820,6 +1825,12 @@ void DisplayListPlayerSkia::clip_path(SkPath path, Gfx::WindingRule winding_rule
 bool DisplayListPlayerSkia::would_be_fully_clipped_by_painter(Gfx::IntRect rect) const
 {
     return surface().canvas().quickReject(to_skia_rect(rect));
+}
+
+Gfx::IntRect DisplayListPlayerSkia::device_clip_bounds() const
+{
+    auto bounds = surface().canvas().getDeviceClipBounds();
+    return { bounds.x(), bounds.y(), bounds.width(), bounds.height() };
 }
 
 }

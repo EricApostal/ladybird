@@ -28,10 +28,12 @@
 #include <LibCore/Forward.h>
 #include <LibCore/SharedVersion.h>
 #include <LibGC/Weak.h>
+#include <LibGC/WeakHashMap.h>
 #include <LibGC/WeakHashSet.h>
 #include <LibGfx/Point.h>
 #include <LibHTTP/Cache/CacheMode.h>
 #include <LibJS/Forward.h>
+#include <LibJS/SourceCode.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibUnicode/Forward.h>
@@ -733,8 +735,10 @@ public:
     void capture_events();
     void release_events();
 
-    Utf16String const& source() const { return m_source; }
-    void set_source(Utf16String source) { m_source = move(source); }
+    // NB: The source is kept as source code, which LibJS compresses while nothing reads it.
+    Utf16String source() const { return m_source ? m_source->code() : Utf16String {}; }
+    size_t source_length_in_code_units() const { return m_source ? m_source->length_in_code_units() : 0; }
+    void set_source(Utf16String);
 
     HTML::EnvironmentSettingsObject& relevant_settings_object() const;
 
@@ -1335,7 +1339,7 @@ public:
         // A containing block's line content, which each source holds a reference to, and that block's raw
         // document-absolute position.
         struct Source {
-            void const* line_content { nullptr };
+            Layout::RustFFI::InlineContent const* line_content { nullptr };
             i32 x { 0 };
             i32 y { 0 };
             bool operator==(Source const&) const = default;
@@ -1982,10 +1986,8 @@ private:
     void notify_each_document_observer(GetNotifier&& get_notifier, Args&&... args)
     {
         GC::RootVector<GC::Ref<DocumentObserver>> document_observers;
-        document_observers.ensure_capacity(m_document_observers.size());
-
-        for (auto observer : m_document_observers)
-            document_observers.unchecked_append(observer);
+        for (auto& observer : m_document_observers)
+            document_observers.append(observer);
 
         for (auto document_observer : document_observers) {
             if (auto notifier = get_notifier(*document_observer))
@@ -2063,7 +2065,7 @@ private:
     bool m_has_been_destroyed { false };
     bool m_observers_consider_document_fully_active { false };
 
-    Utf16String m_source;
+    RefPtr<JS::SourceCode const> m_source;
 
     GC::Ptr<Element> m_pending_parsing_blocking_script;
 
@@ -2257,7 +2259,7 @@ private:
 
     // Document should not visit DocumentObserver to avoid leaks.
     // It's responsibility of object that requires DocumentObserver to keep it alive.
-    HashTable<GC::RawRef<DocumentObserver>> m_document_observers;
+    GC::WeakHashSet<DocumentObserver> m_document_observers;
 
     // Every SVG use element connected to this document's node tree, maintained by SVGUseElement on insertion and
     // removal. This lets SVG elements notify interested use elements about mutations without traversing the entire
@@ -2663,16 +2665,15 @@ private:
     mutable SelectorQuery const* m_last_selector_query { nullptr };
 
     // Cache of querySelectorAll results, validated lazily against the query root's dom_tree_version/character_data_version.
-    OwnPtr<QuerySelectorResultCache> m_query_selector_result_cache;
+    GC::Ptr<QuerySelectorResultCache> m_query_selector_result_cache;
 
     // The ids that aria-labelledby and aria-describedby reference in a tree, validated lazily against the tree's
     // dom_tree_version. Computing accessible names asks this for the parent and the ancestors of every text node.
     struct IdsReferencedFromAria {
-        GC::Weak<Node> root;
         u64 dom_tree_version { 0 };
         HashTable<Utf16FlyString> ids;
     };
-    mutable HashMap<GC::RawPtr<Node const>, IdsReferencedFromAria> m_ids_referenced_from_aria;
+    mutable GC::WeakHashMap<Node, IdsReferencedFromAria> m_ids_referenced_from_aria;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

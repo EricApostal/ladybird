@@ -19,7 +19,7 @@ use crate::painting::record::inputs::CaretTarget;
 use crate::painting::selection::{HighlightPseudoElement, SelectionRange};
 use crate::painting::text_fragment::{self, SelectionOffsets};
 use libgfx_rust::path::Path;
-use libgfx_rust::{Color, FloatPoint, IntPoint, IntRect, Orientation, WindingRule};
+use libgfx_rust::{Color, FloatPoint, GlyphRunOrientation, IntPoint, IntRect, WindingRule};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -37,6 +37,7 @@ pub(crate) struct HighlightShadowLayer {
     pub color_is_current_color: bool,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SpanTextDecoration {
     pub lines: [u8; 8],
     pub line_count: u32,
@@ -50,6 +51,7 @@ pub(crate) struct HighlightDecorationMetrics {
     pub thickness: Option<CssPixels>,
     pub underline_offset: CssPixels,
     pub underline_position_horizontal: u8,
+    pub underline_position_vertical: u8,
     pub skip_ink: u8,
 }
 
@@ -464,7 +466,7 @@ fn compute_render_spans<O: Observer>(
 
 pub(crate) struct GlyphRunEmission {
     pub baseline_start: FloatPoint,
-    pub orientation: Orientation,
+    pub orientation: GlyphRunOrientation,
     pub glyph_bounding_rect: IntRect,
 }
 
@@ -472,13 +474,49 @@ pub(crate) struct GlyphRunEmission {
 /// width and turning it a quarter turn clockwise about the rect's top-left corner, so the blob's
 /// bounds follow the same mapping.
 fn vertical_glyph_bounds(horizontal_bounds: IntRect, fragment_device_rect: IntRect) -> IntRect {
+    let (bounds, fragment) = (WideRect::of(horizontal_bounds), WideRect::of(fragment_device_rect));
     IntRect::new(
-        fragment_device_rect.x + fragment_device_rect.width
-            - (horizontal_bounds.y + horizontal_bounds.height - fragment_device_rect.y),
-        fragment_device_rect.y + (horizontal_bounds.x - fragment_device_rect.x),
+        saturated(fragment.x + fragment.width - (bounds.y + bounds.height - fragment.y)),
+        saturated(fragment.y + (bounds.x - fragment.x)),
         horizontal_bounds.height,
         horizontal_bounds.width,
     )
+}
+
+/// The player draws a counterclockwise run by turning the horizontal blob a quarter turn counterclockwise, so the
+/// blob's start lands on the bottom-left corner of the fragment rect, and its bounds follow the same mapping.
+fn counterclockwise_glyph_bounds(horizontal_bounds: IntRect, fragment_device_rect: IntRect) -> IntRect {
+    let (bounds, fragment) = (WideRect::of(horizontal_bounds), WideRect::of(fragment_device_rect));
+    IntRect::new(
+        saturated(fragment.x + (bounds.y - fragment.y)),
+        saturated(fragment.y + fragment.height - (bounds.x + bounds.width - fragment.x)),
+        horizontal_bounds.height,
+        horizontal_bounds.width,
+    )
+}
+
+/// A device rect with room to add its coordinates to its sizes: Glyph bounds come from float coordinates that saturate
+/// at the ends of the i32 range, so their sums can go past it.
+struct WideRect {
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+}
+
+impl WideRect {
+    fn of(rect: IntRect) -> Self {
+        Self {
+            x: rect.x.into(),
+            y: rect.y.into(),
+            width: rect.width.into(),
+            height: rect.height.into(),
+        }
+    }
+}
+
+fn saturated(value: i64) -> i32 {
+    value.clamp(i32::MIN.into(), i32::MAX.into()) as i32
 }
 
 pub(crate) fn glyph_run_emission(
@@ -493,10 +531,12 @@ pub(crate) fn glyph_run_emission(
         x: (fragment_absolute_rect.x.to_float() as f64 * scale) as f32,
         y: ((fragment_absolute_rect.y.to_float() + fragment.baseline.to_float()) as f64 * scale) as f32,
     };
-    let orientation = if fragment.writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB {
-        Orientation::Horizontal
-    } else {
-        Orientation::Vertical
+    // https://drafts.csswg.org/css-writing-modes-4/#valdef-writing-mode-sideways-lr
+    // "... and all text is typeset sideways, with the glyphs' tops facing left (the line-over side)."
+    let orientation = match fragment.writing_mode {
+        crate::css::css_enums::writing_mode::HORIZONTAL_TB => GlyphRunOrientation::Horizontal,
+        crate::css::css_enums::writing_mode::SIDEWAYS_LR => GlyphRunOrientation::VerticalCounterclockwise,
+        _ => GlyphRunOrientation::Vertical,
     };
     let horizontal_bounds = IntRect::new(
         (bounds.x * scale as f32 + baseline_start.x).round_ties_even() as i32,
@@ -505,8 +545,11 @@ pub(crate) fn glyph_run_emission(
         (bounds.height * scale as f32).round_ties_even() as i32,
     );
     let glyph_bounding_rect = match orientation {
-        Orientation::Horizontal => horizontal_bounds,
-        Orientation::Vertical => vertical_glyph_bounds(horizontal_bounds, fragment_device_rect),
+        GlyphRunOrientation::Horizontal => horizontal_bounds,
+        GlyphRunOrientation::Vertical => vertical_glyph_bounds(horizontal_bounds, fragment_device_rect),
+        GlyphRunOrientation::VerticalCounterclockwise => {
+            counterclockwise_glyph_bounds(horizontal_bounds, fragment_device_rect)
+        }
     };
     GlyphRunEmission {
         baseline_start,
@@ -532,7 +575,7 @@ pub(crate) fn paint_fragments<O: Observer>(recorder: &mut PaintRecorder<'_, O>, 
     // highlight overlay redraws that text (and those decorations) over all the highlight overlay
     // backgrounds using that highlight's own color.
     for span in &spans {
-        paint_text_shadow(recorder, block, span, &span.shadow_layers);
+        paint_text_shadow(recorder, block, span, &span.shadow_layers, None);
     }
     // Glyph strokes can extend beyond a highlight rectangle. Keep the normal glyphs outside the highlights, then
     // let each overlay redraw the text inside its rectangle without a stroke.
@@ -638,7 +681,7 @@ pub(crate) fn paint_fragments<O: Observer>(recorder: &mut PaintRecorder<'_, O>, 
         // Any text-shadow applying to a highlight pseudo-element is drawn over its corresponding
         // highlight overlay background.
         for (span, overlay) in overlays() {
-            paint_text_shadow(recorder, block, span, &overlay.shadow_layers);
+            paint_text_shadow(recorder, block, span, &overlay.shadow_layers, Some(overlay));
         }
     }
 
@@ -707,6 +750,7 @@ fn paint_text_shadow<O: Observer>(
     block: NodeSlotId,
     span: &RenderSpan,
     shadow_layers: &[ShadowLayer],
+    shadowed_highlight: Option<&HighlightOverlay>,
 ) {
     if shadow_layers.is_empty() {
         return;
@@ -764,32 +808,146 @@ fn paint_text_shadow<O: Observer>(
     // shadow filter that TextShadowPainter puts on the text's layer.
     // Shadow layers are ordered front-to-back, so we paint them in reverse.
     let (layers, shadows_bounding_rect) = text_shadow_layers_and_bounds(shadow_layers, fragment_device_rect, scale);
-    recorder.recorder.paint_text_shadow(
-        &layers,
-        shadows_bounding_rect,
-        fragment_device_rect,
-        baseline_start,
-        GlyphRunForRecording {
-            font_smoothing: recorder
-                .source
-                .node_style_if_live(fragment.style_source)
-                .unwrap()
-                .inherited_text()
-                .font_smoothing,
-            font_id: FontResourceId(font_id),
-            glyphs: run
-                .glyphs
-                .placed()
-                .skip(span_glyphs.start)
-                .take(span_glyphs.len())
-                .filter(|placed| placed.glyph.should_paint())
-                .map(DisplayListGlyph::from),
-        },
-        scale,
-        orientation,
-        ForceDarkRole::None,
+    let font_smoothing = recorder
+        .source
+        .node_style_if_live(fragment.style_source)
+        .unwrap()
+        .inherited_text()
+        .font_smoothing;
+    let paint_glyph_shadows = |recorder: &mut PaintRecorder<'_, O>, layers: &[TextShadowLayer]| {
+        recorder.recorder.paint_text_shadow(
+            layers,
+            shadows_bounding_rect,
+            fragment_device_rect,
+            baseline_start,
+            GlyphRunForRecording {
+                font_smoothing,
+                font_id: FontResourceId(font_id),
+                glyphs: run
+                    .glyphs
+                    .placed()
+                    .skip(span_glyphs.start)
+                    .take(span_glyphs.len())
+                    .filter(|placed| placed.glyph.should_paint())
+                    .map(DisplayListGlyph::from),
+            },
+            scale,
+            orientation,
+            ForceDarkRole::None,
+        );
+    };
+
+    // https://drafts.csswg.org/css-text-decor-4/#text-shadow-property
+    // Each layer shadows the element's text and all its text decorations (composited together). The shadow effects
+    // are applied front-to-back: the first shadow is on top.
+    // The decorations a highlight adds belong to its overlay, so only the overlay's own shadows shadow them, and the
+    // text's own shadows shadow none of them.
+    let shadowed_span = RenderSpan {
+        fragment_index: span.fragment_index,
+        start_code_unit: span.start_code_unit,
+        end_code_unit: span.end_code_unit,
+        text_color: span.text_color,
+        shadow_layers: Vec::new(),
+        highlights: shadowed_highlight
+            .map(|overlay| HighlightOverlay {
+                highlight: overlay.highlight,
+                background_color: overlay.background_color,
+                shadow_layers: Vec::new(),
+                text_decoration: overlay.text_decoration,
+            })
+            .into_iter()
+            .collect(),
+        decoration_color: span.decoration_color,
+    };
+    let decoration_sets = crate::painting::record::paint::text_decoration::decoration_sets_for_span(
+        recorder.source,
+        block,
+        &shadowed_span,
     );
+    if decoration_sets.is_empty() {
+        paint_glyph_shadows(recorder, &layers);
+    } else {
+        let decoration_box = span_decoration_box(recorder.source, fragment, span);
+        for layer in &layers {
+            paint_glyph_shadows(recorder, std::slice::from_ref(layer));
+            paint_decoration_shadow(
+                recorder,
+                block,
+                span.fragment_index,
+                decoration_box,
+                &decoration_sets,
+                layer,
+            );
+        }
+    }
     recorder.recorder.set_glyph_run_text(None);
+}
+
+/// Paints the shadow that `layer` casts from the decoration lines of `sets`: the lines in the shadow's color, moved by
+/// its offset and blurred by its blur radius.
+fn paint_decoration_shadow<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    block: NodeSlotId,
+    fragment_index: u32,
+    decoration_box: CssPixelRect,
+    sets: &[crate::painting::record::paint::text_decoration::TextDecorationSet],
+    layer: &TextShadowLayer,
+) {
+    let paint_lines = |recorder: &mut PaintRecorder<'_, O>| {
+        for set in sets {
+            let mut set = *set;
+            set.color = layer.color.0;
+            crate::painting::record::paint::text_decoration::paint_decoration_lines(
+                recorder,
+                block,
+                fragment_index,
+                decoration_box,
+                &set,
+                layer.rounded_offset,
+                ForceDarkRole::None,
+            );
+        }
+    };
+    if layer.blur_radius <= 0 {
+        paint_lines(recorder);
+        return;
+    }
+
+    let side = recorder.source.committed_side_data(block);
+    let fragment = &side.fragments()[fragment_index as usize];
+    let fragment_rect = text_fragment::absolute_rect(recorder.source, fragment);
+    let mut ink_bounds = IntRect::default();
+    for set in sets {
+        let bounds =
+            crate::painting::record::paint::text_decoration::decoration_ink_bounds(fragment, fragment_rect, set);
+        ink_bounds = ink_bounds.united(recorder.converter.enclosing_device_rect(bounds));
+    }
+    // NB: A blur reaches about three standard deviations, which is one and a half blur radii.
+    let margin = layer.blur_radius * 2;
+    let clip_rect = IntRect::new(
+        ink_bounds.x + layer.rounded_offset.x - margin,
+        ink_bounds.y + layer.rounded_offset.y - margin,
+        ink_bounds.width + margin * 2,
+        ink_bounds.height + margin * 2,
+    );
+    // https://drafts.csswg.org/css-backgrounds-3/#shadow-blur
+    // [...] the resulting shadow must approximate [...] the image that would be generated by applying to the shadow a
+    // Gaussian blur with a standard deviation equal to half the blur radius.
+    let standard_deviation = layer.blur_radius as f32 / 2.0;
+    let group = recorder.recorder.begin_isolated_group();
+    paint_lines(recorder);
+    recorder.recorder.finish_group_with_effects(
+        group,
+        crate::painting::display_list::recorder::IsolatedGroupEffects {
+            clip_rect: clip_rect.to_float(),
+            opacity: 1.0,
+            filter: Some(Arc::new(
+                libgfx_rust::filter::Filter::gaussian_blur(standard_deviation, standard_deviation, None).serialize(),
+            )),
+            compositing_and_blending_operator: libgfx_rust::CompositingAndBlendingOperator::Normal,
+            mask_kind: libgfx_rust::MaskKind::Alpha,
+        },
+    );
 }
 
 /// The text a fragment holds between code unit offsets into it.
@@ -908,30 +1066,25 @@ fn paint_text_fragment<O: Observer>(
     recorder.recorder.set_glyph_run_text(text);
     // Paint text, clipped to span range if not full fragment.
     let is_full_fragment = span.start_code_unit == 0 && span.end_code_unit == fragment.length_in_code_units;
-    let mut decoration_box = fragment_absolute_rect;
     if is_full_fragment {
         if draw_glyphs {
             paint_glyphs(&mut recorder.recorder);
         }
-    } else {
+    } else if draw_glyphs {
         let offsets = SelectionOffsets {
             start: span.start_code_unit,
             end: span.end_code_unit,
         };
-        let range_rects = text_fragment::rects_for_selection_offsets(recorder.source, fragment, offsets);
-        for range_rect in &range_rects {
-            let span_rect = converter.rounded_device_rect(*range_rect);
-            if draw_glyphs {
-                recorder.recorder.record_clipped_to(span_rect, paint_glyphs);
-            }
+        for range_rect in text_fragment::rects_for_selection_offsets(recorder.source, fragment, offsets) {
+            recorder
+                .recorder
+                .record_clipped_to(converter.rounded_device_rect(range_rect), paint_glyphs);
         }
-        let range_rect = text_fragment::rect_for_selection_offsets(recorder.source, fragment, offsets);
-        decoration_box.x = range_rect.x;
-        decoration_box.width = range_rect.width;
     }
 
     recorder.recorder.set_glyph_run_text(None);
 
+    let decoration_box = span_decoration_box(recorder.source, fragment, span);
     for set in decoration_sets {
         crate::painting::record::paint::text_decoration::paint_decoration_lines(
             recorder,
@@ -939,8 +1092,34 @@ fn paint_text_fragment<O: Observer>(
             span.fragment_index,
             decoration_box,
             set,
+            IntPoint::default(),
+            ForceDarkRole::Foreground,
         );
     }
+}
+
+/// The part of a fragment that the decorations of `span` run along: the whole fragment, or the span's range of it.
+fn span_decoration_box(source: &impl PaintRead, fragment: &FragmentRecord, span: &RenderSpan) -> CssPixelRect {
+    let mut decoration_box = text_fragment::absolute_rect(source, fragment);
+    if span.start_code_unit == 0 && span.end_code_unit == fragment.length_in_code_units {
+        return decoration_box;
+    }
+    let offsets = SelectionOffsets {
+        start: span.start_code_unit,
+        end: span.end_code_unit,
+    };
+    let range_rect = text_fragment::rect_for_selection_offsets(source, fragment, offsets);
+    // NB: The span of vertical text runs down the fragment.
+    if fragment.writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB
+        && !fragment.glyph_run.as_ref().is_some_and(|run| run.is_upright)
+    {
+        decoration_box.x = range_rect.x;
+        decoration_box.width = range_rect.width;
+    } else {
+        decoration_box.y = range_rect.y;
+        decoration_box.height = range_rect.height;
+    }
+    decoration_box
 }
 
 // Paints the caret when it sits in a fragment owned by `owner`; the block itself
@@ -982,5 +1161,14 @@ mod tests {
         // Its advance runs down the fragment from two pixels in, and its ascent side ends up on the
         // right, four pixels short of the fragment's right edge.
         assert_eq!(vertical, IntRect::new(100, 52, 24, 40));
+    }
+
+    #[test]
+    fn turned_glyph_bounds_saturate_rather_than_overflow() {
+        let fragment = IntRect::new(16, 16, 20, 60);
+        // A run so long that its width saturated when its float bounds were taken to device pixels.
+        let horizontal = IntRect::new(16, 16, i32::MAX, 24);
+        assert_eq!(vertical_glyph_bounds(horizontal, fragment).height, i32::MAX);
+        assert_eq!(counterclockwise_glyph_bounds(horizontal, fragment).y, i32::MIN + 77);
     }
 }

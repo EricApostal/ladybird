@@ -823,7 +823,12 @@ void LocationEdit::set_field_hovered(bool hovered)
 
 void LocationEdit::contextMenuEvent(QContextMenuEvent* event)
 {
-    QMenu* menu = createStandardContextMenu();
+    // NB: A menu is kept until another is shown in its place, as Cocoa delivers a native menu's choice through queued
+    //     events after the menu closes.
+    if (m_context_menu)
+        delete_menu_later(*m_context_menu);
+    auto* menu = createStandardContextMenu();
+    m_context_menu = menu;
 
     auto* paste_action = menu->findChild<QAction*>(QStringLiteral("edit-paste"), Qt::FindDirectChildrenOnly);
 
@@ -862,7 +867,6 @@ void LocationEdit::contextMenuEvent(QContextMenuEvent* event)
         menu->addAction(paste_and_go_action);
 
     execute_context_menu(*menu, event->globalPos());
-    delete menu;
 }
 
 // Leaving a tab parks its omnibox's editing session: the suggestion popup closes, but everything else is kept,
@@ -1250,7 +1254,9 @@ void LocationEdit::update_chrome_style()
 
     m_is_updating_chrome_style = true;
     // Match the popup's palette without feeding our styled background into the next style update.
-    setStyleSheet(ChromeStyle::location_edit_style_sheet(Theme::chrome_palette(*this)));
+    auto style_sheet = ChromeStyle::location_edit_style_sheet(Theme::chrome_palette(*this));
+    if (styleSheet() != style_sheet)
+        setStyleSheet(style_sheet);
     m_is_updating_chrome_style = false;
     update_zoom_indicator();
     update_in_use_chip_icons();

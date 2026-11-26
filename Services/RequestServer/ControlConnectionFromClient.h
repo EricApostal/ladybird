@@ -35,7 +35,7 @@ public:
     static Optional<ControlConnectionFromClient&> the();
 
     // Resolves a name through the system resolver of the process that launched RequestServer.
-    void resolve_host_with_system_resolver(ByteString const& host, Core::Socket::AddressFamily, Function<void(DNS::Resolver::SystemResolution)>);
+    DNS::Resolver::CancelRemoteSystemResolution resolve_host_with_system_resolver(ByteString const& host, Core::Socket::AddressFamily, Function<void(DNS::Resolver::SystemResolution)>);
 
 private:
     ControlConnectionFromClient(NonnullOwnPtr<IPC::Transport>, RequestServer::ConnectionFromClient::ConnectionMap&, RequestServer::ConnectionFromClient::RequestTransferLeaseMap&, Optional<HTTP::DiskCache&>);
@@ -52,6 +52,8 @@ private:
     virtual void set_use_system_dns() override;
 
     virtual void set_proxy_configuration(HTTP::ProxyConfiguration) override;
+
+    virtual void trust_certificate(ByteString host, u16 port, ByteString fingerprint) override;
 
     virtual void set_performance_monitor_enabled(bool) override;
 
@@ -84,6 +86,7 @@ private:
     Optional<MonotonicTime> m_last_performance_push;
 
     HashMap<u64, Function<void(DNS::Resolver::SystemResolution)>> m_pending_system_resolutions;
+    HashTable<u64> m_cancelled_system_resolutions;
     u64 m_next_system_resolution_id { 0 };
 };
 

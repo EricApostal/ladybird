@@ -19,6 +19,7 @@
 #include <LibGfx/RustFFI.h>
 #include <core/SkBitmap.h>
 #include <core/SkBlender.h>
+#include <core/SkCanvas.h>
 #include <core/SkColorFilter.h>
 #include <core/SkColorSpace.h>
 #include <core/SkData.h>
@@ -50,6 +51,13 @@ static_assert(to_underlying(PathVerb::Cubic) == to_underlying(SkPathVerb::kCubic
 static_assert(to_underlying(PathVerb::Close) == to_underlying(SkPathVerb::kClose));
 static_assert(sizeof(PathVerb) == sizeof(SkPathVerb));
 static_assert(sizeof(FloatPoint) == sizeof(SkPoint));
+
+void draw_tile_image_rect(SkCanvas& canvas, SkImage const& image, SkRect const& source_rect, SkRect const& target_rect, bool filtered, SkPaint const& paint)
+{
+    auto sampling = filtered ? SkSamplingOptions { SkFilterMode::kLinear } : SkSamplingOptions {};
+    auto constraint = filtered ? SkCanvas::kFast_SrcRectConstraint : SkCanvas::kStrict_SrcRectConstraint;
+    canvas.drawImageRect(&image, source_rect, target_rect, sampling, &paint, constraint);
+}
 
 SkMatrix to_skia_matrix(AffineTransform const& affine_transform)
 {
@@ -535,13 +543,13 @@ sk_sp<SkImage> sk_texture_image_sharing_pixels_of_decoded_image_frame([[maybe_un
 #endif
 }
 
-sk_sp<SkImage> sk_image_adopting_bitmap(NonnullRefPtr<Bitmap> bitmap, ColorSpace const& color_space)
+sk_sp<SkImage> sk_image_adopting_bitmap(NonnullRefPtr<Bitmap const> bitmap, ColorSpace const& color_space)
 {
     auto info = SkImageInfo::Make(bitmap->width(), bitmap->height(), to_skia_color_type(bitmap->format()), to_skia_alpha_type(bitmap->format(), bitmap->alpha_type()), to_skia_color_space(color_space));
     auto row_bytes = bitmap->pitch();
     auto byte_count = bitmap->size_in_bytes();
     auto* pixels = bitmap->scanline_u8(0);
-    auto data = SkData::MakeWithProc(pixels, byte_count, [](void const*, void* context) { static_cast<Bitmap*>(context)->unref(); }, &bitmap.leak_ref());
+    auto data = SkData::MakeWithProc(pixels, byte_count, [](void const*, void* context) { static_cast<Bitmap const*>(context)->unref(); }, const_cast<Bitmap*>(&bitmap.leak_ref()));
     return SkImages::RasterFromData(info, move(data), row_bytes);
 }
 

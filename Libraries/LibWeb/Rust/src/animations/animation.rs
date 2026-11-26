@@ -13,6 +13,7 @@ use super::timeline::TimelineHandle;
 use super::timeline_state::TimelineState;
 use super::timing::{AnimationPlayState, AnimationPlayback, TimeValue};
 use super::weak_record_set::WeakRecordSet;
+use crate::css::ffi_support::RcRef;
 use crate::css::property_metadata::property_name;
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
 use crate::css::style::animations::AppliedAnimationDefinition;
@@ -149,8 +150,6 @@ pub(crate) struct CssTransitionState {
     pub(crate) generation: u64,
     /// https://drafts.csswg.org/css-transitions/#transition-start-time
     pub(crate) start_time: f64,
-    /// https://drafts.csswg.org/css-transitions/#transition-end-time
-    pub(crate) end_time: f64,
     /// https://drafts.csswg.org/css-transitions/#transition-start-value
     pub(crate) start_value: RetainedStyleValueData,
     /// https://drafts.csswg.org/css-transitions/#transition-end-value
@@ -165,6 +164,9 @@ pub(crate) struct CssTransitionState {
     pub(crate) previous_phase: TransitionPhase,
     /// Whether the transition was started provisionally and is neither committed nor discarded yet.
     pub(crate) provisional: bool,
+    /// The time the play that started the transition becomes ready at, or none where its pending play task decides it.
+    /// It is cleared once that task runs or the play ends.
+    pub(crate) initial_ready_time: Option<f64>,
     /// Whether the transition is one the hover of a clock lane started, which the host took in.
     pub(crate) adopted_from_lane: bool,
     /// The effect the transition was started with, which it keeps whatever script sets as its associated effect. Its
@@ -454,15 +456,9 @@ impl AnimationRecord {
         }
     }
 
-    /// The time of the style change event that started the CSS transition the record is of.
-    /// https://drafts.csswg.org/css-transitions/#style-change-event
     #[must_use]
-    pub(crate) fn css_transition_style_change_event_time(&self) -> f64 {
-        let start_delay = self
-            .effect
-            .as_ref()
-            .map_or(0.0, |effect| effect.borrow().timing().start_delay.value);
-        self.css_transition().start_time - start_delay
+    pub(crate) fn css_transition_initial_ready_time(&self) -> Option<f64> {
+        self.css_transition().initial_ready_time
     }
 
     pub(crate) fn css_transition_mut(&mut self) -> &mut CssTransitionState {
@@ -645,6 +641,11 @@ impl AnimationHandle {
     /// Whether the handle is to `animation`.
     pub(crate) fn is(&self, animation: &AnimationCell) -> bool {
         std::ptr::eq(Rc::as_ptr(&self.0), animation)
+    }
+
+    /// Takes a reference of its own to the animation the host lends.
+    pub(crate) fn retained_from_lent(cell: RcRef<'_, AnimationCell>) -> Self {
+        Self(cell.to_rc())
     }
 
     /// Takes a reference of its own to an animation the host holds a reference to.

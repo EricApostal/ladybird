@@ -2722,21 +2722,6 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         contributions
     }
 
-    pub(crate) fn outer_inline_contributions_of_legend_whose_fit_content_size_ignores_its_limits(
-        &self,
-        sized: SizedBox<'_>,
-        available_block_size: AvailableSize,
-        constraints: ContainingBlockConstraints,
-    ) -> OuterInlineContributions {
-        let legend = sized.node;
-        let content_sizes = self.content_inline_sizes(sized, constraints, None).sizes;
-        OuterInlineContributions {
-            min_content_inline_size: content_sizes.min,
-            max_content_inline_size: content_sizes.max,
-            ..self.outer_inline_contributions(legend, available_block_size, constraints)
-        }
-    }
-
     pub(crate) fn block_level_table_wrapper_outer_inline_contributions(
         &self,
         sized: SizedBox<'_>,
@@ -4026,7 +4011,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             )
         });
         let block_size_is_automatic = self.should_treat_block_size_as_auto(sized, available_space, constraints);
-        let mut used_block_size = if block_size_is_automatic {
+        let preferred_block_size = if block_size_is_automatic {
             natural
         } else {
             self.calculate_inner_block_size(
@@ -4036,24 +4021,8 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 constraints,
             )
         };
-        if !self.should_treat_max_block_size_as_none(node, available_space.block_size, constraints)
-            && !style.max_height().is_auto()
-        {
-            used_block_size = used_block_size.min(self.calculate_inner_block_size(
-                sized,
-                available_space,
-                style.max_height(),
-                constraints,
-            ));
-        }
-        if !is_plain_auto(style.min_height()) {
-            used_block_size = used_block_size.max(self.calculate_inner_block_size(
-                sized,
-                available_space,
-                style.min_height(),
-                constraints,
-            ));
-        }
+        let used_block_size =
+            self.clamp_block_size_to_min_max(sized, preferred_block_size, available_space, constraints);
         // Only force a definite content box when a button's used block size exceeds its content block size, so a larger
         // preferred or minimum size has room to center within, or when a text input's differs from it in either
         // direction. A content-sized box stays indefinite, so an intrinsic keyword does not resolve percentage-sized

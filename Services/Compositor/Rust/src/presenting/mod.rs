@@ -18,7 +18,7 @@ mod window_server;
 use crate::backing_stores::{AllocationOutcome, BackingStores, Publication, StorePublication, StoreResizeOutcome};
 use crate::frame_inputs::FrameInputs;
 use crate::host::{ContextTimer, Host, PendingFrame};
-use crate::raster_host::{FfiSublayer, PaintingResources, RasterHost, SurfaceBlend};
+use crate::raster_host::{FfiSublayer, PaintingResources, RasterHost, SurfaceBlend, SurfaceSampling};
 use crate::remote_layers::{ShowingLayer, WindowServerObject};
 use crate::surfaces::painting_surface::PaintingSurface;
 use crate::surfaces::presentable_surface::PresentableSurface;
@@ -26,6 +26,7 @@ use damage::{PaintedFrame, StoreDamage};
 use layer_overlay::LayerOverlaySwitch;
 use layers::ContextLayers;
 use libcompositing_rust::display_list::commands::CompositorContextId;
+use libcompositing_rust::display_list::layers::SpaceToFrame;
 use libcompositing_rust::display_list::replay::{
     CompositedContexts, CompositingInsideEffects, NoCompositedContexts, ReplayFrame, ReplaySelection,
     ResolvedCompositedContext, composite_inside_effects, replay_display_list,
@@ -34,7 +35,9 @@ use libcompositing_rust::host::FfiRasterPainter;
 use libcompositing_rust::ipc_types::Compositing_CompositorLayersDescription as CompositorLayersDescription;
 use libcompositing_rust::scrolling::DisplayList;
 use libcompositing_rust::time::{Duration, MonotonicTime};
-use libgfx_rust::{Color, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, IntSize, enclosing_int_rect};
+use libgfx_rust::{
+    AffineTransform, Color, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, IntSize, enclosing_int_rect,
+};
 use pacing::PacedTickRequest;
 use std::rc::Rc;
 
@@ -101,6 +104,23 @@ impl FrameToPaint<'_> {
     pub fn surface_clear_color(&self) -> Color {
         self.display_list.surface_clear_color().unwrap_or(Color::TRANSPARENT)
     }
+
+    /// What the frame shows of the raster of the page within `viewport_rect` of its own pixels.
+    pub fn rect_of_raster_shown_in(&self, viewport_rect: IntRect) -> IntRect {
+        rect_of_raster_shown_through(self.frame_inputs.raster_to_frame, viewport_rect)
+    }
+}
+
+/// What a frame shows of the raster of the page within `viewport_rect` of its own pixels: that rect, or for a frame that
+/// maps the raster to its pixels through `raster_to_frame`, the bounds of what the transform shows there.
+pub(crate) fn rect_of_raster_shown_through(
+    raster_to_frame: Option<AffineTransform>,
+    viewport_rect: IntRect,
+) -> IntRect {
+    match raster_to_frame {
+        Some(raster_to_frame) => SpaceToFrame::Transform(raster_to_frame).rect_in_space(viewport_rect),
+        None => viewport_rect,
+    }
 }
 
 /// Whether screenshots paint through the layers and tiles that frames are presented from, so that tests that compare
@@ -136,20 +156,26 @@ impl LayeredPaintState {
     }
 }
 
-fn bounded_composited_raster_scale(mut scale: FloatSize, viewport_size: IntSize) -> FloatSize {
+const MAXIMUM_RASTER_DIMENSION: f32 = 16384.0;
+const MAXIMUM_PIXEL_COUNT_OF_64_MIB_SURFACE: f32 = 16.0 * 1024.0 * 1024.0;
+
+fn clamped_composited_raster_scale(scale: FloatSize) -> FloatSize {
+    FloatSize {
+        width: scale.width.clamp(0.25, 5.0),
+        height: scale.height.clamp(0.25, 5.0),
+    }
+}
+
+fn bounded_composited_raster_scale(scale: FloatSize, viewport_size: IntSize) -> FloatSize {
     if viewport_size.width <= 0 || viewport_size.height <= 0 {
         return FloatSize {
             width: 1.0,
             height: 1.0,
         };
     }
-    scale = FloatSize {
-        width: scale.width.clamp(0.25, 5.0),
-        height: scale.height.clamp(0.25, 5.0),
-    };
+    let mut scale = clamped_composited_raster_scale(scale);
     // Reserve a pixel on each axis for fractional placement.
-    const MAXIMUM_DIMENSION: f32 = 16384.0;
-    const MAXIMUM_PIXEL_COUNT_OF_64_MIB_SURFACE: f32 = 16.0 * 1024.0 * 1024.0;
+    const MAXIMUM_DIMENSION: f32 = MAXIMUM_RASTER_DIMENSION;
     scale.width = scale.width.min((MAXIMUM_DIMENSION - 1.0) / viewport_size.width as f32);
     scale.height = scale
         .height
@@ -162,6 +188,48 @@ fn bounded_composited_raster_scale(mut scale: FloatSize, viewport_size: IntSize)
         scale.height *= factor;
     }
     scale
+}
+
+/// The part of a viewport too large to raster whole at `scale` that the surface the parent draws holds instead, in
+/// viewport pixels: as much of the viewport as the raster limits allow, around `visible_rect`. `current` is kept as long
+/// as it still holds the visible part, so that the parent's tiles, which each show a different part, don't move it back
+/// and forth. None where even the visible part can't be rastered at `scale`.
+fn raster_region_around(
+    visible_rect: IntRect,
+    viewport_size: IntSize,
+    scale: FloatSize,
+    current: Option<IntRect>,
+) -> Option<IntRect> {
+    // Reserve two pixels on each axis: one for fractional placement, and one for the region's own fractional origin.
+    let maximum_width = ((MAXIMUM_RASTER_DIMENSION - 2.0) / scale.width).floor() as i64;
+    let maximum_height = ((MAXIMUM_RASTER_DIMENSION - 2.0) / scale.height).floor() as i64;
+    let maximum_area = ((MAXIMUM_PIXEL_COUNT_OF_64_MIB_SURFACE - 4.0 * MAXIMUM_RASTER_DIMENSION - 4.0)
+        / (scale.width * scale.height))
+        .floor() as i64;
+    let (visible_width, visible_height) = (visible_rect.width as i64, visible_rect.height as i64);
+    if visible_width > maximum_width || visible_height > maximum_height || visible_width * visible_height > maximum_area
+    {
+        return None;
+    }
+    let mut width = (viewport_size.width as i64).min(maximum_width);
+    let mut height = (viewport_size.height as i64).min(maximum_height);
+    if width * height > maximum_area {
+        width = (maximum_area / height).max(visible_width);
+    }
+    if width * height > maximum_area {
+        height = (maximum_area / width).max(visible_height);
+    }
+    let (width, height) = (width as i32, height as i32);
+    if let Some(current) = current
+        && current.width == width
+        && current.height == height
+        && current.contains_rect(visible_rect)
+    {
+        return Some(current);
+    }
+    let x = (visible_rect.x + visible_rect.width / 2 - width / 2).clamp(0, viewport_size.width - width);
+    let y = (visible_rect.y + visible_rect.height / 2 - height / 2).clamp(0, viewport_size.height - height);
+    Some(IntRect::new(x, y, width, height))
 }
 
 fn rect_of_size(size: IntSize) -> IntRect {
@@ -220,6 +288,9 @@ pub struct ContextPresenting {
     unbounded_raster_scale_of_embedding: FloatSize,
     raster_scale: FloatSize,
     raster_translation: FloatPoint,
+    /// Where the viewport is too large to raster whole at the scale the parent draws it at, the part of it the surface
+    /// the parent draws holds, in viewport pixels. The translation then moves the part's origin to the surface's.
+    raster_region: Option<IntRect>,
 
     painted_frame: Option<PaintedFrame>,
     layers: ContextLayers,
@@ -263,6 +334,7 @@ impl ContextPresenting {
                 height: 1.0,
             },
             raster_translation: FloatPoint::default(),
+            raster_region: None,
             painted_frame: None,
             layers: ContextLayers::default(),
             layer_overlay: LayerOverlaySwitch::default(),
@@ -361,6 +433,14 @@ impl ContextPresenting {
     // embedding's scale is bounded for the new viewport. Bounding the already bounded scale instead can round it
     // differently, which would discard the raster on every replay.
     fn fit_surface_drawn_by_parent_to_viewport(&mut self) {
+        // The parent's next replay chooses the region again, for the new viewport.
+        if let Some(region) = self.raster_region.take() {
+            self.raster_translation = FloatPoint {
+                x: self.raster_translation.x + (region.x as f32 * self.raster_scale.width).floor(),
+                y: self.raster_translation.y + (region.y as f32 * self.raster_scale.height).floor(),
+            };
+            self.painted_frame = None;
+        }
         let scale = bounded_composited_raster_scale(self.unbounded_raster_scale_of_embedding, self.viewport_size);
         if self.raster_scale != scale {
             self.raster_scale = scale;
@@ -547,8 +627,15 @@ impl ContextPresenting {
         self.surface_drawn_by_parent.is_some()
     }
 
-    /// Makes the next paint redo the raster where the embedding now draws it at another scale or phase.
-    pub fn update_composited_raster_transform(&mut self, destination_rect: FloatRect, transform: &FloatMatrix4x4) {
+    /// Makes the next paint redo the raster where the embedding now draws it at another scale or phase, or shows a part
+    /// of a viewport too large to raster whole that the surface doesn't hold. `visible_device_rect` is the part of the
+    /// parent's canvas that its clips leave the context.
+    pub fn update_composited_raster_transform(
+        &mut self,
+        destination_rect: FloatRect,
+        transform: &FloatMatrix4x4,
+        visible_device_rect: IntRect,
+    ) {
         if self.presents_to_client || self.viewport_size.is_empty() || destination_rect.is_empty() {
             return;
         }
@@ -571,48 +658,77 @@ impl ContextPresenting {
         };
 
         // Perspective keeps the native resolution until we can choose a scale from the visible projected region.
-        let scale = bounded_composited_raster_scale(self.unbounded_raster_scale_of_embedding, self.viewport_size);
+        let mut scale = bounded_composited_raster_scale(self.unbounded_raster_scale_of_embedding, self.viewport_size);
+        let clamped_scale = clamped_composited_raster_scale(self.unbounded_raster_scale_of_embedding);
 
         let mut translation = FloatPoint::default();
-        if !has_perspective && m[0][1] == 0.0 && m[1][0] == 0.0 && scale.width == scale_x && scale.height == scale_y {
-            let mut x = m[0][0] * destination_rect.x + m[0][3];
-            let mut y = m[1][1] * destination_rect.y + m[1][3];
+        let mut region = None;
+        if !has_perspective
+            && m[0][1] == 0.0
+            && m[1][0] == 0.0
+            && clamped_scale.width == scale_x
+            && clamped_scale.height == scale_y
+        {
+            let x = m[0][0] * destination_rect.x + m[0][3];
+            let y = m[1][1] * destination_rect.y + m[1][3];
             if !x.is_finite() || !y.is_finite() {
                 return;
             }
-            // Mirrored placements need the opposite fractional phase so the remaining image transform still
-            // lands on integer device pixels.
-            if m[0][0] < 0.0 {
-                x = -x;
+            // A viewport too large to raster whole at the scale the parent draws it at is rastered at that scale only
+            // around the part the parent shows, rather than whole at a lower scale, which the parent would then
+            // magnify into a blur.
+            if scale != clamped_scale && m[0][0] > 0.0 && m[1][1] > 0.0 {
+                let visible_rect = enclosing_int_rect(FloatRect::new(
+                    (visible_device_rect.x as f32 - x) / scale_x,
+                    (visible_device_rect.y as f32 - y) / scale_y,
+                    visible_device_rect.width as f32 / scale_x,
+                    visible_device_rect.height as f32 / scale_y,
+                ))
+                .intersected(rect_of_size(self.viewport_size));
+                region = raster_region_around(visible_rect, self.viewport_size, clamped_scale, self.raster_region);
+                if region.is_some() {
+                    scale = clamped_scale;
+                }
             }
-            if m[1][1] < 0.0 {
-                y = -y;
+            if scale == clamped_scale {
+                // Mirrored placements need the opposite fractional phase so the remaining image transform still
+                // lands on integer device pixels.
+                let x = if m[0][0] < 0.0 { -x } else { x };
+                let y = if m[1][1] < 0.0 { -y } else { y };
+                translation = FloatPoint {
+                    x: x - x.floor(),
+                    y: y - y.floor(),
+                };
+                // The region's origin lands on the surface's, a whole number of pixels away, to keep the phase.
+                if let Some(region) = region {
+                    translation.x -= (region.x as f32 * scale.width).floor();
+                    translation.y -= (region.y as f32 * scale.height).floor();
+                }
             }
-            translation = FloatPoint {
-                x: x - x.floor(),
-                y: y - y.floor(),
-            };
         }
 
-        if self.raster_scale == scale && self.raster_translation == translation {
+        if self.raster_scale == scale && self.raster_translation == translation && self.raster_region == region {
             return;
         }
         self.raster_scale = scale;
         self.raster_translation = translation;
+        self.raster_region = region;
         self.painted_frame = None;
     }
 
     pub fn composited_surface(&self) -> Option<ResolvedCompositedContext> {
         let surface = self.surface_drawn_by_parent.as_ref()?;
         let painted_frame = self.painted_frame.as_ref()?;
+        let content_rect = FloatRect::new(
+            self.raster_translation.x,
+            self.raster_translation.y,
+            painted_frame.viewport_size.width as f32 * self.raster_scale.width,
+            painted_frame.viewport_size.height as f32 * self.raster_scale.height,
+        );
         Some(ResolvedCompositedContext {
             surface: surface.as_ffi().cast_mut().cast(),
-            content_rect: FloatRect::new(
-                self.raster_translation.x,
-                self.raster_translation.y,
-                painted_frame.viewport_size.width as f32 * self.raster_scale.width,
-                painted_frame.viewport_size.height as f32 * self.raster_scale.height,
-            ),
+            content_rect,
+            held_content_rect: content_rect.intersected(rect_of_size(surface.size()).to_float()),
         })
     }
 
@@ -713,11 +829,14 @@ impl ContextPresenting {
         if self.presents_to_client {
             return self.viewport_size;
         }
+        let rastered_rect = self.raster_region.unwrap_or_else(|| rect_of_size(self.viewport_size));
         IntSize {
-            width: (self.viewport_size.width as f32 * self.raster_scale.width + self.raster_translation.x).ceil()
-                as i32,
-            height: (self.viewport_size.height as f32 * self.raster_scale.height + self.raster_translation.y).ceil()
-                as i32,
+            width: ((rastered_rect.x + rastered_rect.width) as f32 * self.raster_scale.width
+                + self.raster_translation.x)
+                .ceil() as i32,
+            height: ((rastered_rect.y + rastered_rect.height) as f32 * self.raster_scale.height
+                + self.raster_translation.y)
+                .ceil() as i32,
         }
     }
 
@@ -988,6 +1107,9 @@ impl ContextPresenting {
         };
         if !screenshots_paint_from_layers() || !self.paint_screenshot_from_layers(env, target, &frame) {
             let save_count = env.raster.save(target);
+            if let Some(raster_to_frame) = frame_inputs.raster_to_frame {
+                apply_raster_to_frame(env.raster, target, raster_to_frame);
+            }
             replay_into(env, target, &frame, ReplaySelection::default());
             env.raster.restore_to_count(target, save_count);
         }
@@ -1003,9 +1125,13 @@ impl ContextPresenting {
         target: &Rc<PaintingSurface>,
         frame: &FrameToPaint<'_>,
     ) -> bool {
-        // The layers are rastered under the raster transform, which a screenshot does not apply.
+        // The layers are rastered under the raster transform, which a screenshot does not apply. A screenshot taken
+        // while the frame maps the raster to its pixels through a transform replays the list through it instead.
         let target_size = target.size();
-        if target_size.is_empty() || self.raster_transform() != FloatMatrix4x4::identity() {
+        if target_size.is_empty()
+            || self.raster_transform() != FloatMatrix4x4::identity()
+            || frame.frame_inputs.raster_to_frame.is_some()
+        {
             return false;
         }
         self.with_layered_paint_state(LayeredPaintState::of_screenshot(target_size), |this| {
@@ -1114,8 +1240,14 @@ impl ContextPresenting {
             let composited = env.raster.create_surface(source_size, Some(&source), false);
             if let Some(composited) = composited {
                 let source_rect = rect_of_size(source_size);
-                env.raster
-                    .draw_surface(&composited, &source, source_rect, source_rect, SurfaceBlend::Source);
+                env.raster.draw_surface(
+                    &composited,
+                    &source,
+                    source_rect,
+                    source_rect,
+                    SurfaceBlend::Source,
+                    SurfaceSampling::Nearest,
+                );
                 composite_layers_shown_by_window_server(&composited, painted_frame);
                 source = composited;
             }
@@ -1140,6 +1272,8 @@ impl ContextPresenting {
         // LCD coverage follows the physical pixel grid. Destination blending can erase pixels in the canvas fill.
         self.backing_stores.publication() == StorePublication::Published
             && !self.scales_frames_to_fit
+            // A pinch from zoom 1 keeps the tiles it starts with, scaled, until it rasters at another scale.
+            && frame_inputs.raster_scale == 1
             && self.device_pixel_ratio.fract() == 0.0
             && display_list.storage().summary().destination_blending_records.is_empty()
             // A blend or backdrop filter that reads the root group needs its original isolation from the canvas fill.
@@ -1196,6 +1330,27 @@ pub(crate) fn apply_raster_transform(
 ) {
     raster.translate(surface, translation.x, translation.y);
     raster.scale(surface, scale.width, scale.height);
+}
+
+/// Has what is drawn into the surface next go through `raster_to_frame`, a scale and a translation.
+pub(crate) fn apply_raster_to_frame(
+    raster: &RasterHost,
+    surface: &Rc<PaintingSurface>,
+    raster_to_frame: AffineTransform,
+) {
+    debug_assert!(raster_to_frame.b() == 0.0 && raster_to_frame.c() == 0.0);
+    apply_raster_transform(
+        raster,
+        surface,
+        FloatSize {
+            width: raster_to_frame.a(),
+            height: raster_to_frame.d(),
+        },
+        FloatPoint {
+            x: raster_to_frame.e(),
+            y: raster_to_frame.f(),
+        },
+    );
 }
 
 pub(crate) fn replay_into(
@@ -1276,4 +1431,71 @@ pub(crate) fn composite_inside_effects_of_frame(
                 composite,
             );
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UNSCALED: FloatSize = FloatSize {
+        width: 1.0,
+        height: 1.0,
+    };
+
+    #[test]
+    fn a_wide_viewport_rasters_a_full_height_band_around_the_visible_part() {
+        let viewport = IntSize {
+            width: 40000,
+            height: 150,
+        };
+        let region = raster_region_around(IntRect::new(30000, 0, 360, 150), viewport, UNSCALED, None).unwrap();
+        assert_eq!(region.width, 16382);
+        assert_eq!(region.height, 150);
+        assert!(region.contains_rect(IntRect::new(30000, 0, 360, 150)));
+        assert_eq!(region.x, 30180 - 16382 / 2);
+    }
+
+    #[test]
+    fn a_region_stays_put_while_it_holds_the_visible_part() {
+        let viewport = IntSize {
+            width: 40000,
+            height: 150,
+        };
+        let first = raster_region_around(IntRect::new(0, 0, 360, 150), viewport, UNSCALED, None).unwrap();
+        assert_eq!(first.x, 0);
+        let nearby = raster_region_around(IntRect::new(4000, 0, 360, 150), viewport, UNSCALED, Some(first)).unwrap();
+        assert_eq!(nearby, first);
+        let far = raster_region_around(IntRect::new(20000, 0, 360, 150), viewport, UNSCALED, Some(first)).unwrap();
+        assert!(far.contains_rect(IntRect::new(20000, 0, 360, 150)));
+    }
+
+    #[test]
+    fn a_region_stays_within_the_viewport_and_the_pixel_budget() {
+        let viewport = IntSize {
+            width: 12000,
+            height: 2000,
+        };
+        let scale = FloatSize {
+            width: 2.0,
+            height: 2.0,
+        };
+        let region = raster_region_around(IntRect::new(11900, 1900, 100, 100), viewport, scale, None).unwrap();
+        assert!(rect_of_size(viewport).contains_rect(region));
+        assert!(region.contains_rect(IntRect::new(11900, 1900, 100, 100)));
+        let pixels = (region.width as f32 * scale.width + 2.0) * (region.height as f32 * scale.height + 2.0);
+        assert!(pixels <= MAXIMUM_PIXEL_COUNT_OF_64_MIB_SURFACE);
+        assert!(region.width as f32 * scale.width + 2.0 <= MAXIMUM_RASTER_DIMENSION);
+    }
+
+    #[test]
+    fn a_visible_part_too_large_to_raster_gets_no_region() {
+        let viewport = IntSize {
+            width: 40000,
+            height: 40000,
+        };
+        assert_eq!(
+            raster_region_around(IntRect::new(0, 0, 20000, 100), viewport, UNSCALED, None),
+            None
+        );
+    }
 }

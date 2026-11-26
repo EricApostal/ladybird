@@ -1974,8 +1974,8 @@ void ConnectionFromClient::clear_inspected_dom_node(Web::PageId page_id)
         return;
 
     for (auto& navigable : Web::HTML::all_local_navigables()) {
-        if (navigable->active_document() != nullptr) {
-            navigable->active_document()->set_inspected_node(nullptr);
+        if (navigable.active_document() != nullptr) {
+            navigable.active_document()->set_inspected_node(nullptr);
         }
     }
 }
@@ -1987,8 +1987,8 @@ void ConnectionFromClient::highlight_dom_node(Web::PageId page_id, Web::UniqueNo
         return;
 
     for (auto& navigable : Web::HTML::all_local_navigables()) {
-        if (navigable->active_document() != nullptr) {
-            navigable->active_document()->set_highlighted_node(nullptr, {});
+        if (navigable.active_document() != nullptr) {
+            navigable.active_document()->set_highlighted_node(nullptr, {});
         }
     }
 
@@ -2080,8 +2080,8 @@ void ConnectionFromClient::clear_flexbox_highlight(Web::PageId page_id, Web::Uni
     }
 
     for (auto& navigable : Web::HTML::all_local_navigables()) {
-        if (navigable->active_document())
-            navigable->active_document()->clear_flexbox_highlighted_node(nullptr);
+        if (navigable.active_document())
+            navigable.active_document()->clear_flexbox_highlighted_node(nullptr);
     }
 }
 
@@ -2118,8 +2118,8 @@ void ConnectionFromClient::clear_grid_highlight(Web::PageId page_id, Web::Unique
     }
 
     for (auto& navigable : Web::HTML::all_local_navigables()) {
-        if (navigable->active_document())
-            navigable->active_document()->clear_grid_highlighted_node(nullptr);
+        if (navigable.active_document())
+            navigable.active_document()->clear_grid_highlighted_node(nullptr);
     }
 }
 
@@ -4157,6 +4157,12 @@ void ConnectionFromClient::set_has_picture_in_picture_support(Web::PageId page_i
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().picture_in_picture_controller().set_has_picture_in_picture_support(has_support);
+}
+
+void ConnectionFromClient::set_offers_to_trust_self_signed_certificates(Web::PageId page_id, bool offers)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().set_offers_to_trust_self_signed_certificates(offers);
 }
 
 void ConnectionFromClient::did_open_picture_in_picture_window(Web::PageId page_id, Gfx::IntSize window_size)

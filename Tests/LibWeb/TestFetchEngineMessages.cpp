@@ -30,12 +30,13 @@ TEST_CASE(commands_round_trip_their_payloads)
     commands.append(Command::Abort { .fetch_id = FetchId(2) });
     commands.append(Command::Terminate { .fetch_id = FetchId(3) });
     commands.append(Command::Stop { .fetch_id = FetchId(4) });
-    commands.append(Command::ResolveRedirect { .delivery_id = DeliveryId(5), .continuation_id = ContinuationId(6), .resolution = Command::ResolveRedirect::AcceptAsFinal {} });
+    commands.append(Command::ResolveRedirect { .fetch_id = FetchId(5), .continuation_id = ContinuationId(6), .resolution = Command::ResolveRedirect::AcceptAsFinal {} });
     commands.append(Command::PreloadResponseResolved {
         .fetch_id = FetchId(7),
         .response = { .outcome = Command::CompletedPreloadResponse::Completed { .body = Delivered<Core::ImmutableBytes> { Core::ImmutableBytes::adopt(MUST(ByteBuffer::copy("preloaded"sv.bytes()))) } } },
     });
     commands.append(Command::TransportControl { .request_id = RequestId(8), .transport_epoch = TransportEpoch(9), .operation = Command::TransportControl::ReleaseNavigationHoldUpTo { .byte_count = 4096 } });
+    commands.append(Command::PreloadWaitAbandoned { .fetch_id = FetchId(10) });
 
     Vector<u64> seen_ids;
     for (auto& command : commands) {
@@ -47,13 +48,14 @@ TEST_CASE(commands_round_trip_their_payloads)
             [&](Command::ResolveRedirect const& resolve) {
                 EXPECT(resolve.resolution.has<Command::ResolveRedirect::AcceptAsFinal>());
                 EXPECT_EQ(resolve.continuation_id, ContinuationId(6));
-                seen_ids.append(resolve.delivery_id.value());
+                seen_ids.append(resolve.fetch_id.value());
             },
             [&](Command::PreloadResponseResolved const& preload) {
                 auto const& completed = preload.response.outcome.get<Command::CompletedPreloadResponse::Completed>();
                 EXPECT_EQ(completed.body.handle().bytes(), "preloaded"sv.bytes());
                 seen_ids.append(preload.fetch_id.value());
             },
+            [&](Command::PreloadWaitAbandoned const& abandoned) { seen_ids.append(abandoned.fetch_id.value()); },
             [&](Command::TransportControl const& control) {
                 EXPECT_EQ(control.transport_epoch, TransportEpoch(9));
                 EXPECT_EQ(control.operation.get<Command::TransportControl::ReleaseNavigationHoldUpTo>().byte_count, 4096u);
@@ -62,7 +64,7 @@ TEST_CASE(commands_round_trip_their_payloads)
             [&](Command::NavigationBodyAdopted const&) { FAIL("no navigation body was adopted"); },
             [&](Command::AdoptNetworkTransport const&) { FAIL("no transport was posted"); });
     }
-    EXPECT_EQ(seen_ids, (Vector<u64> { 2, 3, 4, 5, 7, 8 }));
+    EXPECT_EQ(seen_ids, (Vector<u64> { 2, 3, 4, 5, 7, 8, 10 }));
 }
 
 static bool peer_has_hung_up(IPC::Transport& transport)
@@ -121,9 +123,17 @@ TEST_CASE(events_round_trip_their_payloads)
     timing_seed.start_time = 12.5;
     timing_seed.render_blocking = true;
 
+    auto response = Web::Fetch::Infrastructure::Response::create();
+    response->set_status(201);
+
     Vector<EngineEvent> events;
-    events.append(Event::ResponseDelivery { .delivery_id = DeliveryId(1), .body = NullBody {}, .timing_seed = move(timing_seed) });
-    events.append(Event::EndOfBody { .delivery_id = DeliveryId(2), .final_sizes = { .encoded_body_size = 10, .decoded_body_size = 20 }, .end_time = 99 });
+    events.append(Event::ResponseDelivery {
+        .response = response,
+        .body = NullBody {},
+        .timing_seed = move(timing_seed),
+        .redirect_continuation_id = ContinuationId(1),
+    });
+    events.append(Event::EndOfBody { .delivery_id = DeliveryId(2), .end_time = 99 });
     events.append(Event::ConsumeBodyResult { .delivery_id = DeliveryId(3), .outcome = Event::ConsumeBodyResult::Bytes { Core::ImmutableBytes::adopt(MUST(ByteBuffer::copy("body"sv.bytes()))) } });
     events.append(Event::BodyChannelReadable { .delivery_id = DeliveryId(4), .ticket = WakeTicket(7) });
     events.append(Event::DeliveryEnd { .delivery_id = DeliveryId(5), .outcome = Event::DeliveryEnd::Revoked {} });
@@ -176,21 +186,25 @@ TEST_CASE(events_round_trip_their_payloads)
             .network_error = Requests::NetworkError::IncompleteContent,
         },
     });
+    events.append(Event::FetchEnded {});
 
     Vector<u64> seen_ids;
     bool seen_network_phases = false;
+    bool seen_fetch_end = false;
     Vector<StringView> seen_request_body_events;
     Vector<u64> seen_network_request_ids;
     for (auto const& event : events) {
         event.visit(
             [&](Event::ResponseDelivery const& delivery) {
+                EXPECT_EQ(delivery.response.ptr(), response.ptr());
+                EXPECT_EQ(delivery.response->status(), 201);
                 EXPECT(delivery.body.has<NullBody>());
                 EXPECT_EQ(delivery.timing_seed.start_time, 12.5);
                 EXPECT(delivery.timing_seed.render_blocking);
-                seen_ids.append(delivery.delivery_id.value());
+                seen_ids.append(delivery.redirect_continuation_id->value());
             },
             [&](Event::EndOfBody const& end) {
-                EXPECT_EQ(end.final_sizes.decoded_body_size, 20u);
+                EXPECT_EQ(end.end_time, 99);
                 seen_ids.append(end.delivery_id.value());
             },
             [&](Event::ConsumeBodyResult const& result) {
@@ -255,10 +269,12 @@ TEST_CASE(events_round_trip_their_payloads)
                         EXPECT(finished.network_error == Requests::NetworkError::IncompleteContent);
                     });
                 seen_network_request_ids.append(network_activity.request_id.value());
-            });
+            },
+            [&](Event::FetchEnded const&) { seen_fetch_end = true; });
     }
     EXPECT_EQ(seen_ids, (Vector<u64> { 1, 2, 3, 4, 5, 6 }));
     EXPECT(seen_network_phases);
+    EXPECT(seen_fetch_end);
     EXPECT_EQ(seen_request_body_events, (Vector<StringView> { "progress"sv, "end of body"sv, "read stream"sv, "sent from source"sv }));
     EXPECT_EQ(seen_network_request_ids, (Vector<u64> { 8, 9, 10, 11 }));
 }

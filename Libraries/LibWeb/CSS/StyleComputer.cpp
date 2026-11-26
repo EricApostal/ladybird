@@ -907,12 +907,13 @@ RequiredInvalidationAfterStyleChange StyleComputer::run_transition_step_for_inst
     StyleEngineFFI::FfiAnimationOverlayPublication publication;
     publish_sampled_animation_overlays(read, { &overlay, 1 }, { &publication, 1 });
     element.refresh_computed_style(read, pseudo_element, InstalledStyle::adopt(publication.record));
-    // NB: refresh_computed_style() shows the new record on the element's own layout node. A transition that starts
+    // NB: refresh_computed_style() shows the new record on the element's own layout node, unless the node shows a
+    //     style the arena derived from the old one, which applying the style derives again. A transition that starts
     //     with an inherited property moves what that node's anonymous descendants inherit, too, and applying the
     //     style reaches them; otherwise they show the after-change value until the next animation frame.
     auto* layout_node = pseudo_element.has_value() ? element.pseudo_element_unsafe_layout_node(read, *pseudo_element) : element.unsafe_layout_node(read);
     if (layout_node) {
-        if (publication.invalidation.requires_layout_node_style_application)
+        if (publication.invalidation.requires_layout_node_style_application || layout_node->has_layout_derived_style())
             layout_node->apply_style(element.style_record_identity(pseudo_element));
         else if (publication.invalidation.requires_style_resource_update)
             layout_node->attach_style_resources();
@@ -983,6 +984,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
         .pseudo_element_serialization = pseudo_element_serialization.has_value() ? pseudo_element_serialization->raw_identity() : 0,
         .has_slot = slot.has_value(),
         .slot = slot.value_or(Animations::RustFFI::AnimationOwnerSlot { 0 }),
+        .has_last_animation_frame_timestamp = m_document->last_animation_frame_timestamp().has_value(),
         .style_change_event_time = current_time->value,
         .generation = document().transition_generation(),
         .overlay_store = overlay ? overlay->rust_store() : nullptr,

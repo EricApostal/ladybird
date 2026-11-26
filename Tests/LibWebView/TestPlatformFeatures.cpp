@@ -20,7 +20,7 @@ using WebView::FeatureStatus;
 using WebView::PlatformFeatureDecisions;
 using WebView::SystemFacts;
 
-static constexpr FFmpegFacts ffmpeg_9_0 { .avcodec_version = FFmpegFacts::version(63, 1, 102), .avutil_version = FFmpegFacts::version(61, 1, 102), .shares_bundled_struct_layouts = true };
+static constexpr FFmpegFacts ffmpeg_9_0 { .avcodec_version = FFmpegFacts::version(63, 1, 102), .avutil_version = FFmpegFacts::version(61, 1, 102), .has_vulkan_decoder_for_its_version = true };
 
 // As NVIDIA's driver reports them: references are decoded into the output, and no modifier tiles a DPB.
 static SystemFacts facts_with_a_coinciding_dpb()
@@ -214,10 +214,10 @@ TEST_CASE(each_ffmpeg_needs_a_codec_the_gpu_decodes)
     EXPECT(decisions.is_enabled(Feature::VulkanVideoBundledFFmpeg));
 }
 
-TEST_CASE(system_ffmpeg_needs_matching_struct_layouts)
+TEST_CASE(system_ffmpeg_needs_a_vulkan_decoder_built_for_its_version)
 {
     auto facts = facts_with_a_coinciding_dpb();
-    facts.system_ffmpeg->shares_bundled_struct_layouts = false;
+    facts.system_ffmpeg->has_vulkan_decoder_for_its_version = false;
     auto decisions = evaluate(facts);
     EXPECT_EQ(decisions.status_of(Feature::VulkanVideoSystemFFmpeg).state, FeatureStatus::State::Unsupported);
     EXPECT(decisions.is_enabled(Feature::VulkanVideoBundledFFmpeg));
@@ -400,4 +400,36 @@ TEST_CASE(system_facts_reject_malformed_json)
 
     facts.gpu->driver_info = MUST(String::repeated('x', 1025));
     EXPECT(SystemFacts::from_json(facts.to_json().serialized()).is_error());
+}
+
+TEST_CASE(curl_names_the_openssl_it_uses_without_parentheses)
+{
+    using PlatformFeatures::OpenSSLFacts;
+    EXPECT_EQ(OpenSSLFacts::openssl_version_from_curl_ssl_version("OpenSSL/4.1.0"sv), "4.1.0"sv);
+    EXPECT_EQ(OpenSSLFacts::openssl_version_from_curl_ssl_version("OpenSSL/3.5.1 (GnuTLS/3.8.9)"sv), "3.5.1"sv);
+    EXPECT(!OpenSSLFacts::openssl_version_from_curl_ssl_version("GnuTLS/3.8.9 (OpenSSL/3.5.1)"sv).has_value());
+    EXPECT_EQ(OpenSSLFacts::openssl_version_from_curl_ssl_version("(GnuTLS/3.8.9) OpenSSL/3.5.1"sv), "3.5.1"sv);
+    EXPECT(!OpenSSLFacts::openssl_version_from_curl_ssl_version("(OpenSSL/3.5.1) GnuTLS/3.8.9"sv).has_value());
+    EXPECT(!OpenSSLFacts::openssl_version_from_curl_ssl_version("LibreSSL/4.0.0"sv).has_value());
+}
+
+TEST_CASE(only_a_curl_on_another_openssl_is_a_mismatch)
+{
+    using PlatformFeatures::OpenSSLFacts;
+    EXPECT(!(OpenSSLFacts { .linked_version = "4.1.0"_string, .curl_version = "4.1.0"_string }).curl_uses_another_openssl());
+    EXPECT(!(OpenSSLFacts { .linked_version = "4.1.0"_string, .curl_version = {} }).curl_uses_another_openssl());
+    EXPECT((OpenSSLFacts { .linked_version = "3.5.9"_string, .curl_version = "4.1.0"_string }).curl_uses_another_openssl());
+    // Even within a major version, the layout of the structures RequestServer reaches into may differ.
+    EXPECT((OpenSSLFacts { .linked_version = "3.5.9"_string, .curl_version = "3.6.0"_string }).curl_uses_another_openssl());
+}
+
+TEST_CASE(openssl_facts_survive_json)
+{
+    SystemFacts facts;
+    facts.openssl = PlatformFeatures::OpenSSLFacts { .linked_version = "3.5.9"_string, .curl_version = "4.1.0"_string };
+    EXPECT(MUST(SystemFacts::from_json(facts.to_json().serialized())) == facts);
+
+    // A curl on another TLS library leaves the curl version out.
+    facts.openssl->curl_version = {};
+    EXPECT(MUST(SystemFacts::from_json(facts.to_json().serialized())) == facts);
 }

@@ -8,11 +8,11 @@
 #include <LibCore/CrashHandler.h>
 #include <LibSandbox/ConnectBroker.h>
 #include <LibSandbox/FileBroker.h>
+#include <LibSandbox/LinuxFcntl.h>
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
 #include <asm/termbits.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <linux/audit.h>
 #include <linux/netlink.h>
 #include <linux/sched.h>
@@ -2144,14 +2144,12 @@ void SeccompPolicy::allow_file_descriptor_operations()
     append(SECCOMP_LOAD_SYSCALL_NR);
     append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
 
-#ifdef F_DUPFD_QUERY
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
     append(SECCOMP_LOAD_ARGUMENT(1));
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_DUPFD_QUERY, 0, 1));
     append(SECCOMP_ALLOW);
     append(SECCOMP_LOAD_SYSCALL_NR);
     append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
-#endif
 
 #ifdef F_ADD_SEALS
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
@@ -2746,6 +2744,17 @@ void SeccompPolicy::allow_gpu_device_operations()
 #endif
 #ifdef __NR_fchmodat2
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fchmodat2, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+
+    // NVIDIA also tries to make its device nodes when they are missing, as they are on a machine without an NVIDIA
+    // GPU. Refuse mknod() the same way, whatever it would make.
+#ifdef __NR_mknod
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mknod, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+#ifdef __NR_mknodat
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mknodat, 0, 1));
     append(SECCOMP_ERRNO(EPERM));
 #endif
 

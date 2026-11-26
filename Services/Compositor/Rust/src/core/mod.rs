@@ -253,13 +253,6 @@ impl CompositorCore {
         !context.borrow().presents_to_client() && parent_context_id != context_id
     }
 
-    pub fn presents_to_client(&self, context_id: CompositorContextId) -> bool {
-        let _entered = self.enter();
-
-        self.context_if_present(context_id)
-            .is_some_and(|context| context.borrow().presents_to_client())
-    }
-
     pub fn context_is_effectively_visible(&self, context_id: CompositorContextId) -> bool {
         let _entered = self.enter();
 
@@ -474,6 +467,16 @@ impl CompositorCore {
     ) {
         let _entered = self.enter();
 
+        if !self.presentations.borrow().contains_key(&presentation_id) {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: Ignoring binding of context {} to presentation {}, which is already gone",
+                context_id.0,
+                presentation_id.0
+            );
+            return;
+        }
         let Some(context) = self.context_if_present(context_id) else {
             return;
         };
@@ -740,6 +743,7 @@ impl CompositorCore {
         display_list: Rc<DisplayList>,
         visual_context_tree: AccumulatedVisualContextTree,
         scroll_state_snapshot: ScrollStateSnapshot,
+        keyboard_scroll_state: KeyboardScrollState,
         now: MonotonicTime,
     ) -> bool {
         let _entered = self.enter();
@@ -749,6 +753,7 @@ impl CompositorCore {
             display_list,
             visual_context_tree,
             scroll_state_snapshot,
+            keyboard_scroll_state,
             now,
         );
         self.finish_entry(now);
@@ -967,7 +972,7 @@ impl CompositorCore {
 
     // Hands the context's async scroll updates to its WebContent process as soon as they exist,
     // so a rendering update reads them locally instead of asking for them over a synchronous call.
-    pub(super) fn publish_pending_async_scroll_updates(&self, _: CompositorContextId, context: &RefCell<ContextState>) {
+    pub(super) fn publish_pending_async_scroll_updates(&self, context: &RefCell<ContextState>) {
         context.borrow_mut().publish_pending_async_scroll_updates();
     }
 
@@ -1032,7 +1037,7 @@ impl CompositorCore {
         }
 
         if presents_on_display {
-            self.publish_pending_async_scroll_updates(context_id, context);
+            self.publish_pending_async_scroll_updates(context);
             let needs_frame = context.borrow_mut().visual_animations_need_frame(now);
             if needs_frame {
                 context.borrow_mut().advance_visual_animations(frame_time);
@@ -1080,7 +1085,7 @@ impl CompositorCore {
         if let Some(frame) = result.frame_to_present {
             self.request_present(context_id, &frame);
         }
-        self.publish_pending_async_scroll_updates(context_id, context);
+        self.publish_pending_async_scroll_updates(context);
         if result.should_request_rendering_update {
             context.borrow_mut().request_rendering_update();
         }

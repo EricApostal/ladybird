@@ -27,47 +27,38 @@ pub use crate::display_list::placement::{
     CompositeClip, RasterSpace, RasterSpaceAnchorKind, RasterSpaceIndex, RunGroupIndex, raster_space_anchors,
 };
 use crate::display_list::placement::{
-    EXTENT_LIMIT_IN_DEVICE_PIXELS, enclosing_int_rect_within_extent_limit, space_and_ancestors_below_viewport,
-    spatial_nodes_that_move_on_their_own,
+    EXTENT_LIMIT_IN_DEVICE_PIXELS, MAXIMUM_RASTER_SPACE_COUNT, enclosing_int_rect_within_extent_limit,
+    space_and_ancestors_below_viewport, spatial_nodes_that_move_on_their_own,
 };
 use crate::display_list::reach::Reach;
 use crate::display_list::storage::{DisplayListStorage, ListPosition, ListSpan};
 use crate::display_list::summary::LiveContent;
+use crate::display_list::tiles::CellRange;
 use crate::display_list::window_server_placement::{
     WhyWindowServerCannotCompositeEffect, WhyWindowServerCannotShowMedia, WindowServerPlacement,
     WindowServerPlacementOfEffect, window_server_placement_of_effect,
 };
-use crate::visual_context::queries::{NestingOfLiveEffects, backdrop_reader_by_reading_effect_index};
+use crate::visual_context::queries::backdrop_reader_by_reading_effect_index;
 use crate::visual_context::{VisualContextTree, WorldTransforms, device_offset_for_index};
 use libgfx_rust::{AffineTransform, CornerRadii, FloatMatrix4x4, FloatPoint, IntPoint, IntRect};
+use libipc_rust::wire::{Decode, Encode};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::rc::Rc;
 
 pub mod planning;
 mod wire;
 
-pub use wire::{LayerPlan, UnvalidatedLayerPlan, compositor_takes_plans_within};
+pub use wire::{LayerPlan, StackOnWire, UnvalidatedLayerPlan, ValidatedLayerPlan, compositor_takes_plans_within};
 
 // Twice the extent limit of a plan, which leaves room for the margins that planning adds past the extent of a space.
 // The rects of a stack from another process are within it, and so are the offsets a frame composites spaces at, so that
 // a rect offset by such an offset still fits in an `IntRect`.
 const COORDINATE_LIMIT_IN_DEVICE_PIXELS: i32 = 2 * EXTENT_LIMIT_IN_DEVICE_PIXELS as i32;
 
-/// The most canvases, videos and nested contexts that get layers.
-pub const MAXIMUM_MEDIA_LAYER_COUNT: usize = 8;
-
 /// The most carets and scroll bars that get layers, each of which the compositor paints into a small surface of its
-/// own. Each cuts its band once, and a plan cuts a band at most `MAXIMUM_CUT_COUNT_OF_RECEIVED_BAND` times.
+/// own. Each cuts its band once, and a plan cuts a band at most `MAXIMUM_CUT_COUNT_OF_RECEIVED_BAND` times. Canvases,
+/// videos and nested contexts are bounded only by those cuts.
 pub const MAXIMUM_LAYER_COUNT_OF_LIVE_CONTENT_DRAWN_BY_ITS_RECORD: usize = 64;
-
-/// The most layers a plan gives live content of the kind of `content`.
-pub(crate) fn maximum_layer_count_of_live_content_like(content: LiveContent) -> usize {
-    if content.is_drawn_by_its_record() {
-        MAXIMUM_LAYER_COUNT_OF_LIVE_CONTENT_DRAWN_BY_ITS_RECORD
-    } else {
-        MAXIMUM_MEDIA_LAYER_COUNT
-    }
-}
 
 /// The most composited effects that nest around a layer of a plan: the effects a frame composites the layer inside,
 /// each inside the next. Pages nest far fewer, as the compositor composites only an effect that it animates, or one
@@ -92,7 +83,7 @@ pub(crate) fn media_name(content: LiveContent) -> &'static str {
 }
 
 /// Why the compositor cannot composite an effect, which keeps what it holds from having layers of its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum WhyCompositorCannotCompositeEffect {
     FilterMovesWhatItFilters,
     FilterReadsFartherThanTilesAreFollowed,
@@ -110,13 +101,12 @@ impl std::fmt::Display for WhyCompositorCannotCompositeEffect {
 }
 
 /// Why a list is painted in a single layer that replays all of it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum WhyListIsOneLayer {
     EmptyViewport,
     EmptyDisplayList,
     SortingContext3D,
     RootIsolationEffectIsNotPlainGroup,
-    MaskDeclaredUnderEffectsItsMaskIsNotUnder,
     RecordsBlendWithWhatOtherLayersHoldBelowThem,
     EffectTheCompositorCannotCompositeIsComposited(WhyCompositorCannotCompositeEffect),
     CompositedEffectsNestTooDeep,
@@ -137,9 +127,6 @@ impl std::fmt::Display for WhyListIsOneLayer {
             WhyListIsOneLayer::EmptyDisplayList => "empty display list",
             WhyListIsOneLayer::SortingContext3D => "3D sorting context holding an effect that reads or is composited",
             WhyListIsOneLayer::RootIsolationEffectIsNotPlainGroup => "root isolation effect is not a plain group",
-            WhyListIsOneLayer::MaskDeclaredUnderEffectsItsMaskIsNotUnder => {
-                "mask content declared under effects its mask is not under"
-            }
             WhyListIsOneLayer::RecordsBlendWithWhatOtherLayersHoldBelowThem => {
                 "records blend with what other layers hold below them"
             }
@@ -251,6 +238,33 @@ impl SpaceToFrame {
     }
 }
 
+fn within_coordinate_limit(value: i64) -> i64 {
+    let limit = i64::from(COORDINATE_LIMIT_IN_DEVICE_PIXELS);
+    value.clamp(-limit, limit)
+}
+
+// The edges are kept within the coordinate limit, so that the size between them still fits in an `IntRect`.
+fn rect_at_raster_scale(rect: IntRect, factor: i32) -> IntRect {
+    let at_raster_scale = |coordinate: i64| within_coordinate_limit(coordinate * i64::from(factor));
+    let (left, top) = (at_raster_scale(i64::from(rect.x)), at_raster_scale(i64::from(rect.y)));
+    let right = at_raster_scale(i64::from(rect.x) + i64::from(rect.width));
+    let bottom = at_raster_scale(i64::from(rect.y) + i64::from(rect.height));
+    IntRect::new(left as i32, top as i32, (right - left) as i32, (bottom - top) as i32)
+}
+
+fn corner_radii_at_raster_scale(radii: CornerRadii, factor: i32) -> CornerRadii {
+    let scaled = |radius: libgfx_rust::CornerRadius| libgfx_rust::CornerRadius {
+        horizontal_radius: radius.horizontal_radius.saturating_mul(factor),
+        vertical_radius: radius.vertical_radius.saturating_mul(factor),
+    };
+    CornerRadii {
+        top_left: scaled(radii.top_left),
+        top_right: scaled(radii.top_right),
+        bottom_right: scaled(radii.bottom_right),
+        bottom_left: scaled(radii.bottom_left),
+    }
+}
+
 /// A transform of a space and its inverse, or none for a transform that shows nothing of the space: one with a value
 /// that is not finite, or one without an inverse of finite values.
 fn transform_and_inverse_that_show_space(transform: AffineTransform) -> Option<(AffineTransform, AffineTransform)> {
@@ -260,7 +274,7 @@ fn transform_and_inverse_that_show_space(transform: AffineTransform) -> Option<(
 }
 
 /// The index of a node in `LayerStack::nodes`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct PlacementNodeIndex(pub usize);
 
 /// The index of a band in `LayerStack::bands`.
@@ -464,6 +478,9 @@ pub struct LayerStack {
     pub swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
     /// Per band, the innermost band at or around it whose node the compositor composites inside its effect.
     innermost_composited_band_at_or_around_band: Vec<Option<BandIndex>>,
+    /// How many raster pixels each device pixel of the plan is: 1 for a stack as planned, and the power of two a stack
+    /// from `at_raster_scale` is at.
+    pub raster_scale: i32,
 }
 
 /// What a window server composites by itself of the layers of a frame, besides the canvases and videos it shows.
@@ -678,41 +695,48 @@ fn node_covers_viewport(nodes: &[PlacementNode], spaces: &[RasterSpace], node_in
 /// What a plan says of a stack of more than one layer, each thing once: the nodes without their identities, and the
 /// bands in the order of a walk that enters the first band, and at each cut whose barrier is a nested band, the next
 /// band, each band with what only it knows of its layers. `LayerStack::of_layered_plan` works out the rest.
-#[derive(Clone, Debug)]
-struct LayeredPlan {
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct LayeredPlan {
+    #[ipc(max_size = wire::MAXIMUM_NODE_COUNT_OF_RECEIVED_STACK)]
     nodes: Vec<NodeOfPlan>,
+    #[ipc(max_size = wire::MAXIMUM_BAND_COUNT_OF_RECEIVED_STACK)]
     bands: Vec<BandOfPlan>,
+    #[ipc(max_size = MAXIMUM_RASTER_SPACE_COUNT)]
     tiles_hold_content_moving_within_space_by_space_index: Vec<bool>,
+    #[ipc(max_size = MAXIMUM_RASTER_SPACE_COUNT)]
     swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
 }
 
 /// A placement node without its identity, which the stack works out of the node, the node it is in and the spaces.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 struct NodeOfPlan {
     raster_space_index: RasterSpaceIndex,
+    #[ipc(max_size = MAXIMUM_RASTER_SPACE_COUNT)]
     composite_clips: Vec<CompositeClip>,
     composited_effect: Option<EffectNodeIndex>,
     parent_index: Option<PlacementNodeIndex>,
     reach_in_parent_node: Reach<IntRect>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 struct BandOfPlan {
     placement_node_index: PlacementNodeIndex,
     /// In paint order.
+    #[ipc(max_size = wire::MAXIMUM_SPAN_COUNT_OF_RECEIVED_BAND)]
     record_spans: Vec<ListSpan>,
     reach_of_layer_below_all_cuts: IntRect,
     /// In paint order.
+    #[ipc(max_size = wire::MAXIMUM_CUT_COUNT_OF_RECEIVED_BAND)]
     cuts: Vec<CutOfPlan>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 struct CutOfPlan {
     barrier: BarrierOfPlan,
     reach_of_layer_above_cut: IntRect,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 enum BarrierOfPlan {
     /// Live content that is a layer of its own, the `ordinal`th drawing of its content in paint order. Where `cuts_band`
     /// is set, it cuts the tiles its reach touches, and otherwise no tile, as no record of the band painted after it can
@@ -806,6 +830,7 @@ impl LayerStack {
             tiles_hold_content_moving_within_space_by_space_index: vec![true],
             swept_reach_in_parent_space_by_space_index: vec![None],
             innermost_composited_band_at_or_around_band: Vec::new(),
+            raster_scale: 1,
         }
         .with_lookups()
     }
@@ -1005,8 +1030,54 @@ impl LayerStack {
                 .tiles_hold_content_moving_within_space_by_space_index,
             swept_reach_in_parent_space_by_space_index: plan.swept_reach_in_parent_space_by_space_index,
             innermost_composited_band_at_or_around_band: Vec::new(),
+            raster_scale: 1,
         }
         .with_lookups()
+    }
+
+    /// The stack as frames that raster its spaces at `factor` raster pixels per device pixel of the plan draw it, where
+    /// `factor` is a power of two, which keeps whole pixels whole. Its rects in raster coordinates are `factor` times
+    /// larger, and a barrier cuts the tiles of every cell of the plan it cuts, so that each tile, a part of one cell of
+    /// the plan, takes the records the planner put in that cell.
+    pub fn at_raster_scale(&self, factor: i32) -> LayerStack {
+        debug_assert!(factor >= 1 && (factor as u32).is_power_of_two());
+        if factor == 1 {
+            return self.clone();
+        }
+        let scaled = |rect: IntRect| rect_at_raster_scale(rect, factor);
+        let scaled_reach = |reach: Reach<IntRect>| match reach {
+            Reach::Within(rect) => Reach::Within(scaled(rect)),
+            reach => reach,
+        };
+        let mut stack = self.clone();
+        stack.raster_scale = self.raster_scale.saturating_mul(factor);
+        for space in &mut stack.spaces {
+            space.extent = scaled(space.extent);
+            if let RasterSpaceAnchorKind::AnimatedTransform { raster_scale } = &mut space.anchor_kind {
+                *raster_scale *= factor as f32;
+            }
+        }
+        for node in &mut stack.nodes {
+            node.reach_in_parent_node = scaled_reach(node.reach_in_parent_node);
+            for clip in &mut node.composite_clips {
+                clip.rect = scaled(clip.rect);
+                clip.corner_radii = corner_radii_at_raster_scale(clip.corner_radii, factor);
+            }
+        }
+        for band in &mut stack.bands {
+            for cut in &mut band.cuts {
+                if let Reach::Within(cut_rect) = cut.cut_reach {
+                    cut.cut_reach = Reach::Within(rect_at_raster_scale(CellRange::touched_by(cut_rect).rect(), factor));
+                }
+            }
+        }
+        for layer in &mut stack.layers {
+            layer.reach = scaled(layer.reach);
+        }
+        for swept_reach in stack.swept_reach_in_parent_space_by_space_index.iter_mut().flatten() {
+            *swept_reach = scaled(*swept_reach);
+        }
+        stack
     }
 
     pub fn replays_whole_list(&self) -> bool {
@@ -1059,16 +1130,16 @@ impl LayerStack {
                 let anchor_translation = space_or_ancestor.anchor_translation_on_whole_device_pixels(
                     device_offset_for_index(scroll_offsets, space_or_ancestor.anchor),
                 );
+                let raster_scale = i64::from(self.raster_scale);
                 (
-                    x_so_far + i64::from(anchor_translation.x),
-                    y_so_far + i64::from(anchor_translation.y),
+                    x_so_far + i64::from(anchor_translation.x) * raster_scale,
+                    y_so_far + i64::from(anchor_translation.y) * raster_scale,
                 )
             },
         );
-        let limit = i64::from(COORDINATE_LIMIT_IN_DEVICE_PIXELS);
         IntPoint {
-            x: x.clamp(-limit, limit) as i32,
-            y: y.clamp(-limit, limit) as i32,
+            x: within_coordinate_limit(x) as i32,
+            y: within_coordinate_limit(y) as i32,
         }
     }
 
@@ -1231,11 +1302,9 @@ impl LayerStack {
                 *read_reach_by_composited_node_index[node_index.0]
                     .get_or_insert_with(|| read_reach_of_composited_node(node_index, effect))
             });
-            summed_read_reach_by_band_index.push(
-                summed_around
-                    .saturating_add(read_reach_of_node)
-                    .min(LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS),
-            );
+            summed_read_reach_by_band_index.push(summed_around.saturating_add(read_reach_of_node).min(
+                LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS.saturating_mul(self.raster_scale),
+            ));
         }
         self.layers
             .iter()
@@ -1682,48 +1751,14 @@ impl LayerStack {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayeringObstacles {
     pub sorts_planes_by_depth: bool,
-    pub mask_declared_under_effects_its_mask_is_not_under: bool,
 }
 
 impl LayeringObstacles {
-    pub fn of(list: &DisplayListStorage, tree: &VisualContextTree) -> Self {
-        Self::of_with_nesting_of_live_effects(list, tree, &NestingOfLiveEffects::of(tree))
-    }
-
-    pub(crate) fn of_with_nesting_of_live_effects(
-        list: &DisplayListStorage,
-        tree: &VisualContextTree,
-        nesting_of_live_effects: &NestingOfLiveEffects<'_>,
-    ) -> Self {
+    pub fn of(tree: &VisualContextTree) -> Self {
         Self {
             sorts_planes_by_depth: tree.may_sort_planes_by_depth(),
-            mask_declared_under_effects_its_mask_is_not_under: !mask_declarations_are_on_effect_chains_of_their_masks(
-                list,
-                nesting_of_live_effects,
-            ),
         }
     }
-
-    /// Whether every tile replays every record of its band, as which records can show in a tile cannot be told.
-    pub fn every_tile_replays_every_record(&self) -> bool {
-        self.mask_declared_under_effects_its_mask_is_not_under
-    }
-}
-
-// A tile replays the declaration of a mask's content along with what the mask holds, and so opens the effects the
-// declaration is under there, which draw nothing only when they are the mask's own or those around it. A list from
-// another process can name a mask that the tree does not hold as a live node. No effect is inside such a mask.
-fn mask_declarations_are_on_effect_chains_of_their_masks(
-    list: &DisplayListStorage,
-    nesting_of_live_effects: &NestingOfLiveEffects<'_>,
-) -> bool {
-    list.summary().mask_declarations.iter().all(|declaration| {
-        let mask_effect = declaration.mask_effect;
-        let declaration_effect = list.run(declaration.record.run_index as usize).context.effect;
-        declaration_effect.is_none()
-            || nesting_of_live_effects.is_or_is_inside(declaration_effect, mask_effect)
-            || nesting_of_live_effects.is_or_is_inside(mask_effect, declaration_effect)
-    })
 }
 
 fn anchors_of_layer_plans(tree: &VisualContextTree) -> Vec<SpatialNodeIndex> {

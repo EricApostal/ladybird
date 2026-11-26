@@ -418,7 +418,13 @@ public:
         update_reopen_recently_closed_action();
 
         m_close_current_tab_action = make_action("&Close Current Tab");
-        m_close_current_tab_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Close));
+        auto close_tab_shortcuts = QKeySequence::keyBindings(QKeySequence::StandardKey::Close);
+#if !defined(AK_OS_MACOS)
+        QKeySequence control_f4(Qt::CTRL | Qt::Key_F4);
+        if (!close_tab_shortcuts.contains(control_f4))
+            close_tab_shortcuts.append(control_f4);
+#endif
+        m_close_current_tab_action->setShortcuts(close_tab_shortcuts);
         QObject::connect(m_close_current_tab_action, &QAction::triggered, this, []() {
             auto* tab = Application::the().active_tab();
             if (!tab)
@@ -495,6 +501,8 @@ public:
         m_toggle_bookmark_bar_action = create_application_action(*m_application_widget, Application::bookmarks().toggle_bookmark_bar_action(), IncludeActionIcon::No);
         m_toggle_sidebar_action = create_application_action(*m_application_widget, application.toggle_vertical_tabs_expanded_action(), IncludeActionIcon::No);
 
+        m_navigate_back_action = create_application_action(*m_application_widget, application.navigate_back_action(), IncludeActionIcon::No);
+        m_navigate_forward_action = create_application_action(*m_application_widget, application.navigate_forward_action(), IncludeActionIcon::No);
         m_reload_action = create_application_action(*m_application_widget, application.reload_action(), IncludeActionIcon::No);
         m_reload_bypassing_cache_action = create_application_action(*m_application_widget, application.reload_bypassing_cache_action(), IncludeActionIcon::No);
 
@@ -540,6 +548,7 @@ public:
         m_bookmarks_menu = create_application_menu(*m_application_widget, Application::bookmarks().menu());
 
         m_history_menu = create_application_menu(*m_application_widget, application.history_menu());
+        add_history_navigation_actions(*m_history_menu, *m_navigate_back_action, *m_navigate_forward_action);
         QObject::connect(m_history_menu, &QMenu::aboutToShow, this, [this]() {
             auto* tab = Application::the().active_tab();
             update_history_menu(*m_history_menu, tab ? &tab->view() : nullptr);
@@ -662,6 +671,8 @@ private:
     QAction* m_toggle_bookmark_bar_action { nullptr };
     QAction* m_toggle_sidebar_action { nullptr };
     QAction* m_open_location_action { nullptr };
+    QAction* m_navigate_back_action { nullptr };
+    QAction* m_navigate_forward_action { nullptr };
     QAction* m_reload_action { nullptr };
     QAction* m_reload_bypassing_cache_action { nullptr };
     QAction* m_stop_action { nullptr };
@@ -900,6 +911,8 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
         // The Hub may receive startup messages before it has constructed its transport.
         IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
 
+        auto transport = TRY(IPC::Transport::create(move(port_a_recv), move(port_b_send)));
+
         Optional<Core::Process> spawned_process;
         {
             MutexLocker child_registration_locker(hub_bootstrap->server.child_registration_lock());
@@ -907,8 +920,6 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
             hub_bootstrap->server.register_child_transport(spawned_process->pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
         }
         auto process = spawned_process.release_value();
-
-        auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
 #    else
         int socket_fds[2] {};
         TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_fds));
@@ -1524,6 +1535,9 @@ void Application::present_window(BrowserWindow& window, WindowConfiguration cons
 
         window.activateWindow();
         window.raise();
+
+        if (m_openssl_mismatch_awaiting_window.has_value())
+            show_openssl_mismatch_card(window);
     }
 }
 
@@ -2433,6 +2447,7 @@ void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
     }
 
     auto& window = active_window();
+    auto deferred_tab_updates = window.tab_widget().defer_tab_updates();
     auto* previous_tab = window.current_tab();
     for (auto const& url : urls) {
         auto location = previous_tab
@@ -2515,6 +2530,27 @@ void Application::display_download_confirmation_dialog(StringView download_name,
 void Application::display_error_dialog(StringView error_message) const
 {
     create_message_box(QMessageBox::Warning, error_message, active_window_if_any())->open();
+}
+
+// A system curl that has moved on to another OpenSSL than the one Ladybird was built against. RequestServer then leaves
+// curl's TLS configuration alone, so pages still load, but only rebuilding Ladybird brings its own checks back.
+void Application::display_openssl_mismatch(String const& curl_openssl_version, String const& linked_openssl_version)
+{
+    m_openssl_mismatch_awaiting_window = OpenSSLMismatch { curl_openssl_version, linked_openssl_version };
+    // Without a window, the next one that opens shows it. Under WebDriver, the warning that the Hub logged has to do.
+    if (auto* window = active_window_if_any())
+        show_openssl_mismatch_card(*window);
+}
+
+void Application::show_openssl_mismatch_card(BrowserWindow& window)
+{
+    auto mismatch = m_openssl_mismatch_awaiting_window.release_value();
+
+    Vector<PageCard::Button> buttons;
+    buttons.append({ "Dismiss", PageCard::ButtonRole::Primary, {} });
+    auto text = qformatted("Ladybird was built against OpenSSL {}, but your system's curl uses OpenSSL {}. Secure connections work without some of Ladybird's own checks until Ladybird is rebuilt.",
+        mismatch.linked_openssl_version, mismatch.curl_openssl_version);
+    window.show_page_card(BrowserWindow::PageCardSlot::RebuildNeeded, "This build of Ladybird is out of date", text, move(buttons));
 }
 
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)
@@ -3219,6 +3255,8 @@ DEFINE_APP_MENU_GETTER(QAction, open_downloads_action);
 DEFINE_APP_MENU_GETTER(QAction, toggle_bookmark_bar_action);
 DEFINE_APP_MENU_GETTER(QAction, toggle_sidebar_action);
 DEFINE_APP_MENU_GETTER(QAction, open_location_action);
+DEFINE_APP_MENU_GETTER(QAction, navigate_back_action);
+DEFINE_APP_MENU_GETTER(QAction, navigate_forward_action);
 DEFINE_APP_MENU_GETTER(QAction, reload_action);
 DEFINE_APP_MENU_GETTER(QAction, reload_bypassing_cache_action);
 DEFINE_APP_MENU_GETTER(QAction, stop_action);

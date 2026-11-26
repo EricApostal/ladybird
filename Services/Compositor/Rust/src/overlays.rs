@@ -13,8 +13,9 @@ use libcompositing_rust::display_list::commands::{
     FillPath, FillRect, FontResourceId, OptionalFloatRect, PathPaintKind, ReplayLayer, StrokePath,
 };
 use libcompositing_rust::display_list::ffi_bytes::FfiBytes;
-use libcompositing_rust::display_list::replay::{
-    ListReplay, RecordsContext, ReplayFrame, ReplayPainter, replay_records,
+use libcompositing_rust::display_list::replay::{RecordsContext, ReplayFrame, ReplayPainter, replay_records};
+use libcompositing_rust::ipc_types::{
+    Compositing_PausedDebuggerOverlayAction, Compositing_PictureInPictureControl, Compositing_UIOverlays,
 };
 use libcompositing_rust::overlays::{
     PausedDebuggerOverlayGeometry, paused_debugger_overlay_geometry, picture_in_picture_controls_geometry,
@@ -25,9 +26,10 @@ use libcompositing_rust::time::MonotonicTime;
 use libcompositing_rust::visual_context::{TransformData, TransformDataRole, VisualContextTree};
 use libgfx_rust::path::Path;
 use libgfx_rust::{
-    CapStyle, Color, CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, IntRect, IntSize,
-    JoinStyle, Orientation, ShouldAntiAlias, WindingRule, enclosing_int_rect,
+    CapStyle, Color, CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, GlyphRunOrientation,
+    IntRect, IntSize, JoinStyle, ShouldAntiAlias, WindingRule, enclosing_int_rect,
 };
+use libipc_rust::wire::Utf8String;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PausedDebuggerOverlayAction {
@@ -74,6 +76,39 @@ pub struct UIOverlays {
     pub paused_debugger: Option<PausedDebuggerOverlayState>,
     pub picture_in_picture_controls: Option<PictureInPictureControlsState>,
     pub compositor_layers: Option<CompositorLayersOverlayState>,
+}
+
+impl From<Compositing_UIOverlays> for UIOverlays {
+    fn from(overlays: Compositing_UIOverlays) -> Self {
+        let font_family_of = |font_family: Option<Utf8String>| {
+            font_family.map(|font_family| String::from_utf8_lossy(font_family.as_bytes()).into_owned())
+        };
+        Self {
+            paused_debugger: overlays.paused_debugger.map(|state| PausedDebuggerOverlayState {
+                font_family: font_family_of(state.font_family),
+                hovered_action: state.hovered_action.map(|action| match action {
+                    Compositing_PausedDebuggerOverlayAction::StepOver => PausedDebuggerOverlayAction::StepOver,
+                    Compositing_PausedDebuggerOverlayAction::Continue => PausedDebuggerOverlayAction::Continue,
+                }),
+            }),
+            picture_in_picture_controls: overlays.picture_in_picture_controls.map(|state| {
+                PictureInPictureControlsState {
+                    shown: state.shown,
+                    hovered_control: state.hovered_control.map(|control| match control {
+                        Compositing_PictureInPictureControl::BackToTab => PictureInPictureControl::BackToTab,
+                        Compositing_PictureInPictureControl::Close => PictureInPictureControl::Close,
+                    }),
+                }
+            }),
+            compositor_layers: overlays.compositor_layers.map(|state| CompositorLayersOverlayState {
+                font_family: font_family_of(state.font_family),
+                hidden_layer_ids: state.hidden_layer_ids,
+                selected_layer_ids: state.selected_layer_ids,
+                hovered_layer_id: state.hovered_layer_id,
+                raster_count_reset_generation: state.raster_count_reset_generation,
+            }),
+        }
+    }
 }
 
 /// What a new set of overlays changes of the frames.
@@ -335,10 +370,9 @@ impl OverlayRecords {
 
 fn replay_overlay_records(records: &AlignedRecords, painter: &mut impl ReplayPainter) {
     OVERLAY_TREE.with(|tree| {
-        let list = ListReplay::new(tree);
         let frame = ReplayFrame::unscrolled(0);
         let context = RecordsContext {
-            list_replay: &list,
+            tree,
             frame: &frame,
             to_root_matrix_of_inline_clip_space: &|_| None,
         };
@@ -552,7 +586,7 @@ impl OverlayRecorder<'_> {
                 translation: FloatPoint::default(),
                 scale,
                 color,
-                orientation: Orientation::Horizontal,
+                orientation: GlyphRunOrientation::Horizontal,
                 font_smoothing: 0,
             },
             &inline_data,

@@ -11,10 +11,11 @@
 
 use super::builder::{COMMAND_ALIGNMENT, HEADER_SIZE, bounding_rect_computed_from_payload, read_header};
 use super::commands::*;
+use libgfx_rust::filter::Filter;
 use libgfx_rust::{
-    CapStyle, Color, CompositingAndBlendingOperator, GradientInterpolationMethod, GradientInterpolationType,
-    HueInterpolationMethod, IntRect, InterpolationColorSpace, JoinStyle, LineStyle, MaskKind, Orientation,
-    PolarColorSpace, RectangularColorSpace, ScalingMode, ShouldAntiAlias, WindingRule,
+    CapStyle, Color, CompositingAndBlendingOperator, GlyphRunOrientation, GradientInterpolationMethod,
+    GradientInterpolationType, HueInterpolationMethod, IntRect, InterpolationColorSpace, JoinStyle, LineStyle,
+    MaskKind, Orientation, PolarColorSpace, RectangularColorSpace, ScalingMode, ShouldAntiAlias, WindingRule,
 };
 use std::mem::{align_of, offset_of, size_of};
 
@@ -67,6 +68,7 @@ tape_enum!(InterpolationColorSpace as i32 { LinearRGB, SRGB });
 tape_enum!(CapStyle as i32 { Butt, Round, Square });
 tape_enum!(JoinStyle as i32 { Miter, Round, Bevel });
 tape_enum!(Orientation as i32 { Horizontal, Vertical });
+tape_enum!(GlyphRunOrientation as i32 { Horizontal, Vertical, VerticalCounterclockwise });
 tape_enum!(GradientInterpolationType as u8 { Rectangular, Polar });
 tape_enum!(RectangularColorSpace as u8 {
     Srgb,
@@ -146,6 +148,12 @@ impl Payload<'_> {
             return Err("Display list span exceeds its command payload");
         }
         Ok((start, size))
+    }
+
+    // A span that holds a serialized filter graph, which the player builds without checking it.
+    fn filter_span_at(self, offset: usize) -> Result<Filter, ValidationError> {
+        let (start, size) = self.span_at(offset)?;
+        Filter::deserialize(&self.bytes[start..start + size]).ok_or("Display list command has a malformed filter")
     }
 
     // A span of `T` values, which the player reads in place.
@@ -297,6 +305,15 @@ fn validate_canvas_2d_paint(payload: Payload, offset: usize) -> Result<(), Valid
 fn validate_canvas_2d_compositing(payload: Payload, offset: usize) -> Result<(), ValidationError> {
     payload.span_at(offset + offset_of!(Canvas2DCompositing, filter))?;
     payload.bool_at(offset + offset_of!(Canvas2DCompositing, has_filter))?;
+    if payload.u8_at(offset + offset_of!(Canvas2DCompositing, has_filter)) != 0 {
+        // A canvas filter comes from CSS filter functions, which draw no images, so the player has none to give it.
+        let filter = payload.filter_span_at(offset + offset_of!(Canvas2DCompositing, filter))?;
+        let mut draws_an_image = false;
+        filter.for_each_image_frame_id(&mut |_| draws_an_image = true);
+        if draws_an_image {
+            return Err("Canvas 2D stream command has a filter that draws an image");
+        }
+    }
     // The player turns the global alpha into a byte, which only a value from 0 to 1 converts to.
     let global_alpha = payload.f32_at(offset + offset_of!(Canvas2DCompositing, global_alpha));
     if !(0.0..=1.0).contains(&global_alpha) {
@@ -387,7 +404,7 @@ fn validate_command_fields(
                 return Err("Glyph run stroke width must be finite and nonnegative");
             }
             p.array_span_at::<DisplayListGlyph>(offset_of!(DrawGlyphRun, glyphs))?;
-            p.enum_at::<Orientation>(offset_of!(DrawGlyphRun, orientation))?;
+            p.enum_at::<GlyphRunOrientation>(offset_of!(DrawGlyphRun, orientation))?;
         }
         T::FillRect => {
             p.enum_at::<CompositingAndBlendingOperator>(offset_of!(FillRect, compositing_and_blending_operator))?;
@@ -485,7 +502,7 @@ fn validate_command_fields(
         T::PaintTextShadow => {
             p.array_span_at::<DisplayListGlyph>(offset_of!(PaintTextShadow, glyphs))?;
             p.array_span_at::<TextShadowLayer>(offset_of!(PaintTextShadow, layers))?;
-            p.enum_at::<Orientation>(offset_of!(PaintTextShadow, orientation))?;
+            p.enum_at::<GlyphRunOrientation>(offset_of!(PaintTextShadow, orientation))?;
         }
         T::PaintPathBoxShadow => {
             p.span_at(offset_of!(PaintPathBoxShadow, shape_path_data))?;
@@ -521,7 +538,10 @@ fn validate_command_fields(
         T::DrawIsolatedGroup => {
             nested.add(offset_of!(DrawIsolatedGroup, content))?;
             nested.add(offset_of!(DrawIsolatedGroup, mask))?;
-            p.span_at(offset_of!(DrawIsolatedGroup, filter))?;
+            // A group without a filter has an empty span.
+            if p.span_at(offset_of!(DrawIsolatedGroup, filter))?.1 != 0 {
+                p.filter_span_at(offset_of!(DrawIsolatedGroup, filter))?;
+            }
             p.enum_at::<CompositingAndBlendingOperator>(offset_of!(
                 DrawIsolatedGroup,
                 compositing_and_blending_operator
@@ -918,6 +938,39 @@ mod tests {
             ..recorded.command_runs[0]
         }];
         assert!(validate_tape(&widened_tape, &run_table_bytes(&widened_runs)).is_ok());
+    }
+
+    #[test]
+    fn an_isolated_group_with_a_filter_that_the_player_cannot_build_is_rejected() {
+        let validate = |filter: &[u8]| {
+            let mut builder = DisplayListBuilder::new();
+            let mut group = builder.begin_group::<DrawIsolatedGroup>(Vec::new());
+            builder.append(&fill_rect(), &[], ContextRef::default());
+            let filter = builder.append_group_inline_data(&mut group, filter);
+            let content = builder.group_content_span(&group);
+            builder.finish_group(
+                group,
+                &DrawIsolatedGroup {
+                    clip_rect: IntRect::new(0, 0, 10, 10).to_float(),
+                    content,
+                    mask: DisplayListDataSpan::default(),
+                    filter,
+                    opacity: 1.0,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    mask_kind: MaskKind::Alpha,
+                },
+                ContextRef::default(),
+            );
+            let recorded = builder.finish();
+            validate_tape(&recorded.bytes, &run_table_bytes(&recorded.command_runs)).map(|_| ())
+        };
+        let blur = Filter::blur(2.0, 2.0, None).serialize();
+        assert_eq!(validate(&blur), Ok(()));
+        assert_eq!(validate(&[]), Ok(()));
+        assert_eq!(
+            validate(&blur[..blur.len() - 1]),
+            Err("Display list command has a malformed filter")
+        );
     }
 
     #[test]

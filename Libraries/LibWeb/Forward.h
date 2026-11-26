@@ -34,6 +34,7 @@ namespace Web::Fetch::Engine {
 class FetchBodyDeliveryGate;
 class FetchByteChannel;
 class FetchEngineRecord;
+class FetchLoad;
 class WholeBodyTransport;
 
 }
@@ -43,6 +44,7 @@ class WholeBodyTransport;
 GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchBodyDeliveryGate);
 GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchByteChannel);
 GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchEngineRecord);
+GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchLoad);
 GC_UNTRACED_CAPTURE_WITH_ROOTED_CALLBACKS(Web::Fetch::Engine::WholeBodyTransport);
 GC_UNTRACED_CAPTURE(Gfx::Typeface);
 GC_UNTRACED_CAPTURE(HTTP::HeaderList);
@@ -581,6 +583,7 @@ struct NetworkActivity;
 namespace Web::Fetch::Fetching {
 
 class PendingResponse;
+class PreloadWaitHandle;
 class RefCountedFlag;
 
 }
@@ -649,7 +652,6 @@ class AudioTrack;
 class AudioTrackList;
 class AutoplaySettings;
 class BarProp;
-class BeforeUnloadEvent;
 class BrowsingContext;
 class Canvas2DContextBase;
 class CanvasHost;
@@ -672,13 +674,11 @@ class DOMStringMap;
 class DragDataStore;
 class DragEvent;
 class ElementInternals;
-class ErrorEvent;
 class EventHandler;
 class EventLoop;
 class External;
 class FormAssociatedElement;
 class FormAssociatedTextControlElement;
-class FormDataEvent;
 class History;
 class HistoryExecutor;
 class HTMLAllCollection;
@@ -773,7 +773,6 @@ class Location;
 class MediaError;
 class MediaStreamPlayback;
 class MessagePort;
-class MimeType;
 class MimeTypeArray;
 class ModuleMap;
 class Navigable;
@@ -782,7 +781,6 @@ class NavigateEvent;
 class Navigation;
 struct NavigationAPIMethodTracker;
 class NavigationActivation;
-class NavigationCurrentEntryChangeEvent;
 class NavigationDestination;
 class NavigationHistoryEntry;
 class NavigationObserver;
@@ -790,13 +788,10 @@ class NavigationTransition;
 class Navigator;
 class OffscreenCanvas;
 class OffscreenCanvasRenderingContext2D;
-class PageTransitionEvent;
-class Plugin;
 class PluginArray;
 class PopoverTargetAttributes;
 class PreloadEntry;
 struct PreloadKey;
-class PromiseRejectionEvent;
 class RadioButtonGroupRegistry;
 class RadioNodeList;
 class RemoteNavigable;
@@ -809,7 +804,6 @@ class SharedResourceRequest;
 class SharedWorker;
 class SharedWorkerGlobalScope;
 class Storage;
-class SubmitEvent;
 class TextTrack;
 class TextTrackCue;
 class TextTrackCueList;
@@ -817,8 +811,6 @@ class TextTrackList;
 class TextTrackObserver;
 class Timer;
 class TimeRanges;
-class ToggleEvent;
-class TrackEvent;
 class UserActivation;
 class UserScrollGestureHold;
 class ValidityState;
@@ -1146,7 +1138,6 @@ class SVGTitleElement;
 class SVGTransformList;
 class SVGUseElement;
 class SVGViewElement;
-class TimeEvent;
 
 }
 

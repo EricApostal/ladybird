@@ -219,7 +219,9 @@ void Page::notify_document_about_user_activation(HTML::CrossProcessId document_i
             continue;
 
         // 5.1. Set window's last activation timestamp to the current high resolution time.
-        // 5.2. Notify the close watcher manager about user activation given window.
+        // 5.2. Set window's has history-action activation to true.
+        // 5.3. Set window's has sticky activation to true.
+        // 5.4. Notify the close watcher manager about user activation given window.
         document->window()->notify_about_user_activation();
         return;
     }
@@ -523,7 +525,11 @@ EventResult Page::handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint po
             navigable->event_handler().reset_mouse_input_tracking({});
         }
     };
-    return root.event_handler().handle_mouseup(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, remote_target);
+    GC::Ptr<HTML::LocalNavigable> middle_button_scrolling_navigable = m_middle_button_scrolling_navigable.ptr();
+    auto result = root.event_handler().handle_mouseup(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, remote_target);
+    if (middle_button_scrolling_navigable && !middle_button_scrolling_navigable->has_been_destroyed())
+        middle_button_scrolling_navigable->event_handler().end_middle_button_scroll_after_release_elsewhere({}, button);
+    return result;
 }
 
 EventResult Page::handle_mouseup(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers)
@@ -538,7 +544,15 @@ EventResult Page::handle_mousedown(HTML::LocalNavigable& root, DevicePixelPoint 
             navigable->event_handler().reset_mouse_input_tracking({});
         m_mouse_event_tracking_navigable = nullptr;
     }
-    return root.event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, remote_target);
+    // NB: A press anywhere, in any document, ends a middle button scroll. It still goes where it's aimed, but it has no
+    //     default actions there, so it can't start a scroll of its own.
+    GC::Ptr<HTML::LocalNavigable> middle_button_scrolling_navigable = m_middle_button_scrolling_navigable.ptr();
+    m_press_ends_a_middle_button_scroll = middle_button_scrolling_navigable && !middle_button_scrolling_navigable->has_been_destroyed();
+    auto result = root.event_handler().handle_mousedown(device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, remote_target);
+    if (m_press_ends_a_middle_button_scroll && !middle_button_scrolling_navigable->has_been_destroyed())
+        middle_button_scrolling_navigable->event_handler().end_middle_button_scroll_for_press({});
+    m_press_ends_a_middle_button_scroll = false;
+    return result;
 }
 
 EventResult Page::handle_mousedown(DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count)
@@ -556,8 +570,16 @@ void Page::set_hover_reporting_navigable(Badge<EventHandler>, GC::Ptr<HTML::Loca
     m_hover_reporting_navigable = navigable;
 }
 
+void Page::set_middle_button_scrolling_navigable(Badge<EventHandler>, GC::Ptr<HTML::LocalNavigable> navigable)
+{
+    m_middle_button_scrolling_navigable = navigable;
+}
+
 EventResult Page::handle_mousemove(HTML::LocalNavigable& root, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target)
 {
+    // A middle button scroll follows the pointer wherever it moves, whichever document the move goes to.
+    if (auto navigable = m_middle_button_scrolling_navigable; navigable && !navigable->has_been_destroyed())
+        navigable->event_handler().update_middle_button_scroll({}, device_to_css_point(screen_position));
     return root.event_handler().handle_mousemove(device_to_css_point(position), device_to_css_point(screen_position), buttons, modifiers, remote_target);
 }
 
@@ -761,7 +783,7 @@ void Page::keyboard_scroll_editability_changed(DOM::Document& document)
         invalidate_compositor_keyboard_scroll_state();
 }
 
-Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch)
+Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor()
 {
     if (!has_local_traversable() || !local_traversable()->has_compositor_context())
         return {};
@@ -772,7 +794,6 @@ Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor
     m_keyboard_scroll_focus_is_editable = document && document->active_input_events_target();
     auto state = snapshot.state;
     state.generation = m_keyboard_scroll_state_generation;
-    state.visual_context_tree_structural_epoch = visual_context_tree_structural_epoch;
     m_keyboard_scroll_state_is_scrollable = state.target.has_value();
     m_keyboard_scroll_state_is_current = true;
     return state;
@@ -862,9 +883,9 @@ void Page::set_force_dark_for_local_roots(bool enabled)
     // NB: A local root can still be a stand-in that its remote parent doesn't list as a child yet, which local_roots()
     //     wouldn't find, so this sets it on every local navigable of the page.
     GC::RootVector<GC::Ref<HTML::LocalNavigable>> navigables;
-    for (auto navigable : HTML::all_local_navigables()) {
-        if (&navigable->page() == this && !navigable->has_been_destroyed())
-            navigables.append(*navigable);
+    for (auto& navigable : HTML::all_local_navigables()) {
+        if (&navigable.page() == this && !navigable.has_been_destroyed())
+            navigables.append(navigable);
     }
     for (auto const& navigable : navigables)
         navigable->set_force_dark_enabled(enabled);
@@ -900,7 +921,7 @@ Vector<GC::Root<HTML::LocalNavigable>> Page::hosted_navigables() const
 GC::Ptr<HTML::Navigable> Page::navigable_with_id(HTML::CrossProcessId id) const
 {
     for (auto& navigable : HTML::all_local_navigables()) {
-        if (navigable->id() == id && &navigable->page() == this && !navigable->has_been_destroyed())
+        if (navigable.id() == id && &navigable.page() == this && !navigable.has_been_destroyed())
             return navigable;
     }
     if (auto navigable = HTML::remote_navigable_with_id(*this, id); navigable && !navigable->has_been_destroyed())
@@ -1254,7 +1275,7 @@ void Page::finish_discarding()
     // of another page holds for one of them is closed.
     GC::RootVector<GC::Ref<HTML::RemoteNavigable>> remote_navigables;
     for (auto& remote_navigable : HTML::all_remote_navigables()) {
-        if (&remote_navigable->page() == this)
+        if (&remote_navigable.page() == this)
             remote_navigables.append(remote_navigable);
     }
     for (auto& remote_navigable : remote_navigables) {

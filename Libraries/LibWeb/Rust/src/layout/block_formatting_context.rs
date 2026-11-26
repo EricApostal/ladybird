@@ -230,6 +230,8 @@ struct BlockLevelBoxLayoutPrelude {
     /// Where placing the box introduced clearance, the margins between the clearance and the box: its block-start
     /// margin, collapsed with those of its first children.
     margins_after_clearance: Option<CollapsedMargins>,
+    /// The open top margin group before the child adds its block-start margin.
+    top_margins_before_child: Option<CollapsedMargins>,
 }
 
 /// A block-level box its flow laid out and has yet to place.
@@ -2168,25 +2170,6 @@ impl<'pass> BlockFormattingContext<'pass> {
             cells.padding_left = padding_left;
             cells.padding_right = padding_right;
         });
-        // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
-        // A rendered legend with a computed inline size of auto uses the
-        // fit-content size, resolved here so the legend's children are laid
-        // out against the used size rather than a provisional stretch size.
-        if style.width().is_auto() {
-            let container = self.containing_block(node);
-            if !container.is_invalid()
-                && self.facts(container).is_fieldset_box()
-                && self.facts(container).rendered_legend() == node
-            {
-                return Some(sizing.calculate_fit_content_size(
-                    sizing_context::SizedBox::new(node, &self.metrics_of(sized_child)),
-                    SizingAxis::Inline,
-                    remaining_available_space,
-                    constraints,
-                ));
-            }
-        }
-
         // An auto margin that is not honoured resolves to zero and stops taking part in the remaining steps.
         fn zero_out_auto_margin(margin: &mut CssPixels, is_auto: &mut bool) {
             if *is_auto {
@@ -2196,7 +2179,11 @@ impl<'pass> BlockFormattingContext<'pass> {
         }
 
         let remaining_inline_size = remaining_available_space.inline_size.to_px_or_zero();
-        let containing_block_direction = self.style(self.containing_block(node)).direction();
+        let containing_block = self.containing_block(node);
+        let containing_block_direction = self.style(containing_block).direction();
+        let is_auto_sized_legend = style.width().is_auto()
+            && self.facts(containing_block).is_fieldset_box()
+            && self.facts(containing_block).rendered_legend() == node;
         let computed_margin_left = style.margin_left();
         let computed_margin_right = style.margin_right();
         // NB: A box that establishes an orthogonal flow and has an automatic inline size is sized to its content, not
@@ -2258,7 +2245,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 } else if !*margin_left_is_auto && !*margin_right_is_auto {
                     if containing_block_direction == direction::RTL {
                         *margin_left += underflow;
-                    } else if !is_content_sized_orthogonal_flow {
+                    } else if !is_content_sized_orthogonal_flow && !is_auto_sized_legend {
                         *margin_right += underflow;
                     }
                 } else if !*margin_left_is_auto && *margin_right_is_auto {
@@ -2282,6 +2269,15 @@ impl<'pass> BlockFormattingContext<'pass> {
             // NOTE: Replaced elements had their inline size calculated independently above.
             //       We use that inline size as the input here to ensure that margins get resolved.
             replaced_inline_size
+        } else if is_auto_sized_legend {
+            // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
+            // If the computed value of 'inline-size' is 'auto', then the used value is the fit-content inline size.
+            Some(sizing.calculate_fit_content_size(
+                sizing_context::SizedBox::new(node, &self.metrics_of(sized_child)),
+                SizingAxis::Inline,
+                remaining_available_space,
+                constraints,
+            ))
         } else if facts.is_table_wrapper() {
             // NB: An auto-width table shrinks to fit the space next to floats. A table with a specified width does not,
             //     so its percentages resolve against the containing block instead. Either way, the wrapper reports the
@@ -2965,10 +2961,60 @@ impl<'pass> BlockFormattingContext<'pass> {
         (metrics.border_box_block_size(false), !metrics.has_definite_block_size())
     }
 
+    /// Places the box past floats, removing its margin from the parent's top margin group if it has to move down.
+    #[allow(clippy::too_many_arguments)]
+    fn place_in_flow_box_past_floats(
+        &self,
+        sized_child: ChildSizedHere<'_>,
+        block_container: BlockContainer,
+        input: &LayoutInput,
+        content_block_offset: CssPixels,
+        containing_block_rect_in_root_now: &mut CssPixelRect,
+        top_margins_before_child: &mut Option<CollapsedMargins>,
+    ) -> InFlowBoxPlacement {
+        let placement = self.compute_in_flow_box_placement(
+            sized_child,
+            block_container,
+            input,
+            content_block_offset,
+            *containing_block_rect_in_root_now,
+        );
+        if placement.content_block_offset <= content_block_offset {
+            return placement;
+        }
+        let Some(margins) = top_margins_before_child.take() else {
+            return placement;
+        };
+
+        // A box pushed down by floats stops collapsing its top margin into its parent. Keep the margins that joined
+        // the group before this child, and place the box past floats from the parent's position without its margin.
+        let node = sized_child.node;
+        let previous_adjustment = self.block_offset_adjustment_from_pending_ancestor_block_start_margins(node);
+        {
+            let mut margin_state = self.margin_state_mut();
+            margin_state
+                .top_margin_group
+                .as_mut()
+                .expect("the child's margin joined a top margin group")
+                .margins = margins;
+            margin_state.reset();
+        }
+        containing_block_rect_in_root_now.y +=
+            self.block_offset_adjustment_from_pending_ancestor_block_start_margins(node) - previous_adjustment;
+        self.rebuild_float_bands();
+        self.compute_in_flow_box_placement(
+            sized_child,
+            block_container,
+            input,
+            content_block_offset,
+            *containing_block_rect_in_root_now,
+        )
+    }
+
     /// Finds where `sized_child`, a block-level box of this flow, goes from `content_block_offset` on, past the floats
     /// it avoids, and the inline size it takes there, which its cells take.
     #[allow(clippy::too_many_arguments)]
-    fn place_in_flow_box_past_floats(
+    fn compute_in_flow_box_placement(
         &self,
         sized_child: ChildSizedHere<'_>,
         block_container: BlockContainer,
@@ -4010,6 +4056,63 @@ impl<'pass> BlockFormattingContext<'pass> {
         layout
     }
 
+    /// Gives `node`, a child of a table cell with a length height, the percentage basis that row measurement uses:
+    /// none for most boxes, so a percentage height acts as auto, the cell's specified height for a replaced box, and
+    /// zero for a scrollable box. It's kept out of line, so its locals stay out of the recursive block-layout frames.
+    #[inline(never)]
+    pub(super) fn adjust_table_cell_child_input(
+        &self,
+        node: Node,
+        containing_block: &BlockContainer,
+        input: &mut LayoutInput,
+    ) {
+        let facts = self.facts(node);
+        if !facts.is_box() || facts.document_in_quirks_mode() || facts.is_absolutely_positioned() {
+            return;
+        }
+        let mut cell = containing_block.node;
+        while !cell.is_invalid() && self.facts(cell).is_anonymous() && !self.facts(cell).is_table_cell() {
+            cell = self.containing_block(cell);
+        }
+        if cell.is_invalid() || !self.facts(cell).is_table_cell() {
+            return;
+        }
+        let metrics = if cell == containing_block.node {
+            &containing_block.cells
+        } else if cell == self.run.box_ {
+            &self.root_cells
+        } else {
+            return;
+        };
+        let cell_style = self.style(cell);
+        if !cell_style.height().is_length() {
+            return;
+        }
+        let basis = if facts.is_replaced_box() {
+            // https://drafts.csswg.org/css-tables-3/#row-layout
+            // AD-HOC: Row layout gives a replaced descendant with a percentage height an automatic height while the
+            //         row is measured. For web compatibility, it resolves against the cell's specified height instead,
+            //         before the rows are sized and after.
+            let mut basis = cell_style.height().to_px(CssPixels::default());
+            if cell_style.box_sizing() == box_sizing::BORDER_BOX {
+                let collapsed = metrics.uses_collapsing_borders_model;
+                basis -= metrics.border_box_top(collapsed) + metrics.border_box_bottom(collapsed);
+            }
+            basis.max(CssPixels::default())
+        } else if !metrics.has_definite_block_size
+            && self.style(node).height().contains_percentage()
+            && matches!(self.style(node).overflow_y(), overflow::AUTO | overflow::SCROLL)
+        {
+            // A scrollable percentage-height child contributes zero while its cell's row is measured.
+            // https://drafts.csswg.org/css-tables-3/#row-layout
+            CssPixels::default()
+        } else {
+            return;
+        };
+        input.containing_block_constraints.percentage_basis_block_size = Some(basis);
+        input.available_space.block_size = AvailableSize::definite(basis);
+    }
+
     fn child_layout_input(
         &self,
         containing_block: BlockContainer,
@@ -4105,10 +4208,11 @@ impl<'pass> BlockFormattingContext<'pass> {
         run: &FormattingContextRun<'pass>,
         node: Node,
         block_container: BlockContainer,
-        input: LayoutInput,
+        mut input: LayoutInput,
         containing_block_position_in_root: FfiCssPixelPoint,
         interrupted_inline_content: Option<InterruptedInlineContent>,
     ) -> Option<LaidOutBlockLevelBox> {
+        self.adjust_table_cell_child_input(node, &block_container, &mut input);
         let facts = self.facts(node);
         let containing_line_box_fragment = interrupted_inline_content.and_then(|interrupted| interrupted.line);
 
@@ -4289,6 +4393,12 @@ impl<'pass> BlockFormattingContext<'pass> {
         let is_in_flow_candidate = self.run.fragmentainer.is_some() && self.is_first_or_last_in_flow_candidate(node);
         let discards_block_start_margin =
             is_in_flow_candidate && self.discard_block_start_margin_of_next_child.replace(false);
+        let top_margins_before_child = {
+            let margin_state = self.margin_state();
+            margin_state
+                .has_open_top_margin_group()
+                .then_some(margin_state.margins_since_reset)
+        };
         // A quirky block-start margin that collapses into the block start of a quirks-mode body or table cell is left
         // out, by clearance too.
         let block_start_margin_is_quirky = self.facts(node).has_quirky_block_start_margin();
@@ -4381,6 +4491,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 discards_block_start_margin,
                 introduced_clearance,
                 margins_after_clearance,
+                top_margins_before_child: top_margins_before_child.filter(|_| !introduced_clearance),
             },
         );
         Some(self.place_laid_out_block_level_box(sized_child, unplaced, in_flow_reuse, interrupted_inline_content))
@@ -4402,7 +4513,8 @@ impl<'pass> BlockFormattingContext<'pass> {
         definite_content_block_size_of_fieldset_to_fill: Option<CssPixels>,
         inline_space_used_before_children_formatted: inline_formatting_context::SpaceUsedByFloats,
         content_block_offset_before_floats: CssPixels,
-        containing_block_rect_in_root_now: CssPixelRect,
+        mut containing_block_rect_in_root_now: CssPixelRect,
+        top_margins_before_child: &mut Option<CollapsedMargins>,
         placement: &mut InFlowBoxPlacement,
         flow_places_box: bool,
     ) -> (formatting_context::ChildLayout, Option<(CssPixels, CssPixels)>) {
@@ -4492,7 +4604,8 @@ impl<'pass> BlockFormattingContext<'pass> {
                 block_container,
                 input,
                 content_block_offset_before_floats,
-                containing_block_rect_in_root_now,
+                &mut containing_block_rect_in_root_now,
+                top_margins_before_child,
             );
             if placement_beside_all_floats == *placement {
                 break (layout, pre_run_table_border_box);
@@ -4523,6 +4636,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             discards_block_start_margin,
             introduced_clearance,
             margins_after_clearance,
+            mut top_margins_before_child,
         } = prelude;
         let node = sized_child.node;
         let available_space = input.available_space;
@@ -4555,22 +4669,23 @@ impl<'pass> BlockFormattingContext<'pass> {
             block_offset + margin_top + self.metrics_of(sized_child).border_box_top(false);
         let containing_block_rect_in_root =
             self.containing_block_rect(block_container, containing_block_position_in_root);
-        let containing_block_rect_in_root_now = containing_block_rect_in_root.translated(
+        let mut containing_block_rect_in_root_now = containing_block_rect_in_root.translated(
             CssPixels::default(),
             self.block_offset_adjustment_from_pending_ancestor_block_start_margins(node),
         );
-        let content_position_in_root_now = |content_block_offset: CssPixels| FfiCssPixelPoint {
-            x: containing_block_rect_in_root_now.x,
-            y: containing_block_rect_in_root_now.y + content_block_offset,
-        };
 
         let mut placement = self.place_in_flow_box_past_floats(
             sized_child,
             block_container,
             &input,
             content_block_offset_before_floats,
-            containing_block_rect_in_root_now,
+            &mut containing_block_rect_in_root_now,
+            &mut top_margins_before_child,
         );
+        let content_position_in_root_now = |content_block_offset: CssPixels| FfiCssPixelPoint {
+            x: containing_block_rect_in_root_now.x,
+            y: containing_block_rect_in_root_now.y + content_block_offset,
+        };
         let InFlowBoxPlacement {
             content_inline_offset,
             content_block_offset,
@@ -4679,6 +4794,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 inline_space_used_before_children_formatted,
                 content_block_offset_before_floats,
                 containing_block_rect_in_root_now,
+                &mut top_margins_before_child,
                 &mut placement,
                 pending_position.is_some(),
             );
@@ -5354,24 +5470,29 @@ impl<'pass> BlockFormattingContext<'pass> {
             if fragmentainer.keeps_box_layouts {
                 return self.in_flow_reuse_storing_layout(key, validity, containing_block_position_in_root);
             }
-            return fragmentainer
+            let Some(layout) = fragmentainer
                 .box_layouts
                 .layout_of(node)
-                .filter(|layout| {
-                    layout.entry.validity == validity
-                        && layout.entry.key == key
-                        && self.column_box_layout_stays_unbroken_here(
-                            node,
-                            block_container,
-                            fragmentainer,
-                            layout,
-                            containing_block_position_in_root,
-                        )
-                })
-                .map_or(InFlowReuse::Ineligible, |layout| InFlowReuse::Hit {
-                    entry: layout.entry.clone(),
-                    fragment: layout.fragment.clone(),
-                });
+                .filter(|layout| layout.entry.validity == validity && layout.entry.key == key)
+            else {
+                return InFlowReuse::Ineligible;
+            };
+            let Some(block_end) = self.column_box_layout_block_end_here(
+                node,
+                block_container,
+                fragmentainer,
+                &layout,
+                containing_block_position_in_root,
+            ) else {
+                return InFlowReuse::Ineligible;
+            };
+            // NB: The stored layout places the box's contents without laying them out, so the column notes how far
+            //     they reach here.
+            fragmentainer.note_content_block_end(block_end);
+            return InFlowReuse::Hit {
+                entry: layout.entry.clone(),
+                fragment: layout.fragment.clone(),
+            };
         }
         if self.run.pass.in_flow_block_cache_store().is_none()
             || !self.in_flow_child_may_be_reused(node, block_container, containing_line_box_fragment)
@@ -5420,53 +5541,34 @@ impl<'pass> BlockFormattingContext<'pass> {
         }
     }
 
-    /// Whether placing `layout` at the next position in this flow leaves every block end a column tests in the box
-    /// within this column, with nothing about the start of the column changing how the box lays out.
-    fn column_box_layout_stays_unbroken_here(
+    /// How far the box of `layout` reaches when placed at the next position in this flow, where that leaves every
+    /// block end a column tests in the box within this column, with nothing about the start of the column changing how
+    /// the box lays out.
+    fn column_box_layout_block_end_here(
         &self,
         node: Node,
         block_container: Node,
         fragmentainer: &fragmentation::Fragmentainer<'_>,
         layout: &fragmentation::ColumnBoxLayout,
         containing_block_position_in_root: FfiCssPixelPoint,
-    ) -> bool {
+    ) -> Option<CssPixels> {
         let entry = &layout.entry;
         if self.discard_block_start_margin_of_next_child.get()
             || self.margin_state().has_open_top_margin_group()
             || !self.floats_read_by_contents_still_stand(node, entry, containing_block_position_in_root)
         {
-            return false;
+            return None;
         }
-        self.rebuild_float_bands();
-        let flow_position = self.flow_position();
-        let position_past_floats = self
-            .flow_position_past_floats_cleared_by(
-                node,
-                flow_position,
-                Some(BlockLevelBoxInFlow {
-                    block_start_margin: entry.cells.margin_top(),
-                    containing_block_inline_size: entry.key.containing_block_inline_size,
-                    input: &entry.key.input,
-                }),
-                containing_block_position_in_root,
-            )
-            .map(|(position, _)| position);
-        let block_start_margin = {
-            let mut margin_state = self.margin_state().clone();
-            let mut margins_left_by_contents = entry.margins_left_by_contents.clone();
-            collapse_block_start_margin_of_reused_child(
-                &mut margin_state,
-                &entry.cells,
-                self.facts(node).has_quirky_block_start_margin(),
-                &mut margins_left_by_contents,
-                position_past_floats.is_some(),
-            )
-        };
-        let border_box_block_start_in_root = containing_block_position_in_root.y
-            + self.block_offset_adjustment_from_pending_ancestor_block_start_margins(block_container)
-            + position_past_floats.unwrap_or(flow_position)
-            + block_start_margin;
-        !fragmentainer.exceeds(border_box_block_start_in_root + layout.block_size_that_stays_unbroken)
+        let position_past_floats =
+            self.position_past_floats_cleared_by_stored_layout(node, entry, containing_block_position_in_root);
+        let block_end = self.border_box_block_start_of_stored_layout_in_root(
+            node,
+            block_container,
+            entry,
+            position_past_floats,
+            containing_block_position_in_root,
+        ) + layout.block_size_that_stays_unbroken;
+        (!fragmentainer.exceeds(block_end)).then_some(block_end)
     }
 
     pub(crate) fn keeps_column_box_layouts(&self) -> bool {
@@ -5495,20 +5597,8 @@ impl<'pass> BlockFormattingContext<'pass> {
         if self.floats.borrow().is_empty() {
             return floats_read.floats_in_reach.is_empty() && !floats_read.introduced_clearance;
         }
-        self.rebuild_float_bands();
-        let flow_position = self.flow_position();
-        let position_past_floats = self
-            .flow_position_past_floats_cleared_by(
-                node,
-                flow_position,
-                Some(BlockLevelBoxInFlow {
-                    block_start_margin: entry.cells.margin_top(),
-                    containing_block_inline_size: entry.key.containing_block_inline_size,
-                    input: &entry.key.input,
-                }),
-                containing_block_position_in_root,
-            )
-            .map(|(position, _)| position);
+        let position_past_floats =
+            self.position_past_floats_cleared_by_stored_layout(node, entry, containing_block_position_in_root);
         if floats_read.read_before_top_margins_settled
             && (floats_read.stored_in_open_top_margin_group
                 || floats_read.margins_before_box != self.margin_state().margins_since_reset
@@ -5519,21 +5609,13 @@ impl<'pass> BlockFormattingContext<'pass> {
         let Some(read_start_from_border_box) = floats_read.read_start_from_border_box else {
             return true;
         };
-        let block_start_margin = {
-            let mut margin_state = self.margin_state().clone();
-            let mut margins_left_by_contents = entry.margins_left_by_contents.clone();
-            collapse_block_start_margin_of_reused_child(
-                &mut margin_state,
-                &entry.cells,
-                self.facts(node).has_quirky_block_start_margin(),
-                &mut margins_left_by_contents,
-                position_past_floats.is_some(),
-            )
-        };
-        let border_box_block_start = containing_block_position_in_root.y
-            + self.block_offset_adjustment_from_pending_ancestor_block_start_margins(node)
-            + position_past_floats.unwrap_or(flow_position)
-            + block_start_margin;
+        let border_box_block_start = self.border_box_block_start_of_stored_layout_in_root(
+            node,
+            node,
+            entry,
+            position_past_floats,
+            containing_block_position_in_root,
+        );
         let lowest_margin_edge = self
             .lowest_left_margin_edge
             .get()
@@ -6001,6 +6083,9 @@ impl<'pass> BlockFormattingContext<'pass> {
         child_input: &LayoutInput,
         containing_block_position_in_root: FfiCssPixelPoint,
     ) -> Option<ChildJobAhead> {
+        let mut adjusted_input = child_input.clone();
+        self.adjust_table_cell_child_input(child, &block_container, &mut adjusted_input);
+        let child_input = &adjusted_input;
         let pass = &self.run.pass;
         let facts = self.facts(child);
         if facts.is_box()
@@ -6111,11 +6196,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         let Some(read_start_from_border_box) = floats_read.read_start_from_border_box else {
             return !contents_ignore_quirky_margins
                 || self
-                    .position_past_floats_cleared_by_child_laid_out_ahead(
-                        node,
-                        entry,
-                        containing_block_position_in_root,
-                    )
+                    .position_past_floats_cleared_by_stored_layout(node, entry, containing_block_position_in_root)
                     .is_none();
         };
         let group_of_contents_is_negative = entry
@@ -6130,35 +6211,26 @@ impl<'pass> BlockFormattingContext<'pass> {
             return false;
         }
         let position_past_floats =
-            self.position_past_floats_cleared_by_child_laid_out_ahead(node, entry, containing_block_position_in_root);
+            self.position_past_floats_cleared_by_stored_layout(node, entry, containing_block_position_in_root);
         if contents_ignore_quirky_margins && position_past_floats.is_some() {
             return false;
         }
-        let flow_position = self.flow_position();
-        let block_start_margin = {
-            let mut margin_state = self.margin_state().clone();
-            let mut margins_left_by_contents = entry.margins_left_by_contents.clone();
-            collapse_block_start_margin_of_reused_child(
-                &mut margin_state,
-                &entry.cells,
-                self.facts(node).has_quirky_block_start_margin(),
-                &mut margins_left_by_contents,
-                position_past_floats.is_some(),
-            )
-        };
-        let read_start_in_root = containing_block_position_in_root.y
-            + self.block_offset_adjustment_from_pending_ancestor_block_start_margins(node)
-            + position_past_floats.unwrap_or(flow_position)
-            + block_start_margin
-            + read_start_from_border_box;
+        let read_start_in_root = self.border_box_block_start_of_stored_layout_in_root(
+            node,
+            node,
+            entry,
+            position_past_floats,
+            containing_block_position_in_root,
+        ) + read_start_from_border_box;
         self.lowest_left_margin_edge
             .get()
             .max(self.lowest_right_margin_edge.get())
             .is_none_or(|edge| edge <= read_start_in_root)
     }
 
-    /// Where clearance puts a child laid out ahead of this walk among the floats placed so far, if it gets any.
-    fn position_past_floats_cleared_by_child_laid_out_ahead(
+    /// Where clearance puts `node` among the floats placed so far, placed with its stored layout `entry` at the next
+    /// position in this flow, if it gets any.
+    fn position_past_floats_cleared_by_stored_layout(
         &self,
         node: Node,
         entry: &in_flow_block_cache::InFlowBlockEntry,
@@ -6176,6 +6248,32 @@ impl<'pass> BlockFormattingContext<'pass> {
             containing_block_position_in_root,
         )
         .map(|(position, _)| position)
+    }
+
+    /// Where the border box of `node` starts in the root, placed with its stored layout `entry` at the next position in
+    /// this flow, or at `position_past_floats` where clearance puts it, below the pending block-start margins of the
+    /// ancestors of `adjusted_for`. Its block-start margin collapses as placing it would collapse it.
+    fn border_box_block_start_of_stored_layout_in_root(
+        &self,
+        node: Node,
+        adjusted_for: Node,
+        entry: &in_flow_block_cache::InFlowBlockEntry,
+        position_past_floats: Option<CssPixels>,
+        containing_block_position_in_root: FfiCssPixelPoint,
+    ) -> CssPixels {
+        let mut margin_state = self.margin_state().clone();
+        let mut margins_left_by_contents = entry.margins_left_by_contents.clone();
+        let block_start_margin = collapse_block_start_margin_of_reused_child(
+            &mut margin_state,
+            &entry.cells,
+            self.facts(node).has_quirky_block_start_margin(),
+            &mut margins_left_by_contents,
+            position_past_floats.is_some(),
+        );
+        containing_block_position_in_root.y
+            + self.block_offset_adjustment_from_pending_ancestor_block_start_margins(adjusted_for)
+            + position_past_floats.unwrap_or(self.flow_position())
+            + block_start_margin
     }
 
     /// Places a child laid out ahead of this walk, if that layout holds among the floats placed so far.
@@ -6485,6 +6583,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         let Some(outcome) = outcome else {
             return FragmentationStep::LayOut;
         };
+        let nested_lines_block_end = fragmentainer.take_pending_nested_lines_block_end();
         if let Some(broken) = &outcome.broken_inside {
             if self.allows_unforced_breaks() {
                 let content_block_end = state.container_content_box_block_start_in_root
@@ -6501,6 +6600,12 @@ impl<'pass> BlockFormattingContext<'pass> {
                     }
                     fragmentainer.outcome_mut().overflows = true;
                 }
+                fragmentainer.note_content_block_end(content_block_end);
+                if let Some(nested_lines_block_end) = nested_lines_block_end {
+                    fragmentainer.note_content_block_end(nested_lines_block_end);
+                }
+            } else if let Some(nested_lines_block_end) = nested_lines_block_end {
+                fragmentainer.note_pending_nested_lines_block_end(nested_lines_block_end);
             }
             self.fragmentainer_has_content.set(true);
             state.container_stop_token = self.stop_fragmentainer(
@@ -6537,6 +6642,17 @@ impl<'pass> BlockFormattingContext<'pass> {
                 }
                 fragmentainer.outcome_mut().overflows = true;
             }
+            // NB: A box that its margins collapse through holds no content, and where it ends is only provisional: A
+            //     later sibling's margin can still move it.
+            if !outcome.collapses_through {
+                fragmentainer.note_content_block_end(block_end);
+            }
+            if let Some(nested_lines_block_end) = nested_lines_block_end {
+                fragmentainer.note_content_block_end(nested_lines_block_end);
+            }
+        } else if let Some(nested_lines_block_end) = nested_lines_block_end {
+            // NB: Inside a box that avoids breaks, the step after that box decides if its lines stay.
+            fragmentainer.note_pending_nested_lines_block_end(nested_lines_block_end);
         }
         let break_after = self.propagated_break_after(child);
         if fragmentation::is_forced_column_break(break_after) {
@@ -6734,6 +6850,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             fragmentainer.note_space_shortage(line_block_end_in_root);
         }
         if is_kept {
+            fragmentainer.note_content_block_end(line_block_end_in_root);
             self.fragmentainer_has_content.set(true);
         }
     }
@@ -6744,18 +6861,33 @@ impl<'pass> BlockFormattingContext<'pass> {
         }
     }
 
-    pub(crate) fn note_unbreakable_line_root(&self, line_root: Node, lines_block_end_in_root: CssPixels) {
-        if line_root != self.run.box_ {
+    /// Notes how far the lines of `line_root` reach where the run lays them out without breaks, as inside a box that
+    /// avoids breaks or has size containment.
+    pub(crate) fn note_unfragmented_line_root(&self, line_root: Node, lines_block_end_in_root: CssPixels) {
+        if line_root == self.run.box_ {
             return;
         }
+        if let Some(fragmentainer) = self.run.fragmentainer.as_ref() {
+            fragmentainer.note_pending_nested_lines_block_end(lines_block_end_in_root);
+        }
+    }
+
+    pub(crate) fn note_unbreakable_line_root(&self, line_root: Node, lines_block_end_in_root: CssPixels) {
         let Some(fragmentainer) = self.run.fragmentainer.as_ref() else {
             return;
         };
+        // NB: A line root inside a box of the run breaks, or doesn't, with that box: Its lines reach as far as they do
+        //     only if that box stays in the fragmentainer, which the step after the box decides.
+        if line_root != self.run.box_ {
+            fragmentainer.note_pending_nested_lines_block_end(lines_block_end_in_root);
+            return;
+        }
         fragmentainer.note_unbreakable_block_size(lines_block_end_in_root);
         if fragmentainer.exceeds(lines_block_end_in_root) {
             fragmentainer.note_space_shortage(lines_block_end_in_root);
             fragmentainer.outcome_mut().overflows = true;
         }
+        fragmentainer.note_content_block_end(lines_block_end_in_root);
     }
 
     pub(crate) fn note_overflowing_content(&self) {
@@ -7340,9 +7472,15 @@ impl<'pass> BlockFormattingContext<'pass> {
             }
             // NB: Only the attempt that is kept tells the host what it found out.
             self.run.pass.receive_residue(layout.residue);
+            // NB: A column is as tall as the content it holds reaches, even where the content ends with a negative
+            //     margin: That margin moves up only what follows it in the column, and nothing does.
+            let consumed_block_size = layout
+                .outcome
+                .automatic_content_block_size
+                .max(outcome.content_block_end);
             return ColumnLayout {
                 outcome,
-                consumed_block_size: layout.outcome.automatic_content_block_size,
+                consumed_block_size,
                 baselines: layout.outcome.baselines,
                 root_line_data,
                 contents,
@@ -7882,10 +8020,11 @@ impl<'pass> BlockFormattingContext<'pass> {
         run: &FormattingContextRun<'pass>,
         sized_float: ChildSizedHere<'_>,
         block_container: BlockContainer,
-        input: LayoutInput,
+        mut input: LayoutInput,
         containing_block_position_in_root: FfiCssPixelPoint,
     ) -> FloatLaidOutAheadOfItsPosition {
         let node = sized_float.node;
+        self.adjust_table_cell_child_input(node, &block_container, &mut input);
         let float_input =
             self.size_float_for_its_run(sized_float, block_container, &input, containing_block_position_in_root);
         let layout = self.layout_inside(run, sized_float, block_container, float_input, false);
@@ -8415,6 +8554,20 @@ impl<'pass> BlockFormattingContext<'pass> {
                 margin_bottom = CssPixels::default();
             }
             return (last_in_flow_child.border_box_block_end + margin_bottom).max(CssPixels::default());
+        }
+        // NB: Where margins collapse through every in-flow child, and that collapsed margin can't collapse with this
+        //     box's top margin either, it's the margin of the last of those children: Unless it collapses with this
+        //     box's bottom margin as well, the box runs to its bottom edge, from the block-start content edge.
+        if !facts.children_are_inline()
+            && children.is_some_and(|children| !children.pending_margins_collapse_through_block_start)
+        {
+            let margin_bottom = self.margin_state_mut().collapsed_margin_at_block_end_of(&facts);
+            let used = self.cells_laid_out_here(sized_child);
+            if margin_bottom != CssPixels::default()
+                && (used.padding_bottom() != CssPixels::default() || used.border_bottom() != CssPixels::default())
+            {
+                return margin_bottom.max(CssPixels::default());
+            }
         }
 
         // AD-HOC: Contenteditable elements must have a minimum block size (line-height) when empty, to remain clickable

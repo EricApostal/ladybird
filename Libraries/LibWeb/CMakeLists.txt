@@ -279,6 +279,7 @@ set(SOURCES
     Fetch/Engine/FetchExecutor.cpp
     Fetch/Engine/InlineFetchExecutor.cpp
     Fetch/Engine/NetworkTransportHandle.cpp
+    Fetch/Engine/WholeBodyRead.cpp
     Fetch/Engine/WholeBodyTransport.cpp
     Fetch/Fetching/BodyStreamPullSource.cpp
     Fetch/Fetching/Checks.cpp
@@ -288,6 +289,7 @@ set(SOURCES
     Fetch/Fetching/FetchEventSink.cpp
     Fetch/Fetching/Fetching.cpp
     Fetch/Fetching/PendingResponse.cpp
+    Fetch/Fetching/PreloadWaitHandle.cpp
     Fetch/Fetching/RefCountedFlag.cpp
     Fetch/FetchMethod.cpp
     Fetch/Headers.cpp
@@ -495,7 +497,6 @@ set(SOURCES
     HTML/MediaTrackBase.cpp
     HTML/MessageEvent.cpp
     HTML/MessagePort.cpp
-    HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
     HTML/Navigable.cpp
     HTML/NavigableContainer.cpp
@@ -520,7 +521,6 @@ set(SOURCES
     HTML/Numbers.cpp
     HTML/OffscreenCanvas.cpp
     HTML/OffscreenCanvasRenderingContext2D.cpp
-    HTML/PageSwapEvent.cpp
     HTML/PageTransitionEvent.cpp
     HTML/Parser/Entities.cpp
     HTML/Parser/HTMLEncodingDetection.cpp
@@ -529,7 +529,6 @@ set(SOURCES
     HTML/Parser/HTMLTokenizer.cpp
     HTML/Parser/IncrementalDocumentParser.cpp
     HTML/Parser/SpeculativeHTMLParser.cpp
-    HTML/Plugin.cpp
     HTML/PluginArray.cpp
     HTML/PolicyContainers.cpp
     HTML/PreparedNavigationDescriptor.cpp
@@ -993,7 +992,7 @@ target_sources(LibWeb PRIVATE $<TARGET_OBJECTS:LibJSObjects>)
 target_compile_definitions(LibWeb PRIVATE LibJS_EXPORTS)
 target_link_libraries(LibWeb PUBLIC LibCompositing LibWebCommon LibJSHeaders)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibWebRTCClient)
+target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibRequests LibGC LibImageDecoderClient LibThreading LibWebRTCClient)
 
 # The library's Rust code: the bindings crate, which depends on the LibJS runtime and on libweb_rust, so that one archive
 # holds all three and the runtime is in the process once. The runtime's features are LibJS's.

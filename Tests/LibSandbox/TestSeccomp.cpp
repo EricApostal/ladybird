@@ -11,12 +11,12 @@
 #include <AK/Time.h>
 #include <LibCore/DirIterator.h>
 #include <LibSandbox/ConnectBroker.h>
+#include <LibSandbox/LinuxFcntl.h>
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
 #include <LibTest/TestCase.h>
 #include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <ifaddrs.h>
 #include <linux/filter.h>
 #include <linux/landlock.h>
@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -123,6 +124,26 @@ static int run_with_policy(Configure configure, Body body)
     int status = 0;
     VERIFY(waitpid(child, &status, 0) == child);
     return status;
+}
+
+TEST_CASE(file_descriptor_policy_allows_open_file_description_queries)
+{
+    auto body = [] {
+        int descriptors[2];
+        VERIFY(pipe(descriptors) == 0);
+        auto result = fcntl(descriptors[0], F_DUPFD_QUERY, descriptors[0]);
+        if (result == -1) {
+            // Kernels before Linux 6.10 don't implement F_DUPFD_QUERY.
+            VERIFY(errno == EINVAL);
+            return;
+        }
+        VERIFY(result == 1);
+        VERIFY(fcntl(descriptors[0], F_DUPFD_QUERY, descriptors[1]) == 0);
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST_CASE(runtime_policy_refuses_other_processes_and_resource_limit_changes)
@@ -423,6 +444,37 @@ TEST_CASE(gpu_policy_refuses_path_permission_changes_without_crashing)
     EXPECT_EQ(metadata.st_mode & 0777, 0600u);
     VERIFY(close(fd) == 0);
     VERIFY(unlink(path) == 0);
+}
+
+TEST_CASE(gpu_policy_refuses_device_node_creation_without_crashing)
+{
+    char directory[] = "/tmp/ladybird-mknod-XXXXXX";
+    VERIFY(mkdtemp(directory));
+    auto path = ByteString::formatted("{}/nvidiactl", directory);
+
+    auto status = run_with_policy(
+        [](auto& policy) {
+            policy.allow_filesystem_writes();
+            policy.allow_gpu_device_operations();
+        },
+        [&] {
+#ifdef __NR_mknod
+            VERIFY(syscall(__NR_mknod, path.characters(), S_IFCHR | 0666, makedev(195, 255)) == -1);
+            VERIFY(errno == EPERM);
+#endif
+#ifdef __NR_mknodat
+            VERIFY(syscall(__NR_mknodat, AT_FDCWD, path.characters(), S_IFCHR | 0666, makedev(195, 255)) == -1);
+            VERIFY(errno == EPERM);
+#endif
+        });
+
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    struct stat metadata {};
+    EXPECT_EQ(lstat(path.characters(), &metadata), -1);
+    VERIFY(rmdir(directory) == 0);
 }
 
 TEST_CASE(readonly_open_policy_accepts_the_flags_opendir_and_libpulse_use)

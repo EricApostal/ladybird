@@ -28,7 +28,26 @@ static JsonObject ffmpeg_to_json(FFmpegFacts const& facts)
     JsonObject object;
     object.set("avcodec_version"sv, facts.avcodec_version);
     object.set("avutil_version"sv, facts.avutil_version);
-    object.set("shares_bundled_struct_layouts"sv, facts.shares_bundled_struct_layouts);
+    object.set("has_vulkan_decoder_for_its_version"sv, facts.has_vulkan_decoder_for_its_version);
+    return object;
+}
+
+Optional<StringView> OpenSSLFacts::openssl_version_from_curl_ssl_version(StringView ssl_version)
+{
+    // MultiSSL builds list every backend and parenthesize the inactive ones, in no particular order.
+    for (auto backend : ssl_version.split_view(' ')) {
+        if (backend.starts_with("OpenSSL/"sv))
+            return backend.substring_view("OpenSSL/"sv.length());
+    }
+    return {};
+}
+
+static JsonObject openssl_to_json(OpenSSLFacts const& facts)
+{
+    JsonObject object;
+    object.set("linked_version"sv, facts.linked_version);
+    if (facts.curl_version.has_value())
+        object.set("curl_version"sv, *facts.curl_version);
     return object;
 }
 
@@ -60,6 +79,8 @@ JsonObject SystemFacts::to_json() const
         object.set("bundled_ffmpeg"sv, ffmpeg_to_json(*bundled_ffmpeg));
     if (system_ffmpeg.has_value())
         object.set("system_ffmpeg"sv, ffmpeg_to_json(*system_ffmpeg));
+    if (openssl.has_value())
+        object.set("openssl"sv, openssl_to_json(*openssl));
     return object;
 }
 
@@ -112,7 +133,16 @@ static ErrorOr<FFmpegFacts> ffmpeg_from_json(JsonObject const& object)
     FFmpegFacts facts;
     facts.avcodec_version = TRY(read_u32(object, "avcodec_version"sv));
     facts.avutil_version = TRY(read_u32(object, "avutil_version"sv));
-    facts.shares_bundled_struct_layouts = TRY(read_bool(object, "shares_bundled_struct_layouts"sv));
+    facts.has_vulkan_decoder_for_its_version = TRY(read_bool(object, "has_vulkan_decoder_for_its_version"sv));
+    return facts;
+}
+
+static ErrorOr<OpenSSLFacts> openssl_from_json(JsonObject const& object)
+{
+    OpenSSLFacts facts;
+    facts.linked_version = TRY(read_string(object, "linked_version"sv));
+    if (object.has("curl_version"sv))
+        facts.curl_version = TRY(read_string(object, "curl_version"sv));
     return facts;
 }
 
@@ -153,6 +183,8 @@ ErrorOr<SystemFacts> SystemFacts::from_json(JsonObject const& object)
         facts.bundled_ffmpeg = TRY(ffmpeg_from_json(*TRY(read_object(object, "bundled_ffmpeg"sv))));
     if (object.has("system_ffmpeg"sv))
         facts.system_ffmpeg = TRY(ffmpeg_from_json(*TRY(read_object(object, "system_ffmpeg"sv))));
+    if (object.has("openssl"sv))
+        facts.openssl = TRY(openssl_from_json(*TRY(read_object(object, "openssl"sv))));
     return facts;
 }
 

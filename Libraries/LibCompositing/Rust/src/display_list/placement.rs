@@ -20,18 +20,20 @@ use crate::display_list::effect_clip_plan::EffectClipPlan;
 use crate::display_list::effect_geometry::{Extent, FiltersOfEffects, changed_extent_through_filters};
 use crate::display_list::reach::Reach;
 use crate::visual_context::queries::TreeCullingScratch;
-use crate::visual_context::world_transforms::translation_on_whole_device_pixels;
+use crate::visual_context::world_transforms::{
+    bounds_of_projected_rect_if_corners_in_front_of_eye, translation_on_whole_device_pixels,
+};
 use crate::visual_context::{
-    ClipNodeData, CompositorScrollNodeRecord, EffectNodeData, RasterRoot, SpatialData, StickyData, VisualContextTree,
-    WorldTransforms,
+    ClipNodeData, CompositorScrollNodeRecord, RasterRoot, SpatialData, StickyData, VisualContextTree, WorldTransforms,
 };
 use libgfx_rust::{CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, IntPoint, IntRect, enclosing_int_rect};
+use libipc_rust::wire::{Decode, Encode};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::rc::Rc;
 
 /// The index of a raster space among the spaces of a placement, each after the space it is in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct RasterSpaceIndex(pub usize);
 
 impl RasterSpaceIndex {
@@ -136,7 +138,7 @@ impl RasterSpace {
 
 /// A rect, with rounded corners or not, that rasters of content are clipped to as they are composited, in the raster
 /// coordinates of a space whose anchor the content does not move with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct CompositeClip {
     pub raster_space_index: RasterSpaceIndex,
     pub rect: IntRect,
@@ -349,13 +351,6 @@ fn compositor_scrolled_nodes_without_own_space<'a>(
         .filter(move |node| *node != VISUAL_VIEWPORT_NODE_INDEX && !scrollers_with_spaces.contains(node))
 }
 
-fn visual_viewport_only_translates(tree: &VisualContextTree) -> bool {
-    let Some(SpatialData::Transform(transform)) = tree.spatial_nodes.first().map(|node| &node.data) else {
-        return false;
-    };
-    translation_if_only_translates(&transform.matrix_including_origin()).is_some()
-}
-
 // How deep below the viewport each node is, where nothing between it and the viewport transforms or moves on its own,
 // so that content of the node lands on whole device pixels wherever it is scrolled to.
 struct DepthsBelowViewportOnWholeDevicePixels<'a> {
@@ -550,9 +545,6 @@ pub fn raster_space_anchors(
     tree: &VisualContextTree,
     spatial_nodes_that_move_on_their_own: &[bool],
 ) -> Vec<SpatialNodeIndex> {
-    if !visual_viewport_only_translates(tree) {
-        return Vec::new();
-    }
     let mut depths_below_viewport = DepthsBelowViewportOnWholeDevicePixels::new(spatial_nodes_that_move_on_their_own);
     let candidate_scrollers: Vec<ScrollerThatCanHaveSpace> = tree
         .compositor_scroll_table()
@@ -813,31 +805,6 @@ impl RasterSpaces {
             })
             .clone()
     }
-}
-
-fn bounds_of_projected_rect_if_corners_in_front_of_eye(matrix: FloatMatrix4x4, rect: FloatRect) -> Option<FloatRect> {
-    const SMALLEST_W_IN_FRONT_OF_EYE: f32 = 0.00001;
-    let corners = [
-        (rect.x, rect.y),
-        (rect.right(), rect.y),
-        (rect.x, rect.bottom()),
-        (rect.right(), rect.bottom()),
-    ]
-    .map(|(x, y)| matrix.map_vector4([x, y, 0.0, 1.0]));
-    if corners.iter().any(|corner| corner[3] <= SMALLEST_W_IN_FRONT_OF_EYE) {
-        return None;
-    }
-    let xs = corners.map(|corner| corner[0] / corner[3]);
-    let ys = corners.map(|corner| corner[1] / corner[3]);
-    let (left, right) = (
-        xs.into_iter().fold(f32::INFINITY, f32::min),
-        xs.into_iter().fold(f32::NEG_INFINITY, f32::max),
-    );
-    let (top, bottom) = (
-        ys.into_iter().fold(f32::INFINITY, f32::min),
-        ys.into_iter().fold(f32::NEG_INFINITY, f32::max),
-    );
-    Some(FloatRect::new(left, top, right - left, bottom - top))
 }
 
 pub(crate) fn is_finite_rect(rect: FloatRect) -> bool {
@@ -1172,10 +1139,8 @@ pub struct RunGroupIndex(pub usize);
 pub struct RunGroups {
     first_and_last_run_of_groups: Vec<(u32, u32)>,
     group_of_run: Vec<u32>,
-    group_is_under_mask: Vec<bool>,
     roots_of_contexts_sorting_planes_by_depth: Vec<Option<SpatialNodeIndex>>,
     run_is_sorted_by_depth: Vec<bool>,
-    group_is_sorted_by_depth: Vec<bool>,
 }
 
 // By the tree's structure rather than effect values, so that groups stay put while an opacity animates. An effect that
@@ -1270,13 +1235,7 @@ impl RunGroups {
         let mut sorting_context_of_run = Vec::new();
         let outermost_grouping_effects =
             outermost_grouping_effects(tree, effect_leaves_its_runs_ungrouped_by_effect_index);
-        let mut effect_chain_holds_mask = vec![false; tree.effect_nodes.len()];
-        tree.visit_effect_nodes_parents_first(|index| {
-            let node = &tree.effect_nodes[index];
-            let parent_holds_mask = !node.parent.is_none() && effect_chain_holds_mask[node.parent.0 as usize];
-            effect_chain_holds_mask[index] = parent_holds_mask || matches!(node.data, EffectNodeData::Mask(_));
-        });
-        let (grouping_effect_of_run, run_is_under_mask): (Vec<EffectNodeIndex>, Vec<bool>) = command_runs
+        let grouping_effect_of_run: Vec<EffectNodeIndex> = command_runs
             .into_iter()
             .map(|run| {
                 sorting_context_of_run.push(
@@ -1286,15 +1245,12 @@ impl RunGroups {
                         .flatten(),
                 );
                 if run.context.effect.is_none() {
-                    (EffectNodeIndex::NONE, false)
+                    EffectNodeIndex::NONE
                 } else {
-                    (
-                        outermost_grouping_effects[run.context.effect.0 as usize],
-                        effect_chain_holds_mask[run.context.effect.0 as usize],
-                    )
+                    outermost_grouping_effects[run.context.effect.0 as usize]
                 }
             })
-            .unzip();
+            .collect();
         let first_and_last_run_of_groups =
             first_and_last_run_of_groups_holding_whole_grouping_effects_and_sorting_contexts(
                 &grouping_effect_of_run,
@@ -1304,31 +1260,12 @@ impl RunGroups {
         for (group_index, &(first, last)) in first_and_last_run_of_groups.iter().enumerate() {
             group_of_run[first as usize..=last as usize].fill(group_index as u32);
         }
-
-        let group_is_under_mask = first_and_last_run_of_groups
-            .iter()
-            .map(|&(first, last)| {
-                run_is_under_mask[first as usize..=last as usize]
-                    .iter()
-                    .any(|&under_mask| under_mask)
-            })
-            .collect();
         let run_is_sorted_by_depth: Vec<bool> = sorting_context_of_run.iter().map(Option::is_some).collect();
-        let group_is_sorted_by_depth = first_and_last_run_of_groups
-            .iter()
-            .map(|&(first, last)| {
-                run_is_sorted_by_depth[first as usize..=last as usize]
-                    .iter()
-                    .any(|&sorted| sorted)
-            })
-            .collect();
         Self {
             first_and_last_run_of_groups,
             group_of_run,
-            group_is_under_mask,
             roots_of_contexts_sorting_planes_by_depth,
             run_is_sorted_by_depth,
-            group_is_sorted_by_depth,
         }
     }
 
@@ -1347,12 +1284,8 @@ impl RunGroups {
         self.roots_of_contexts_sorting_planes_by_depth == roots_of_contexts_sorting_planes_by_depth
     }
 
-    /// Whether the group holds a 3D sorting context that sorts its planes by depth, whose content is replayed whole
-    /// wherever any of the group shows, as sorting the planes reads all of them.
-    pub fn group_is_sorted_by_depth(&self, group: RunGroupIndex) -> bool {
-        self.group_is_sorted_by_depth[group.0]
-    }
-
+    /// Whether the run is in a 3D sorting context that sorts its planes by depth, whose runs are replayed whole
+    /// wherever any of them shows, as sorting the planes reads all of them.
     pub fn run_is_sorted_by_depth(&self, run_index: usize) -> bool {
         self.run_is_sorted_by_depth[run_index]
     }
@@ -1363,10 +1296,5 @@ impl RunGroups {
 
     pub fn group_of_run(&self, run_index: usize) -> RunGroupIndex {
         RunGroupIndex(self.group_of_run[run_index] as usize)
-    }
-
-    /// Whether the group is under a mask, whose content is replayed whole wherever any of it shows.
-    pub fn group_is_under_mask(&self, group: RunGroupIndex) -> bool {
-        self.group_is_under_mask[group.0]
     }
 }

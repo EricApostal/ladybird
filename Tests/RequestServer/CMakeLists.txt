@@ -20,9 +20,9 @@ if (LINUX)
 endif()
 
 if (NOT WIN32)
-    list(APPEND TEST_SOURCES TestHTTP2ConnectionSpecificFields.cpp)
+    list(APPEND TEST_SOURCES TestCertificateExceptions.cpp TestHTTP2ConnectionSpecificFields.cpp)
 endif()
 
 target_sources(TestRequestServer PRIVATE ${TEST_SOURCES})
-target_link_libraries(TestRequestServer PRIVATE requestserverservice OpenSSL::Crypto OpenSSL::SSL CURL::libcurl LibThreading)
+target_link_libraries(TestRequestServer PRIVATE requestserverservice LibCrypto OpenSSL::Crypto OpenSSL::SSL CURL::libcurl LibThreading)
 target_include_directories(TestRequestServer PRIVATE ${LADYBIRD_SOURCE_DIR}/Services)

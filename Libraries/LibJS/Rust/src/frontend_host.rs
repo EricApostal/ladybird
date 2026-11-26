@@ -6,10 +6,12 @@
 
 //! The functions the Rust frontend (Libraries/LibJS/Rust) calls on the runtime that embeds it, through host.rs.
 
-use libregex_rust::ast::Flags;
+use libregex_compiler::ast::Flags;
+use libregex_compiler::parser::Error as ParseError;
 use libregex_rust::regex::Regex;
 use num_bigint::BigInt;
 
+use crate::host::RegexError;
 use crate::runtime::big_int_algorithms;
 use crate::runtime::regexp_object::parse_regex_pattern;
 use crate::runtime::value::number_to_string;
@@ -21,11 +23,11 @@ pub fn number_to_utf16(value: f64) -> Vec<u16> {
 }
 
 /// Compiles a regular expression literal, so that the frontend can report an invalid one as an early error.
-pub fn validate_regex(pattern: &[u16], flags: &[u16]) -> Result<(), String> {
+pub fn validate_regex(pattern: &[u16], flags: &[u16]) -> Result<(), RegexError> {
     let has_flag = |flag: u8| flags.contains(&u16::from(flag));
 
     let parsed_pattern = parse_regex_pattern(pattern, has_flag(b'u'), has_flag(b'v'))
-        .map_err(|error| format!("RegExp compile error: {}", error.error))?;
+        .map_err(|error| RegexError::Invalid(format!("RegExp compile error: {}", error.error)))?;
 
     let compile_flags = Flags {
         global: has_flag(b'g'),
@@ -37,13 +39,10 @@ pub fn validate_regex(pattern: &[u16], flags: &[u16]) -> Result<(), String> {
         sticky: has_flag(b'y'),
         has_indices: has_flag(b'd'),
     };
-    // Converted the way LibRegex's rust_regex_compile converts a UTF-16 pattern, although ParsePattern only produces
-    // ASCII.
-    let pattern_characters = char::decode_utf16(parsed_pattern.iter().copied())
-        .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect();
-    Regex::compile_chars(pattern_characters, compile_flags)
-        .map_err(|error| format!("RegExp compile error: {error}"))?;
+    Regex::compile_utf16(&parsed_pattern, compile_flags, |error| match error {
+        ParseError::TooDeeplyNested => RegexError::OutOfStack,
+        error => RegexError::Invalid(format!("RegExp compile error: {error}")),
+    })?;
     Ok(())
 }
 

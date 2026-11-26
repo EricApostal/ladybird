@@ -17,7 +17,9 @@ use crate::surfaces::painting_surface::PaintingSurface;
 use libcompositing_rust::display_list::commands::CompositorContextId;
 use libcompositing_rust::display_list::replay::{CompositedContexts, NoCompositedContexts, ResolvedCompositedContext};
 use libcompositing_rust::ipc_types::{
-    Compositing_ContextVisibility as ContextVisibility, compositor_presentation_client, compositor_web_content_client,
+    Compositing_ContextVisibility as ContextVisibility,
+    Compositing_RenderingOpportunityFrameTime as RenderingOpportunityFrameTime, compositor_presentation_client,
+    compositor_web_content_client,
 };
 use libcompositing_rust::scrolling::wheel_gesture_identity::TouchpadGestureEnd;
 use libcompositing_rust::time::MonotonicTime;
@@ -108,12 +110,14 @@ impl CompositedContexts for ContextsNestedIn<'_> {
         child_context_id: u64,
         destination_rect: FloatRect,
         canvas_matrix: &FloatMatrix4x4,
+        visible_device_rect: IntRect,
     ) -> Option<ResolvedCompositedContext> {
         self.core.resolve_composited_context(
             self.parent_context_id,
             CompositorContextId(child_context_id),
             destination_rect,
             canvas_matrix,
+            visible_device_rect,
             self.now,
         )
     }
@@ -380,6 +384,7 @@ impl CompositorCore {
         child_context_id: CompositorContextId,
         destination_rect: FloatRect,
         canvas_matrix: &FloatMatrix4x4,
+        visible_device_rect: IntRect,
         now: MonotonicTime,
     ) -> Option<ResolvedCompositedContext> {
         let child_state = self.context_if_present(child_context_id)?;
@@ -388,7 +393,7 @@ impl CompositorCore {
         }
         // A context nested in itself, through others, is already being painted.
         let mut child_presenting = self.presenting_of(child_context_id)?.try_borrow_mut().ok()?;
-        child_presenting.update_composited_raster_transform(destination_rect, canvas_matrix);
+        child_presenting.update_composited_raster_transform(destination_rect, canvas_matrix, visible_device_rect);
         if child_presenting.needs_rasterization() {
             let (display_list, frame_inputs) = {
                 let mut child_state = child_state.try_borrow_mut().ok()?;
@@ -1067,6 +1072,8 @@ impl CompositorCore {
         context_id: CompositorContextId,
         frame_time: MonotonicTime,
         frame_interval: f64,
+        display_refresh_rate: f64,
+        frame_time_kind: RenderingOpportunityFrameTime,
     ) {
         let web_content_client_id = context.borrow().web_content_client_id();
         self.host.post_to_web_content(
@@ -1075,6 +1082,8 @@ impl CompositorCore {
                 context_id,
                 frame_time_nanoseconds: frame_time.nanoseconds(),
                 frame_interval_milliseconds: frame_interval,
+                display_interval_milliseconds: 1000.0 / display_refresh_rate,
+                frame_time_kind,
             },
         );
     }
@@ -1114,7 +1123,14 @@ impl CompositorCore {
                 })
             };
             if let Some(frame_interval) = delivery {
-                self.post_rendering_opportunity(context, context_id, frame_time, frame_interval);
+                self.post_rendering_opportunity(
+                    context,
+                    context_id,
+                    frame_time,
+                    frame_interval,
+                    display_refresh_rate,
+                    RenderingOpportunityFrameTime::DisplayTick,
+                );
                 return;
             }
         }
@@ -1140,7 +1156,14 @@ impl CompositorCore {
             presenting.rendering_opportunity_request.did_deliver(now);
             frame_interval
         };
-        self.post_rendering_opportunity(context, context_id, now, frame_interval);
+        self.post_rendering_opportunity(
+            context,
+            context_id,
+            now,
+            frame_interval,
+            display_refresh_rate,
+            RenderingOpportunityFrameTime::BetweenDisplayTicks,
+        );
     }
 
     pub(super) fn vsync_inner(&self, display_id: Option<u64>, frame_time: MonotonicTime, now: MonotonicTime) {
@@ -1190,7 +1213,14 @@ impl CompositorCore {
                 }
             };
             if let Some(frame_interval) = rendering_opportunity {
-                self.post_rendering_opportunity(context, context_id, frame_time, frame_interval);
+                self.post_rendering_opportunity(
+                    context,
+                    context_id,
+                    frame_time,
+                    frame_interval,
+                    display_refresh_rate,
+                    RenderingOpportunityFrameTime::DisplayTick,
+                );
             }
 
             let present_is_scheduled_on_tick_display = {

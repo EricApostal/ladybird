@@ -822,14 +822,6 @@ ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> 
     m_profile = TRY(Profile::create(profile_selection, profile_roots));
 #endif
 
-    auto const& paths = m_profile->paths();
-    auto root_for_tests = m_web_content_options.is_test_mode == IsTestMode::Yes ? m_browser_options.local_file_root_for_tests : Optional<ByteString> {};
-    m_local_file_grant_policy = LocalFileGrantPolicy {
-        Core::StandardPaths::home_directory(),
-        { paths.config, paths.data, paths.cache, paths.runtime, paths.identity, m_instance_data_directory },
-        move(root_for_tests),
-    };
-
     return {};
 }
 
@@ -863,7 +855,12 @@ void Application::create_mach_port_server([[maybe_unused]] ByteString const& pro
                 m_event_loop->deferred_invoke([this, transport = move(transport.ports)]() mutable {
                     if (!m_on_browser_process_transport)
                         return;
-                    m_on_browser_process_transport(make<IPC::Transport>(move(transport.receive_right), move(transport.send_right)));
+                    auto browser_process_transport = IPC::Transport::create(move(transport.receive_right), move(transport.send_right));
+                    if (browser_process_transport.is_error()) {
+                        warnln("Unable to accept a Browser process's transport: {}", browser_process_transport.error());
+                        return;
+                    }
+                    m_on_browser_process_transport(browser_process_transport.release_value());
                 });
             });
     };
@@ -2113,6 +2110,14 @@ void Application::system_facts_arrived(SystemFacts const& facts)
 
     m_system_facts = facts;
     reevaluate_platform_features();
+
+    // RequestServer leaves curl's TLS configuration alone in this case, rather than corrupt memory, but the user can only
+    // fix it by rebuilding Ladybird.
+    if (facts.openssl.has_value() && facts.openssl->curl_uses_another_openssl()) {
+        warnln("The system's curl uses OpenSSL {}, but Ladybird was built against OpenSSL {}. Rebuild Ladybird against the system's OpenSSL.",
+            *facts.openssl->curl_version, facts.openssl->linked_version);
+        display_openssl_mismatch(*facts.openssl);
+    }
 
     // A Compositor started from the cached facts is relaunched with the features the system has now.
     if (m_compositor_client && m_platform_feature_decisions->features_for(FeatureProcess::Compositor).to_byte_string() != m_compositor_launched_features) {

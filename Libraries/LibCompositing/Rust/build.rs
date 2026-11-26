@@ -295,6 +295,7 @@ fn generate_ipc_definitions(manifest_dir: &Path, out_dir: &Path) -> Result<(), B
             "DisplayListProperties.rs",
         ),
         ("Libraries/LibCompositing/Types.ipc", "Types.rs"),
+        ("Libraries/LibCompositing/UIOverlays.ipc", "UIOverlays.rs"),
         ("Libraries/LibWebCommon/UIEvents/KeyCode.ipc", "KeyCode.rs"),
         ("Libraries/LibWebCommon/UIEvents/MouseButton.ipc", "MouseButton.rs"),
         (
@@ -569,6 +570,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("CompositingAndBlendingOperator", "Gfx::CompositingAndBlendingOperator"),
         ("ColorFilterType", "Gfx::ColorFilterType"),
         ("Orientation", "Gfx::Orientation"),
+        ("GlyphRunOrientation", "Gfx::GlyphRunOrientation"),
         ("MaskKind", "Gfx::MaskKind"),
         ("ShouldAntiAlias", "Gfx::ShouldAntiAlias"),
         ("CssPixels", "Web::CSSPixels"),

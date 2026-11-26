@@ -30,6 +30,7 @@ enum class IncludeActionIcon : u8 {
 
 QMenu* create_application_menu(QWidget& parent, Menu&);
 void repopulate_application_menu(QMenu& menu, Menu& source);
+void add_history_navigation_actions(QMenu&, QAction& back, QAction& forward);
 void update_history_menu(QMenu& menu, WebContentView*);
 void populate_session_history_traversal_menu(QMenu& menu, WebContentView&, int direction);
 
@@ -71,6 +72,7 @@ void enable_menu_icons(QMenu&);
 #endif
 
 void execute_context_menu(QMenu&, QPoint const& global_position);
+void delete_menu_later(QMenu&);
 QMenu& replace_context_menu(QPointer<QMenu>& shown_menu, QWidget& parent, Menu&);
 void execute_context_menu_later(QPointer<QMenu>& shown_menu, QWidget& parent, Menu&, QPoint const& global_position);
 

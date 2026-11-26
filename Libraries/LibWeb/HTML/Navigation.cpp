@@ -182,8 +182,7 @@ WebIDL::ExceptionOr<void> Navigation::update_current_entry(NavigationUpdateCurre
 
     // 5. Fire an event named currententrychange at this using NavigationCurrentEntryChangeEvent,
     //    with its navigationType attribute initialized to null and its from initialized to current.
-    NavigationCurrentEntryChangeEventInit event_init { {}, *current, {} };
-    dispatch_event(HTML::NavigationCurrentEntryChangeEvent::create(HTML::EventNames::currententrychange, event_init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window()))));
+    dispatch_event(create_navigation_current_entry_change_event(relevant_realm(window()), EventNames::currententrychange, {}, *current));
 
     return {};
 }
@@ -826,14 +825,7 @@ void Navigation::abort_a_navigate_event(GC::Ref<NavigateEvent> event, JS::Value 
 
     // 6. Fire an event named navigateerror at navigation using ErrorEvent, with additional attributes initialized
     //    according to errorInfo.
-    ErrorEventInit event_init = {};
-    event_init.filename = error_info.filename;
-    event_init.message = error_info.message;
-    event_init.lineno = error_info.lineno;
-    event_init.colno = error_info.colno;
-    event_init.error = error_info.error;
-
-    dispatch_event(ErrorEvent::create(EventNames::navigateerror, event_init, HighResolutionTime::current_high_resolution_time(realm.global_object())));
+    dispatch_event(create_error_event(realm, EventNames::navigateerror, {}, error_info));
 
     // 7. If navigation's transition is null, then return.
     if (!m_transition)
@@ -1716,8 +1708,7 @@ void Navigation::update_the_navigation_api_entries_for_a_same_document_navigatio
 
     // 12. Fire an event named currententrychange at navigation using NavigationCurrentEntryChangeEvent,
     //     with its navigationType attribute initialized to navigationType and its from initialized to oldCurrentNHE.
-    NavigationCurrentEntryChangeEventInit event_init { {}, *old_current_nhe, navigation_type };
-    dispatch_event(NavigationCurrentEntryChangeEvent::create(EventNames::currententrychange, event_init, HighResolutionTime::current_high_resolution_time(realm.global_object())));
+    dispatch_event(create_navigation_current_entry_change_event(realm, EventNames::currententrychange, navigation_type, *old_current_nhe));
 
     // 13. For each disposedNHE of disposedNHEs:
     for (auto& disposed_nhe : disposed_nhes) {

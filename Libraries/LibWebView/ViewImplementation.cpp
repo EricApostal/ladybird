@@ -888,26 +888,42 @@ void ViewImplementation::set_has_system_focus(bool has_system_focus)
 
 void ViewImplementation::load_from_browser_ui(URL::URL const& url, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
-    load(traversable().prepare_navigation(url, {}, history_handling), UserSelectedLocalFile {});
+    load(traversable().prepare_navigation(url, {}, history_handling));
+}
+
+static bool process_hosting_may_read_local_files(Web::HTML::EnvironmentId const& environment_id)
+{
+    bool may_read_local_files = false;
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        if (!client.hosted_environment(environment_id).has_value())
+            return IterationDecision::Continue;
+        may_read_local_files = client.may_read_local_files();
+        return IterationDecision::Break;
+    });
+    return may_read_local_files;
 }
 
 // A navigation a page asked the browser's UI to start for it — a link opened with a middle-click, e.g. — whose
 // source is still that page.
-void ViewImplementation::load(Web::HTML::PreparedNavigationDescriptor navigation, LocalFileAccess local_file_access)
+void ViewImplementation::load(Web::HTML::PreparedNavigationDescriptor navigation)
 {
+    // NB: A page can't have the browser's UI load a file: URL that its own navigation couldn't.
+    if (auto const& fetch_client = navigation.source_snapshot_params.fetch_client; navigation.url.scheme() == "file"sv && fetch_client.has_value()) {
+        if (!process_hosting_may_read_local_files(fetch_client->id))
+            return;
+    }
+
     if (on_before_browser_initiated_navigation)
         on_before_browser_initiated_navigation();
 
-    if (auto const& fetch_client = navigation.source_snapshot_params.fetch_client; local_file_access.has<Empty>() && fetch_client.has_value())
-        local_file_access = WebContentClient::local_file_access_of_process_hosting(fetch_client->id);
-    prepare_for_navigation_after_crash(NavigationToRetry { navigation.url, prepare_navigation_to_retry(navigation), local_file_access });
+    prepare_for_navigation_after_crash(NavigationToRetry { navigation.url, prepare_navigation_to_retry(navigation) });
     m_last_stopped_navigation.clear();
     if (navigation.url.scheme() != "javascript"sv) {
         if (navigation.url.fragment().has_value() && navigation.url.fragment()->contains(":~:"sv))
             m_text_fragment_indication_is_visible = true;
         m_browser_ui_load = BrowserUILoad { navigation.navigation_id, navigation.url };
     }
-    traversable().begin_navigation(move(navigation), {}, move(local_file_access));
+    traversable().begin_navigation(move(navigation));
     if (traversable().has_uncommitted_navigation())
         set_loading_state(true);
     dump_session_history("load"sv);
@@ -973,6 +989,69 @@ void ViewImplementation::load_html(StringView html)
     traversable().navigate(URL::about_srcdoc(), Utf16String::from_utf8(html));
     if (traversable().has_uncommitted_navigation())
         set_loading_state(true);
+}
+
+void ViewImplementation::did_request_certificate_warning(Badge<WebContentPage>, URL::URL const& url, Web::HTML::CrossProcessId document_state_id)
+{
+    if (!Application::settings().config_variable_as_bool(ConfigVariableID::OfferToTrustSelfSignedCertificates))
+        return;
+
+    // Only the error page the view still displays may ask, and not once another navigation has started.
+    if (traversable().has_uncommitted_navigation() || traversable().session_history().current_entry().document_state->id != document_state_id)
+        return;
+
+    // Snapshot the rejected certificate so trusting it cannot trust a later rejection for the same host.
+    auto certificate = RequestServerManager::the().rejected_self_signed_certificate(session(), url);
+    if (!certificate.has_value())
+        return;
+
+    // Declining reloads the error page; suppress its repeated warning request.
+    if (auto declined = exchange(m_declined_certificate, {}); declined == certificate)
+        return;
+
+    CertificateWarning warning { .url = url, .certificate = certificate.release_value(), .form_submission = {}, .form_initiator_origin = URL::Origin::create_opaque(), .form_is_not_resent = false };
+
+    // Preserve the form for resubmission before replacing the error page's history entry.
+    auto const& document_state = *traversable().session_history().current_entry().document_state;
+    if (auto const* form_submission = document_state.resource.get_pointer<Web::HTML::POSTResource>()) {
+        auto const& initiator_origin = document_state.initiator_origin;
+        if (initiator_origin.has_value() && !initiator_origin->is_opaque() && initiator_origin->is_same_site(url.origin())) {
+            warning.form_submission = *form_submission;
+            warning.form_initiator_origin = *initiator_origin;
+        } else {
+            warning.form_is_not_resent = true;
+        }
+    }
+
+    m_certificate_warning = move(warning);
+    load(traversable().prepare_navigation(URL::URL::about("certificate"sv), {}, Web::Bindings::NavigationHistoryBehavior::Replace));
+}
+
+void ViewImplementation::answer_certificate_warning(Badge<CertificateUI>, URL::URL const& url, StringView fingerprint, bool trust)
+{
+    // Apply the answer only to the warning the user reviewed.
+    if (!m_certificate_warning.has_value() || m_certificate_warning->url != url || m_certificate_warning->certificate.fingerprint != fingerprint)
+        return;
+    auto warning = exchange(m_certificate_warning, {});
+
+    if (!trust) {
+        // NB: Never send the form to a server whose certificate the user declined.
+        m_declined_certificate = warning->certificate;
+        load(traversable().prepare_navigation(warning->url, {}, Web::Bindings::NavigationHistoryBehavior::Replace));
+        return;
+    }
+
+    RequestServerManager::the().trust_certificate(session(), warning->certificate);
+
+    if (!warning->form_submission.has_value()) {
+        load(traversable().prepare_navigation(warning->url, {}, Web::Bindings::NavigationHistoryBehavior::Replace));
+        return;
+    }
+
+    auto navigation = traversable().prepare_navigation(warning->url, warning->form_submission.release_value(), Web::Bindings::NavigationHistoryBehavior::Replace);
+    navigation.csp_navigation_type = Web::ContentSecurityPolicy::Directives::NavigationType::FormSubmission;
+    navigation.initiator_origin_snapshot = move(warning->form_initiator_origin);
+    load(move(navigation));
 }
 
 void ViewImplementation::reload(BypassCache bypass_cache)
@@ -1112,6 +1191,10 @@ void ViewImplementation::did_not_apply_reload()
 
 void ViewImplementation::did_commit_history_step()
 {
+    // A pending certificate warning belongs to the about:certificate page that shows it.
+    if (m_certificate_warning.has_value() && !url().equals(URL::URL::about("certificate"sv), URL::ExcludeFragment::Yes))
+        m_certificate_warning.clear();
+
     did_update_url();
     update_navigation_action_state();
 }
@@ -1921,6 +2004,11 @@ static void send_global_privacy_control(WebContentPage const& page)
     page.async_set_enable_global_privacy_control(Application::settings().global_privacy_control() == GlobalPrivacyControl::Yes);
 }
 
+static void send_offer_to_trust_self_signed_certificates(WebContentPage const& page)
+{
+    page.async_set_offers_to_trust_self_signed_certificates(Application::settings().config_variable_as_bool(ConfigVariableID::OfferToTrustSelfSignedCertificates));
+}
+
 // Only a page hosting the tab's traversable takes this request: It applies to the page's local traversable, which a page
 // embedding an out-of-process iframe doesn't have.
 static void send_force_dark(WebContentPage const& page)
@@ -1940,6 +2028,7 @@ void ViewImplementation::send_preferences_to_page(WebContentPage& page)
     send_browsing_behavior(page);
     send_autoplay_settings(page);
     send_global_privacy_control(page);
+    send_offer_to_trust_self_signed_certificates(page);
     auto* spell_checker = Application::the().spell_checker();
     page.async_set_spell_checking_available(spell_checker != nullptr);
     page.async_set_writing_suggestions_available(spell_checker && spell_checker->can_suggest());
@@ -4524,8 +4613,8 @@ Optional<ViewImplementation&> ViewImplementation::find_view_by_handle(StringView
 void ViewImplementation::load_for_webdriver_navigation(URL::URL const& url)
 {
     auto navigation = traversable().prepare_navigation(url);
-    prepare_for_navigation_after_crash(NavigationToRetry { url, prepare_navigation_to_retry(navigation), UserSelectedLocalFile {} });
-    traversable().begin_navigation(move(navigation), {}, UserSelectedLocalFile {});
+    prepare_for_navigation_after_crash(NavigationToRetry { url, prepare_navigation_to_retry(navigation) });
+    traversable().begin_navigation(move(navigation));
 }
 
 void ViewImplementation::did_start_webdriver_navigation()
@@ -4689,7 +4778,7 @@ SessionHistorySnapshot ViewImplementation::session_history_snapshot() const
         .entries = session_history.entries(),
         .used_steps = session_history.used_steps(),
         .current_used_step_index = session_history.current_used_step_index(),
-        .local_file_roots_of_document_states = session_history.local_file_roots_of_document_states(),
+        .document_states_holding_local_file_content = session_history.document_states_holding_local_file_content(),
     };
 }
 
@@ -5035,18 +5124,18 @@ Optional<ViewImplementation::NavigationToRetry> ViewImplementation::navigation_t
         navigation = traversable().navigation_being_finalized();
     if (!navigation)
         return {};
-    return NavigationToRetry { navigation->url, navigation->retry, navigation->local_file_access };
+    return NavigationToRetry { navigation->url, navigation->retry };
 }
 
 void ViewImplementation::retry_navigation(NavigationToRetry retry, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
     if (!retry.navigation.has_value()) {
-        load(traversable().prepare_navigation(retry.url, {}, history_handling), move(retry.local_file_access));
+        load_from_browser_ui(retry.url, history_handling);
         return;
     }
     auto navigation = retry.navigation.release_value();
     navigation.history_handling = history_handling;
-    load(move(navigation), move(retry.local_file_access));
+    load(move(navigation));
 }
 
 void ViewImplementation::prepare_for_navigation_after_crash(Optional<NavigationToRetry> navigation_to_retry)
@@ -5180,6 +5269,12 @@ void ViewImplementation::permission_settings_changed(Web::Permissions::Permissio
 void ViewImplementation::global_privacy_control_changed()
 {
     traversable().for_each_hosting_page(send_global_privacy_control);
+}
+
+void ViewImplementation::config_variable_changed(ConfigVariableID id)
+{
+    if (id == ConfigVariableID::OfferToTrustSelfSignedCertificates)
+        traversable().for_each_hosting_page(send_offer_to_trust_self_signed_certificates);
 }
 
 Vector<SitePermissionRow> ViewImplementation::site_permission_rows() const

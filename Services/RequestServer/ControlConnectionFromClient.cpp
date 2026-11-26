@@ -8,6 +8,7 @@
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibIPC/TransportHandle.h>
 #include <RequestServer/AlternativeServices.h>
+#include <RequestServer/CertificateExceptions.h>
 #include <RequestServer/ControlConnectionFromClient.h>
 #include <RequestServer/Request.h>
 #include <RequestServer/Resolver.h>
@@ -170,13 +171,6 @@ void ControlConnectionFromClient::set_dns_server(ByteString host_or_address, u16
     if (host_or_address == dns_info.server_hostname && port == dns_info.port && use_tls == dns_info.use_dns_over_tls && validate_dnssec_locally == dns_info.validate_dnssec_locally)
         return;
 
-    if (auto v4 = IPv4Address::from_string(host_or_address); v4.has_value())
-        dns_info.server_address = Core::SocketAddress { v4.value(), port };
-    else if (auto v6 = IPv6Address::from_string(host_or_address); v6.has_value())
-        dns_info.server_address = Core::SocketAddress { v6.value(), port };
-    else
-        dns_info.server_address = {};
-
     dns_info.server_hostname = host_or_address;
     dns_info.port = port;
     dns_info.use_dns_over_tls = use_tls;
@@ -189,7 +183,6 @@ void ControlConnectionFromClient::set_use_system_dns()
 {
     auto& dns_info = DNSInfo::the();
     dns_info.server_hostname = {};
-    dns_info.server_address = {};
 
     Resolver::reset_connections();
 }
@@ -197,6 +190,11 @@ void ControlConnectionFromClient::set_use_system_dns()
 void ControlConnectionFromClient::set_proxy_configuration(HTTP::ProxyConfiguration proxy_configuration)
 {
     RequestServer::set_proxy_configuration(move(proxy_configuration));
+}
+
+void ControlConnectionFromClient::trust_certificate(ByteString host, u16 port, ByteString fingerprint)
+{
+    add_certificate_exception(host, port, move(fingerprint));
 }
 
 void ControlConnectionFromClient::set_performance_monitor_enabled(bool enabled)
@@ -264,19 +262,28 @@ void ControlConnectionFromClient::remove_cache_entries_accessed_before(UnixDateT
         m_disk_cache->remove_entries_accessed_before(before);
 }
 
-void ControlConnectionFromClient::resolve_host_with_system_resolver(ByteString const& host, Core::Socket::AddressFamily family, Function<void(DNS::Resolver::SystemResolution)> on_resolved)
+DNS::Resolver::CancelRemoteSystemResolution ControlConnectionFromClient::resolve_host_with_system_resolver(ByteString const& host, Core::Socket::AddressFamily family, Function<void(DNS::Resolver::SystemResolution)> on_resolved)
 {
     VERIFY(family != Core::Socket::AddressFamily::Unspecified);
 
     auto resolution_id = m_next_system_resolution_id++;
     m_pending_system_resolutions.set(resolution_id, move(on_resolved));
     async_resolve_host_with_system_resolver(resolution_id, host, family == Core::Socket::AddressFamily::IPv6Only);
+
+    return [weak_this = make_weak_ptr<ControlConnectionFromClient>(), resolution_id] {
+        auto self = weak_this.strong_ref();
+        if (self && self->m_pending_system_resolutions.remove(resolution_id))
+            self->m_cancelled_system_resolutions.set(resolution_id);
+    };
 }
 
 void ControlConnectionFromClient::resolved_host_with_system_resolver(u64 resolution_id, Optional<Vector<ByteString>> addresses)
 {
     auto on_resolved = m_pending_system_resolutions.take(resolution_id);
     if (!on_resolved.has_value()) {
+        // The answer to a lookup the resolver gave up on still comes, and is dropped.
+        if (m_cancelled_system_resolutions.remove(resolution_id))
+            return;
         did_misbehave("Unexpected system resolver answer");
         return;
     }

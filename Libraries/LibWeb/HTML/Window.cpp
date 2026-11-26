@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Utf8View.h>
 #include <LibGC/Heap.h>
@@ -374,8 +375,6 @@ void Window::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_animation_frame_callback_driver);
     visitor.visit(m_idle_request_callbacks);
     visitor.visit(m_runnable_idle_callbacks);
-    visitor.visit(m_pdf_viewer_plugin_objects);
-    visitor.visit(m_pdf_viewer_mime_type_objects);
     visitor.visit(m_close_watcher_manager);
     visitor.visit(m_cookie_store);
     visitor.visit(m_speech_synthesis);
@@ -755,18 +754,9 @@ void Window::fire_a_page_transition_event(Utf16FlyString const& event_name, bool
     // To fire a page transition event named eventName at a Window window with a boolean persisted,
     // fire an event named eventName at window, using PageTransitionEvent,
     // with the persisted attribute initialized to persisted,
-    PageTransitionEventInit event_init {};
-    event_init.persisted = persisted;
-    auto event = PageTransitionEvent::create(event_name, event_init, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
-
-    // ...the cancelable attribute initialized to true,
-    event->set_cancelable(true);
-
+    // the cancelable attribute initialized to true,
     // the bubbles attribute initialized to true,
-    event->set_bubbles(true);
-
-    // isTrusted is a convenience that indicates whether an event is dispatched by the user agent (as opposed to using dispatchEvent())
-    event->set_is_trusted(true);
+    auto event = create_page_transition_event(relevant_realm(*this), event_name, { .bubbles = true, .cancelable = true }, persisted);
 
     // and legacy target override flag set.
     DOM::EventDispatcher::dispatch(*this, event, true);
@@ -821,16 +811,8 @@ WebIDL::ExceptionOr<GC::Ref<Storage>> Window::session_storage()
 // https://html.spec.whatwg.org/multipage/interaction.html#sticky-activation
 bool Window::has_sticky_activation() const
 {
-    // When the current high resolution time given W
-    auto current_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(*this));
-
-    // is greater than or equal to the last activation timestamp in W
-    if (current_time >= m_last_activation_timestamp) {
-        // W is said to have sticky activation.
-        return true;
-    }
-
-    return false;
+    // When W's has sticky activation is true, then W is said to have sticky activation.
+    return m_has_sticky_activation;
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#transient-activation
@@ -858,8 +840,8 @@ bool Window::has_transient_activation() const
 // https://html.spec.whatwg.org/multipage/interaction.html#history-action-activation
 bool Window::has_history_action_activation() const
 {
-    // When the last history-action activation timestamp of W is not equal to the last activation timestamp of W, then W is said to have history-action activation.
-    return m_last_history_action_activation_timestamp != m_last_activation_timestamp;
+    // When W's has history-action activation is true, then W is said to have history-action activation.
+    return m_has_history_action_activation;
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#consume-user-activation
@@ -877,13 +859,13 @@ void Window::consume_user_activation_of_windows_hosted_by(Page& page, UserActiva
     for (auto& window : windows) {
         switch (consumption) {
         case UserActivationConsumption::Transient:
-            // 5. For each window in windows, if window's last activation timestamp is not positive infinity, then set window's last activation timestamp to negative infinity.
+            // 5. For each window of windows, if window's last activation timestamp is not positive infinity, then set window's last activation timestamp to negative infinity.
             if (window->last_activation_timestamp() != AK::Infinity<HighResolutionTime::DOMHighResTimeStamp>)
                 window->set_last_activation_timestamp(-AK::Infinity<HighResolutionTime::DOMHighResTimeStamp>);
             break;
         case UserActivationConsumption::HistoryAction:
-            // 5. For each window in windows, set window's last history-action activation timestamp to window's last activation timestamp.
-            window->set_last_history_action_activation_timestamp(window->last_activation_timestamp());
+            // 5. For each window of windows, set window's has history-action activation to false.
+            window->set_has_history_action_activation(false);
             break;
         }
     }
@@ -907,13 +889,19 @@ void Window::consume_history_action_user_activation()
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#activation-notification
-// Steps 5.1 and 5.2 for one of the windows.
+// Steps 5.1 to 5.4 for one of the windows.
 void Window::notify_about_user_activation()
 {
     // 5.1. Set window's last activation timestamp to the current high resolution time.
     m_last_activation_timestamp = HighResolutionTime::current_high_resolution_time(relevant_global_object(*this));
 
-    // 5.2. Notify the close watcher manager about user activation given window.
+    // 5.2. Set window's has history-action activation to true.
+    m_has_history_action_activation = true;
+
+    // 5.3. Set window's has sticky activation to true.
+    m_has_sticky_activation = true;
+
+    // 5.4. Notify the close watcher manager about user activation given window.
     close_watcher_manager()->notify_about_user_activation();
 }
 
@@ -955,14 +943,20 @@ void Window::run_activation_notification_steps(DOM::Document& document)
             windows.append(*window);
     }
 
-    // 5. For each window in windows:
+    // NB: The UI process keeps each window's sticky activation for documents in other processes. It must learn of a
+    //     window's first activation even if the activation reaches no other process.
+    auto gives_a_window_sticky_activation = any_of(windows, [](auto const& window) { return !window->has_sticky_activation(); });
+
+    // 5. For each window of windows:
     for (auto& window : windows) {
         // 1. Set window's last activation timestamp to the current high resolution time.
-        // 2. Notify the close watcher manager about user activation given window.
+        // 2. Set window's has history-action activation to true.
+        // 3. Set window's has sticky activation to true.
+        // 4. Notify the close watcher manager about user activation given window.
         window->notify_about_user_activation();
     }
 
-    if (reaches_navigables_other_pages_host)
+    if (reaches_navigables_other_pages_host || gives_a_window_sticky_activation)
         document.page().client().page_did_notify_about_user_activation(document.id());
 }
 
@@ -1120,51 +1114,6 @@ GC::Ptr<LocalNavigable> Window::navigable() const
 {
     // A Window's navigable is the navigable whose active document is the Window's associated Document's, or null if there is no such navigable.
     return m_associated_document->navigable();
-}
-
-// https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-plugin-objects
-ReadonlySpan<GC::Ref<Plugin>> Window::pdf_viewer_plugin_objects()
-{
-    // Each Window object has a PDF viewer plugin objects list. If the user agent's PDF viewer supported is false, then it is the empty list.
-    // Otherwise, it is a list containing five Plugin objects, whose names are, respectively:
-    // 0.   "PDF Viewer"
-    // 1.   "Chrome PDF Viewer"
-    // 2.   "Chromium PDF Viewer"
-    // 3.   "Microsoft Edge PDF Viewer"
-    // 4.   "WebKit built-in PDF"
-    // The values of the above list form the PDF viewer plugin names list. https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-plugin-names
-    if (!page().pdf_viewer_supported())
-        return {};
-
-    if (m_pdf_viewer_plugin_objects.is_empty()) {
-        // FIXME: Propagate errors.
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "PDF Viewer"_string));
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "Chrome PDF Viewer"_string));
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "Chromium PDF Viewer"_string));
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "Microsoft Edge PDF Viewer"_string));
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "WebKit built-in PDF"_string));
-    }
-
-    return m_pdf_viewer_plugin_objects;
-}
-
-// https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-mime-type-objects
-ReadonlySpan<GC::Ref<MimeType>> Window::pdf_viewer_mime_type_objects()
-{
-    // Each Window object has a PDF viewer mime type objects list. If the user agent's PDF viewer supported is false, then it is the empty list.
-    // Otherwise, it is a list containing two MimeType objects, whose types are, respectively:
-    // 0.   "application/pdf"
-    // 1.   "text/pdf"
-    // The values of the above list form the PDF viewer mime types list. https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-mime-types
-    if (!page().pdf_viewer_supported())
-        return {};
-
-    if (m_pdf_viewer_mime_type_objects.is_empty()) {
-        m_pdf_viewer_mime_type_objects.append(MimeType::create(*this, "application/pdf"_string));
-        m_pdf_viewer_mime_type_objects.append(MimeType::create(*this, "text/pdf"_string));
-    }
-
-    return m_pdf_viewer_mime_type_objects;
 }
 
 static bool s_test_mode = false;
@@ -1380,7 +1329,7 @@ void Window::blur()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-locationbar
-GC::Ref<BarProp const> Window::locationbar()
+GC::Ref<BarProp> Window::locationbar()
 {
     if (!m_locationbar)
         m_locationbar = BarProp::create(*this);
@@ -1389,7 +1338,7 @@ GC::Ref<BarProp const> Window::locationbar()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-menubar
-GC::Ref<BarProp const> Window::menubar()
+GC::Ref<BarProp> Window::menubar()
 {
     if (!m_menubar)
         m_menubar = BarProp::create(*this);
@@ -1398,7 +1347,7 @@ GC::Ref<BarProp const> Window::menubar()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-personalbar
-GC::Ref<BarProp const> Window::personalbar()
+GC::Ref<BarProp> Window::personalbar()
 {
     if (!m_personalbar)
         m_personalbar = BarProp::create(*this);
@@ -1407,7 +1356,7 @@ GC::Ref<BarProp const> Window::personalbar()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-scrollbars
-GC::Ref<BarProp const> Window::scrollbars()
+GC::Ref<BarProp> Window::scrollbars()
 {
     if (!m_scrollbars)
         m_scrollbars = BarProp::create(*this);
@@ -1416,7 +1365,7 @@ GC::Ref<BarProp const> Window::scrollbars()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-statusbar
-GC::Ref<BarProp const> Window::statusbar()
+GC::Ref<BarProp> Window::statusbar()
 {
     if (!m_statusbar)
         m_statusbar = BarProp::create(*this);
@@ -1425,7 +1374,7 @@ GC::Ref<BarProp const> Window::statusbar()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-toolbar
-GC::Ref<BarProp const> Window::toolbar()
+GC::Ref<BarProp> Window::toolbar()
 {
     if (!m_toolbar)
         m_toolbar = BarProp::create(*this);

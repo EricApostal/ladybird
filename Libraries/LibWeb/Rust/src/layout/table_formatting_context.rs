@@ -1861,6 +1861,11 @@ impl<'pass> TableFormattingContext<'pass> {
         }
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
+            // In fixed mode, only the cells of the first row measure the columns (see cell_is_measured), so a length
+            // width on a cell in a later row doesn't constrain its column either.
+            if !self.cell_is_measured(cell, TrackAxis::Column) {
+                continue;
+            }
             let style = self.style(cell.box_);
             // "any of the cells spanning only that column"
             if cell.column_span == 1 && style.width().is_length() {
@@ -1937,7 +1942,15 @@ impl<'pass> TableFormattingContext<'pass> {
             let inline_offsets = cell_box.border_box_left(collapsed) + cell_box.border_box_right(collapsed);
             let width = style.width();
             let max_width = style.max_width();
-            let mut min_inline = style.min_width().to_px(inline_basis);
+            // https://www.w3.org/TR/css-tables-3/#percentage-contribution
+            // "Please note that 'min-width' is not included in this computation. As a result, a percentage 'min-width'
+            // is ignored."
+            let min_width = style.min_width();
+            let mut min_inline = if min_width.is_length() {
+                min_width.to_px(inline_basis)
+            } else {
+                CssPixels::default()
+            };
             let mut inline_size = if width.is_length() {
                 width.to_px(inline_basis)
             } else {
@@ -2299,6 +2312,20 @@ impl<'pass> TableFormattingContext<'pass> {
             for (index, value) in contributions.iter().copied().enumerate() {
                 self.set_track_percentage(axis, index, value);
             }
+        }
+        // https://drafts.csswg.org/css-tables-3/#width-distribution-in-fixed-mode
+        // If, when percentages are resolved based on the assignable table width, the sum of columns widths based on this
+        // resolution would exceed the assignable table width, they are instead to be resolved relative to their
+        // percentage value such that the sum of columns width meets the assignable table width exactly.
+        if axis == TrackAxis::Column && self.use_fixed_mode_layout() {
+            let sum: f64 = (0..count).map(|index| self.track_percentage(axis, index)).sum();
+            if sum > 100.0 {
+                for index in 0..count {
+                    let value = self.track_percentage(axis, index) * 100.0 / sum;
+                    self.set_track_percentage(axis, index, value);
+                }
+            }
+            return;
         }
         // Clamp total intrinsic percentage to 100%: https://www.w3.org/TR/css-tables-3/#intrinsic-percentage-width-of-a-column
         let mut total = 0.0;
@@ -3055,9 +3082,11 @@ impl<'pass> TableFormattingContext<'pass> {
                 sum + self.columns[cell.column_index + index].used_inline_size
             });
             let mut cell_box = self.cell_box_with_resolved_sides(cell_index, collapsed, cell_padding_basis);
-            // NB: A percentage block size of the cell counts as 0px until the rows are sized (see
-            //     initialize_row_content_sizes), so it gives the contents no basis yet.
-            if style.height().contains_percentage() {
+            // The row measures the cell's contents without a definite percentage block-size basis. The specified
+            // cell height still contributes to the row minimum, and stretch_cells_to_their_rows resolves the contents
+            // against the final height. Quirks mode keeps its percentage-height calculation.
+            // https://drafts.csswg.org/css-tables-3/#row-layout
+            if !self.node_facts(cell.box_).document_in_quirks_mode() || style.height().contains_percentage() {
                 cell_box.has_definite_block_size = false;
             }
             // A cell whose columns all have 'visibility: collapse' is removed from the display along with them, as in
@@ -3650,6 +3679,7 @@ impl<'pass> TableFormattingContext<'pass> {
     /// cell out again at its stretched size with its contents moved, for those boxes to be laid out against it.
     fn stretch_cells_to_their_rows(&mut self, run: &FormattingContextRun<'pass>) {
         let collapsed = self.style(self.run.box_).border_collapse() != BORDER_COLLAPSE_SEPARATE;
+        let mut relaid_out_any_cell = false;
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
             if self.cell_layouts[cell_index].contents_depend_on_percentage_block_size
@@ -3672,7 +3702,28 @@ impl<'pass> TableFormattingContext<'pass> {
                         ..RootSizingDirectives::default()
                     },
                 );
+                self.cells[cell_index].baseline = self.cell_baseline(cell_index);
+                relaid_out_any_cell = true;
             }
+        }
+        // The contents laid out again can put a cell's baseline elsewhere, so the rows take their baselines from the
+        // cells as they are now, before any cell is aligned on one.
+        if relaid_out_any_cell {
+            for row in &mut self.rows {
+                row.baseline = None;
+                row.max_cell_descent = CssPixels::default();
+                row.smallest_cell_block_end_offset = None;
+            }
+            for cell_index in 0..self.cells.len() {
+                let cell = self.cells[cell_index];
+                if !self.rows[cell.row_index].is_collapsed {
+                    let style = self.style(cell.box_);
+                    self.note_cell_in_row_baseline(cell_index, &style);
+                }
+            }
+        }
+        for cell_index in 0..self.cells.len() {
+            let cell = self.cells[cell_index];
             let laid_out = self.cell_layouts[cell_index].box_cells;
             let free_space = self.compute_row_content_block_size(cell) - laid_out.border_box_block_size(collapsed);
             let contents_block_offset = self.cell_contents_block_offset(cell_index, free_space);

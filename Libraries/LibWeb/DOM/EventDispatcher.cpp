@@ -34,6 +34,7 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
+#include <LibWeb/UIEvents/PointerEvent.h>
 #include <LibWeb/UIEvents/TouchEvent.h>
 
 namespace Web::DOM {
@@ -172,6 +173,12 @@ void EventDispatcher::invoke(Event::PathEntry& struct_, Event& event, Event::Pha
     // that is either struct or preceding struct, whose shadow-adjusted target is non-null.
     event.set_target(last_valid_shadow_adjusted_target.value().shadow_adjusted_target.ptr());
 
+    // AD-HOC: Coalesced events have the same target as the trusted pointer event they were coalesced into.
+    if (event.is_trusted()) {
+        if (auto* pointer_event = as_if<UIEvents::PointerEvent>(event))
+            pointer_event->set_target_of_coalesced_events(event.target());
+    }
+
     // 2. Set event’s relatedTarget to struct’s relatedTarget.
     event.set_related_target(struct_.related_target.ptr());
 
@@ -231,6 +238,43 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
 {
     bool legacy_output_did_listeners_throw = false;
     return dispatch(target, event, legacy_target_override, legacy_output_did_listeners_throw);
+}
+
+static bool button_submits_or_resets_its_form(HTML::HTMLButtonElement const& button)
+{
+    return button.form() && (button.is_submit_button() || button.type_state() == HTML::HTMLButtonElement::TypeAttributeState::Reset);
+}
+
+static GC::Ptr<EventTarget> link_activation_target_above_button(Event const& event, HTML::HTMLButtonElement const& button)
+{
+    bool passed_button = false;
+    GC::Ptr<EventTarget> intervening_activation_target;
+    for (auto const& entry : event.path()) {
+        auto& invocation_target = *entry.invocation_target;
+        if (&invocation_target == &button) {
+            passed_button = true;
+            continue;
+        }
+        if (!passed_button || !invocation_target.has_activation_behavior())
+            continue;
+
+        // INTEROP: An intervening form-associated submit or reset button consumes activation
+        //          before it can reach the link, even when its form action is canceled.
+        if (auto* ancestor_button = as_if<HTML::HTMLButtonElement>(invocation_target); ancestor_button
+            && ancestor_button->enabled() && button_submits_or_resets_its_form(*ancestor_button)) {
+            if (!intervening_activation_target)
+                intervening_activation_target = ancestor_button;
+            continue;
+        }
+
+        if (is<HTML::HTMLAnchorElement>(invocation_target))
+            return intervening_activation_target ? intervening_activation_target : GC::Ptr<EventTarget> { invocation_target };
+
+        // NB: Keep other intervening activation behaviors, such as labels, as boundaries.
+        //     The link fallback must not bypass them just because the clicked button is plain.
+        return {};
+    }
+    return {};
 }
 
 // https://dom.spec.whatwg.org/#concept-event-dispatch
@@ -532,40 +576,15 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
         }
     }
 
-    // INTEROP: Plain buttons inside links allow the link's default action. Check after event listeners
-    //          have run, since a click listener can give the button a submit, reset, command, or popover action.
-    if (auto* button = as_if<HTML::HTMLButtonElement>(activation_target.ptr()); button && event.bubbles() && button->enabled()
-        && button->type_state() == HTML::HTMLButtonElement::TypeAttributeState::Button
-        && !button->get_the_attribute_associated_element(HTML::AttributeNames::commandfor, button->command_for_element())
-        && !HTML::PopoverTargetAttributes::get_the_popover_target_element(*button)) {
-        bool passed_button = false;
-        GC::Ptr<EventTarget> intervening_activation_target;
-        for (auto const& entry : event.path()) {
-            if (entry.invocation_target.ptr() == button) {
-                passed_button = true;
-                continue;
-            }
-            if (!passed_button)
-                continue;
-
-            // INTEROP: An intervening form-associated submit or reset button consumes activation
-            //          before it can reach the link, even when its form action is canceled.
-            if (auto* ancestor_button = as_if<HTML::HTMLButtonElement>(entry.invocation_target.ptr()); ancestor_button
-                && ancestor_button->enabled() && ancestor_button->form()
-                && (ancestor_button->is_submit_button() || ancestor_button->type_state() == HTML::HTMLButtonElement::TypeAttributeState::Reset)) {
-                if (!intervening_activation_target)
-                    intervening_activation_target = ancestor_button;
-                continue;
-            }
-            if (is<HTML::HTMLAnchorElement>(*entry.invocation_target) && entry.invocation_target->has_activation_behavior()) {
-                activation_target = intervening_activation_target ? intervening_activation_target : entry.invocation_target;
-                break;
-            }
-
-            // NB: Keep other intervening activation behaviors, such as labels, as boundaries.
-            //     The link fallback must not bypass them just because the clicked button is plain.
-            if (entry.invocation_target->has_activation_behavior())
-                break;
+    // INTEROP: Buttons inside links that neither submit nor reset a form allow the link's default action. Check after
+    //          event listeners have run, since a click listener can give the button a submit, reset, command, or
+    //          popover action.
+    if (auto* button = as_if<HTML::HTMLButtonElement>(activation_target.ptr()); button && event.bubbles()) {
+        if (auto link_activation_target = link_activation_target_above_button(event, *button); link_activation_target
+            && button->enabled() && !button_submits_or_resets_its_form(*button)
+            && !button->get_the_attribute_associated_element(HTML::AttributeNames::commandfor, button->command_for_element())
+            && !HTML::PopoverTargetAttributes::get_the_popover_target_element(*button)) {
+            activation_target = link_activation_target;
         }
     }
 
@@ -596,6 +615,13 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
 
         // 3. Set event’s touch target list to the empty list.
         event.clear_touch_target_list();
+    }
+
+    // AD-HOC: The coalesced events of a trusted pointer event keep its final target, also when script dispatches the
+    //         event again.
+    if (event.is_trusted()) {
+        if (auto* pointer_event = as_if<UIEvents::PointerEvent>(event))
+            pointer_event->set_target_of_coalesced_events(event.target());
     }
 
     // 12. If activationTarget is non-null, then:

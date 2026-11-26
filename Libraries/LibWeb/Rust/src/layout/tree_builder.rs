@@ -6,6 +6,7 @@
 
 use super::*;
 
+use crate::css::computed_value_views::StyleRecordGroups;
 use crate::css::css_enums::{content_visibility, white_space_collapse};
 use crate::css::style::RecordDemand;
 use crate::css::style::RetainedState;
@@ -520,10 +521,7 @@ impl TreeBuildJob {
                 &created,
             );
         }
-        arena.set_pending_rebuilt_subtree_roots(
-            live_rebuilt_subtree_roots,
-            state.layout_tree_update_escaped_rebuild_roots,
-        );
+        arena.set_pending_rebuilt_subtree_roots(live_rebuilt_subtree_roots);
         let viewport = arena.layout_root();
         assert!(!viewport.is_invalid(), "a layout tree build places the viewport");
         state.release_pinned_style_records(arena);
@@ -591,40 +589,6 @@ pub(super) fn list_box_of_entry(arena: &LayoutNodeArena, entry: NodeSlotId) -> N
         parent = arena.data(parent).parent.get();
     }
     parent
-}
-
-/// Notes the entries that the nodes `nodes` had in the child lists of boxes that stay, for the build that plans those
-/// lists again: `nodes` are a node that leaves the document and its shadow-including descendants, in tree order. The
-/// box of a node holds the boxes of its descendants, so a node with a box had one entry, that box. A node without one,
-/// such as a `display: contents` element, had those of its descendants whose list's box goes with none of the nodes.
-pub(crate) fn note_removed_list_entries(arena: &mut LayoutNodeArena, nodes: &[u32]) {
-    let attached_entry = |arena: &LayoutNodeArena, node: StyleNodeID| {
-        let row = arena.bound_row(node);
-        (!row.is_invalid() && !arena.data(row).parent.get().is_invalid()).then(|| arena.list_entry_top_row(row))
-    };
-    let mut nodes = nodes.iter().filter_map(|&node| StyleNodeID::from_raw(node));
-    let Some(removed_node) = nodes.next() else {
-        return;
-    };
-    if let Some(entry) = attached_entry(arena, removed_node) {
-        arena.layout_tree_update_marks_mut().note_removed_entry(entry);
-        return;
-    }
-    let mut removed: Option<HashSet<StyleNodeID>> = None;
-    for node in nodes.clone() {
-        let Some(entry) = attached_entry(arena, node) else {
-            continue;
-        };
-        let removed = removed.get_or_insert_with(|| nodes.clone().chain([removed_node]).collect());
-        let list_box = list_box_of_entry(arena, entry);
-        if arena
-            .dom_node_style_node(list_box)
-            .is_some_and(|owner| removed.contains(&owner))
-        {
-            continue;
-        }
-        arena.layout_tree_update_marks_mut().note_removed_entry(entry);
-    }
 }
 
 /// Detaches what is left of the boxes of the node `node` names as the node leaves the document, while its identity
@@ -1132,24 +1096,19 @@ pub extern "C" fn layout_node_kind_is_replaced_box(kind: NodeKind) -> bool {
 /// Whether a box of `kind`, built for an element whose style was `built_for`, can show the style `style` as it is. A box
 /// whose kind its display decided can't show a display that asks for another kind of box: the layout tree update that
 /// the display change marks replaces it, and until then it keeps the style it was built for.
-///
-/// # Safety
-/// Each of `built_for` and `style` is null or the groups of a style record the caller keeps alive for the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_box_can_show_style(
+pub extern "C" fn layout_box_can_show_style(
     kind: NodeKind,
-    built_for: *const std::ffi::c_void,
-    style: *const std::ffi::c_void,
+    built_for: Option<&StyleRecordGroups>,
+    style: Option<&StyleRecordGroups>,
 ) -> bool {
-    use super::node_data::LayoutStyleRef;
-    // SAFETY: Guaranteed by the caller.
-    let (Some(built_for), Some(style)) = (unsafe { LayoutStyleRef::from_raw(built_for) }, unsafe {
-        LayoutStyleRef::from_raw(style)
-    }) else {
+    let (Some(built_for), Some(style)) = (built_for, style) else {
         return true;
     };
-    // SAFETY: Guaranteed by the caller.
-    let (built_for, style) = unsafe { (built_for.view().display(), style.view().display()) };
+    let (built_for, style) = (
+        ComputedValuesView::of_record_groups(built_for).display(),
+        ComputedValuesView::of_record_groups(style).display(),
+    );
     node_kind_for_display(built_for) != Some(kind) || node_kind_for_display(style) == Some(kind)
 }
 
@@ -1193,12 +1152,6 @@ impl<'a> TreeBuilderHost<'a> {
 
     fn display(&self, node: LayoutNode) -> FfiDisplay {
         self.style(node).map_or_else(FfiDisplay::block, |style| style.display())
-    }
-
-    fn display_before_box_type_transformation(&self, node: LayoutNode) -> FfiDisplay {
-        self.style(node).map_or_else(FfiDisplay::block, |style| {
-            style.display_before_box_type_transformation()
-        })
     }
 
     fn set_children_are_inline(&mut self, node: LayoutNode, children_are_inline: bool) {
@@ -1925,20 +1878,12 @@ impl crate::layout::tree_plan::table_fixup::TableFixupTree for TreeBuilderHost<'
         node_is_out_of_flow(self, node)
     }
 
-    fn is_absolutely_positioned(&self, node: LayoutNode) -> bool {
-        self.style(node).is_some_and(|style| style.is_absolutely_positioned())
-    }
-
     fn is_inline_outside(&self, node: LayoutNode) -> bool {
         node_is_inline_outside(self, node)
     }
 
     fn display(&self, node: LayoutNode) -> FfiDisplay {
         TreeBuilderHost::display(self, node)
-    }
-
-    fn display_before_box_type_transformation(&self, node: LayoutNode) -> FfiDisplay {
-        TreeBuilderHost::display_before_box_type_transformation(self, node)
     }
 
     fn text_is_white_space(&mut self, text: LayoutNode) -> bool {

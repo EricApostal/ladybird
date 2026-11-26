@@ -245,7 +245,11 @@ bool CoreAnimationRemoteLayer::can_show(WindowServerPlacement const&, Content co
         },
         [](NonnullRefPtr<Media::VideoFrame> const& frame) {
             // A frame that a decoder left in memory has no surface that the window server could read.
-            return frame->surface() != nullptr;
+            if (frame->surface() == nullptr)
+                return false;
+            // The window server converts a surface from YCbCr by the matrix it is tagged with, and no tag names the
+            // identity matrix that an RGB surface needs.
+            return frame->cicp().matrix_coefficients() != Media::MatrixCoefficients::Identity;
         });
 }
 
@@ -286,13 +290,15 @@ void CoreAnimationRemoteLayer::place_frame(Optional<Gfx::IntSize> fit_within)
 }
 
 // The part of a surface that a layer shows, as a unit rectangle, which turns upside down along with the layer's y-axis.
-static CGRect unit_rect_of_surface_part(CALayer* layer, Gfx::IntSize part_size, Gfx::IntSize surface_size)
+static CGRect unit_rect_of_surface_part(CALayer* layer, Gfx::IntRect part, Gfx::IntSize surface_size)
 {
-    auto unit_width = static_cast<CGFloat>(part_size.width()) / surface_size.width();
-    auto unit_height = static_cast<CGFloat>(part_size.height()) / surface_size.height();
+    auto unit_x = static_cast<CGFloat>(part.x()) / surface_size.width();
+    auto unit_y = static_cast<CGFloat>(part.y()) / surface_size.height();
+    auto unit_width = static_cast<CGFloat>(part.width()) / surface_size.width();
+    auto unit_height = static_cast<CGFloat>(part.height()) / surface_size.height();
     return layer.contentsAreFlipped
-        ? CGRectMake(0, 0, unit_width, unit_height)
-        : CGRectMake(0, 1 - unit_height, unit_width, unit_height);
+        ? CGRectMake(unit_x, unit_y, unit_width, unit_height)
+        : CGRectMake(unit_x, 1 - unit_y - unit_height, unit_width, unit_height);
 }
 
 static Core::IOSurfaceHandle const& iosurface_of(PresentableSurface const& surface)
@@ -336,7 +342,7 @@ bool CoreAnimationRemoteLayer::show_frame(Frame frame)
     commit_layer_changes([&] {
         auto* content_layer = as_layer(m_content_layer);
         if (buffer) {
-            content_layer.contentsRect = unit_rect_of_surface_part(content_layer, m_painted_size, surface_size);
+            content_layer.contentsRect = unit_rect_of_surface_part(content_layer, { {}, m_painted_size }, surface_size);
             content_layer.contentsScale = device_pixel_ratio;
         }
         lay_out_frame(fit_within);
@@ -857,6 +863,7 @@ void CoreAnimationRemoteLayer::update_shown_tile(ShownSublayer& shown_sublayer, 
         return;
     auto& surface = tile.surface.surface();
     surface.did_hand_to_window_server();
+    tile_layer.contentsRect = unit_rect_of_surface_part(tile_layer, tile.rect_in_surface, surface.size());
     tile_layer.contents = (__bridge id)iosurface_of(surface).core_foundation_pointer();
     shown_sublayer.content = move(tile.surface);
 }
@@ -1090,7 +1097,7 @@ void CoreAnimationRemoteLayer::show_content(ShownSublayer& shown_sublayer, Remot
             if (auto* sample_buffer_layer = as_sample_buffer_layer(content_layer)) {
                 enqueue_video_surface(sample_buffer_layer, surface, frame->color_metadata(), shown_size);
             } else {
-                content_layer.contentsRect = unit_rect_of_surface_part(content_layer, shown_size, surface_size);
+                content_layer.contentsRect = unit_rect_of_surface_part(content_layer, { {}, shown_size }, surface_size);
                 content_layer.opaque = YES;
                 content_layer.contents = (__bridge id)surface;
             }

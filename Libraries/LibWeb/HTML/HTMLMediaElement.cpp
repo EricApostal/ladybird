@@ -976,10 +976,7 @@ GC::Ref<TextTrack> HTMLMediaElement::add_text_track(Bindings::TextTrackKind kind
     //    textTracks attribute's TextTrackList object, using TrackEvent, with the track attribute initialized to the new
     //    text track's TextTrack object.
     queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(text_track), [](auto& text_track, HTMLMediaElement& self) {
-        Bindings::TrackEventInit event_init {};
-        event_init.track = text_track;
-
-        auto event = TrackEvent::create(HTML::EventNames::addtrack, move(event_init), HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(self)));
+        auto event = create_track_event(HTML::relevant_realm(self), HTML::EventNames::addtrack, text_track);
         self.m_text_tracks->dispatch_event(event);
     }));
 
@@ -2500,10 +2497,7 @@ void HTMLMediaElement::on_audio_track_added(Media::Track const& track)
         audio_track->set_enabled(true);
 
     // 7. Fire an event named addtrack at this AudioTrackList object, using TrackEvent, with the track attribute initialized to the new AudioTrack object.
-    TrackEventInit event_init {};
-    event_init.track = audio_track;
-
-    auto event = TrackEvent::create(EventNames::addtrack, move(event_init), event_time_stamp_for_element(*this));
+    auto event = create_track_event(relevant_realm(*this), EventNames::addtrack, audio_track);
     m_audio_tracks->dispatch_event(event);
 }
 
@@ -2541,10 +2535,7 @@ void HTMLMediaElement::on_video_track_added(Media::Track const& track)
         video_track->set_selected(true);
 
     // 7. Fire an event named addtrack at this VideoTrackList object, using TrackEvent, with the track attribute initialized to the new VideoTrack object.
-    TrackEventInit event_init {};
-    event_init.track = video_track;
-
-    auto event = TrackEvent::create(HTML::EventNames::addtrack, move(event_init), event_time_stamp_for_element(*this));
+    auto event = create_track_event(relevant_realm(*this), HTML::EventNames::addtrack, video_track);
     m_video_tracks->dispatch_event(event);
 }
 
@@ -2645,7 +2636,7 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
     //     https://html.spec.whatwg.org/multipage/media.html#media-elements
     //     Therefore, we enumerate all the available tracks into our VideoTrackList and AudioTrackList.
 
-    set_up_playback_manager_error_handler(GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { *this }), [](auto& weak_self, Utf16String error_message) {
+    m_playback_manager_failure_callback = GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { *this }), [](auto& weak_self, Utf16String error_message) {
         if (!weak_self)
             return;
         auto& self = *weak_self;
@@ -2657,10 +2648,12 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
 
         // 2. Abort this subalgorithm, returning to the resource selection algorithm.
         failure_callback->function()(move(error_message));
-    }));
+    });
 
     m_playback_manager->add_media_source(*m_remote_fetch_data->stream)
         ->when_resolved(GC::weak_callback(*this, [weak_manager = m_playback_manager->make_weak_ptr()](auto& self, MediaClient::RemotePlaybackManager::AddedTracks& added_tracks) {
+            self.listen_for_playback_manager_errors();
+
             // -> If the media resource is found to have an audio track
             for (auto const& track : added_tracks.audio_tracks) {
                 self.on_audio_track_added(track);
@@ -2711,9 +2704,8 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
-void HTMLMediaElement::set_up_playback_manager_error_handler(GC::Ref<GC::Function<void(Utf16String)>> failure_callback)
+void HTMLMediaElement::listen_for_playback_manager_errors()
 {
-    m_playback_manager_failure_callback = failure_callback;
     m_playback_manager->on_error = GC::weak_callback(*this, [](auto& self, Media::DecoderError&& error) {
         self.handle_playback_manager_error(move(error));
     });
@@ -2762,7 +2754,7 @@ void HTMLMediaElement::set_up_playback_manager_for_local(GC::Ref<GC::Function<vo
     // NB: The Media Source Extensions spec creates the tracks in its initialization segment received algorithm, and
     //     SourceBuffer runs the steps once enough of the media data has been fetched to determine its metadata.
 
-    set_up_playback_manager_error_handler(GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { *this }, failure_callback), [](auto& weak_self, auto& failure_callback, Utf16String error_message) {
+    m_playback_manager_failure_callback = GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { *this }, failure_callback), [](auto& weak_self, auto& failure_callback, Utf16String error_message) {
         if (!weak_self)
             return;
         auto& self = *weak_self;
@@ -2772,7 +2764,8 @@ void HTMLMediaElement::set_up_playback_manager_for_local(GC::Ref<GC::Function<vo
 
         // 2. Abort this subalgorithm, returning to the resource selection algorithm.
         failure_callback->function()(move(error_message));
-    }));
+    });
+    listen_for_playback_manager_errors();
 
     m_playback_manager->on_playback_state_change = GC::weak_callback(*this, [](auto& self) {
         self.on_playback_manager_state_change();
@@ -3824,22 +3817,8 @@ bool HTMLMediaElement::is_allowed_to_play() const
 {
     // A media element is said to be allowed to play if the user agent and the system allow media playback in the
     // current context.
-    // NB: We allow playback once the document has been activated by the user, with an exception for inaudible media.
-    //     Gating on transient activation instead pauses audible media once the activation expires, e.g. between ads,
-    //     or media in a playlist.
-    if (auto window = document().window(); window && window->has_sticky_activation())
-        return true;
-
-    switch (AutoplaySettings::the().decision_for_origin(document(), document().origin())) {
-    case AutoplayDecision::Allowed:
-        return true;
-    case AutoplayDecision::AllowedIfInaudible:
-        return effective_media_volume() == 0.0;
-    case AutoplayDecision::Blocked:
-        return false;
-    }
-
-    VERIFY_NOT_REACHED();
+    auto is_audible = effective_media_volume() == 0.0 ? IsAudible::No : IsAudible::Yes;
+    return system_allows_media_playback(document(), is_audible);
 }
 
 HTMLMediaElement::PlaybackDirection HTMLMediaElement::direction_of_playback() const

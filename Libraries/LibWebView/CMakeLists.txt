@@ -45,7 +45,6 @@ set(SOURCES
     ImageDecoderControlClient.cpp
     ImageDecoderManager.cpp
     LingeringIndicator.cpp
-    LocalFileRoot.cpp
     MediaSessionCoordinator.cpp
     NavigationLoader.cpp
     Omnibox.cpp
@@ -100,6 +99,7 @@ set(SOURCES
     WebUI.cpp
     WebUI/AboutUI.cpp
     WebUI/ApplicationWebUI.cpp
+    WebUI/CertificateUI.cpp
     WebUI/CrashReportsUI.cpp
     WebUI/SupportUI.cpp
     WebUI/SettingsUI.cpp

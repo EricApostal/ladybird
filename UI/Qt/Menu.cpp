@@ -29,6 +29,7 @@
 namespace Ladybird {
 
 static constexpr auto DYNAMIC_HISTORY_MENU_ITEM_PROPERTY = "LadybirdDynamicHistoryMenuItem";
+static constexpr auto HISTORY_NAVIGATION_SEPARATOR_PROPERTY = "LadybirdHistoryNavigationSeparator";
 static constexpr size_t RECENT_HISTORY_MENU_ITEM_LIMIT = 15;
 
 static void set_action_shortcuts(QAction&, ActionID);
@@ -463,12 +464,29 @@ QMenu* create_application_menu(QWidget& parent, Menu& menu)
     return application_menu;
 }
 
+// NB: Qt deletes the native items of a menu's actions when they are removed from it, but not when the menu is
+//     destroyed. So the actions are removed from the menu and its submenus first.
+static void remove_actions(QMenu& menu)
+{
+    for (auto* action : menu.actions()) {
+        menu.removeAction(action);
+        if (auto* submenu = action->menu())
+            remove_actions(*submenu);
+    }
+}
+
+void delete_menu_later(QMenu& menu)
+{
+    remove_actions(menu);
+    menu.deleteLater();
+}
+
 QMenu& replace_context_menu(QPointer<QMenu>& shown_menu, QWidget& parent, Menu& menu)
 {
     // NB: A menu is kept until another is shown in its place, as Cocoa delivers a native menu's choice through queued
     //     events after the menu closes.
     if (shown_menu)
-        shown_menu->deleteLater();
+        delete_menu_later(*shown_menu);
     shown_menu = create_application_menu(parent, menu);
     return *shown_menu;
 }
@@ -489,7 +507,7 @@ void repopulate_application_menu(QMenu& menu, Menu& source)
     // NB: A submenu's action belongs to the submenu, so clearing the menu only removes it.
     for (auto* action : menu.actions()) {
         if (auto* submenu = action->menu())
-            submenu->deleteLater();
+            delete_menu_later(*submenu);
     }
     menu.clear();
     add_items_to_menu(menu, source);
@@ -506,17 +524,6 @@ static QAction* create_dynamic_history_separator(QMenu& menu)
     auto* separator = new QAction(&menu);
     separator->setSeparator(true);
     return separator;
-}
-
-static QAction* create_history_navigation_action(QMenu& menu, WebContentView& view, Action& source_action, QKeySequence::StandardKey shortcut)
-{
-    auto* action = new QAction(qstring_from_ak_string(source_action.text()), &menu);
-    action->setEnabled(source_action.enabled());
-    action->setShortcuts(QKeySequence::keyBindings(shortcut));
-    QObject::connect(action, &QAction::triggered, &view, [&source_action] {
-        source_action.activate();
-    });
-    return action;
 }
 
 static QAction* create_recent_history_menu_action(QMenu& menu, WebContentView& view, WebView::HistoryEntry const& entry)
@@ -543,6 +550,15 @@ static QAction* create_recent_history_menu_action(QMenu& menu, WebContentView& v
     return action;
 }
 
+// NB: Back and Forward stay in the History menu at all times, so their shortcuts work before the menu is first shown.
+void add_history_navigation_actions(QMenu& menu, QAction& back, QAction& forward)
+{
+    auto* first = menu.actions().isEmpty() ? nullptr : menu.actions().first();
+    menu.insertAction(first, &back);
+    menu.insertAction(first, &forward);
+    menu.insertSeparator(first)->setProperty(HISTORY_NAVIGATION_SEPARATOR_PROPERTY, true);
+}
+
 void update_history_menu(QMenu& menu, WebContentView* view)
 {
     for (auto* action : menu.actions()) {
@@ -555,10 +571,15 @@ void update_history_menu(QMenu& menu, WebContentView* view)
     if (!view)
         return;
 
-    auto* insertion_point = menu.actions().isEmpty() ? nullptr : menu.actions().first();
-    insert_dynamic_history_action(menu, insertion_point, *create_history_navigation_action(menu, *view, view->navigate_back_action(), QKeySequence::StandardKey::Back));
-    insert_dynamic_history_action(menu, insertion_point, *create_history_navigation_action(menu, *view, view->navigate_forward_action(), QKeySequence::StandardKey::Forward));
-    insert_dynamic_history_action(menu, insertion_point, *create_dynamic_history_separator(menu));
+    // NB: The recent entries go after Back, Forward and the separator below them.
+    QAction* insertion_point = nullptr;
+    auto actions = menu.actions();
+    for (qsizetype i = 0; i < actions.size(); ++i) {
+        if (actions[i]->property(HISTORY_NAVIGATION_SEPARATOR_PROPERTY).toBool()) {
+            insertion_point = i + 1 < actions.size() ? actions[i + 1] : nullptr;
+            break;
+        }
+    }
 
     auto entries = view->recent_history_entries(RECENT_HISTORY_MENU_ITEM_LIMIT);
     for (auto const& entry : entries) {

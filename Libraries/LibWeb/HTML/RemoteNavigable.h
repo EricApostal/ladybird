@@ -6,10 +6,10 @@
 
 #pragma once
 
-#include <AK/HashTable.h>
 #include <AK/Vector.h>
 #include <LibCompositing/Types.h>
 #include <LibGC/Root.h>
+#include <LibGC/WeakHashSet.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 
@@ -66,6 +66,7 @@ public:
     virtual Optional<URL::Origin> active_document_origin() const override { return m_replicated_state.active_document_origin; }
     virtual SandboxingFlagSet active_document_sandboxing_flag_set() const override { return m_replicated_state.active_document_sandboxing_flag_set; }
     virtual bool active_document_is_fully_active() const override { return m_replicated_state.active_document_is_fully_active; }
+    virtual bool active_window_has_sticky_activation() const override { return m_replicated_state.active_window_has_sticky_activation; }
     virtual bool active_document_is_completely_loaded() const override { return m_replicated_state.active_document_is_completely_loaded; }
     virtual bool active_document_is(DOM::Document const&) const override { return false; }
     virtual Vector<GC::Root<Navigable>> active_document_inclusive_descendant_navigables() override;
@@ -88,7 +89,6 @@ private:
     RemoteNavigable(GC::Ref<Page>, CrossProcessId, GC::Ptr<Navigable> parent, ReplicatedNavigableState);
 
     virtual void visit_edges(Cell::Visitor&) override;
-    virtual void finalize() override;
 
     virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(PreparedNavigation) override;
 
@@ -108,7 +108,7 @@ private:
     bool m_has_been_destroyed { false };
 };
 
-WEB_API HashTable<GC::RawRef<RemoteNavigable>>& all_remote_navigables();
+WEB_API GC::WeakHashSet<RemoteNavigable>& all_remote_navigables();
 WEB_API GC::Ptr<RemoteNavigable> remote_navigable_with_id(Page const&, CrossProcessId);
 
 }

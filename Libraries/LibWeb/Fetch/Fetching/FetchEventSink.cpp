@@ -7,6 +7,7 @@
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/Fetch/Fetching/FetchEventSink.h>
+#include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
@@ -24,12 +25,11 @@ FetchEventSink::FetchEventSink(Infrastructure::FetchController const& controller
 {
 }
 
-GC::Ref<Infrastructure::FetchController> FetchEventSink::controller() const
+GC::Ptr<Infrastructure::FetchController> FetchEventSink::controller() const
 {
-    VERIFY(m_controller_registry);
-    auto controller = m_controller_registry->find(m_controller_token);
-    VERIFY(controller);
-    return *controller;
+    if (!m_controller_registry)
+        return {};
+    return m_controller_registry->find(m_controller_token);
 }
 
 // https://fetch.spec.whatwg.org/#concept-http-network-fetch
@@ -136,9 +136,17 @@ static void drain_request_body_stream(GC::Ref<Infrastructure::FetchController> c
 void FetchEventSink::handle_event(Engine::EngineEvent event)
 {
     VERIFY(m_agent_thread_id.is_current_thread());
-    auto controller = this->controller();
+    if (m_fetch_ended)
+        return;
+    auto found_controller = this->controller();
+    if (!found_controller)
+        return;
+    GC::Ref controller = *found_controller;
 
     event.visit(
+        [&](Engine::Event::ResponseDelivery& delivery) {
+            finish_fetch_response_handover(controller, move(delivery));
+        },
         [&](Engine::Event::RequestBodyProgress const& progress) {
             Infrastructure::queue_fetch_task(controller, controller->task_destination(), GC::create_function(GC::Heap::the(), GC::captures(controller, progress.length), [](auto& controller, auto& length) {
                 process_body_chunk(controller, length);
@@ -168,7 +176,10 @@ void FetchEventSink::handle_event(Engine::EngineEvent event)
         [&](Engine::Event::EndOfBody const& end_of_body) {
             controller->did_end_body(end_of_body);
         },
-        [](Engine::Event::ResponseDelivery const&) { VERIFY_NOT_REACHED(); },
+        [&](Engine::Event::FetchEnded const&) {
+            m_fetch_ended = true;
+            controller->did_end_fetch();
+        },
         [](Engine::Event::ConsumeBodyResult const&) { VERIFY_NOT_REACHED(); },
         [](Engine::Event::BodyChannelReadable const&) { VERIFY_NOT_REACHED(); },
         [](Engine::Event::DeliveryEnd const&) { VERIFY_NOT_REACHED(); },

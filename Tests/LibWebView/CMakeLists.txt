@@ -117,7 +117,6 @@ if (APPLE OR LINUX)
         TestCrashReportReview.cpp
         TestCrashReportStore.cpp
         TestFontService.cpp
-        TestLocalFileRoot.cpp
         TestOpenLocalFileForRenderer.cpp
         TestRendererFontService.cpp
     )
@@ -155,6 +154,7 @@ if (NOT WIN32)
         TestAutocomplete.cpp
         TestBeforeUnload.cpp
         TestBrowserHistoryTraversal.cpp
+        TestChildFrameReports.cpp
         TestCompositorStartup.cpp
         TestCrashOverlay.cpp
         TestCrashReportSubmission.cpp
@@ -179,6 +179,7 @@ if (NOT WIN32)
         TestRendererViolationReports.cpp
         TestRequestServerClientSessions.cpp
         TestRequestServerDiskCaches.cpp
+        TestRequestServerRelaunchFailure.cpp
         TestShadowTreeTooltipsAndLinks.cpp
         TestSharedWorkerHost.cpp
         TestSpareWebContentProcess.cpp

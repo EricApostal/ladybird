@@ -6,6 +6,7 @@ name: Backport
 # not by whoever added the label, and run CI like any other PR. A cherry-pick that conflicts still gets a PR, as a draft
 # with the conflict committed; resolve it on that PR's branch. The original PR gets a comment with the outcome. The
 # `no backport` label records that a PR shouldn't be backported, and removing it backports to the PR's backport labels.
+# The backport branch is deleted when its PR is closed without being merged; GitHub deletes it on merge.
 
 on:
   pull_request_target:
@@ -113,6 +114,42 @@ jobs:
             exit 1
           fi
 
+  delete-branch:
+    if: >-
+      github.repository == 'LadybirdBrowser/ladybird'
+      && github.event.action == 'closed'
+      && !github.event.pull_request.merged
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && startsWith(github.event.pull_request.base.ref, 'release/')
+      && startsWith(github.event.pull_request.head.ref, 'backport/')
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    permissions:
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: 'Delete the backport branch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+        run: |
+          open_prs=$(gh api "repos/${REPO}/pulls?state=open&head=${REPO%%/*}:${HEAD}" --jq length)
+          if [ "$open_prs" -gt 0 ]; then
+            echo "An open PR uses ${HEAD}, so the branch stays."
+            exit 0
+          fi
+          if ! output=$(gh api --method DELETE "repos/${REPO}/git/refs/heads/${HEAD}" 2>&1); then
+            # Someone may have deleted the branch already.
+            lookup=$(gh api "repos/${REPO}/branches/${HEAD}" --silent 2>&1) && exists=1 || exists=0
+            if [ "$exists" -eq 1 ] || [[ "$lookup" != *"(HTTP 404)"* ]]; then
+              echo "::error::$output"
+              exit 1
+            fi
+          fi
+
   backport:
     needs: prepare
     if: ${{ !cancelled() && needs.prepare.outputs.branches != '' }}
@@ -123,7 +160,7 @@ jobs:
     steps:
       - name: 'Create a token for the Ladybird Backport app'
         id: app-token
-        uses: actions/create-github-app-token@v3.3.0
+        uses: actions/create-github-app-token@v3.4.0
         with:
           client-id: ${{ vars.BACKPORT_APP_CLIENT_ID }}
           private-key: ${{ secrets.BACKPORT_APP_PRIVATE_KEY }}
@@ -135,7 +172,7 @@ jobs:
 
       - name: 'Create the backport PRs'
         id: backport
-        uses: korthout/backport-action@v4.7.1
+        uses: korthout/backport-action@v5.0.0
         with:
           github_token: ${{ steps.app-token.outputs.token }}
           label_pattern: ''

@@ -48,6 +48,34 @@ struct LineRelativeAlignedSubtree {
     shift: CssPixels,
 }
 
+/// Extends the aligned subtree whose root and alignment `subtree` names to hold `start..end`, or the line box
+/// `earliest..latest` where the box is in no aligned subtree.
+fn extend_aligned_subtree_or_line_box(
+    aligned_subtrees: &mut Vec<LineRelativeAlignedSubtree>,
+    (earliest, latest): (&mut CssPixels, &mut CssPixels),
+    subtree: Option<(Node, u8)>,
+    (start, end): (CssPixels, CssPixels),
+) {
+    let Some((root, alignment)) = subtree else {
+        *earliest = (*earliest).min(start);
+        *latest = (*latest).max(end);
+        return;
+    };
+    match aligned_subtrees.iter_mut().find(|subtree| subtree.root == root) {
+        Some(subtree) => {
+            subtree.block_start = subtree.block_start.min(start);
+            subtree.block_end = subtree.block_end.max(end);
+        }
+        None => aligned_subtrees.push(LineRelativeAlignedSubtree {
+            root,
+            alignment,
+            block_start: start,
+            block_end: end,
+            shift: CssPixels::default(),
+        }),
+    }
+}
+
 struct LineAlignment {
     earliest: CssPixels,
     latest: CssPixels,
@@ -100,6 +128,12 @@ pub(crate) struct LineBuilder<'builder, 'context> {
     lines_known_to_hold_no_content: Option<usize>,
     text_indentation: inline_formatting_context::TextIndentation,
     direction: u8,
+    /// The direction that unicode-bidi: plaintext gives a line from the first strong text of the next content, while
+    /// the line holds none yet.
+    plaintext_direction_of_next_content: Option<u8>,
+    /// The last search for the first strong text ahead: the items it covers, from where it started to where it
+    /// stopped, and the text type it found.
+    first_strong_text_ahead: Option<(std::ops::RangeInclusive<u32>, Option<u8>)>,
     last_line_needs_update: bool,
     is_continuation: bool,
     should_advance_to_last_line_box_block_end: bool,
@@ -198,6 +232,8 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             lines_known_to_hold_no_content: Some(0),
             text_indentation: inline_formatting_context::TextIndentation::of(style, containing_inline_size),
             direction: style.direction(),
+            plaintext_direction_of_next_content: None,
+            first_strong_text_ahead: None,
             last_line_needs_update: false,
             is_continuation: false,
             should_advance_to_last_line_box_block_end: false,
@@ -370,6 +406,19 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         forced_break: Option<inline_content::ForcedBreakPosition>,
         next_size: Option<CssPixels>,
     ) {
+        self.break_line_sized_by(forced, forced_break, next_size, None);
+    }
+
+    /// Breaks the line, as break_line() does. `size_at`, where given, is the inline size of the next content where a
+    /// line starts at the given position, for content whose size depends on that (tabs, e.g.): Each line the break
+    /// moves past floats to is checked with the size the content would have there.
+    fn break_line_sized_by(
+        &mut self,
+        forced: ForcedBreak,
+        forced_break: Option<inline_content::ForcedBreakPosition>,
+        next_size: Option<CssPixels>,
+        mut size_at: Option<&mut dyn FnMut(CssPixels) -> CssPixels>,
+    ) {
         // FIXME: Respect inline direction.
 
         self.keep_line_of_collapsed_whitespace_edges();
@@ -412,7 +461,14 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             );
             let available = self.available_inline_size_for_current_line;
             let indent = self.line(self.line_count() - 1).indent;
-            let next_too_wide = available.pixels_greater_than(next_size.unwrap_or_default() + indent);
+            let next_size_on_line = match size_at.as_mut() {
+                Some(size_at) => {
+                    let position = self.inline_position_of_next_content();
+                    size_at(position)
+                }
+                None => next_size.unwrap_or_default(),
+            };
+            let next_too_wide = available.pixels_greater_than(next_size_on_line + indent);
             if !floats_intrude
                 || (self
                     .context()
@@ -422,6 +478,66 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 break;
             }
         }
+    }
+
+    /// Where the next content on the current line starts, from the start edge of the block container's content box:
+    /// past the floats on the start side of the line's direction, any indent, and the content already on the line.
+    /// Notes `item` as the next content, for the direction that the first strong text from it on gives a line under
+    /// unicode-bidi: plaintext, which tabs that start the item are placed for.
+    pub(crate) fn note_next_content(
+        &mut self,
+        prepared: &prepared_inline_content::PreparedInlineContent,
+        item: &inline_level_iterator::Item,
+    ) {
+        self.plaintext_direction_of_next_content = None;
+        if self.containing_style().unicode_bidi() != unicode_bidi::PLAINTEXT || !item.starts_with_tabs(prepared) {
+            return;
+        }
+        let index = item.prepared_item_index();
+        let text_type = match &self.first_strong_text_ahead {
+            Some((covered, text_type)) if covered.contains(&index) => *text_type,
+            _ => {
+                let (stop, text_type) = prepared.first_strong_text_from(index);
+                self.first_strong_text_ahead = Some((index..=stop, text_type));
+                text_type
+            }
+        };
+        self.plaintext_direction_of_next_content = text_type.map(|text_type| {
+            if text_type == GLYPH_TEXT_TYPE_RTL {
+                direction::RTL
+            } else {
+                direction::LTR
+            }
+        });
+    }
+
+    fn line_holds_strong_text(&self, line_index: usize) -> bool {
+        self.line(line_index).fragments.iter().any(|fragment| {
+            fragment
+                .glyphs
+                .as_ref()
+                .is_some_and(|glyphs| matches!(glyphs.text_type, GLYPH_TEXT_TYPE_LTR | GLYPH_TEXT_TYPE_RTL))
+        })
+    }
+
+    pub(crate) fn inline_position_of_next_content(&mut self) -> CssPixels {
+        let line_index = self.ensure_last_line_index();
+        let line_block_size = self
+            .max_block_size_on_current_line
+            .max(self.containing_style().line_height())
+            .max(self.float_fit_height());
+        // NB: Under unicode-bidi: plaintext, a line takes its direction from its first strong text, which content
+        //     before that text is placed for too.
+        let line_direction = match self.plaintext_direction_of_next_content {
+            Some(direction) if !self.line_holds_strong_text(line_index) => direction,
+            _ => self.line(line_index).direction,
+        };
+        let start_side_intrusion = self.context().start_side_float_intrusion(
+            self.current_block_offset,
+            self.current_block_offset + line_block_size,
+            line_direction,
+        );
+        start_side_intrusion + self.line(line_index).inline_length
     }
 
     pub(crate) fn current_line_is_empty(&mut self) -> bool {
@@ -479,6 +595,20 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             return false;
         }
         self.break_line(ForcedBreak::No, None, Some(next_item_inline_size));
+        true
+    }
+
+    /// Breaks the line, as break_if_needed() does, before content whose inline size depends on where its line starts:
+    /// `size_at` gives that size for a line starting at a position.
+    pub(crate) fn break_if_needed_sized_by(
+        &mut self,
+        next_item_inline_size: CssPixels,
+        size_at: &mut dyn FnMut(CssPixels) -> CssPixels,
+    ) -> bool {
+        if !self.should_break(next_item_inline_size) {
+            return false;
+        }
+        self.break_line_sized_by(ForcedBreak::No, None, Some(next_item_inline_size), Some(size_at));
         true
     }
 
@@ -728,15 +858,9 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
     ) {
         self.prepare_to_append_inline_content();
         let line_index = self.ensure_last_line_index();
-        let has_strong_direction = |text_type| matches!(text_type, GLYPH_TEXT_TYPE_LTR | GLYPH_TEXT_TYPE_RTL);
         if self.containing_style().unicode_bidi() == unicode_bidi::PLAINTEXT
-            && !self.line(line_index).fragments.iter().any(|fragment| {
-                fragment
-                    .glyphs
-                    .as_ref()
-                    .is_some_and(|glyphs| has_strong_direction(glyphs.text_type))
-            })
-            && has_strong_direction(glyphs.text_type)
+            && !self.line_holds_strong_text(line_index)
+            && matches!(glyphs.text_type, GLYPH_TEXT_TYPE_LTR | GLYPH_TEXT_TYPE_RTL)
         {
             self.line_mut(line_index).direction = if glyphs.text_type == GLYPH_TEXT_TYPE_RTL {
                 direction::RTL
@@ -1976,38 +2100,14 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 && self.facts(ancestor).is_fragmented_inline()
                 && ancestor != containing_block
             {
-                let ancestor_style = self.style(ancestor);
-                if line_relative_alignment(ancestor_style).is_some() {
+                if line_relative_alignment(self.style(ancestor)).is_some() {
                     inline_box_alignments.push(InlineBoxAlignment {
                         box_: ancestor,
                         vertical_shift: CssPixels::default(),
                     });
                     break;
                 }
-                if ancestor_style.vertical_align_is_keyword()
-                    && ancestor_style.vertical_align_keyword() == vertical_align::BASELINE
-                {
-                    inline_box_alignments.push(InlineBoxAlignment {
-                        box_: ancestor,
-                        vertical_shift: CssPixels::default(),
-                    });
-                    ancestor = self.context().parent_node(ancestor);
-                    continue;
-                }
-                let ancestor_metrics = self.inline_box_alignment_metrics(ancestor);
-                let ancestor_parent_style = self.parent_style(ancestor);
-                let baseline_style = ancestor_style.with_vertical_align_keyword(vertical_align::BASELINE);
-                let ancestor_vertical_shift = self.block_offset_for_alignment(
-                    ancestor_style,
-                    ancestor_parent_style,
-                    ancestor_metrics,
-                    line_box_baseline,
-                ) - self.block_offset_for_alignment(
-                    baseline_style,
-                    ancestor_parent_style,
-                    ancestor_metrics,
-                    line_box_baseline,
-                );
+                let ancestor_vertical_shift = self.vertical_shift_of_inline_box(ancestor);
                 enclosing_vertical_shift += ancestor_vertical_shift;
                 if !own_alignment_is_line_relative {
                     new_block_offset += ancestor_vertical_shift;
@@ -2036,25 +2136,12 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                         let (box_start, box_end) =
                             (ancestor_baseline - bounds.ascent, ancestor_baseline + bounds.descent);
                         // NB: An inline box inside an aligned subtree of its own extends that subtree.
-                        if let Some((outer_root, alignment)) = self.line_relative_aligned_subtree_root(ancestor) {
-                            if let Some(subtree) =
-                                aligned_subtrees.iter_mut().find(|subtree| subtree.root == outer_root)
-                            {
-                                subtree.block_start = subtree.block_start.min(box_start);
-                                subtree.block_end = subtree.block_end.max(box_end);
-                            } else {
-                                aligned_subtrees.push(LineRelativeAlignedSubtree {
-                                    root: outer_root,
-                                    alignment,
-                                    block_start: box_start,
-                                    block_end: box_end,
-                                    shift: CssPixels::default(),
-                                });
-                            }
-                        } else {
-                            earliest = earliest.min(box_start);
-                            latest = latest.max(box_end);
-                        }
+                        extend_aligned_subtree_or_line_box(
+                            &mut aligned_subtrees,
+                            (&mut earliest, &mut latest),
+                            self.line_relative_aligned_subtree_root(ancestor),
+                            (box_start, box_end),
+                        );
                     }
                     ancestor_shift -= shift;
                 }
@@ -2084,23 +2171,12 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 )
             };
             if self.fragment_extends_line_box(line_index, &text, fragment_index) {
-                if let Some((root, alignment)) = aligned_subtree {
-                    if let Some(subtree) = aligned_subtrees.iter_mut().find(|subtree| subtree.root == root) {
-                        subtree.block_start = subtree.block_start.min(inline_box_start);
-                        subtree.block_end = subtree.block_end.max(inline_box_end);
-                    } else {
-                        aligned_subtrees.push(LineRelativeAlignedSubtree {
-                            root,
-                            alignment,
-                            block_start: inline_box_start,
-                            block_end: inline_box_end,
-                            shift: CssPixels::default(),
-                        });
-                    }
-                } else {
-                    earliest = earliest.min(inline_box_start);
-                    latest = latest.max(inline_box_end);
-                }
+                extend_aligned_subtree_or_line_box(
+                    &mut aligned_subtrees,
+                    (&mut earliest, &mut latest),
+                    aligned_subtree,
+                    (inline_box_start, inline_box_end),
+                );
             }
 
             let is_text_node = self.line(line_index).fragments[fragment_index].is_block_ellipsis
@@ -2172,23 +2248,12 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                             inline_box_baseline - bounds.ascent,
                             inline_box_baseline + bounds.descent,
                         );
-                        if let Some((root, alignment)) = self.line_relative_aligned_subtree_root(alignment.box_) {
-                            if let Some(subtree) = aligned_subtrees.iter_mut().find(|subtree| subtree.root == root) {
-                                subtree.block_start = subtree.block_start.min(box_start);
-                                subtree.block_end = subtree.block_end.max(box_end);
-                            } else {
-                                aligned_subtrees.push(LineRelativeAlignedSubtree {
-                                    root,
-                                    alignment,
-                                    block_start: box_start,
-                                    block_end: box_end,
-                                    shift: CssPixels::default(),
-                                });
-                            }
-                        } else {
-                            earliest = earliest.min(box_start);
-                            latest = latest.max(box_end);
-                        }
+                        extend_aligned_subtree_or_line_box(
+                            &mut aligned_subtrees,
+                            (&mut earliest, &mut latest),
+                            self.line_relative_aligned_subtree_root(alignment.box_),
+                            (box_start, box_end),
+                        );
                     }
                     inline_box_baseline -= alignment.vertical_shift;
                     remaining_vertical_shift -= alignment.vertical_shift;

@@ -32,6 +32,7 @@ use crate::css::parser::component_value::{
     consume_a_small_list_of_component_values,
 };
 use crate::css::parser::fonts_parser::parse_font_property;
+use crate::css::parser::gap_decorations_parser::{parse_gap_decorations_longhand, parse_gap_decorations_shorthand};
 use crate::css::parser::grid_parser::parse_grid_property;
 use crate::css::parser::images_gradients_parser::{is_image_function_name, parse_image_property, parse_image_value};
 use crate::css::parser::positions_shapes_parser::{
@@ -4188,7 +4189,6 @@ fn parse_unordered_shorthand(context: &ParseContext, property: u16, values: &[Co
             | property_id::BORDER_LEFT
             | property_id::BORDER_RIGHT
             | property_id::BORDER_TOP
-            | property_id::COLUMN_RULE
             | property_id::FLEX_FLOW
             | property_id::OUTLINE
             | property_id::TEXT_WRAP
@@ -5880,6 +5880,22 @@ fn parse_animation_transition_shorthand(
         ),
         _ => return ParseOutcome::NotHandled,
     };
+    // https://drafts.csswg.org/css-values-4/#custom-idents
+    // When parsing positionally-ambiguous keywords in a property value, a <custom-ident> production can only claim the
+    // keyword if no other unfulfilled production can claim it.
+    // NB: So the longhand whose value is a <custom-ident> is tried last: "transition: ease" sets the timing function,
+    //     rather than naming a property "ease".
+    let custom_ident_longhand = if property == property_id::ANIMATION {
+        property_id::ANIMATION_NAME
+    } else {
+        property_id::TRANSITION_PROPERTY
+    };
+    let parse_order = parsed_longhands
+        .iter()
+        .copied()
+        .filter(|&longhand| longhand != custom_ident_longhand)
+        .chain([custom_ident_longhand])
+        .collect::<Vec<_>>();
     let layers = values.split(ComponentValue::is_comma).collect::<Vec<_>>();
     let mut coordinated = vec![Vec::with_capacity(layers.len()); parsed_longhands.len()];
     for layer in &layers {
@@ -5887,12 +5903,16 @@ fn parse_animation_transition_shorthand(
         if components.is_empty() {
             return ParseOutcome::Invalid;
         }
-        let mut parsed = vec![None; parsed_longhands.len()];
-        if !assign_shorthand_components(context, &components, parsed_longhands, 0, &mut parsed) {
+        let mut parsed = vec![None; parse_order.len()];
+        if !assign_shorthand_components(context, &components, &parse_order, 0, &mut parsed) {
             return ParseOutcome::Invalid;
         }
         for (index, &longhand) in parsed_longhands.iter().enumerate() {
-            let Some(value) = parsed[index]
+            let parsed_index = parse_order
+                .iter()
+                .position(|&parsed_longhand| parsed_longhand == longhand)
+                .expect("every longhand is in the parse order");
+            let Some(value) = parsed[parsed_index]
                 .take()
                 .or_else(|| coordinating_initial_item(context, longhand))
             else {
@@ -6091,6 +6111,10 @@ fn parse_css_value_after_substitution_scan(
         if !matches!(outcome, ParseOutcome::NotHandled) {
             return outcome;
         }
+        let outcome = parse_gap_decorations_shorthand(context, property_id, values);
+        if !matches!(outcome, ParseOutcome::NotHandled) {
+            return outcome;
+        }
         let outcome = parse_line_clamp_shorthand(context, property_id, values);
         if !matches!(outcome, ParseOutcome::NotHandled) {
             return outcome;
@@ -6179,6 +6203,10 @@ fn parse_css_value_after_substitution_scan(
     let grid_outcome = parse_grid_property(context, property_id, values);
     if !matches!(grid_outcome, ParseOutcome::NotHandled) {
         return grid_outcome;
+    }
+    let gap_decorations_outcome = parse_gap_decorations_longhand(context, property_id, values);
+    if !matches!(gap_decorations_outcome, ParseOutcome::NotHandled) {
+        return gap_decorations_outcome;
     }
     let long_tail_outcome = parse_long_tail_property(context, property_id, values);
     if !matches!(long_tail_outcome, ParseOutcome::NotHandled) {

@@ -125,7 +125,8 @@ def write_constructor_steps(
     arguments_with_leading_comma = f", {arguments}" if arguments else ""
     arguments_with_vm = f"vm{arguments_with_leading_comma}"
     event_constructor_timestamp_argument = ""
-    if any(parent.name == "Event" for parent in context.inheritance_stack(interface)):
+    is_event_interface = any(parent.name == "Event" for parent in context.inheritance_stack(interface))
+    if is_event_interface:
         includes.add("LibWeb/HTML/Scripting/Environments.h")
         includes.add("LibWeb/HighResolutionTime/TimeOrigin.h")
         time_stamp_argument = (
@@ -203,6 +204,15 @@ def write_constructor_steps(
     auto impl = TRY(WebIDL::throw_dom_exception_if_needed(vm, *vm.current_realm(), [&] {{ return construct_impl(); }}));
 """
         )
+    if is_event_interface:
+        out.write(
+            """
+    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    // When an event is created the attribute must be initialized to false.
+    impl->set_is_trusted(false);
+
+"""
+        )
     out.write(
         f"""    auto wrapper = wrap(host_defined_wrapper_world(realm), realm, impl);
 
@@ -254,7 +264,7 @@ def write_html_constructor_steps(
 
     // 3. If the surrounding agent's active custom element constructor map[NewTarget] exists:
     auto& surrounding_agent = HTML::relevant_similar_origin_window_agent(window);
-    if (auto registry_for_constructor = surrounding_agent.active_custom_element_constructor_map.get(GC::Ref {{ new_target }}); registry_for_constructor.has_value() && !registry_for_constructor->is_null()) {{
+    if (auto registry_for_constructor = surrounding_agent.active_custom_element_constructor_map.get(GC::Ref {{ new_target }}); registry_for_constructor.has_value() && registry_for_constructor.value()) {{
         // 1. Set registry to the surrounding agent's active custom element constructor map[NewTarget].
         registry = registry_for_constructor.value();
 

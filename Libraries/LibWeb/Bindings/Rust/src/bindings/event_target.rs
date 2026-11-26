@@ -17,7 +17,7 @@ use libjs_rust::api::{FunctionObject, Gc, Realm, Trace, Value};
 
 use crate::bindings::CallContext;
 use crate::bindings::callback::CallbackInterface;
-use crate::bindings::cpp_cell::CppCell;
+use crate::bindings::cpp_cell::{CppCell, LentCppCell, cpp_class};
 use crate::bindings::interface::{Interface, Ref, Wrappable, cell_from_abi, cell_into_abi};
 
 unsafe extern "C" {
@@ -81,6 +81,7 @@ unsafe extern "C" {
     fn web_bindings_event_time_stamp(event: *mut c_void) -> f64;
     fn web_bindings_event_cancelable(event: *mut c_void) -> bool;
     fn web_bindings_initialize_event(event: *mut c_void, r#type: usize, bubbles: bool, cancelable: bool);
+    fn web_bindings_event_retarget_against_current_target(event: *mut c_void, object: *mut c_void) -> *mut c_void;
 }
 
 /// The EventTarget that an object owns.
@@ -102,6 +103,11 @@ impl CppEventTarget {
     pub(crate) fn new() -> Self {
         // SAFETY: LibWeb returns a new, live EventTarget.
         Self(unsafe { CppCell::from_raw(web_bindings_create_event_target()) })
+    }
+
+    /// An EventTarget of LibWeb's C++ code, which this keeps alive.
+    pub(crate) fn from_lent(event_target: &LentCppCell<cpp_class::EventTarget>) -> Self {
+        Self(CppCell::from_lent(event_target))
     }
 
     /// An EventTarget of LibWeb's C++ code, which this keeps alive.
@@ -225,17 +231,13 @@ impl CppEventTarget {
 pub(crate) struct CppEvent(CppCell);
 
 impl CppEvent {
-    /// # Safety
-    ///
-    /// `event` must be a live Event.
-    pub(crate) unsafe fn from_raw(event: *mut c_void) -> Self {
-        // SAFETY: The caller passes a live Event.
-        Self(unsafe { CppCell::from_raw(event) })
+    pub(crate) fn from_lent(event: &LentCppCell<cpp_class::Event>) -> Self {
+        Self(CppCell::from_lent(event))
     }
 
     pub(crate) fn create(realm: Gc<Realm>, r#type: &str, bubbles: bool, cancelable: bool, composed: bool) -> Self {
         // SAFETY: The realm is live, the type is lent for the call, and LibWeb returns a live event.
-        let event = Self(unsafe {
+        Self(unsafe {
             CppCell::from_raw(web_bindings_create_event(
                 realm.as_ptr().cast(),
                 ak::Span::new(r#type.as_bytes()),
@@ -243,10 +245,7 @@ impl CppEvent {
                 cancelable,
                 composed,
             ))
-        });
-        // NB: Only the implementation creates events this way, to fire them.
-        event.set_is_trusted(true);
-        event
+        })
     }
 
     pub(crate) fn create_for_owner(
@@ -305,6 +304,18 @@ impl CppEvent {
     pub(crate) fn cancelable(&self) -> bool {
         // SAFETY: The event is live.
         unsafe { web_bindings_event_cancelable(self.as_ptr()) }
+    }
+
+    /// The result of retargeting the object, an EventTarget, against the event's currentTarget,
+    /// https://dom.spec.whatwg.org/#retarget
+    pub(crate) fn retarget_against_current_target(&self, object: &CppCell) -> CppCell {
+        // SAFETY: The event and the object are live, and LibWeb returns a live EventTarget.
+        unsafe {
+            CppCell::from_raw(web_bindings_event_retarget_against_current_target(
+                self.as_ptr(),
+                object.as_ptr(),
+            ))
+        }
     }
 
     /// https://dom.spec.whatwg.org/#canceled-flag

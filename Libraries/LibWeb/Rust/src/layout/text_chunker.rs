@@ -165,6 +165,78 @@ unsafe extern "C" {
     safe fn unicode_layout_line_break_class(code_point: u32) -> u8;
     safe fn unicode_layout_joining_type(code_point: u32) -> u8;
     safe fn unicode_layout_code_point_has_emoji_property(code_point: u32) -> bool;
+    safe fn unicode_layout_vertical_orientation(code_point: u32) -> u8;
+    safe fn unicode_layout_cjk_script_class(code_point: u32) -> u8;
+    safe fn unicode_layout_paired_bracket_key(code_point: u32) -> i32;
+}
+
+// LibUnicode's CJKScriptClass, in declaration order.
+mod cjk_script_class {
+    pub(super) const OTHER: u8 = 0;
+    pub(super) const CJK: u8 = 1;
+    pub(super) const NEUTRAL: u8 = 2;
+}
+
+/// Which code units of `text` are in a run of CJK script.
+pub(crate) fn cjk_script_runs(text: &[u16]) -> Vec<bool> {
+    let mut characters = Vec::with_capacity(text.len());
+    let mut lengths = Vec::with_capacity(text.len());
+    for character in char::decode_utf16(text.iter().copied()) {
+        let (class, bracket, length) = match character {
+            Ok(character) => {
+                let class = unicode_layout_cjk_script_class(u32::from(character));
+                let bracket = if class == cjk_script_class::NEUTRAL {
+                    unicode_layout_paired_bracket_key(u32::from(character))
+                } else {
+                    0
+                };
+                (class, bracket, character.len_utf16())
+            }
+            Err(_) => (cjk_script_class::OTHER, 0, 1),
+        };
+        characters.push((class, bracket));
+        lengths.push(length);
+    }
+    let runs = resolve_cjk_script_runs(&characters);
+    runs.iter()
+        .zip(lengths)
+        .flat_map(|(&in_run, length)| std::iter::repeat_n(in_run, length))
+        .collect()
+}
+
+// https://drafts.csswg.org/css-text-decor-4/#text-decoration-skip-ink-property
+// [...] the UA should resolve the text into script runs as described in the "Implementation Notes" of [UAX24]
+// "Unicode Script Property", in particular subsections 5.1 and 5.2.
+// NB: A character of the Common or Inherited script takes the script of the character before it, or, at the start of
+//     the text, of the first character after it that has a script of its own. But a closing bracket takes the script of
+//     the opening bracket it pairs with, as does the text after it. Each character is a class and its paired-bracket key.
+fn resolve_cjk_script_runs(characters: &[(u8, i32)]) -> Vec<bool> {
+    // https://www.unicode.org/reports/tr24/#Common
+    // [...] a stack depth of 63 is sufficient for most purposes.
+    const OPEN_BRACKET_LIMIT: usize = 63;
+    let mut runs = Vec::with_capacity(characters.len());
+    let mut current = characters
+        .iter()
+        .find(|(class, _)| *class != cjk_script_class::NEUTRAL)
+        .is_some_and(|(class, _)| *class == cjk_script_class::CJK);
+    let mut open_brackets: Vec<(i32, bool)> = Vec::new();
+    for &(class, bracket) in characters {
+        if class != cjk_script_class::NEUTRAL {
+            current = class == cjk_script_class::CJK;
+        } else if bracket > 0 {
+            if open_brackets.len() == OPEN_BRACKET_LIMIT {
+                open_brackets.remove(0);
+            }
+            open_brackets.push((bracket, current));
+        } else if bracket < 0
+            && let Some(index) = open_brackets.iter().rposition(|(opening, _)| *opening == -bracket)
+        {
+            current = open_brackets[index].1;
+            open_brackets.truncate(index);
+        }
+        runs.push(current);
+    }
+    runs
 }
 
 // LibUnicode's LineBreakClass, in declaration order.
@@ -387,6 +459,21 @@ mod unicode_test_stubs {
     #[unsafe(no_mangle)]
     extern "C" fn unicode_layout_code_point_has_emoji_property(_code_point: u32) -> bool {
         unreachable!("no unit test segments text");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_layout_vertical_orientation(_code_point: u32) -> u8 {
+        unreachable!("no unit test sets text vertically");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_layout_cjk_script_class(_code_point: u32) -> u8 {
+        unreachable!("no unit test classifies scripts");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_layout_paired_bracket_key(_code_point: u32) -> i32 {
+        unreachable!("no unit test pairs brackets");
     }
 }
 
@@ -691,27 +778,14 @@ fn is_utf16_low_surrogate(code_unit: u16) -> bool {
 }
 
 /// Whether a code point is typeset upright in vertical text whose text orientation is 'mixed'.
-// FIXME: Use the Vertical_Orientation property of Unicode (UAX #50) instead of these blocks of characters, which are
-//        mostly upright.
+// https://drafts.csswg.org/css-writing-modes-4/#vertical-orientations
+// "When text-orientation is mixed, the UA must determine the orientation of each typographic character unit by its
+//  Vertical_Orientation property: typesetting it upright if its orientation property is U, Tu, or Tr; or typesetting
+//  it sideways (90° clockwise from horizontal) if its orientation property is R."
 pub(crate) fn code_point_is_upright_in_mixed_orientation(code_point: u32) -> bool {
-    matches!(
-        code_point,
-        0x1100..=0x11FF
-            | 0x2E80..=0x303F
-            | 0x3040..=0x31FF
-            | 0x3200..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xA960..=0xA97F
-            | 0xAC00..=0xD7FF
-            | 0xF900..=0xFAFF
-            | 0xFE10..=0xFE1F
-            | 0xFE30..=0xFE4F
-            | 0xFF01..=0xFF0C
-            | 0xFF0E..=0xFF1B
-            | 0xFF1F..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x20000..=0x3FFFF
-    )
+    // LibUnicode's VerticalOrientation, in declaration order: Rotated comes first.
+    const ROTATED: u8 = 0;
+    unicode_layout_vertical_orientation(code_point) != ROTATED
 }
 
 /// Mirrors AK::Utf16View::code_point_at, including its lone-surrogate
@@ -1629,7 +1703,51 @@ fn tab_chunk_end(text: &[u16], start: usize, break_after_each_tab: bool) -> usiz
 
 #[cfg(test)]
 mod tests {
-    use super::tab_chunk_end;
+    use super::cjk_script_class::{CJK, NEUTRAL, OTHER};
+    use super::{resolve_cjk_script_runs, tab_chunk_end};
+
+    fn classes(classes: &[u8]) -> Vec<(u8, i32)> {
+        classes.iter().map(|class| (*class, 0)).collect()
+    }
+
+    #[test]
+    fn common_characters_take_the_script_of_the_run_they_are_in() {
+        assert_eq!(
+            resolve_cjk_script_runs(&classes(&[CJK, NEUTRAL, OTHER, NEUTRAL, CJK])),
+            [true, true, false, false, true]
+        );
+    }
+
+    #[test]
+    fn leading_common_characters_take_the_script_that_follows_them() {
+        assert_eq!(
+            resolve_cjk_script_runs(&classes(&[NEUTRAL, NEUTRAL, CJK, OTHER])),
+            [true, true, true, false]
+        );
+        assert_eq!(
+            resolve_cjk_script_runs(&classes(&[NEUTRAL, OTHER, CJK])),
+            [false, false, true]
+        );
+        assert_eq!(resolve_cjk_script_runs(&classes(&[NEUTRAL, NEUTRAL])), [false, false]);
+    }
+
+    #[test]
+    fn a_closing_bracket_takes_the_script_of_its_opening_bracket() {
+        let (open, close) = (i32::from(b'('), -i32::from(b'('));
+        assert_eq!(
+            resolve_cjk_script_runs(&[
+                (CJK, 0),
+                (NEUTRAL, open),
+                (OTHER, 0),
+                (NEUTRAL, close),
+                (NEUTRAL, 0),
+                (CJK, 0)
+            ]),
+            [true, true, false, true, true, true]
+        );
+        // A closing bracket with no opening bracket before it takes the script before it.
+        assert_eq!(resolve_cjk_script_runs(&[(OTHER, 0), (NEUTRAL, close)]), [false, false]);
+    }
 
     #[test]
     fn preserved_tab_chunk_boundaries_respect_break_spaces() {

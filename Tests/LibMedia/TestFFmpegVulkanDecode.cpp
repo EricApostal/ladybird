@@ -10,6 +10,7 @@
 #include <LibMediaCodecs/FFmpeg/FFmpegVulkanVideoDecoder.h>
 #include <LibMediaCodecs/FFmpeg/SystemFFmpeg.h>
 #include <LibMediaCodecs/VideoFrame.h>
+#include <LibMediaCodecs/VideoSurface.h>
 #include <LibMediaCodecs/Vulkan/VulkanVideoDevice.h>
 #include <LibPlatformFeatures/ProcessFeatures.h>
 
@@ -62,7 +63,7 @@ struct DecodedFrame {
 };
 
 struct Decoding {
-    NonnullOwnPtr<Media::FFmpeg::FFmpegVulkanVideoDecoder> decoder;
+    NonnullOwnPtr<Media::VideoDecoder> decoder;
     NonnullRefPtr<Media::Demuxer> demuxer;
     Media::Track track;
     mutable size_t accepted_sample_count { 1 };
@@ -111,7 +112,7 @@ Optional<Decoding> open_decoding(StringView path, Media::CodecID codec_id)
     MUST(demuxer->create_context_for_track(*track));
 
     auto first_sample = MUST(demuxer->get_next_sample_for_track(*track));
-    auto start_decoding = [&] -> Media::DecoderErrorOr<NonnullOwnPtr<Media::FFmpeg::FFmpegVulkanVideoDecoder>> {
+    auto start_decoding = [&] -> Media::DecoderErrorOr<NonnullOwnPtr<Media::VideoDecoder>> {
         auto decoder = TRY(Media::FFmpeg::FFmpegVulkanVideoDecoder::try_create(codec_id, first_sample.new_codec_configuration().value_or({})));
         // Whether the device can decode and export the stream is only known once the first frame negotiates its format.
         TRY(decoder->receive_coded_data(first_sample, Media::DecodeIntent::Output));
@@ -183,6 +184,38 @@ TEST_CASE(vp9_inter_frame_size_change_needs_another_decoder)
     EXPECT_EQ(decoding->accepted_sample_count, 1u);
     for (auto const& frame : frames)
         EXPECT_EQ(frame.size, Gfx::Size<u32>(1280, 720));
+}
+
+// A quality switch can start a sequence with larger frames, which FFmpeg does not renegotiate while the pixel format stays
+// the same.
+TEST_CASE(av1_sequence_with_larger_frames_continues_in_a_new_codec_context)
+{
+    auto decoding = open_decoding("./av1_sequence_size_increase.webm"sv, Media::CodecID::AV1);
+    if (!decoding.has_value())
+        return;
+
+    Vector<DecodedFrame> frames;
+    while (true) {
+        auto frame_result = decoding->next_frame();
+        if (frame_result.is_error()) {
+            EXPECT_EQ(frame_result.error().category(), Media::DecoderErrorCategory::EndOfStream);
+            break;
+        }
+        auto frame = frame_result.release_value();
+        auto surface = frame->surface();
+        EXPECT(surface);
+        if (surface) {
+            EXPECT(frame->width() <= static_cast<u32>(surface->size().width()));
+            EXPECT(frame->height() <= static_cast<u32>(surface->size().height()));
+        }
+        frames.append({ frame->timestamp(), frame->size() });
+    }
+
+    EXPECT_EQ(frames.size(), 12u);
+    if (frames.size() == 12) {
+        EXPECT_EQ(frames.first().size, Gfx::Size<u32>(320, 240));
+        EXPECT_EQ(frames.last().size, Gfx::Size<u32>(640, 480));
+    }
 }
 
 // The file's mastering display and content light levels are only in metadata OBUs, which must survive the copy of a frame

@@ -11,7 +11,7 @@ use core::ptr::NonNull;
 
 use libjs_rust::api::{Gc, MarkedVec, Object, Realm, Trace, Vm};
 
-use crate::bindings::cpp_cell::CppCell;
+use crate::bindings::cpp_cell::{CppCell, LentCppCell, cpp_class};
 use crate::bindings::event_target::CppEventTarget;
 use crate::bindings::interface::Wrappable;
 use crate::bindings::realm_data::realm_data;
@@ -25,9 +25,10 @@ unsafe extern "C" {
     fn web_bindings_window_associated_document(window: *mut c_void) -> *mut c_void;
     fn web_bindings_window_realm(window: *mut c_void) -> *mut c_void;
     fn web_bindings_window_page_id(window: *mut c_void) -> u64;
+    fn web_bindings_window_pdf_viewer_supported(window: *mut c_void) -> bool;
     fn web_bindings_window_has_transient_activation(window: *mut c_void) -> bool;
     fn web_bindings_window_consume_user_activation(window: *mut c_void);
-    fn web_bindings_window_set_last_activation_timestamp_to_now(window: *mut c_void);
+    fn web_bindings_window_give_transient_activation(window: *mut c_void);
     fn web_bindings_is_service_worker_global_scope(global_object: *mut c_void) -> bool;
     fn web_bindings_window_as_event_target(window: *mut c_void) -> *mut c_void;
     fn web_bindings_worker_global_scope_from_global_object(global_object: *mut c_void) -> *mut c_void;
@@ -109,6 +110,10 @@ pub(crate) fn active_windows(vm: &Vm) -> MarkedVec<'_, CppWindow> {
 }
 
 impl CppWindow {
+    pub(crate) fn from_lent(window: &LentCppCell<cpp_class::Window>) -> Self {
+        Self(CppCell::from_lent(window))
+    }
+
     /// # Safety
     ///
     /// `window` must be a live Window.
@@ -152,6 +157,12 @@ impl CppWindow {
         unsafe { web_bindings_window_page_id(self.0.as_ptr()) }
     }
 
+    /// https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-supported
+    pub(crate) fn pdf_viewer_supported(&self) -> bool {
+        // SAFETY: The Window is live.
+        unsafe { web_bindings_window_pdf_viewer_supported(self.0.as_ptr()) }
+    }
+
     /// https://html.spec.whatwg.org/multipage/interaction.html#transient-activation
     pub(crate) fn has_transient_activation(&self) -> bool {
         // SAFETY: The Window is live.
@@ -164,10 +175,10 @@ impl CppWindow {
         unsafe { web_bindings_window_consume_user_activation(self.0.as_ptr()) };
     }
 
-    /// https://html.spec.whatwg.org/multipage/interaction.html#last-activation-timestamp
-    pub(crate) fn set_last_activation_timestamp_to_now(&self) {
+    /// https://html.spec.whatwg.org/multipage/interaction.html#transient-activation
+    pub(crate) fn give_transient_activation(&self) {
         // SAFETY: The Window is live.
-        unsafe { web_bindings_window_set_last_activation_timestamp_to_now(self.0.as_ptr()) };
+        unsafe { web_bindings_window_give_transient_activation(self.0.as_ptr()) };
     }
 
     /// https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-document-window

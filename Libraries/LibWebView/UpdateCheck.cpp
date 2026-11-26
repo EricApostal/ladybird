@@ -131,6 +131,8 @@ Optional<InstallMethod> parse_package_format(StringView contents)
         return InstallMethod::DEB;
     if (format == "RPM"sv)
         return InstallMethod::RPM;
+    if (format == "AppImage"sv)
+        return InstallMethod::AppImage;
     return {};
 }
 
@@ -238,6 +240,7 @@ static Optional<StringView> architecture_name(InstallMethod install_method, Arch
         return architecture == Architecture::AArch64 ? "arm64"sv : "amd64"sv;
     case InstallMethod::RPM:
     case InstallMethod::Flatpak:
+    case InstallMethod::AppImage:
         return architecture == Architecture::AArch64 ? "aarch64"sv : "x86_64"sv;
     case InstallMethod::Source:
         return {};
@@ -312,6 +315,12 @@ static bool release_installs_on(JsonObject const& release, SystemDescription con
         auto flatpak = repositories->get_object("flatpak"sv);
         return flatpak.has_value() && contains_string(flatpak->get_array("architectures"sv), *architecture);
     }
+    case InstallMethod::AppImage:
+        return architecture.has_value() && has_download([&](JsonObject const& download) {
+            auto name = download.get_string("name"sv);
+            return download.get_string("platform"sv) == "Linux"sv && download.get_string("architecture"sv) == *architecture
+                && name.has_value() && name->bytes_as_string_view().ends_with(".AppImage"sv);
+        });
     case InstallMethod::Source:
         return has_download([](JsonObject const& download) { return download.get_string("platform"sv) == "source"sv; });
     }
@@ -361,6 +370,7 @@ AK::Duration time_until_next_update_check(UnixDateTime last_check, UnixDateTime 
 }
 
 struct CountedPeriods {
+    bool _new { false };
     bool day { false };
     bool week { false };
     bool month { false };
@@ -387,6 +397,8 @@ static StringView install_method_name(InstallMethod install_method)
         return "rpm"sv;
     case InstallMethod::Flatpak:
         return "flatpak"sv;
+    case InstallMethod::AppImage:
+        return "appimage"sv;
     case InstallMethod::Source:
         return "source"sv;
     }
@@ -447,6 +459,8 @@ static ByteString update_check_header(SystemDescription const& system, StringVie
         append_member(builder, "arch"sv, "aarch64"sv);
 
     append_member(builder, "pkg"sv, install_method_name(system.install_method));
+    if (counted._new)
+        append_member(builder, "new"sv, {});
     if (counted.day)
         append_member(builder, "daily"sv, {});
     if (counted.week)
@@ -600,13 +614,13 @@ void UpdateChecker::check(UpdateCheckTrigger trigger)
     }
 
     // The first check of each day, week and month counts this installation once for it, and the very first check counts
-    // it for all three.
+    // it for all three and marks the installation as new.
     CountedPeriods counted;
     if (BROWSER_IS_RELEASE_BUILD) {
         if (auto previous_check = last_check(); previous_check.has_value())
             counted = periods_begun_since(*previous_check, m_check_started);
         else
-            counted = { .day = true, .week = true, .month = true };
+            counted = { ._new = true, .day = true, .week = true, .month = true };
     }
 
     auto headers = HTTP::HeaderList::create();

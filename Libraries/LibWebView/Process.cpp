@@ -132,14 +132,24 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
         "PULSE_RUNTIME_PATH"sv,
         "PULSE_SERVER"sv,
     };
-    // Mesa and the Vulkan loader read these to select and configure the GPU driver.
+    // Mesa, its drivers, libva, NVIDIA's driver and the Vulkan loader read these to select and configure the GPU driver.
     static constexpr Array gpu_prefixes {
+        "ACO_"sv,
+        "AMD_"sv,
+        "ANV_"sv,
         "DRI_PRIME"sv,
+        "INTEL_"sv,
+        "LIBVA_"sv,
         "MESA_"sv,
+        "NAK_"sv,
+        "NVK_"sv,
+        "RADV_"sv,
         "VK_"sv,
         "__EGL_"sv,
         "__GLX_"sv,
         "__GL_"sv,
+        "__NV_"sv,
+        "__VK_"sv,
     };
 
     Vector<ByteString> environment;
@@ -286,7 +296,7 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(P
 
     Application::transport_bootstrap_server().register_child_transport(process->pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
 
-    auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
+    auto transport = TRY(IPC::Transport::create(move(port_a_recv), move(port_b_send)));
 #elif defined(AK_OS_WINDOWS)
     // A Windows pipe cannot carry a handle, so the helper also gets a line to the Browser's handle broker.
     auto channel = TRY(Core::System::duplex_pipe());

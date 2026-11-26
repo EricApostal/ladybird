@@ -297,19 +297,9 @@ fn pattern_paint_style<O: Observer>(
             height: 1.0,
         };
     }
-    let device_scale = recorder.inputs.device_pixels_per_css_pixel as f32;
     let mut recorded_to_surface = AffineTransform::identity().scaled(content_scale.width, content_scale.height);
-    if !description.has_view_box {
-        let mut content_to_tile_transform = AffineTransform::identity();
-        if description.content_units_are_object_bounding_box {
-            content_to_tile_transform = AffineTransform::identity()
-                .translated(bounding_box.x * device_scale, bounding_box.y * device_scale)
-                .scaled(bounding_box.width, bounding_box.height);
-        }
-        recorded_to_surface = multiply_affine(
-            recorded_to_surface.translated(-tile_rect.x, -tile_rect.y),
-            content_to_tile_transform,
-        );
+    if !description.has_view_box && description.content_units_are_object_bounding_box {
+        recorded_to_surface = recorded_to_surface.scaled(bounding_box.width, bounding_box.height);
     }
     let tile_content_transform = affine_to_matrix(recorded_to_surface);
     let mut pattern_transform = crate::painting::display_list::commands::OptionalAffineTransform::default();
@@ -469,6 +459,68 @@ pub(crate) fn paint_text_after_children<O: Observer>(
     }
 }
 
+/// The force-dark role of the fills and strokes of the SVG box `paintable`: that of SVG content, or none where the
+/// outermost svg element of the SVG inline in the page is bigger than an icon. Its content is then more likely an
+/// illustration, a chart or a QR code than line art, and it stays as authored.
+fn svg_content_force_dark_role(source: &impl PaintRead, paintable: NodeSlotId) -> ForceDarkRole {
+    let mut root = None;
+    let mut node = Some(paintable);
+    while let Some(current) = node {
+        match source.node_kind_if_live(current) {
+            Some(NodeKind::SVGSVGBox) => root = Some(current),
+            Some(kind) if crate::painting::node_painting::is_svg(kind) => {}
+            // The outermost svg element is the root element of an SVG document, such as an SVG image's, whose content
+            // darkens whatever its size.
+            Some(NodeKind::Viewport) => return ForceDarkRole::Svg,
+            _ => break,
+        }
+        node = source.node_parent_if_live(current);
+    }
+    let Some(root) = root else {
+        return ForceDarkRole::Svg;
+    };
+    let border_box = crate::painting::paintable_geometry::absolute_border_box_rect(source, root);
+    if crate::painting::force_dark::svg_root_size_allows_darkening(
+        border_box.width.to_float(),
+        border_box.height.to_float(),
+    ) {
+        ForceDarkRole::Svg
+    } else {
+        ForceDarkRole::None
+    }
+}
+
+/// The box that a paint server on `paintable`, whose own geometry is `geometry`, maps its object bounding box units onto.
+fn paint_server_object_bounding_box(
+    source: &impl PaintRead,
+    paintable: NodeSlotId,
+    geometry: &crate::layout::svg_formatting_context::SvgGeometry,
+) -> FloatRect {
+    // https://svgwg.org/svg2-draft/text.html#ObjectBoundingBoxUnitsTextObjects
+    // When one of these facilities is applied to text and keyword 'objectBoundingBox' is used (see Object bounding box
+    // units) to specify a graphical effect relative to the "object bounding box", then the object bounding box units
+    // are computed relative to the entire 'text' element in all cases, even when different effects are applied to
+    // different 'tspan' or 'textPath' elements within the same 'text' element.
+    // NB: The layout of a <text> lays out every element inside it again, so a change to the <text>'s box records the
+    //     elements that paint with it again too.
+    let mut text = paintable;
+    while let Some(parent) = source.node_parent_if_live(text)
+        && matches!(
+            source.node_kind_if_live(parent),
+            Some(NodeKind::SVGTextBox | NodeKind::SVGTextPathBox)
+        )
+    {
+        text = parent;
+    }
+    if text == paintable {
+        return geometry.object_bounding_box;
+    }
+    crate::painting::paintable_geometry::committed_svg_geometry(source, text)
+        .map_or(geometry.object_bounding_box, |text_geometry| {
+            text_geometry.object_bounding_box
+        })
+}
+
 fn paint_path_parts<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
@@ -563,16 +615,18 @@ fn paint_path_parts<O: Observer>(
         }
         return;
     }
+    let svg_role = svg_content_force_dark_role(recorder.source, paintable);
 
     let geometry =
         crate::painting::paintable_geometry::committed_svg_geometry(recorder.source, paintable).unwrap_or_default();
+    let object_bounding_box = paint_server_object_bounding_box(recorder.source, paintable, &geometry);
     for (path, path_bounding_box, color_glyph_runs) in &parts {
         // NB: A paint server is placed from the bounding box of the path it paints, so each part is painted with its
         //     own.
         let paint_context = SvgPaintContext {
             viewport: geometry.viewport_user_rect,
             path_bounding_box: *path_bounding_box,
-            object_bounding_box: geometry.object_bounding_box,
+            object_bounding_box,
             paint_transform: affine(paint_transform),
             content_scale: recorder.own_accumulated_2d_scale(paintable),
         };
@@ -596,7 +650,7 @@ fn paint_path_parts<O: Observer>(
                     }
                     if let Some(paint_style) = paint_server_style(recorder, paintable, false, &paint_context) {
                         recorder.recorder.fill_path(FillPathParams {
-                            force_dark_role: ForceDarkRole::Svg,
+                            force_dark_role: svg_role,
                             path,
                             opacity: fill_opacity,
                             paint_style_or_color: PaintStyleOrColor::PaintStyle(paint_style),
@@ -605,7 +659,7 @@ fn paint_path_parts<O: Observer>(
                         });
                     } else if let Some(fill_color) = facts.fill_color {
                         recorder.recorder.fill_path(FillPathParams {
-                            force_dark_role: ForceDarkRole::Svg,
+                            force_dark_role: svg_role,
                             path,
                             opacity: 1.0,
                             paint_style_or_color: PaintStyleOrColor::Color(
@@ -649,7 +703,7 @@ fn paint_path_parts<O: Observer>(
 
                     if let Some(paint_style) = paint_server_style(recorder, paintable, true, &paint_context) {
                         recorder.recorder.stroke_path(StrokePathParams {
-                            force_dark_role: ForceDarkRole::Svg,
+                            force_dark_role: svg_role,
                             cap_style: facts.cap_style,
                             join_style: facts.join_style,
                             miter_limit: facts.miter_limit,
@@ -663,7 +717,7 @@ fn paint_path_parts<O: Observer>(
                         });
                     } else if let Some(stroke_color) = facts.stroke_color {
                         recorder.recorder.stroke_path(StrokePathParams {
-                            force_dark_role: ForceDarkRole::Svg,
+                            force_dark_role: svg_role,
                             cap_style: facts.cap_style,
                             join_style: facts.join_style,
                             miter_limit: facts.miter_limit,
@@ -696,6 +750,7 @@ fn paint_color_glyph_runs<O: Observer>(
     use crate::painting::display_list::commands::{DisplayListGlyph, FontResourceId};
     use crate::painting::display_list::recorder::GlyphRunForRecording;
 
+    let svg_role = svg_content_force_dark_role(recorder.source, paintable);
     let Some(style) = recorder.source.node_style_if_live(paintable) else {
         return;
     };
@@ -724,9 +779,9 @@ fn paint_color_glyph_runs<O: Observer>(
             0.0,
             device_rect,
             f64::from(device_scale),
-            libgfx_rust::Orientation::Horizontal,
+            libgfx_rust::GlyphRunOrientation::Horizontal,
             device_rect,
-            ForceDarkRole::Svg,
+            svg_role,
         );
     }
 }

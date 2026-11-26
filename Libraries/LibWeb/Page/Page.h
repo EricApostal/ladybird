@@ -269,6 +269,10 @@ public:
     bool enable_primary_paste() const { return m_enable_primary_paste; }
     void set_enable_primary_paste(bool b) { m_enable_primary_paste = b; }
 
+    // Whether the UI process replaces self-signed certificate error pages with trust prompts.
+    bool offers_to_trust_self_signed_certificates() const { return m_offers_to_trust_self_signed_certificates; }
+    void set_offers_to_trust_self_signed_certificates(bool b) { m_offers_to_trust_self_signed_certificates = b; }
+
     u64 wheel_event_listener_state_generation() const { return m_wheel_event_listener_state_generation; }
     u64 keyboard_scroll_state_generation() const { return m_keyboard_scroll_state_generation; }
     void invalidate_compositor_wheel_event_listener_state(DOM::Document&);
@@ -277,7 +281,7 @@ public:
     void keyboard_scroll_event_path_changed(DOM::EventTarget const&);
     void keyboard_scroll_dom_tree_changed(DOM::Node const&);
     void keyboard_scroll_editability_changed(DOM::Document&);
-    Compositing::KeyboardScrollState take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch);
+    Compositing::KeyboardScrollState take_keyboard_scroll_state_for_compositor();
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
     void update_needs_beforeunload_check();
     bool had_user_edits() const { return m_had_user_edits; }
@@ -291,6 +295,9 @@ public:
 
     GC::Ptr<HTML::LocalNavigable> hover_reporting_navigable() const { return m_hover_reporting_navigable.ptr(); }
     void set_hover_reporting_navigable(Badge<EventHandler>, GC::Ptr<HTML::LocalNavigable>);
+    void set_middle_button_scrolling_navigable(Badge<EventHandler>, GC::Ptr<HTML::LocalNavigable>);
+    GC::Ptr<HTML::LocalNavigable> middle_button_scrolling_navigable() const { return m_middle_button_scrolling_navigable.ptr(); }
+    bool press_ends_a_middle_button_scroll() const { return m_press_ends_a_middle_button_scroll; }
 
     Gfx::Cursor current_cursor() const { return m_cursor->current(); }
     PageCursor& cursor() { return *m_cursor; }
@@ -587,6 +594,11 @@ private:
     // once passed through, e.g.) leaves the report standing.
     GC::Weak<HTML::LocalNavigable> m_hover_reporting_navigable;
 
+    // The navigable whose middle button scroll is running. It hears of every mouse event, wherever the pointer is.
+    GC::Weak<HTML::LocalNavigable> m_middle_button_scrolling_navigable;
+    // Whether the press being handled ends a middle button scroll, and so has no default actions.
+    bool m_press_ends_a_middle_button_scroll { false };
+
     GC::Ptr<HTML::Navigable> m_top_level_traversable;
     OwnPtr<Compositor::CompositorContextHandle> m_retired_page_compositor_context;
     Vector<GC::Ref<HTML::Navigable>> m_navigables_being_destroyed;
@@ -607,6 +619,7 @@ private:
     bool m_should_block_pop_ups { true };
     bool m_enable_autoscroll { true };
     bool m_enable_primary_paste { true };
+    bool m_offers_to_trust_self_signed_certificates { false };
     u64 m_wheel_event_listener_state_generation { 0 };
     u64 m_keyboard_scroll_state_generation { 0 };
     bool m_keyboard_scroll_state_is_current { false };
@@ -832,18 +845,19 @@ public:
     // A frame request on behalf of one document, for a client whose page shows many documents.
     virtual void request_frame_for(DOM::Document const&) { request_frame(); }
     virtual double rendering_frame_interval_in_milliseconds() const { return 1000.0 / 60.0; }
-    virtual void rendering_opportunity([[maybe_unused]] i64 frame_time_nanoseconds, [[maybe_unused]] double frame_interval_milliseconds) { }
+    virtual void rendering_opportunity([[maybe_unused]] i64 frame_time_nanoseconds, [[maybe_unused]] double frame_interval_milliseconds, [[maybe_unused]] double display_interval_milliseconds, [[maybe_unused]] Compositing::RenderingOpportunityFrameTime frame_time_kind) { }
     virtual void will_begin_rendering_update() { }
     virtual bool has_rendering_opportunity() const { return true; }
     virtual void did_finish_rendering_update() { }
     virtual void set_manual_rendering_opportunities([[maybe_unused]] bool enabled) { }
-    virtual void inject_rendering_opportunity([[maybe_unused]] double frame_time) { }
+    virtual void inject_rendering_opportunity([[maybe_unused]] double frame_time, [[maybe_unused]] Optional<double> cadence, [[maybe_unused]] bool is_display_tick) { }
     virtual void page_did_change_title(Utf16String const&) { }
     virtual void page_did_update_editing_history_state(bool, bool) { }
     // Fired when a document's focused area changes, so the UI process can re-push the input method state (and with it
     // the caret rect) for a field that was focused without the user touching it, e.g. autofocus.
     virtual void page_did_change_focused_editable_element() { }
     virtual void page_did_set_text_fragment_indication_visibility(bool) { }
+    virtual void page_did_request_certificate_warning(URL::URL const&, HTML::CrossProcessId) { }
     virtual void page_did_request_resize_window(Gfx::IntSize, u64) { }
     virtual void page_did_request_reposition_window(Gfx::IntPoint, u64) { }
     virtual void page_did_request_restore_window() { }
