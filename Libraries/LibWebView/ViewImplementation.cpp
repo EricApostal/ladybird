@@ -4319,6 +4319,9 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
     if (m_remote_layer_id.has_value())
         Application::the().show_context_in_remote_layer(*m_remote_layer_id, compositor_context_id);
     Application::the().update_compositor_viewport(compositor_context_id, viewport_size().to_type<int>(), m_device_pixel_ratio);
+    // AD-HOC: A compositor context paces its frames at 60 Hz until it is told what the tab's display does, which a
+    //         page that takes over the tab has to be.
+    update_compositor_display_metadata(page);
     Application::the().update_compositor_context_visibility(compositor_context_id, traversable().system_visibility_state());
     Application::the().update_compositor_context_presents_from_cpu_memory(compositor_context_id, m_presents_from_cpu_memory);
     page.async_update_visibility_state(traversable().id(), traversable().system_visibility_state());
