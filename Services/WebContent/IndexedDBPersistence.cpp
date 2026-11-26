@@ -17,8 +17,9 @@ class IndexedDBPersistence final : public Web::IndexedDB::PersistenceHooks {
 public:
     static IndexedDBPersistence& the()
     {
-        static IndexedDBPersistence persistence;
-        return persistence;
+        // Deliberately never destroyed: a transaction can still commit while the process exits.
+        static auto* persistence = new IndexedDBPersistence;
+        return *persistence;
     }
 
     void set_connection(ConnectionFromClient& connection) { m_connection = connection.make_weak_ptr<ConnectionFromClient>(); }
