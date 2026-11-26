@@ -54,6 +54,7 @@
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
 #include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/ExtensionHooks.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Location.h>
@@ -601,6 +602,32 @@ void initialize_agent(HTML::AgentType type)
     // 8.1.6.7.3 HostLoadImportedModule(referrer, moduleRequest, loadState, payload), https://html.spec.whatwg.org/multipage/webappapis.html#hostloadimportedmodule
     vm.host_load_imported_module = [](JS::ImportedModuleReferrer referrer, JS::ModuleRequest const& module_request, GC::Ptr<GC::Cell> load_state, JS::ImportedModulePayload payload) -> void {
         auto& vm = JS::VM::the();
+
+        // AD-HOC: A browser extension's content scripts run in a world of their own, which imports the extension's
+        //         files. Their scripts are not HTML scripts, so the steps below cannot be run for them.
+        if (auto* hooks = HTML::ExtensionHooks::the()) {
+            auto& importing_realm = *vm.current_realm();
+            auto on_loaded = GC::create_function(importing_realm.heap(), GC::captures(referrer, GC::Ref { importing_realm }, module_request, payload), [](auto& referrer, auto& realm, auto& module_request, auto& payload, JS::ThrowCompletionOr<GC::Ref<JS::Module>> completion) {
+                auto& vm = realm->vm();
+
+                // NB: As below, LibJS needs to find the module on the stack, in an execution context of its own.
+                auto& stack = vm.interpreter_stack();
+                auto* stack_mark = stack.top();
+                auto* module_execution_context = stack.allocate(0, ReadonlySpan<JS::Value> {}, 0);
+                VERIFY(module_execution_context);
+                module_execution_context->set_realm(*realm);
+                if (!completion.is_error())
+                    module_execution_context->set_script_or_module(GC::Ref<JS::Module> { completion.value() });
+                vm.push_execution_context(*module_execution_context);
+
+                JS::finish_loading_imported_module(referrer, module_request, payload, completion);
+
+                vm.pop_execution_context();
+                stack.deallocate(stack_mark);
+            });
+            if (hooks->load_extension_module(importing_realm, module_request.module_specifier.view(), on_loaded))
+                return;
+        }
 
         // 1. Let settingsObject be the current settings object.
         GC::Ref<HTML::EnvironmentSettingsObject> settings_object = HTML::current_settings_object();

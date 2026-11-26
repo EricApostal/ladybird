@@ -11,9 +11,13 @@
 #include <AK/Function.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
-#include <LibURL/Forward.h>
+#include <AK/Utf16View.h>
 #include <AK/Vector.h>
+#include <LibGC/Function.h>
 #include <LibHTTP/Header.h>
+#include <LibJS/Forward.h>
+#include <LibJS/Runtime/Completion.h>
+#include <LibURL/Forward.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -50,6 +54,14 @@ public:
     // Reads the file that a `moz-extension:` URL names. The browser process does, because this process may not read
     // the extension's files, so the answer arrives later. The callback is given null when the file cannot be read.
     virtual void load_extension_resource(URL::URL const& url, PageId, Function<void(Optional<ExtensionResource>)> callback) = 0;
+
+    // Called with an imported module, or with what to reject the import() with.
+    using ModuleLoadCompletion = GC::Function<void(JS::ThrowCompletionOr<GC::Ref<JS::Module>>)>;
+
+    // An import() made in `realm`. If that is the world of an extension's content scripts, this takes the import over
+    // and returns true, calling `on_loaded` now or later. Such a world imports files of its extension, as modules of
+    // its own, which the loading of a page's modules knows nothing about.
+    virtual bool load_extension_module(JS::Realm&, Utf16View specifier, GC::Ref<ModuleLoadCompletion> on_loaded) = 0;
 
     // A request that is about to be sent, as an extension's `webRequest` listener sees it.
     struct InterceptedRequest {

@@ -11,11 +11,13 @@
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/AbstractOperations.h>
+#include <LibJS/Runtime/Error.h>
 #include <LibJS/Runtime/ExecutionContext.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibJS/Script.h>
+#include <LibJS/SourceTextModule.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/Bindings/HostDefined.h>
 #include <LibWeb/Bindings/Intrinsics.h>
@@ -62,6 +64,8 @@ void ExtensionWorld::visit_edges(Visitor& visitor)
     visitor.visit(m_realm);
     visitor.visit(m_world);
     visitor.visit(m_receiver);
+    for (auto& entry : m_modules)
+        visitor.visit(entry.value);
     if (m_execution_context)
         m_execution_context->visit_edges(visitor);
 }
@@ -573,6 +577,88 @@ void ExtensionRuntime::document_will_be_destroyed(Web::DOM::Document& document)
 }
 
 // MARK: Extension files
+
+GC::Ptr<JS::Module> ExtensionWorld::module(String const& url) const
+{
+    if (auto found = m_modules.get(url); found.has_value())
+        return *found;
+    return {};
+}
+
+static void reject_import(Web::HTML::ExtensionHooks::ModuleLoadCompletion const& on_loaded, JS::Realm& realm, String const& why)
+{
+    dbgln("ExtensionRuntime: {}", why);
+    on_loaded.function()(JS::throw_completion(JS::TypeError::create(realm, Utf16String::from_utf8(why.bytes_as_string_view()))));
+}
+
+bool ExtensionRuntime::load_extension_module(JS::Realm& realm, Utf16View specifier, GC::Ref<ModuleLoadCompletion> on_loaded)
+{
+    ExtensionWorld* world = nullptr;
+    for (auto const& entry : m_worlds) {
+        if (entry.value->is_isolated() && &entry.value->realm() == &realm)
+            world = entry.value.ptr();
+    }
+    // Anyone else's import, including those of an extension's own pages, is loaded the usual way.
+    if (!world)
+        return false;
+
+    auto extension_uuid = world->extension_uuid();
+    auto requested = Utf16String::from_utf16(specifier).to_utf8();
+
+    // A specifier is resolved against the root of the extension, whose files are all a content script may import.
+    // NB: This is not yet right for a relative import made by a module in a folder.
+    auto root = URL::Parser::basic_parse(MUST(String::formatted("moz-extension://{}/", extension_uuid)));
+    VERIFY(root.has_value());
+    auto url = URL::Parser::basic_parse(requested.bytes_as_string_view(), *root);
+    if (!url.has_value() || url->scheme() != "moz-extension"sv || url->serialized_host() != extension_uuid.bytes_as_string_view()) {
+        reject_import(*on_loaded, realm, MUST(String::formatted("A content script of {} may not import {}", extension_uuid, requested)));
+        return true;
+    }
+
+    auto key = url->serialize();
+    if (auto loaded = world->module(key)) {
+        on_loaded->function()(GC::Ref<JS::Module> { *loaded });
+        return true;
+    }
+
+    auto context_id = world->context_id();
+    load_extension_resource(*url, world->page_id(), [this, context_id, key, on_loaded = GC::make_root(on_loaded)](Optional<ExtensionResource> resource) {
+        auto found = m_worlds.find(context_id);
+        // The document has gone, and its import with it.
+        if (found == m_worlds.end())
+            return;
+        auto& importing_world = *found->value;
+        auto& world_realm = importing_world.realm();
+
+        // Ends by running what the import's promise set going.
+        Web::HTML::TemporaryExecutionContext execution_context { world_realm };
+
+        // It may have arrived for an earlier import of the same file while this one waited.
+        if (auto loaded = importing_world.module(key)) {
+            on_loaded->function()(GC::Ref<JS::Module> { *loaded });
+            return;
+        }
+        if (!resource.has_value()) {
+            reject_import(*on_loaded, world_realm, MUST(String::formatted("There is no module at {}", key)));
+            return;
+        }
+        auto text = String::from_utf8(StringView { resource->data.bytes() });
+        if (text.is_error()) {
+            reject_import(*on_loaded, world_realm, MUST(String::formatted("{} is not UTF-8", key)));
+            return;
+        }
+
+        auto source = Utf16String::from_utf8(text.value().bytes_as_string_view());
+        auto module = JS::SourceTextModule::parse(source.utf16_view(), world_realm, key.bytes_as_string_view());
+        if (module.is_error()) {
+            reject_import(*on_loaded, world_realm, MUST(String::formatted("{} could not be parsed", key)));
+            return;
+        }
+        importing_world.add_module(key, module.value());
+        on_loaded->function()(GC::Ref<JS::Module> { module.value() });
+    });
+    return true;
+}
 
 bool ExtensionRuntime::allows_cross_origin_request(URL::Origin const& origin, URL::URL const& url)
 {

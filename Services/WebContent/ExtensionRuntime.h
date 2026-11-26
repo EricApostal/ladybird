@@ -92,6 +92,11 @@ public:
     void set_receiver(JS::Object& receiver) { m_receiver = receiver; }
     GC::Ptr<JS::Object> receiver() const { return m_receiver; }
 
+    bool is_isolated() const { return m_world != nullptr; }
+    // The modules the world has imported, by address, so that each is one module however often it is imported.
+    GC::Ptr<JS::Module> module(String const& url) const;
+    void add_module(String const& url, GC::Ref<JS::Module> module) { m_modules.set(url, module); }
+
     // Must be called before an isolated world is dropped, or its wrappers outlive it.
     void detach();
 
@@ -110,6 +115,7 @@ private:
     OwnPtr<JS::ExecutionContext> m_execution_context;
     GC::Ptr<JS::Object> m_receiver;
     Vector<ExtensionScriptFile> m_scripts;
+    HashMap<String, GC::Ref<JS::Module>> m_modules;
 };
 
 // Runs the browser's extensions inside this process: it decides which content scripts a new document gets, gives them
@@ -134,6 +140,7 @@ public:
     virtual void document_will_be_destroyed(Web::DOM::Document&) override;
     virtual bool allows_extension_resource(URL::URL const&, URL::Origin const*) override;
     virtual bool allows_cross_origin_request(URL::Origin const&, URL::URL const&) override;
+    virtual bool load_extension_module(JS::Realm&, Utf16View specifier, GC::Ref<ModuleLoadCompletion>) override;
     virtual void load_extension_resource(URL::URL const&, Web::PageId, Function<void(Optional<ExtensionResource>)>) override;
     virtual bool wants_request_interception() override { return m_intercept_requests; }
     virtual void intercept_request(InterceptedRequest, Function<void(InterceptVerdict)>) override;
