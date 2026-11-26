@@ -559,6 +559,10 @@ void initialize_agent(HTML::AgentType type)
         auto& realm = module_record.realm();
         auto& vm = realm.vm();
 
+        // AD-HOC: A module of an extension's content script world has no HTML script to describe it.
+        if (!module_record.host_defined())
+            return GC::RootHashMap<JS::PropertyKey, JS::Value> {};
+
         // 1. Let moduleScript be moduleRecord.[[HostDefined]].
         auto& module_script = *HTML::script_from_host_defined(module_record.host_defined());
 
