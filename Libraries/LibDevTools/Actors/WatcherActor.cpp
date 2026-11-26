@@ -16,6 +16,7 @@
 #include <LibDevTools/Actors/FrameActor.h>
 #include <LibDevTools/Actors/IndexedDBActor.h>
 #include <LibDevTools/Actors/InspectorActor.h>
+#include <LibDevTools/Actors/NetworkEventActor.h>
 #include <LibDevTools/Actors/NetworkParentActor.h>
 #include <LibDevTools/Actors/StorageActor.h>
 #include <LibDevTools/Actors/StyleSheetsActor.h>
@@ -28,6 +29,9 @@
 #include <LibDevTools/DevToolsServer.h>
 
 namespace DevTools {
+
+// Each network event holds its response body, so only the latest are kept.
+static constexpr auto max_retained_network_events = 500uz;
 
 NonnullRefPtr<WatcherActor> WatcherActor::create(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab)
 {
@@ -225,6 +229,34 @@ void WatcherActor::handle_message(Message const& message)
     }
 
     send_unrecognized_packet_type_error(message);
+}
+
+// A network event outlives the target that saw it: a client asks for the details of a page's requests after the page
+// has loaded, by which time the target has been switched, and a request may finish after the switch too.
+NetworkEventActor& WatcherActor::create_network_event(u64 request_id)
+{
+    auto& actor = devtools().register_actor<NetworkEventActor>(request_id);
+    add_child_actor(actor);
+    m_network_events.set(request_id, actor);
+    m_retained_network_events.append(actor);
+
+    if (m_retained_network_events.size() > max_retained_network_events) {
+        if (auto oldest = m_retained_network_events.take_first().strong_ref()) {
+            // A later request may have been given the same ID.
+            if (network_event(oldest->request_id()) == oldest)
+                m_network_events.remove(oldest->request_id());
+            unregister_child_actor(*oldest);
+        }
+    }
+
+    return actor;
+}
+
+RefPtr<NetworkEventActor> WatcherActor::network_event(u64 request_id) const
+{
+    if (auto it = m_network_events.find(request_id); it != m_network_events.end())
+        return it->value.strong_ref();
+    return {};
 }
 
 BlackboxingActor& WatcherActor::blackboxing_actor()

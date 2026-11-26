@@ -28,11 +28,19 @@ StyleSheetsActor::StyleSheetsActor(DevToolsServer& devtools, String name, WeakPt
             weak_callback(*this, [](auto& self, Web::CSS::StyleSheetIdentifier const& style_sheet, Utf16String source) {
                 self.style_sheet_source_received(style_sheet, move(source));
             }));
+        m_is_listening = true;
     }
 }
 
 StyleSheetsActor::~StyleSheetsActor()
 {
+    stop_listening();
+}
+
+void StyleSheetsActor::stop_listening()
+{
+    if (!exchange(m_is_listening, false))
+        return;
     if (auto tab = m_tab.strong_ref())
         devtools().delegate().stop_listening_for_style_sheet_sources(tab->description());
 }

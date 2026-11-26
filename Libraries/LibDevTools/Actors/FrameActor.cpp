@@ -142,6 +142,11 @@ void FrameActor::stop_listening()
     if (!m_is_listening)
         return;
 
+    // The delegate has one listener for a tab. This one has to be given up now, before the target that replaces this
+    // one listens: the actor itself is destroyed later.
+    if (auto style_sheets = m_style_sheets.strong_ref())
+        style_sheets->stop_listening();
+
     if (auto tab = m_tab.strong_ref()) {
         devtools().delegate().stop_listening_for_console_messages(tab->description());
         devtools().delegate().stop_listening_for_network_events(tab->description());
@@ -592,15 +597,17 @@ void FrameActor::on_console_message(WebView::ConsoleOutput console_output)
 
 void FrameActor::on_network_request_started(DevToolsDelegate::NetworkRequestData data)
 {
-    auto& actor = devtools().register_actor<NetworkEventActor>(data.request_id);
-    add_child_actor(actor);
+    auto watcher = m_watcher.strong_ref();
+    if (!watcher)
+        return;
+
+    auto& actor = watcher->create_network_event(data.request_id);
     actor.set_request_info(move(data.url), move(data.method), data.start_time, move(data.request_headers), move(data.request_body), move(data.initiator_type));
     if (auto tab = m_tab.strong_ref())
         actor.set_browsing_context_ids(tab->description().id, tab->inner_window_id());
     actor.set_referrer_policy(move(data.referrer_policy));
     actor.set_is_navigation_request(data.is_navigation_request);
     actor.set_priority(data.priority);
-    m_network_events.set(data.request_id, actor);
 
     JsonArray events;
     events.must_append(actor.serialize_initial_event());
@@ -620,11 +627,12 @@ void FrameActor::on_network_request_started(DevToolsDelegate::NetworkRequestData
 
 void FrameActor::on_network_response_headers_received(DevToolsDelegate::NetworkResponseData data)
 {
-    auto it = m_network_events.find(data.request_id);
-    if (it == m_network_events.end())
+    auto watcher = m_watcher.strong_ref();
+    auto network_event_actor = watcher ? watcher->network_event(data.request_id) : nullptr;
+    if (!network_event_actor)
         return;
 
-    auto& actor = *it->value;
+    auto& actor = *network_event_actor;
     actor.set_response_start(data.status_code, data.reason_phrase);
     auto loaded_from_cache = data.cache_state != Requests::CacheState::NotCached;
     actor.set_loaded_from_cache(loaded_from_cache);
@@ -682,20 +690,19 @@ void FrameActor::on_network_response_headers_received(DevToolsDelegate::NetworkR
 
 void FrameActor::on_network_response_body_received(u64 request_id, ByteBuffer data)
 {
-    auto it = m_network_events.find(request_id);
-    if (it == m_network_events.end())
-        return;
-
-    it->value->append_response_body(move(data));
+    auto watcher = m_watcher.strong_ref();
+    if (auto actor = watcher ? watcher->network_event(request_id) : nullptr)
+        actor->append_response_body(move(data));
 }
 
 void FrameActor::on_network_request_finished(DevToolsDelegate::NetworkRequestCompleteData data)
 {
-    auto it = m_network_events.find(data.request_id);
-    if (it == m_network_events.end())
+    auto watcher = m_watcher.strong_ref();
+    auto network_event_actor = watcher ? watcher->network_event(data.request_id) : nullptr;
+    if (!network_event_actor)
         return;
 
-    auto& actor = *it->value;
+    auto& actor = *network_event_actor;
     actor.set_request_complete(data.body_size, data.timing_info, data.network_error);
 
     // Calculate total time in milliseconds
@@ -771,9 +778,6 @@ void FrameActor::on_navigation_started(String url)
 
     if (auto inspector = m_inspector.strong_ref())
         inspector->on_navigation_started();
-
-    // Clear our internal tracking of network events
-    m_network_events.clear();
 
     send_document_event("will-navigate"sv, url);
 }

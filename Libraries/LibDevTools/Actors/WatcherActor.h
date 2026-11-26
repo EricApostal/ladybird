@@ -24,6 +24,8 @@ public:
 
     JsonObject serialize_description() const;
     void send_frame_target_available_message();
+    NetworkEventActor& create_network_event(u64 request_id);
+    RefPtr<NetworkEventActor> network_event(u64 request_id) const;
     void switch_frame_target(FrameActor&, String const& url, String const& title);
     void start_watching_thread_state_resources();
     void send_thread_state_available_message(JsonObject);
@@ -69,6 +71,8 @@ private:
     WeakPtr<ThreadConfigurationActor> m_thread_configuration;
     WeakPtr<NetworkParentActor> m_network_parent;
     HashMap<String, WebView::DebuggerBlackboxState> m_blackboxed_sources;
+    HashMap<u64, WeakPtr<NetworkEventActor>> m_network_events;
+    Vector<WeakPtr<NetworkEventActor>> m_retained_network_events;
     bool m_is_watching_frame_targets { false };
     bool m_is_watching_cookie_resources { false };
     bool m_is_watching_indexed_db_resources { false };

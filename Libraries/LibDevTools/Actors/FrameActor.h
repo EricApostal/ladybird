@@ -69,7 +69,6 @@ private:
     WeakPtr<AccessibilityActor> m_accessibility;
 
     Optional<PendingNavigationDocumentEvents> m_pending_navigation_document_events_after_target_switch;
-    HashMap<u64, NonnullRefPtr<NetworkEventActor>> m_network_events;
     bool m_is_listening { false };
 };
 

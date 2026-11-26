@@ -23,6 +23,8 @@ public:
 
     static String resource_id_for_index(StringView actor_name, size_t index);
 
+    void stop_listening();
+
     void set_style_sheets(Vector<Web::CSS::StyleSheetIdentifier>);
     Optional<String> resource_id_for(Web::CSS::StyleSheetIdentifier const&) const;
 
@@ -34,6 +36,7 @@ private:
     void style_sheet_source_received(Web::CSS::StyleSheetIdentifier const&, Utf16String source);
 
     WeakPtr<TabActor> m_tab;
+    bool m_is_listening { false };
 
     Vector<Web::CSS::StyleSheetIdentifier> m_style_sheets;
     HashMap<size_t, Message> m_pending_style_sheet_source_requests;
