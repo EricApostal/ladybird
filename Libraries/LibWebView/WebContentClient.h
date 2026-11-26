@@ -270,6 +270,7 @@ private:
     virtual void gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect) override;
     virtual void gamepad_stop_effects(Web::Gamepad::GamepadHandle handle) override;
     virtual void extension_context_created(Web::PageId page_id, u64 context_id, String extension_uuid, String url, bool is_top_level) override;
+    virtual void did_report_picture_in_picture_availability(Web::PageId page_id, bool available, bool active) override;
     virtual void extension_context_destroyed(Web::PageId page_id, u64 context_id) override;
     virtual void extension_message_from_context(Web::PageId page_id, u64 context_id, String payload) override;
     virtual void request_extension_resource(Web::PageId page_id, u64 request_id, URL::URL url) override;

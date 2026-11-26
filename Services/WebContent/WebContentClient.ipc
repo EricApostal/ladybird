@@ -334,6 +334,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_find_in_page(Web::PageId page_id, size_t current_match_index, Optional<size_t> total_match_count) =|
 
     [NotRouted] extension_context_created(Web::PageId page_id, u64 context_id, String extension_uuid, String url, bool is_top_level) =|
+    [NotRouted] did_report_picture_in_picture_availability(Web::PageId page_id, bool available, bool active) =|
     [NotRouted] extension_context_destroyed(Web::PageId page_id, u64 context_id) =|
     [NotRouted] extension_message_from_context(Web::PageId page_id, u64 context_id, String payload) =|
     [NotRouted] request_extension_resource(Web::PageId page_id, u64 request_id, URL::URL url) =|

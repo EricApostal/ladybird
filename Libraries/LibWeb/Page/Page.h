@@ -489,6 +489,11 @@ public:
     void toggle_media_loop_state();
     void toggle_media_fullscreen_state();
     void toggle_media_picture_in_picture_state();
+    void toggle_picture_in_picture_from_browser();
+
+    // AD-HOC: For the embedder's own Picture-in-Picture button.
+    GC::Ptr<HTML::HTMLVideoElement> video_in_picture_in_picture();
+    GC::Ptr<HTML::HTMLVideoElement> best_video_for_picture_in_picture();
     void toggle_media_controls_state();
     void set_picture_in_picture_window_controls_in_use(bool);
 

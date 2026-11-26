@@ -3945,6 +3945,21 @@ void ConnectionFromClient::toggle_media_picture_in_picture_state(Web::PageId pag
         page->page().toggle_media_picture_in_picture_state();
 }
 
+void ConnectionFromClient::toggle_picture_in_picture_from_browser(Web::PageId page_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().toggle_picture_in_picture_from_browser();
+}
+
+void ConnectionFromClient::request_picture_in_picture_availability(Web::PageId page_id)
+{
+    if (auto page = this->page(page_id); page.has_value()) {
+        auto active = !!page->page().video_in_picture_in_picture();
+        auto available = active || !!page->page().best_video_for_picture_in_picture();
+        async_did_report_picture_in_picture_availability(page_id, available, active);
+    }
+}
+
 void ConnectionFromClient::toggle_media_controls_state(Web::PageId page_id)
 {
     if (auto page = this->page(page_id); page.has_value())

@@ -275,6 +275,14 @@ void WebContentClient::extension_context_created(Web::PageId page_id, u64 contex
     ExtensionBridge::the().context_created(*this, page_id, context_id, move(extension_uuid), move(url), is_top_level);
 }
 
+void WebContentClient::did_report_picture_in_picture_availability(Web::PageId page_id, bool available, bool active)
+{
+    if (!may_act_for_page(page_id))
+        return;
+    if (auto* hosted_page = page(page_id); hosted_page && hosted_page->view().on_picture_in_picture_availability)
+        hosted_page->view().on_picture_in_picture_availability(available, active);
+}
+
 void WebContentClient::extension_context_destroyed(Web::PageId page_id, u64 context_id)
 {
     // NB: A page's documents are destroyed as its tab closes, after the page has gone, so this is not checked against

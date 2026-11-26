@@ -48,6 +48,7 @@
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/TagNames.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
@@ -2134,6 +2135,59 @@ void Page::toggle_media_picture_in_picture_state()
 
     // The request is the page's own, so a page that has changed since the menu opened can still reject it.
     WebIDL::mark_promise_as_handled(video_element->request_picture_in_picture());
+}
+
+GC::Ptr<HTML::HTMLVideoElement> Page::video_in_picture_in_picture()
+{
+    GC::Ptr<HTML::HTMLVideoElement> found;
+    for_each_media_element([&](HTML::HTMLMediaElement& media_element) {
+        if (auto* video = as_if<HTML::HTMLVideoElement>(media_element); video && !found && video->is_picture_in_picture_element())
+            found = *video;
+    });
+    return found;
+}
+
+// AD-HOC: The video the embedder's button floats: one that is playing before one that is not, and then the one with
+//         the most picture.
+GC::Ptr<HTML::HTMLVideoElement> Page::best_video_for_picture_in_picture()
+{
+    GC::Ptr<HTML::HTMLVideoElement> best;
+    bool best_is_playing = false;
+    u64 best_area = 0;
+    for_each_media_element([&](HTML::HTMLMediaElement& media_element) {
+        auto* video = as_if<HTML::HTMLVideoElement>(media_element);
+        if (!video || !video->document().is_fully_active() || !video->can_enter_picture_in_picture())
+            return;
+        auto is_playing = !video->paused();
+        auto area = static_cast<u64>(video->video_width()) * video->video_height();
+        if (best && (best_is_playing > is_playing || (best_is_playing == is_playing && best_area >= area)))
+            return;
+        best = *video;
+        best_is_playing = is_playing;
+        best_area = area;
+    });
+    return best;
+}
+
+void Page::toggle_picture_in_picture_from_browser()
+{
+    if (auto floating = video_in_picture_in_picture()) {
+        picture_in_picture_controller().enqueue_exit(floating->document(), nullptr);
+        return;
+    }
+
+    auto video = best_video_for_picture_in_picture();
+    if (!video)
+        return;
+
+    HTML::TemporaryExecutionContext execution_context { video->document().relevant_settings_object() };
+
+    // The press on the browser's button is the user's gesture, which requestPictureInPicture() asks for. It is given
+    // only once the video is known to be able to float, so that the request uses it up at once and no script of the
+    // page's gets to spend it on anything else.
+    auto& window = HTML::relevant_window(*video);
+    window.set_last_activation_timestamp(HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*video)));
+    WebIDL::mark_promise_as_handled(video->request_picture_in_picture());
 }
 
 void Page::toggle_media_controls_state()

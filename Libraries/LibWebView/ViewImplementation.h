@@ -753,6 +753,8 @@ public:
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
     Function<void(Web::MouseEvent const&, Web::EventResult)> on_finish_handling_mouse_event;
     Function<void(Compositing::PictureInPictureControl)> on_picture_in_picture_control_activated;
+    // Answers request_picture_in_picture_availability(): whether the page has a video that can float, or one floating.
+    Function<void(bool available, bool active)> on_picture_in_picture_availability;
     Function<void(Web::DragEvent const&)> on_finish_handling_drag_event;
     Function<void(String const&)> on_test_finish;
     Function<void(double milliseconds)> on_set_test_timeout;

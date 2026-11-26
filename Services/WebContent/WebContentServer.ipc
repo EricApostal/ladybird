@@ -335,6 +335,8 @@ endpoint WebContentServer routed by Web::PageId page_id
     toggle_media_loop_state(Web::PageId page_id) =|
     toggle_media_fullscreen_state(Web::PageId page_id) =|
     toggle_media_picture_in_picture_state(Web::PageId page_id) =|
+    toggle_picture_in_picture_from_browser(Web::PageId page_id) =|
+    request_picture_in_picture_availability(Web::PageId page_id) =|
     toggle_media_controls_state(Web::PageId page_id) =|
 
     system_time_zone_changed() =|

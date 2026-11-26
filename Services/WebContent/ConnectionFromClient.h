@@ -327,6 +327,8 @@ private:
     virtual void toggle_media_loop_state(Web::PageId page_id) override;
     virtual void toggle_media_fullscreen_state(Web::PageId page_id) override;
     virtual void toggle_media_picture_in_picture_state(Web::PageId page_id) override;
+    virtual void toggle_picture_in_picture_from_browser(Web::PageId page_id) override;
+    virtual void request_picture_in_picture_availability(Web::PageId page_id) override;
     virtual void toggle_media_controls_state(Web::PageId page_id) override;
 
     virtual void take_document_screenshot(Web::PageId page_id) override;
