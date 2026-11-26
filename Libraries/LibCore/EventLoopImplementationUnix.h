@@ -34,6 +34,15 @@ public:
 
     void wait_for_events(EventLoopImplementation::PumpMode);
 
+#ifdef AK_OS_ANDROID
+    // AD-HOC: For a host that runs a loop of its own and pumps this one from it, as FlutterBird does from Android's main
+    //         looper. The descriptor turns readable when something this thread's event loop waits to read arrives,
+    //         which includes a wake from another thread, but not a timer running out. It is edge-triggered: the host
+    //         consumes what it reports before pumping.
+    static int readiness_fd_of_current_thread();
+    static void consume_readiness(int readiness_fd);
+#endif
+
 private:
     void dispatch_signal(int signal_number);
     void dispatch_pending_signals();

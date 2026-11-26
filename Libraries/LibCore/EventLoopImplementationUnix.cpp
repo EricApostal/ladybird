@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/GenericShorthands.h>
 #include <AK/HashMap.h>
 #include <AK/Mutex.h>
@@ -28,6 +29,9 @@
 #include <signal.h>
 #include <sys/select.h>
 #include <unistd.h>
+#ifdef AK_OS_ANDROID
+#    include <sys/epoll.h>
+#endif
 
 namespace Core {
 
@@ -84,6 +88,20 @@ bool has_flag(int value, int flag)
 {
     return (value & flag) == flag;
 }
+
+#ifdef AK_OS_ANDROID
+// Only what is waited on for reading: a descriptor with room to be written to is ready nearly all the time.
+static void watch_for_readiness(int readiness_fd, pollfd const& poll_fd)
+{
+    if (!(poll_fd.events & POLLIN))
+        return;
+    epoll_event event {};
+    event.events = EPOLLIN | EPOLLET;
+    event.data.fd = poll_fd.fd;
+    if (epoll_ctl(readiness_fd, EPOLL_CTL_ADD, poll_fd.fd, &event) < 0 && errno != EEXIST)
+        dbgln("EventLoopImplementationUnix: unable to watch fd {}: errno {}", poll_fd.fd, errno);
+}
+#endif
 
 class EventLoopTimer final : public EventLoopTimeout {
 public:
@@ -180,6 +198,11 @@ struct ThreadData {
             close(wake_pipe_fds[1]);
         }
 
+#ifdef AK_OS_ANDROID
+        if (readiness_fd >= 0)
+            close(readiness_fd);
+#endif
+
         RWLockLocker<RWLock::Mode::Write> locker(thread_data_lock());
         thread_data().remove(thread_id);
     }
@@ -196,6 +219,11 @@ struct ThreadData {
     // The wake pipe is used to notify another event loop that someone has called wake(), or a signal has been received.
     Array<int, 2> wake_pipe_fds { -1, -1 };
     bool wake_pipe_is_signal_target { false };
+
+#ifdef AK_OS_ANDROID
+    // Made when a host first asks for it.
+    int readiness_fd { -1 };
+#endif
 
     AK::ThreadID thread_id;
 };
@@ -622,6 +650,10 @@ void EventLoopManagerUnix::register_notifier(Notifier& notifier)
 
     auto events = notification_type_to_poll_events(notifier.type());
     thread_data.poll_fds.append({ .fd = notifier.fd(), .events = events, .revents = 0 });
+#ifdef AK_OS_ANDROID
+    if (thread_data.readiness_fd >= 0)
+        watch_for_readiness(thread_data.readiness_fd, thread_data.poll_fds.last());
+#endif
 
     notifier.set_owner_thread(thread_data.thread_id);
 }
@@ -635,6 +667,9 @@ void EventLoopManagerUnix::unregister_notifier(Notifier& notifier)
     MutexLocker thread_data_content_locker(thread_data->mutex);
 
     auto notifier_index = thread_data->notifier_to_index.take(&notifier).release_value();
+#ifdef AK_OS_ANDROID
+    auto removed = thread_data->poll_fds[notifier_index];
+#endif
 
     if (notifier_index + 1 < thread_data->poll_fds.size()) {
         swap(thread_data->notifiers[notifier_index], thread_data->notifiers.last());
@@ -646,7 +681,46 @@ void EventLoopManagerUnix::unregister_notifier(Notifier& notifier)
 
     thread_data->notifiers.take_last();
     thread_data->poll_fds.take_last();
+
+#ifdef AK_OS_ANDROID
+    if (thread_data->readiness_fd >= 0 && (removed.events & POLLIN)) {
+        // Another notifier may still be waiting to read from the same descriptor.
+        auto still_read = any_of(thread_data->poll_fds, [&](pollfd const& poll_fd) {
+            return poll_fd.fd == removed.fd && (poll_fd.events & POLLIN);
+        });
+        // NB: This fails for a descriptor that was closed first, which the kernel has already forgotten.
+        if (!still_read)
+            (void)epoll_ctl(thread_data->readiness_fd, EPOLL_CTL_DEL, removed.fd, nullptr);
+    }
+#endif
 }
+
+#ifdef AK_OS_ANDROID
+int EventLoopManagerUnix::readiness_fd_of_current_thread()
+{
+    auto& thread_data = ThreadData::the();
+    MutexLocker locker(thread_data.mutex);
+
+    if (thread_data.readiness_fd < 0) {
+        thread_data.readiness_fd = epoll_create1(EPOLL_CLOEXEC);
+        if (thread_data.readiness_fd < 0) {
+            dbgln("EventLoopImplementationUnix: unable to create an epoll instance: errno {}", errno);
+            return -1;
+        }
+        for (auto const& poll_fd : thread_data.poll_fds)
+            watch_for_readiness(thread_data.readiness_fd, poll_fd);
+    }
+    return thread_data.readiness_fd;
+}
+
+void EventLoopManagerUnix::consume_readiness(int readiness_fd)
+{
+    static constexpr int batch_size = 16;
+    epoll_event events[batch_size];
+    while (epoll_wait(readiness_fd, events, batch_size, 0) == batch_size) {
+    }
+}
+#endif
 
 void EventLoopManagerUnix::did_post_event()
 {
