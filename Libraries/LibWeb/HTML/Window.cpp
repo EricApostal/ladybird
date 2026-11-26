@@ -164,7 +164,21 @@ JS::HostObject& platform_object_for_window(HTML::Window& window)
 JS::HostObject& platform_object_for_window(HTML::Window& window, JS::Realm& realm)
 {
     auto& wrapper_world = Bindings::host_defined_wrapper_world(realm);
-    return *Bindings::wrap(wrapper_world, realm, GC::Ref { window });
+    auto wrapper = Bindings::wrap(wrapper_world, realm, GC::Ref { window });
+
+    // AD-HOC: A Window's members are own properties of its wrapper, which only the wrapper that is a realm's global
+    //         object is given. A browser extension's world also reaches other windows, such as the parent of its frame,
+    //         and scripts there need their members too.
+    if (wrapper_world.type() == Bindings::WrapperWorld::Type::Extension
+        && wrapper.ptr() != &realm.global_object()
+        && !wrapper->storage_has(JS::PropertyKey { "postMessage"_utf16_fly_string })) {
+        auto& other_window_object = *wrapper;
+        WEB_SET_PROTOTYPE_FOR_INTERFACE_ON(other_window_object, Window);
+        Bindings::WindowGlobalMixin window_global_mixin;
+        window_global_mixin.initialize(realm, other_window_object);
+        window_global_mixin.define_unforgeable_attributes(realm, other_window_object);
+    }
+    return *wrapper;
 }
 
 WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window& window)

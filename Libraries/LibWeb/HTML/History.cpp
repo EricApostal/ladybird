@@ -144,7 +144,8 @@ bool can_have_its_url_rewritten(DOM::Document const& document, URL::URL const& t
 
     // 3. If targetURL's scheme is an HTTP(S) scheme, then return true.
     //    (Differences in path, query, and fragment are allowed for http: and https: URLs.)
-    if (target_url.scheme() == "http"sv || target_url.scheme() == "https"sv)
+    // AD-HOC: So are they for the pages of browser extensions, as in Firefox.
+    if (target_url.scheme() == "http"sv || target_url.scheme() == "https"sv || target_url.scheme() == "moz-extension"sv)
         return true;
 
     // 4. If targetURL's scheme is "file", then:

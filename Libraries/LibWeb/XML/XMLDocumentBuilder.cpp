@@ -10,6 +10,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentType.h>
 #include <LibWeb/DOM/ProcessingInstruction.h>
+#include <LibWeb/HTML/ExtensionHooks.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
@@ -152,7 +153,13 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
         // When an XML parser would append a node to a template element, it must instead append it to the template element's template contents (a DocumentFragment node).
         MUST(static_cast<HTML::HTMLTemplateElement&>(*current_node()).content()->append_child(node));
     } else {
-        MUST(current_node()->append_child(node));
+        auto& parent = *current_node();
+        MUST(parent.append_child(node));
+        // AD-HOC: See ladybird_html_parser_append_child(), which does the same for HTML.
+        if (is<DOM::Document>(parent)) {
+            if (auto* hooks = HTML::ExtensionHooks::the())
+                hooks->document_element_inserted(*m_document);
+        }
     }
 
     for (auto const& attribute : attributes) {

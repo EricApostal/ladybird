@@ -43,6 +43,7 @@
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/ExtensionHooks.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
@@ -3069,7 +3070,16 @@ extern "C" size_t ladybird_html_parser_create_element(void* parser, size_t inten
 
 extern "C" void ladybird_html_parser_append_child(size_t parent, size_t child)
 {
-    insert_node_for_parser(node_from_html_parser_ffi(parent), node_from_html_parser_ffi(child), nullptr);
+    auto& parent_node = node_from_html_parser_ffi(parent);
+    auto& child_node = node_from_html_parser_ffi(child);
+    insert_node_for_parser(parent_node, child_node, nullptr);
+
+    // AD-HOC: A browser extension's document_start scripts run once there is a root element. They run script here, as a
+    //         custom element's constructor does while the parser creates it.
+    if (auto* document = as_if<DOM::Document>(parent_node); document && is<DOM::Element>(child_node)) {
+        if (auto* hooks = ExtensionHooks::the())
+            hooks->document_element_inserted(*document);
+    }
 }
 
 extern "C" void ladybird_html_parser_insert_node(size_t parent, size_t offset, size_t child, bool queue_custom_element_reactions)

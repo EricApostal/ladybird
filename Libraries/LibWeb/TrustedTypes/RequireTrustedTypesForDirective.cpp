@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/HTML/ExtensionHooks.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 
 #include <AK/Utf16StringBuilder.h>
@@ -135,6 +136,10 @@ ContentSecurityPolicy::Directives::Directive::Result require_trusted_types_for_p
 // https://w3c.github.io/trusted-types/dist/spec/#does-sink-require-trusted-types
 bool does_sink_require_trusted_types(JS::Object& global, Utf16View sink_group, IncludeReportOnlyPolicies include_report_only_policies)
 {
+    // AD-HOC: A browser extension's content scripts are not held to the page's Trusted Types, as in Firefox.
+    if (HTML::ExtensionHooks::content_script_extension_running().has_value())
+        return false;
+
     // 1. For each policy in global’s CSP list:
     auto const* csp_list = csp_list_of_global(global);
     if (!csp_list)

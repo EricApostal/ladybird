@@ -342,6 +342,12 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
     // 1. Assert: request’s mode is "navigate" or processEarlyHintsResponse is null.
     VERIFY(request.mode() == Infrastructure::Request::Mode::Navigate || !algorithms.process_early_hints_response());
 
+    // AD-HOC: Which code is asking is only known now, while it runs.
+    if (request.current_url().scheme() == "moz-extension"sv) {
+        if (auto extension = HTML::ExtensionHooks::content_script_extension_running(); extension.has_value())
+            request.set_content_script_extension(move(extension));
+    }
+
     // 2. Let taskDestination be null.
     Infrastructure::TaskDestination task_destination;
 
@@ -689,7 +695,10 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
     //    returns blocked, then set response to a network error.
     if (Infrastructure::block_bad_port(request) == Infrastructure::RequestOrResponseBlocking::Blocked
         || MixedContent::should_fetching_request_be_blocked_as_mixed_content(request) == Infrastructure::RequestOrResponseBlocking::Blocked
-        || ContentSecurityPolicy::should_request_be_blocked_by_content_security_policy(request, report_violation) == ContentSecurityPolicy::Directives::Directive::Result::Blocked
+        // AD-HOC: A page's policy does not stand in the way of an extension's files, as in Firefox. What may load them
+        //         is decided by what the extension made web accessible.
+        || (request->current_url().scheme() != "moz-extension"sv
+            && ContentSecurityPolicy::should_request_be_blocked_by_content_security_policy(request, report_violation) == ContentSecurityPolicy::Directives::Directive::Result::Blocked)
         || SRI::should_request_be_blocked_by_integrity_policy(request) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
         response = Infrastructure::Response::network_error("Request was blocked"_string);
     }
@@ -782,6 +791,7 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
         if (
             (origin && request->current_url().origin().is_same_origin(*origin) && request->response_tainting() == Infrastructure::Request::ResponseTainting::Basic)
             || is_permitted_extension_request
+            || HTML::ExtensionHooks::is_content_script_reading_its_own_extension(*request)
             || is_file_to_file_font_load
             || request->current_url().scheme() == "data"sv
             || (request->mode() == Infrastructure::Request::Mode::Navigate || request->mode() == Infrastructure::Request::Mode::WebSocket)) {
@@ -969,7 +979,7 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
                     // - should internalResponse to request be blocked as mixed content
                     MixedContent::should_response_to_request_be_blocked_as_mixed_content(request, internal_response) == Infrastructure::RequestOrResponseBlocking::Blocked
                     // - should internalResponse to request be blocked by Content Security Policy
-                    || ContentSecurityPolicy::should_response_to_request_be_blocked_by_content_security_policy(*internal_response, request, report_violation) == ContentSecurityPolicy::Directives::Directive::Result::Blocked
+                    || (request->current_url().scheme() != "moz-extension"sv && ContentSecurityPolicy::should_response_to_request_be_blocked_by_content_security_policy(*internal_response, request, report_violation) == ContentSecurityPolicy::Directives::Directive::Result::Blocked)
                     // - should internalResponse to request be blocked due to its MIME type
                     || Infrastructure::should_response_to_request_be_blocked_due_to_its_mime_type(internal_response, request) == Infrastructure::RequestOrResponseBlocking::Blocked
                     // - should internalResponse to request be blocked due to nosniff
@@ -1866,7 +1876,8 @@ GC::Ref<PendingResponse> scheme_fetch(JS::Realm& realm, Infrastructure::FetchPar
         if (!browser_initiated_navigation) {
             auto* hooks = HTML::ExtensionHooks::the();
             auto const* origin = request->origin().get_pointer<URL::Origin>();
-            if (!hooks || !hooks->allows_extension_resource(request->current_url(), origin)) {
+            auto is_own_file = HTML::ExtensionHooks::is_content_script_reading_its_own_extension(*request);
+            if (!is_own_file && (!hooks || !hooks->allows_extension_resource(request->current_url(), origin))) {
                 dbgln("Fetch: a request for {} was not allowed (mode {}, origin {})", request->current_url(), to_underlying(request->mode()), origin ? origin->serialize() : "not an origin"_string);
                 return error;
             }
@@ -2454,6 +2465,76 @@ static void process_http_network_or_cache_response(JS::Object& global_object, In
     }));
 }
 
+// AD-HOC: A browser extension sees the headers of a response as they arrive, and can change them, block the response or
+//         send the request elsewhere.
+static GC::Ref<PendingResponse> let_extensions_see_response(JS::Realm& realm, Infrastructure::FetchParams const& fetch_params, NonnullRefPtr<Infrastructure::FetchParams const> http_fetch_params, GC::Ref<PendingResponse> pending_response)
+{
+    auto* hooks = HTML::ExtensionHooks::the();
+    if (!hooks || !hooks->wants_response_interception())
+        return pending_response;
+
+    auto returned_pending_response = PendingResponse::create(fetch_params);
+    pending_response->when_loaded(GC::create_function(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, http_fetch_params, returned_pending_response), [](auto& realm, auto& fetch_params, auto& http_fetch_params, auto& returned_pending_response, NonnullRefPtr<Infrastructure::Response> response) {
+        auto* hooks = HTML::ExtensionHooks::the();
+        auto page = fetch_params->controller()->page();
+        auto http_request = http_fetch_params->request();
+        if (!hooks || response->is_network_error() || !page->has_top_level_traversable()
+            || !http_request->current_url().scheme().is_one_of("http"sv, "https"sv)) {
+            returned_pending_response->resolve(response);
+            return;
+        }
+
+        auto document_url = http_request->current_url();
+        if (auto const& client = http_request->client_snapshot())
+            document_url = client->content_blocker_source_url;
+
+        Vector<HTTP::Header> response_headers;
+        for (auto const& header : *response->header_list())
+            response_headers.append(header);
+
+        HTML::ExtensionHooks::InterceptedRequest intercepted {
+            .page_id = page->client().id(),
+            .request_id = MUST(String::formatted("{}", reinterpret_cast<uintptr_t>(http_request.ptr()))),
+            .url = http_request->current_url(),
+            .method = http_request->method(),
+            .resource_type = HTML::ExtensionHooks::resource_type_for(*http_request),
+            .document_url = move(document_url),
+            .is_top_level = http_request->destination() == Infrastructure::Request::Destination::Document,
+            .status_code = static_cast<u32>(response->status()),
+            .response_headers = move(response_headers),
+        };
+
+        auto continuation = GC::create_function(realm.heap(), GC::captures(NonnullRefPtr { fetch_params }, response, returned_pending_response), [](auto& fetch_params, auto& response, auto& returned_pending_response, HTML::ExtensionHooks::InterceptVerdict verdict) {
+            if (fetch_params->is_canceled()) {
+                returned_pending_response->resolve(Infrastructure::Response::appropriate_network_error(*fetch_params));
+                return;
+            }
+            if (verdict.cancel) {
+                returned_pending_response->resolve(Infrastructure::Response::network_error("The response was blocked by an extension"_string));
+                return;
+            }
+            // NB: The list is replaced rather than changed, as the cache may hold the one the response came with.
+            if (verdict.response_headers.has_value())
+                response->set_header_list(HTTP::HeaderList::create(move(*verdict.response_headers)));
+            if (verdict.redirect_url.has_value()) {
+                auto headers = HTTP::HeaderList::create();
+                for (auto const& header : *response->header_list())
+                    headers->append(header);
+                headers->set({ "Location"sv, verdict.redirect_url->serialize().to_byte_string() });
+                response->set_header_list(move(headers));
+                response->set_status(302);
+            }
+            returned_pending_response->resolve(response);
+        });
+
+        // NB: The extensions answer from another process, so the continuation is held by a root until they do.
+        hooks->intercept_request(move(intercepted), [continuation = GC::make_root(continuation)](HTML::ExtensionHooks::InterceptVerdict verdict) {
+            continuation->function()(move(verdict));
+        });
+    }));
+    return returned_pending_response;
+}
+
 // https://fetch.spec.whatwg.org/#concept-http-network-or-cache-fetch
 static GC::Ref<PendingResponse> continue_http_network_or_cache_fetch(JS::Object& global_object, Infrastructure::FetchParams const& fetch_params, NonnullRefPtr<Infrastructure::FetchParams const> http_fetch_params, RefPtr<Infrastructure::Response> response, RefPtr<Infrastructure::Response> stored_response, RefPtr<HTTP::MemoryCache> http_cache, IsAuthenticationFetch is_authentication_fetch, IsNewConnectionFetch is_new_connection_fetch, HTTP::Cookie::IncludeCredentials include_credentials)
 {
@@ -2897,6 +2978,7 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
                     http_request->header_list()->set(header);
 
                 auto pending_response = continue_http_network_or_cache_fetch(realm.global_object(), *fetch_params, *http_fetch_params, response, stored_response, http_cache, is_authentication_fetch, is_new_connection_fetch, include_credentials);
+                pending_response = let_extensions_see_response(realm, *fetch_params, *http_fetch_params, pending_response);
                 pending_response->when_loaded(GC::create_function(GC::Heap::the(), GC::captures(returned_pending_response), [](GC::Ref<PendingResponse>& returned_pending_response, NonnullRefPtr<Infrastructure::Response> response) { returned_pending_response->resolve(response); }));
             });
 
@@ -2926,7 +3008,10 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
         }
         WebDriver::BiDi::network_before_request_sent(*http_fetch_params);
     }
-    return continue_http_network_or_cache_fetch(realm.global_object(), fetch_params, *http_fetch_params, response, stored_response, http_cache, is_authentication_fetch, is_new_connection_fetch, include_credentials);
+    auto pending_response = continue_http_network_or_cache_fetch(realm.global_object(), fetch_params, *http_fetch_params, response, stored_response, http_cache, is_authentication_fetch, is_new_connection_fetch, include_credentials);
+    if (is_authentication_fetch == IsAuthenticationFetch::No)
+        pending_response = let_extensions_see_response(realm, fetch_params, *http_fetch_params, pending_response);
+    return pending_response;
 }
 
 #if defined(WEB_FETCH_DEBUG)

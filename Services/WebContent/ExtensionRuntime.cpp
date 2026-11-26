@@ -26,6 +26,7 @@
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
@@ -257,6 +258,7 @@ void ExtensionRuntime::set_state(ReadonlyBytes bytes)
                     for (auto const& glob : read_strings(script_object, "excludeGlobs"sv))
                         script.exclude_globs.append(glob.to_byte_string());
                     script.all_frames = script_object.get_bool("allFrames"sv).value_or(false);
+                    script.match_about_blank = script_object.get_bool("matchAboutBlank"sv).value_or(false);
 
                     auto run_at = parse_run_at(script_object.get_string("runAt"sv).value_or("document_idle"_string));
                     auto main_world = script_object.get_string("world"sv).value_or("ISOLATED"_string) == "MAIN"sv;
@@ -292,6 +294,7 @@ void ExtensionRuntime::set_state(ReadonlyBytes bytes)
     m_shim_source = root.get_string("shim"sv).value_or(String {});
     m_extensions = move(extensions);
     m_intercept_requests = root.get_bool("interceptRequests"sv).value_or(false);
+    m_intercept_responses = root.get_bool("interceptResponses"sv).value_or(false);
 }
 
 void ExtensionRuntime::document_did_start(Web::DOM::Document& document)
@@ -322,13 +325,41 @@ void ExtensionRuntime::document_did_start(Web::DOM::Document& document)
         return;
     }
 
-    auto is_top_level = browsing_context->is_top_level();
+    // Content scripts see the document from its root element on, which its parser is yet to create.
+    if (!document.document_element()) {
+        m_documents_awaiting_root.set(&document);
+        return;
+    }
+    run_content_scripts(document);
+}
+
+void ExtensionRuntime::document_element_inserted(Web::DOM::Document& document)
+{
+    if (m_documents_awaiting_root.remove(&document) && document.window() && document.browsing_context())
+        run_content_scripts(document);
+}
+
+void ExtensionRuntime::run_content_scripts(Web::DOM::Document& document)
+{
+    auto is_top_level = document.browsing_context()->is_top_level();
+
+    // A blank frame has no address of its own to match, so it matches by that of the document it is in.
+    Optional<URL::URL> inherited_url;
+    if (document.url().scheme() == "about"sv) {
+        if (auto navigable = document.navigable()) {
+            if (auto container = navigable->container_document())
+                inherited_url = container->url();
+        }
+    }
+
     for (auto const& extension : m_extensions) {
         Vector<ExtensionScriptFile> matched;
         for (auto const& script : extension.content_scripts) {
             if (!is_top_level && !script.all_frames)
                 continue;
-            if (!script.matches_url(url))
+            auto matches = script.matches_url(document.url())
+                || (script.match_about_blank && inherited_url.has_value() && script.matches_url(*inherited_url));
+            if (!matches)
                 continue;
             matched.extend(script.files);
         }
@@ -336,6 +367,15 @@ void ExtensionRuntime::document_did_start(Web::DOM::Document& document)
         if (!matched.is_empty())
             inject_content_scripts(document, extension, move(matched));
     }
+}
+
+Optional<String> ExtensionRuntime::content_script_extension(JS::Realm& realm)
+{
+    for (auto const& entry : m_worlds) {
+        if (entry.value->is_isolated() && &entry.value->realm() == &realm)
+            return entry.value->extension_uuid();
+    }
+    return {};
 }
 
 void ExtensionRuntime::inject_content_scripts(Web::DOM::Document& document, ExtensionEntry const& extension, Vector<ExtensionScriptFile> scripts)
@@ -557,6 +597,7 @@ void ExtensionRuntime::deliver_to_context(u64 context_id, String const& payload)
 void ExtensionRuntime::document_will_be_destroyed(Web::DOM::Document& document)
 {
     m_started_documents.remove(&document);
+    m_documents_awaiting_root.remove(&document);
 
     if (m_worlds.is_empty())
         return;
@@ -785,6 +826,19 @@ void ExtensionRuntime::intercept_request(InterceptedRequest request, Function<vo
     details.set("frameId"sv, request.is_top_level ? 0 : 1);
     details.set("parentFrameId"sv, request.is_top_level ? -1 : 0);
 
+    if (request.status_code.has_value()) {
+        details.set("statusCode"sv, *request.status_code);
+        details.set("statusLine"sv, MUST(String::formatted("HTTP/1.1 {}", *request.status_code)));
+        JsonArray response_headers;
+        for (auto const& header : request.response_headers) {
+            JsonObject entry;
+            entry.set("name"sv, String::from_utf8_with_replacement_character(header.name));
+            entry.set("value"sv, String::from_utf8_with_replacement_character(header.value));
+            MUST(response_headers.append(move(entry)));
+        }
+        details.set("responseHeaders"sv, move(response_headers));
+    }
+
     auto request_id = m_next_intercept_id++;
     m_pending_intercepts.set(request_id, move(callback));
     connection->async_request_extension_intercept(request.page_id, request_id, JsonValue { move(details) }.serialized());
@@ -803,6 +857,19 @@ void ExtensionRuntime::intercept_verdict(u64 request_id, String const& verdict_j
 
         if (auto redirect = object.get_string("redirectUrl"sv); redirect.has_value())
             verdict.redirect_url = URL::Parser::basic_parse(*redirect);
+
+        if (auto headers = object.get_array("responseHeaders"sv); headers.has_value()) {
+            Vector<HTTP::Header> response_headers;
+            headers.value().for_each([&](JsonValue const& value) {
+                if (!value.is_object())
+                    return;
+                auto name = value.as_object().get_string("name"sv);
+                auto header_value = value.as_object().get_string("value"sv);
+                if (name.has_value() && header_value.has_value())
+                    response_headers.append({ name->to_byte_string(), header_value->to_byte_string() });
+            });
+            verdict.response_headers = move(response_headers);
+        }
 
         if (auto headers = object.get_array("requestHeaders"sv); headers.has_value()) {
             headers.value().for_each([&](JsonValue const& value) {

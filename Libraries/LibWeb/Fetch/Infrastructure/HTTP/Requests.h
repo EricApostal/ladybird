@@ -197,6 +197,10 @@ public:
     [[nodiscard]] Optional<ClientType> const& client() const { return m_client; }
     void set_client(Optional<ClientType> client) { m_client = move(client); }
 
+    // AD-HOC: The uuid of the extension whose content script asked for one of the extension's own files.
+    [[nodiscard]] Optional<String> const& content_script_extension() const { return m_content_script_extension; }
+    void set_content_script_extension(Optional<String> extension) { m_content_script_extension = move(extension); }
+
     [[nodiscard]] RefPtr<ClientContextSnapshot const> const& client_snapshot() const { return m_client_snapshot; }
     void set_client_snapshot(RefPtr<ClientContextSnapshot const> client_snapshot) { m_client_snapshot = move(client_snapshot); }
 
@@ -581,6 +585,8 @@ private:
     // https://fetch.spec.whatwg.org/#done-flag
     // A request has an associated done flag. Unless stated otherwise, it is unset.
     bool m_done { false };
+
+    Optional<String> m_content_script_extension;
 
     // Counts this request's body against its client's keepalive quota until its done flag is set, its body is null or
     // it is destroyed.

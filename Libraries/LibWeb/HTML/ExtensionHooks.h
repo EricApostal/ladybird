@@ -43,6 +43,21 @@ public:
         Optional<time_t> modified_time;
     };
 
+    // The document got its root element. This is when a browser extension's document_start scripts run, before the
+    // parser adds anything to it and so before any script of the page's.
+    virtual void document_element_inserted(DOM::Document&) = 0;
+
+    // The uuid of the extension whose content script world `realm` is, if it is one.
+    virtual Optional<String> content_script_extension(JS::Realm& realm) = 0;
+
+    // The same, of the code that is running, if any is. What a page's policies forbid its own scripts, a content script
+    // may do, as in Firefox.
+    static Optional<String> content_script_extension_running();
+
+    // Whether `request` is a content script reading a file of its own extension, which it may whether or not the file
+    // is web accessible.
+    static bool is_content_script_reading_its_own_extension(Fetch::Infrastructure::Request const&);
+
     // Whether a document of `requesting_origin` (null when the request has no origin) may load the extension resource
     // that `url` names. An extension's own pages may; a web page may only reach what the extension made web accessible.
     virtual bool allows_extension_resource(URL::URL const& url, URL::Origin const* requesting_origin) = 0;
@@ -75,6 +90,9 @@ public:
         // The URL of the document that made the request.
         URL::URL document_url;
         bool is_top_level { false };
+        // Set when the response's headers have arrived, which is when extensions see them.
+        Optional<u32> status_code {};
+        Vector<HTTP::Header> response_headers {};
     };
 
     // What the extensions decided. A request is neither cancelled nor redirected unless one of them said so.
@@ -83,10 +101,15 @@ public:
         Optional<URL::URL> redirect_url;
         // Headers to set on the request, replacing any of the same name.
         Vector<HTTP::Header> request_headers;
+        // All the headers the response is to have, in place of those it came with.
+        Optional<Vector<HTTP::Header>> response_headers {};
     };
 
     // Whether any extension wants to see requests, so that the common case costs nothing.
     virtual bool wants_request_interception() = 0;
+
+    // The same for the headers of responses.
+    virtual bool wants_response_interception() = 0;
 
     // Asks the browser what its extensions want done with `request`. The answer arrives later, and the request is
     // held until it does.

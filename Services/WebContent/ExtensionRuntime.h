@@ -49,6 +49,8 @@ struct ExtensionContentScript {
     Vector<ByteString> include_globs;
     Vector<ByteString> exclude_globs;
     bool all_frames { false };
+    // Whether an about:blank or about:srcdoc frame matches when what made it does.
+    bool match_about_blank { false };
     Vector<ExtensionScriptFile> files;
 
     bool matches_url(URL::URL const&) const;
@@ -141,6 +143,9 @@ public:
     virtual bool allows_extension_resource(URL::URL const&, URL::Origin const*) override;
     virtual bool allows_cross_origin_request(URL::Origin const&, URL::URL const&) override;
     virtual bool load_extension_module(JS::Realm&, Utf16View specifier, GC::Ref<ModuleLoadCompletion>) override;
+    virtual void document_element_inserted(Web::DOM::Document&) override;
+    virtual Optional<String> content_script_extension(JS::Realm&) override;
+    virtual bool wants_response_interception() override { return m_intercept_responses; }
     virtual void load_extension_resource(URL::URL const&, Web::PageId, Function<void(Optional<ExtensionResource>)>) override;
     virtual bool wants_request_interception() override { return m_intercept_requests; }
     virtual void intercept_request(InterceptedRequest, Function<void(InterceptVerdict)>) override;
@@ -148,6 +153,8 @@ public:
 private:
     ExtensionRuntime() = default;
 
+    // Runs, in a web page, the content scripts that match it.
+    void run_content_scripts(Web::DOM::Document&);
     // Gives `world` its bridge to the browser and runs the extension's shim in it. Returns after the document_start
     // scripts of the world have run.
     void start_context(Web::DOM::Document&, ExtensionEntry const&, ExtensionWorld&);
@@ -161,6 +168,8 @@ private:
     HashMap<u64, GC::Root<ExtensionWorld>> m_worlds;
     // Documents that have had their scripts decided: a document becomes active again when history returns to it.
     HashTable<Web::DOM::Document*> m_started_documents;
+    // Documents that became active before they had a root element, whose content scripts wait for it.
+    HashTable<Web::DOM::Document*> m_documents_awaiting_root;
     u64 m_next_context_id { 1 };
 
     HashMap<u64, Function<void(Optional<ExtensionResource>)>> m_pending_resources;
@@ -168,6 +177,7 @@ private:
 
     // Whether an extension wants to see requests before they are sent, and those waiting to hear what to do.
     bool m_intercept_requests { false };
+    bool m_intercept_responses { false };
     HashMap<u64, Function<void(InterceptVerdict)>> m_pending_intercepts;
     u64 m_next_intercept_id { 1 };
 };

@@ -294,6 +294,7 @@ NonnullRefPtr<Request> Request::clone() const
     new_request->set_form_submission(m_form_submission);
     new_request->set_render_blocking(m_render_blocking);
     new_request->set_url_list(m_url_list);
+    new_request->set_content_script_extension(m_content_script_extension);
     new_request->set_redirect_count(m_redirect_count);
     new_request->set_response_tainting(m_response_tainting);
     new_request->set_prevent_no_cache_cache_control_header_modification(m_prevent_no_cache_cache_control_header_modification);
