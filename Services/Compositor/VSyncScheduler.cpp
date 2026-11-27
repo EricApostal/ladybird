@@ -26,6 +26,8 @@
 #    include <android/choreographer.h>
 #    include <android/looper.h>
 #    include <pthread.h>
+#    include <stdlib.h>
+#    include <sys/system_properties.h>
 #endif
 
 namespace Compositor {
@@ -430,6 +432,8 @@ private:
             dbgln("VSyncScheduler: this process has no choreographer");
             return;
         }
+        // Its being there says that the screen's refreshes are what pace frames (`ps -T`).
+        pthread_setname_np(pthread_self(), "VSyncChoreo");
         // Never released, so that it can be woken for as long as this object lives.
         ALooper_acquire(looper);
         m_looper.store(looper);
@@ -567,8 +571,18 @@ private:
     OwnPtr<TimerVSyncScheduler> m_fallback;
 };
 
+// For finding out how fast pages can be drawn, whatever the screen shows: with
+// `adb shell setprop debug.ladybird.frame_rate 480`, frames are paced by a timer, at whatever rate they are asked for.
+static bool a_test_frame_rate_is_set()
+{
+    char value[PROP_VALUE_MAX] {};
+    return __system_property_get("debug.ladybird.frame_rate", value) > 0 && atof(value) > 0;
+}
+
 OwnPtr<VSyncScheduler> create_vsync_scheduler(Optional<u64>, Function<void(MonotonicTime)>&& tick_callback)
 {
+    if (a_test_frame_rate_is_set())
+        return make<TimerVSyncScheduler>(move(tick_callback));
     return make<ChoreographerVSyncScheduler>(move(tick_callback));
 }
 
