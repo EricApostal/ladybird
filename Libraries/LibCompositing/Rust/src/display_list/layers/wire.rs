@@ -34,6 +34,9 @@ pub(super) const MAXIMUM_NODE_COUNT_OF_RECEIVED_STACK: usize = 1 << 16;
 pub(super) const MAXIMUM_BAND_COUNT_OF_RECEIVED_STACK: usize = 1 << 16;
 pub(super) const MAXIMUM_CUT_COUNT_OF_RECEIVED_BAND: usize = 256;
 pub(super) const MAXIMUM_SPAN_COUNT_OF_RECEIVED_BAND: usize = 1 << 20;
+/// The most reaches of animated content a plan carries, one per animation and space. A plan carries none past it, and
+/// the compositor then makes a frame for every animation.
+pub(super) const MAXIMUM_ANIMATED_CONTENT_REACH_COUNT_OF_RECEIVED_STACK: usize = 1 << 14;
 /// The most canvases, videos and nested contexts that get layers where giving each one a layer cuts a band more times
 /// than the compositor decodes: the cuts a band leaves after the most carets and scroll bars that get layers.
 pub(super) const CANVAS_VIDEO_AND_NESTED_CONTEXT_LAYERS_A_BAND_LEAVES_CUTS_FOR: usize =
@@ -234,7 +237,12 @@ fn check_rects_and_coordinates(plan: &LayeredPlan) -> Result<(), &'static str> {
         .iter()
         .flatten()
         .all(|swept_reach| within(*swept_reach));
-    if !nodes_are_within || !layers_are_within || !swept_reaches_are_within {
+    let reaches_of_animated_content_are_within = plan
+        .reach_of_animated_content
+        .iter()
+        .flatten()
+        .all(|animated_content| within(animated_content.reach));
+    if !nodes_are_within || !layers_are_within || !swept_reaches_are_within || !reaches_of_animated_content_are_within {
         return Err("a rect or a coordinate of the stack lies past the limit a plan keeps to");
     }
     Ok(())
@@ -255,6 +263,23 @@ fn check_values_per_space(plan: &LayeredPlan, spaces: &[RasterSpace]) -> Result<
             });
     if !only_animated_spaces_are_swept {
         return Err("a space whose anchor the compositor does not animate has a swept reach");
+    }
+    Ok(())
+}
+
+fn check_reach_of_animated_content(
+    plan: &LayeredPlan,
+    spaces: &[RasterSpace],
+    tree: &VisualContextTree,
+) -> Result<(), &'static str> {
+    let animation_count = tree.visual_animations().len();
+    let names_animations_and_spaces_the_stack_holds =
+        plan.reach_of_animated_content.iter().flatten().all(|animated_content| {
+            (animated_content.animation_index as usize) < animation_count
+                && animated_content.raster_space_index.0 < spaces.len()
+        });
+    if !names_animations_and_spaces_the_stack_holds {
+        return Err("animated content is of an animation the tree does not hold or in a space the stack does not hold");
     }
     Ok(())
 }
@@ -511,9 +536,9 @@ fn check_stack_of_plan(stack: &LayerStack) -> Result<(), &'static str> {
 /// compositor animates, and no two layers share an identity.
 ///
 /// The checks leave out what can only make pixels wrong: whether reaches and composite clips hold what the records
-/// draw, which effects must be composited, which layers can hold content, whether every record is in a span, which
-/// spaces hold content that moves within them, and where the window server can show media. The list and the tree pass
-/// their own checks first.
+/// draw, whether animated content shows only where the plan says, which effects must be composited, which layers can
+/// hold content, whether every record is in a span, which spaces hold content that moves within them, and where the
+/// window server can show media. The list and the tree pass their own checks first.
 fn validated_stack(
     stack: StackOnWire,
     list: &DisplayListStorage,
@@ -560,6 +585,7 @@ impl LayerStack {
         check_viewport_rect(viewport_rect)?;
         check_rects_and_coordinates(&plan)?;
         check_values_per_space(&plan, &spaces)?;
+        check_reach_of_animated_content(&plan, &spaces, tree)?;
         check_nodes(&plan.nodes, &spaces, list, tree)?;
         check_nesting_of_composited_effects(&plan.nodes)?;
         check_composited_effects_nest_as_in_tree(&plan.nodes, nesting_of_live_effects)?;
@@ -586,10 +612,11 @@ mod tests {
     };
     use crate::display_list::layers::planning::{LayerStackInputs, PlannedLayers, plan_layer_stack};
     use crate::display_list::layers::{
-        BandIndex, BandOfPlan, CutOfPlan, CutsOfCell, LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS,
-        LayerContent, LayerIdentity, LayerIndex, MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeNamesFromIndices,
-        PlacementNodeBand, PlacementNodeIndex, WhatWindowServerShowsOfFrame, WhyCompositorCannotCompositeEffect,
-        WhyFrameHoldsLayer, WindowServerCompositing, WindowServerPresentationOfMedia,
+        AnimatedContentReach, BandIndex, BandOfPlan, CutOfPlan, CutsOfCell,
+        LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS, LayerContent, LayerIdentity, LayerIndex,
+        MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeNamesFromIndices, PlacementNodeBand, PlacementNodeIndex,
+        WhatWindowServerShowsOfFrame, WhyCompositorCannotCompositeEffect, WindowServerCompositing,
+        WindowServerPresentationOfMedia,
     };
     use crate::display_list::placement::{
         CompositeClip, MAXIMUM_RASTER_SPACE_COUNT, RasterSpace, RasterSpaceGeometry, WhatEverySpaceOfTreeShares,
@@ -1101,10 +1128,16 @@ mod tests {
         );
         let composited = stack_of(page_with_nested_composited_effects());
         assert_eq!(composited.composited_effects.len(), 2);
-        assert_eq!(
-            kinds_of_anchors(&stack_of(page_with_spinner())),
-            ["viewport", "animated"]
-        );
+        let spinner = stack_of(page_with_spinner());
+        assert_eq!(kinds_of_anchors(&spinner), ["viewport", "animated"]);
+        assert!(matches!(
+            spinner.reach_of_animated_content.as_deref(),
+            Some([AnimatedContentReach {
+                animation_index: 0,
+                raster_space_index: RasterSpaceIndex::VIEWPORT,
+                ..
+            }])
+        ));
         let root_page = page_with_spinner_holding_the_root_group();
         let root_effect = root_page.tree.root_isolation_effect;
         let composited_effects_of_root_page: Vec<EffectNodeIndex> = stack_of(root_page)
@@ -1497,6 +1530,25 @@ mod tests {
             Decoder::new(&bytes, []).decode::<StackOnWire>(),
             Err(DecodeError::SizeTooLarge(_))
         ));
+        let too_many_reaches_of_animated_content = MAXIMUM_ANIMATED_CONTENT_REACH_COUNT_OF_RECEIVED_STACK + 1;
+        let mut plan_with_too_many_reaches_of_animated_content = page.planned_plan();
+        plan_with_too_many_reaches_of_animated_content.reach_of_animated_content = Some(vec![
+            AnimatedContentReach {
+                animation_index: 0,
+                raster_space_index: RasterSpaceIndex::VIEWPORT,
+                reach: IntRect::new(0, 0, 1, 1),
+            };
+            too_many_reaches_of_animated_content
+        ]);
+        let mut encoder = Encoder::new();
+        encoder
+            .encode(&StackOnWire::Layered(plan_with_too_many_reaches_of_animated_content))
+            .unwrap();
+        let bytes = encoder.finish().0;
+        assert!(matches!(
+            Decoder::new(&bytes, []).decode::<StackOnWire>(),
+            Err(DecodeError::SizeTooLarge(_))
+        ));
         let plan_with_note_lines = |note_lines: Vec<String>| {
             encoded(&LayerPlan {
                 note_lines,
@@ -1793,6 +1845,33 @@ mod tests {
             ("swept reach past the limit", page_with_spinner, |plan| {
                 plan.swept_reach_in_parent_space_by_space_index[1] = Some(IntRect::new(1 << 30, 0, 1, 1));
             }),
+            ("reach of animated content past the limit", page_with_spinner, |plan| {
+                plan.reach_of_animated_content
+                    .as_mut()
+                    .expect("the spinner's plan tells where it shows")[0]
+                    .reach = IntRect::new(1 << 30, 0, 1, 1);
+            }),
+            (
+                "animated content of an animation the tree does not hold",
+                page_with_spinner,
+                |plan| {
+                    plan.reach_of_animated_content
+                        .as_mut()
+                        .expect("the spinner's plan tells where it shows")[0]
+                        .animation_index = 1;
+                },
+            ),
+            (
+                "animated content in a space the stack does not hold",
+                page_with_spinner,
+                |plan| {
+                    let raster_space_index = RasterSpaceIndex(space_count(plan));
+                    plan.reach_of_animated_content
+                        .as_mut()
+                        .expect("the spinner's plan tells where it shows")[0]
+                        .raster_space_index = raster_space_index;
+                },
+            ),
             ("a value per space missing", page_with_two_canvases, |plan| {
                 plan.tiles_hold_content_moving_within_space_by_space_index.pop();
             }),
@@ -1977,16 +2056,15 @@ mod tests {
     }
 
     // Reads the stack as the compositor reads it for a frame over the whole viewport, and as the dump reads it.
-    // A window server that shows tiles shows a caret from a surface of its own, as it shows a tile, and the base layer
-    // with it. Any other leaves the caret to the frame.
+    // The window server shows a caret from a surface of its own, as it shows a tile, and the base layer with it.
     #[test]
-    fn only_a_window_server_that_shows_tiles_shows_a_caret() {
+    fn a_window_server_shows_carets_and_the_base_layer() {
         let stack = page_with_carets().planned().stack;
         let composite_offsets = stack.composite_offsets(&[FloatPoint::default(); 4]);
-        let window_server = |shows_tiles_of_painted_layers| WhatWindowServerShowsOfFrame {
+        let window_server = WhatWindowServerShowsOfFrame {
             compositing: WindowServerCompositing {
-                shows_tiles_of_painted_layers,
-                filters_what_is_below_layers: shows_tiles_of_painted_layers,
+                shows_tiles_of_painted_layers: true,
+                filters_what_is_below_layers: true,
             },
             can_show_media_of_layer: &|_| true,
             can_composite_effect_of_node: &|_| true,
@@ -1996,20 +2074,9 @@ mod tests {
             .filter(|layer| matches!(stack.layers[layer.0].content, LayerContent::OwnSurface { .. }))
             .collect();
         assert_eq!(caret_layers.len(), 2);
-        let shown_by_window_server_that_shows_tiles =
-            stack.layers_the_window_server_shows(&composite_offsets, &window_server(true));
-        assert!(shown_by_window_server_that_shows_tiles[stack.base_layer.0]);
-        assert!(
-            caret_layers
-                .iter()
-                .all(|layer| shown_by_window_server_that_shows_tiles[layer.0])
-        );
-        for layer in caret_layers {
-            assert_eq!(
-                stack.why_frame_holds_layer(layer, &window_server(false)),
-                WhyFrameHoldsLayer::WindowServerCannotShowItsContent
-            );
-        }
+        let shown_by_window_server = stack.layers_the_window_server_shows(&composite_offsets, &window_server);
+        assert!(shown_by_window_server[stack.base_layer.0]);
+        assert!(caret_layers.iter().all(|layer| shown_by_window_server[layer.0]));
     }
 
     fn read_as_consumers_do(page: &Page, frame_tree: &VisualContextTree, planned: &PlannedLayers, stack: &LayerStack) {
@@ -2026,7 +2093,6 @@ mod tests {
                 stack.layers[layer_index.0].placement_node_index,
                 &composite_offsets,
             );
-            stack.layer_is_in_animated_space(layer_index);
             stack.name_of_layer(layer_index, &NodeNamesFromIndices);
             let space_to_frame = spaces_to_frame[stack.space_of_layer(layer_index).0];
             space_to_frame.rect_in_frame(stack.layers[layer_index.0].reach);
@@ -2035,28 +2101,26 @@ mod tests {
         for band_index in (0..stack.bands.len()).map(BandIndex) {
             stack.band_has_layer_at_or_above_base_layer(band_index);
         }
-        let mut presentation = WindowServerPresentationOfMedia::default();
-        for shows_tiles_of_painted_layers in [false, true] {
-            let window_server_compositing = WindowServerCompositing {
-                shows_tiles_of_painted_layers,
-                filters_what_is_below_layers: shows_tiles_of_painted_layers,
-            };
-            stack.layers_the_window_server_shows(
-                &composite_offsets,
-                &WhatWindowServerShowsOfFrame {
-                    compositing: window_server_compositing,
-                    can_show_media_of_layer: &|_| true,
-                    can_composite_effect_of_node: &|_| true,
-                },
-            );
-            presentation = stack.window_server_presentation_of_media(
-                list,
-                frame_tree,
-                &scroll_offsets,
-                VIEWPORT,
-                window_server_compositing,
-            );
-        }
+        stack.running_animations_can_show_within(|_| true, &composite_offsets, VIEWPORT);
+        let window_server_compositing = WindowServerCompositing {
+            shows_tiles_of_painted_layers: true,
+            filters_what_is_below_layers: true,
+        };
+        stack.layers_the_window_server_shows(
+            &composite_offsets,
+            &WhatWindowServerShowsOfFrame {
+                compositing: window_server_compositing,
+                can_show_media_of_layer: &|_| true,
+                can_composite_effect_of_node: &|_| true,
+            },
+        );
+        let presentation = stack.window_server_presentation_of_media(
+            list,
+            frame_tree,
+            &scroll_offsets,
+            VIEWPORT,
+            window_server_compositing,
+        );
         let planned_with_stack = PlannedLayers {
             stack: stack.clone(),
             stack_on_wire: planned.stack_on_wire.clone(),

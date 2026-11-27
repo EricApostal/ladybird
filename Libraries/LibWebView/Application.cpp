@@ -452,7 +452,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(file_scheme_urls_have_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
-        .help_string = "Wait for a debugger to attach to the given process name (WebContent, RequestServer, etc.)",
+        .help_string = "Wait for a debugger to attach to the given process name (ladybird-render, ladybird-net, etc.)",
         .long_name = "debug-process",
         .value_name = "process-name",
         .accept_value = [&](StringView value) {
@@ -462,7 +462,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
             debug_processes.append(value);
             return true;
         } });
-    args_parser.add_option(profile_process, "Profile the given process name (WebContent, RequestServer, etc.)", "profile-process", 0, "process-name");
+    args_parser.add_option(profile_process, "Profile the given process name (ladybird-render, ladybird-net, etc.)", "profile-process", 0, "process-name");
     args_parser.add_option(profile_tool, "Select the profiler to use: 'callgrind' (default) or 'cpu'", "profile-tool", 0, "tool");
     args_parser.add_option(profile_output, "Write CPU profiler output to the given path", "profile-output", 0, "path");
 #if defined(AK_OS_MACOS)
@@ -552,7 +552,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     create_platform_arguments(args_parser);
     args_parser.parse(m_arguments);
 
-    m_stats_log = TRY(Core::StatsLog::create(stats_log_directory, "Ladybird"sv));
+    m_stats_log = TRY(Core::StatsLog::create(stats_log_directory, "ladybird"sv));
 
     if (!dns_server_port.has_value())
         dns_server_port = use_dns_over_tls ? 853 : 53;
@@ -563,10 +563,19 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     for (auto& process_name : debug_processes) {
         auto type = process_type_from_name(process_name);
-        debug_process_types.append(type);
+        if (!type.has_value()) {
+            warnln("Unknown process name '{}'. Processes are named after their executables, such as ladybird-render.", process_name);
+            return Error::from_string_literal("--debug-process was given an unknown process name");
+        }
+        debug_process_types.append(*type);
     }
-    if (profile_process.has_value())
+    if (profile_process.has_value()) {
         profile_process_type = process_type_from_name(*profile_process);
+        if (!profile_process_type.has_value()) {
+            warnln("Unknown process name '{}'. Processes are named after their executables, such as ladybird-render.", *profile_process);
+            return Error::from_string_literal("--profile-process was given an unknown process name");
+        }
+    }
     if (profile_tool.has_value()) {
         if (*profile_tool == "callgrind"sv)
             selected_profile_tool = ProfileTool::Callgrind;
@@ -1775,7 +1784,8 @@ void Application::launch_spare_web_content_process()
     if (browser_options().webdriver_browser_endpoint.has_value())
         return;
 
-    // Disable spare processes when debugging WebContent. Otherwise, it breaks running `gdb attach -p $(pidof WebContent)`.
+    // Disable spare processes when debugging WebContent. Otherwise, it breaks running
+    // `gdb attach -p $(pidof ladybird-render)`.
     if (browser_options().debug_helper_processes.contains_slow(ProcessType::WebContent))
         return;
     // Disable spare processes when profiling WebContent. This reduces callgrind logging we are not interested in.
@@ -2252,6 +2262,7 @@ ErrorOr<void> Application::launch_compositor_process()
     m_compositor_presentation_client = adopt_ref(*new CompositorPresentationClient(move(transport)));
     m_compositor_presentation_id = presentation.presentation_id();
     m_compositor_presentation_client->async_set_scrollbar_track_press_jumps(platform_scrollbar_track_press_jumps());
+    platform_scrollbar_visibility_changed();
     m_compositor_presentation_client->on_death = [this, presentation_client = m_compositor_presentation_client->make_weak_ptr<CompositorPresentationClient>()] {
         // NB: This runs on a later turn, by which time a new Compositor can have replaced the one this belonged to.
         if (!presentation_client || presentation_client.ptr() != m_compositor_presentation_client.ptr())
@@ -2293,6 +2304,12 @@ void Application::platform_scrollbar_track_press_behavior_changed()
 {
     if (m_compositor_presentation_client)
         m_compositor_presentation_client->async_set_scrollbar_track_press_jumps(platform_scrollbar_track_press_jumps());
+}
+
+void Application::platform_scrollbar_visibility_changed()
+{
+    if (m_compositor_presentation_client)
+        m_compositor_presentation_client->async_set_scrollbars_always_shown(m_settings->appearance().always_show_scrollbars || platform_scrollbars_always_shown());
 }
 
 void Application::notify_compositor_gpu_presentation_unavailable()
@@ -2658,7 +2675,16 @@ Optional<Process&> Application::find_process(pid_t pid)
     return m_process_manager->find_process(pid);
 }
 
-void Application::process_did_exit(Process&& process, Optional<int>)
+static bool exited_on_its_own_without_error(int exit_status)
+{
+#if defined(AK_OS_WINDOWS)
+    return exit_status == 0;
+#else
+    return WIFEXITED(exit_status) && WEXITSTATUS(exit_status) == 0;
+#endif
+}
+
+void Application::process_did_exit(Process&& process, Optional<int> exit_status)
 {
 #if defined(AK_OS_MACOS)
     // A helper that exits before it fetches its transport leaves its ports registered. Holding them would keep the
@@ -2694,6 +2720,7 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         break;
     case ProcessType::VideoDecoderServer:
         // The MediaServer it served asks for a new one once its decoders notice the loss.
+        video_decoder_server_exited(process.child_id(), exit_status.has_value() && !exited_on_its_own_without_error(*exit_status));
         break;
     case ProcessType::WebRTCClient:
         // The WebContent process it served asks for a new one the next time it needs one.
@@ -3229,6 +3256,7 @@ void Application::update_website_color_scheme()
 void Application::appearance_changed(Badge<ApplicationSettingsObserver>)
 {
     update_website_color_scheme();
+    platform_scrollbar_visibility_changed();
 }
 
 void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)

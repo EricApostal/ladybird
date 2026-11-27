@@ -43,6 +43,8 @@ pub enum Timer {
     Context(CompositorContextId, ContextTimer),
     /// Releases what the window servers hold off screen for a window resize that its presentation never commits.
     SynchronizedResizeHold,
+    /// Lets go of what remote layers stopped showing once the window server can no longer be reading it.
+    ReleaseContentWindowServerLetGoOf,
 }
 
 // The host knows a timer by a number of its own, which stays the same for as long as the timer exists.
@@ -56,22 +58,11 @@ struct TimerNumbers {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PendingFrame {
     pub viewport_rect: IntRect,
-    pub forced_damage_rect: IntRect,
 }
 
 impl PendingFrame {
-    pub fn repainting_everything(viewport_rect: IntRect) -> Self {
-        Self {
-            viewport_rect,
-            forced_damage_rect: IntRect::new(0, 0, viewport_rect.width, viewport_rect.height),
-        }
-    }
-
-    pub fn repainting_changes(viewport_rect: IntRect) -> Self {
-        Self {
-            viewport_rect,
-            forced_damage_rect: IntRect::default(),
-        }
+    pub fn within(viewport_rect: IntRect) -> Self {
+        Self { viewport_rect }
     }
 }
 
@@ -91,7 +82,6 @@ pub struct PresentRequest {
     pub context_id: CompositorContextId,
     /// Empty for a frame at the viewport rect the context is presented at.
     pub viewport_rect: Option<IntRect>,
-    pub forced_damage_rect: IntRect,
     pub scheduling: PresentScheduling,
 }
 

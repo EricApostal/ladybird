@@ -11,9 +11,10 @@ use crate::backing_stores::{StorePublication, StoreResizeOutcome};
 use crate::context_state::ContextState;
 use crate::host::{PendingFrame, PresentScheduling};
 use crate::presenting::{ContextPresenting, NestedContexts, PresentingEnvironment};
-use crate::raster_host::{FfiRemoteLayerFrame, FrameHandOff, RasterHost, SublayersHandle};
-use crate::remote_layers::{RemoteLayer, ResizeNotice, WindowServerObject};
+use crate::raster_host::{FrameHandOff, RasterHost};
+use crate::remote_layers::{RemoteLayer, ResizeNotice};
 use crate::surfaces::painting_surface::PaintingSurface;
+use crate::window_server::{Frame, FrameSublayer};
 use libcompositing_rust::display_list::commands::CompositorContextId;
 use libcompositing_rust::display_list::replay::{CompositedContexts, NoCompositedContexts, ResolvedCompositedContext};
 use libcompositing_rust::ipc_types::{
@@ -46,7 +47,8 @@ pub(crate) struct PendingAsyncPresent {
     keeps_shown_store: bool,
     // A frame the window server shows every layer of by itself, with no store below them.
     shows_no_store: bool,
-    sublayers: Option<SublayersHandle>,
+    // What the window server shows of the frame by itself, which holds its content as it is until it is shown.
+    sublayers: Vec<FrameSublayer>,
 }
 
 // What delivering a frame needs of its pending present.
@@ -60,7 +62,7 @@ struct Delivery {
     shows_in_remote_layer: bool,
     keeps_shown_store: bool,
     shows_no_store: bool,
-    sublayers: Option<SublayersHandle>,
+    sublayers: Vec<FrameSublayer>,
 }
 
 /// What a presentation makes of the frames and the scrolling of the contexts it shows.
@@ -70,6 +72,7 @@ pub struct PresentationCapabilities {
     pub scrolls_elastically: bool,
     // Whether a press on a scrollbar track beside the thumb jumps there rather than paging toward it.
     pub scrollbar_track_press_jumps: bool,
+    pub scrollbars_always_shown: bool,
     // LUID of the GPU adapter the presentation can present shared GPU textures on, if any.
     pub gpu_presentation_adapter_luid: Option<u64>,
     // Whether the presentation found it cannot present the shared GPU images it was given.
@@ -245,10 +248,7 @@ impl CompositorCore {
                 let Some(viewport_rect) = viewport_rect else {
                     continue;
                 };
-                let frame = PendingFrame {
-                    viewport_rect,
-                    forced_damage_rect: request.forced_damage_rect,
-                };
+                let frame = PendingFrame::within(viewport_rect);
                 match request.scheduling {
                     PresentScheduling::OnNextDisplayTick => self.schedule_present_frame(request.context_id, frame, now),
                     PresentScheduling::WithDisplayTickInProgress => presenting.borrow_mut().queue_present_frame(frame),
@@ -270,13 +270,18 @@ impl CompositorCore {
         self.schedule_pending_present_frame(context_id, now);
     }
 
-    fn schedule_present_frame_repainting_everything(
+    /// Schedules a frame that repaints its store in full, and that is presented even where it shows nothing new.
+    fn schedule_present_frame_in_full(
         &self,
         context_id: CompositorContextId,
         viewport_rect: IntRect,
         now: MonotonicTime,
     ) {
-        self.schedule_present_frame(context_id, PendingFrame::repainting_everything(viewport_rect), now);
+        let Some(presenting) = self.presenting_of(context_id) else {
+            return;
+        };
+        presenting.borrow_mut().present_next_frame_in_full();
+        self.schedule_present_frame(context_id, PendingFrame::within(viewport_rect), now);
     }
 
     pub(super) fn present_current_frame(&self, context_id: CompositorContextId, now: MonotonicTime) {
@@ -285,7 +290,7 @@ impl CompositorCore {
         };
         let frame_rect = presenting.borrow().frame_rect_to_repaint();
         if let Some(frame_rect) = frame_rect {
-            self.schedule_present_frame_repainting_everything(context_id, frame_rect, now);
+            self.schedule_present_frame_in_full(context_id, frame_rect, now);
         }
     }
 
@@ -295,7 +300,7 @@ impl CompositorCore {
         };
         let frame_rect = presenting.borrow().frame_rect_to_repaint();
         if let Some(frame_rect) = frame_rect {
-            self.schedule_present_frame(context_id, PendingFrame::repainting_changes(frame_rect), now);
+            self.schedule_present_frame(context_id, PendingFrame::within(frame_rect), now);
         }
     }
 
@@ -467,10 +472,6 @@ impl CompositorCore {
             .raster
             .submit_frame(context_id, prepared_frame.rendered_surface.as_ref());
         let shows_in_remote_layer = presenting.store_publication() == StorePublication::ShownInRemoteLayer;
-        // A frame that the window server shows nothing above needs no list, which a remote layer makes when it shows
-        // the frame.
-        let sublayers = (!prepared_frame.sublayers.is_empty())
-            .then(|| self.raster.build_sublayers(context_id, &prepared_frame.sublayers));
         self.async_presents.borrow_mut().push(PendingAsyncPresent {
             token,
             context_id,
@@ -484,7 +485,7 @@ impl CompositorCore {
             shows_in_remote_layer,
             keeps_shown_store: prepared_frame.rendered_surface.is_none(),
             shows_no_store: prepared_frame.window_server_shows_every_layer,
-            sublayers,
+            sublayers: prepared_frame.sublayers,
         });
         presenting.did_submit_prepared_frame(pending_frame.viewport_rect);
         // Handing the frame to the client before its GPU work finishes keeps it ahead of the window server's deadline for
@@ -521,7 +522,7 @@ impl CompositorCore {
             shows_in_remote_layer: present.shows_in_remote_layer,
             keeps_shown_store: present.keeps_shown_store,
             shows_no_store: present.shows_no_store,
-            sublayers: present.sublayers.take(),
+            sublayers: std::mem::take(&mut present.sublayers),
         })
     }
 
@@ -641,23 +642,19 @@ impl CompositorCore {
             });
             Some(store.expect("a frame shown in a remote layer was rendered into a store the window server shows"))
         };
-        // The sublayers go with the frame, which keeps them.
-        let sublayers = delivery
-            .sublayers
-            .take()
-            .unwrap_or_else(|| self.raster.build_sublayers(context_id, &[]));
-        let frame = FfiRemoteLayerFrame {
-            store: store.as_ref().map_or(std::ptr::null(), |store| store.as_ffi()),
+        let frame = Frame {
+            store: store.map(|store| store.lease()),
             shows_no_store: delivery.shows_no_store,
             painted_size: viewport_size,
             device_pixel_ratio: delivery.device_pixel_ratio,
-            has_fit_within: fit_within.is_some(),
-            fit_within: fit_within.unwrap_or_default(),
+            fit_within,
+            sublayers: std::mem::take(&mut delivery.sublayers),
         };
-        if !self
-            .raster
-            .remote_layer_show_frame(&remote_layer.layer, &frame, sublayers)
-        {
+        if !remote_layer.layer.show_frame(frame) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: A remote layer failed to show a frame, which its presentation shows again"
+            );
             self.remote_layers.borrow_mut().stop_showing_context(context_id);
             self.stop_showing_context_in_remote_layer(context_id, now);
             return;
@@ -667,6 +664,7 @@ impl CompositorCore {
             .borrow_mut()
             .did_show_frame(context_id, viewport_size, laid_out_by_page);
         self.tell_of_held_synchronized_resize_frames(held);
+        self.release_content_window_server_let_go_of();
         self.host.post_to_presentation(
             presentation,
             compositor_presentation_client::messages::DidPresentFrameInRemoteLayer {
@@ -690,18 +688,9 @@ impl CompositorCore {
         }
     }
 
-    fn window_server_showing(&self, context_id: CompositorContextId) -> Option<Rc<WindowServerObject>> {
-        self.remote_layers
-            .borrow()
-            .layer_showing(context_id)
-            .map(|remote_layer| remote_layer.showing_layer().window_server)
-    }
-
     pub(super) fn frame_hand_off(&self, context_id: CompositorContextId) -> FrameHandOff {
         match self.remote_layers.borrow().layer_showing(context_id) {
-            Some(remote_layer) => self
-                .raster
-                .window_server_frame_hand_off(&remote_layer.showing_layer().window_server),
+            Some(remote_layer) => remote_layer.showing_layer().window_server.frame_hand_off(),
             None => RasterHost::frame_hand_off_through_presentation(),
         }
     }
@@ -830,12 +819,10 @@ impl CompositorCore {
         let publishing_presentation = bound_presentation
             .filter(|_| presenting.store_publication() == StorePublication::Published)
             .map(|presentation| presentation.0);
-        let window_server = self.window_server_showing(context_id);
         if presenting.add_store_if_window_server_still_reads_every_released_store(
             &self.raster,
             context_id,
             publishing_presentation,
-            window_server.as_deref(),
         ) {
             presenting.schedule_surplus_store_retirement(context_id, &self.host);
         }
@@ -901,12 +888,10 @@ impl CompositorCore {
         let publishing_presentation = bound_presentation
             .filter(|_| presenting.borrow().store_publication() == StorePublication::Published)
             .map(|presentation| presentation.0);
-        let window_server = self.window_server_showing(context_id);
         if presenting.borrow_mut().restore_stores_retired_while_hidden(
             &self.raster,
             context_id,
             publishing_presentation,
-            window_server.as_deref(),
         ) {
             return;
         }
@@ -916,25 +901,32 @@ impl CompositorCore {
 
     // A context scrolls elastically, takes presses on scrollbar tracks, and ends touchpad gestures as the presentation of
     // its root context does. A platform that reports the momentum of a flick reports when the fingers lift for it.
-    pub(super) fn update_scroll_capabilities(&self) {
+    pub(super) fn update_scroll_capabilities(&self, now: MonotonicTime) {
         for (&context_id, context) in &self.contexts {
             let root = self.root_context_id_of(context_id);
             let capabilities = self
                 .context_if_present(root)
                 .and_then(|root| root.borrow().bound_presentation())
                 .and_then(|presentation| self.presentations.borrow().get(&presentation).copied());
-            let mut scroll_capabilities = crate::context_state::ScrollCapabilities::default();
+            let mut scroll_capabilities = crate::context_state::ScrollCapabilities {
+                scrollbars_always_shown: self.scrollbars_always_shown,
+                ..Default::default()
+            };
             if let Some(capabilities) = capabilities {
                 scroll_capabilities.synthesizes_scroll_momentum = capabilities.synthesizes_scroll_momentum;
                 scroll_capabilities.scrolls_elastically = capabilities.scrolls_elastically;
                 scroll_capabilities.scrollbar_track_press_jumps = capabilities.scrollbar_track_press_jumps;
+                scroll_capabilities.scrollbars_always_shown |= capabilities.scrollbars_always_shown;
                 scroll_capabilities.touchpad_gesture_end = if capabilities.synthesizes_scroll_momentum {
                     TouchpadGestureEnd::AfterIdleDelay
                 } else {
                     TouchpadGestureEnd::WhenFingersLift
                 };
             }
-            context.borrow_mut().set_scroll_capabilities(&scroll_capabilities);
+            let visibility_changed = context.borrow_mut().set_scroll_capabilities(&scroll_capabilities, now);
+            if visibility_changed {
+                self.request_present_at_presented_viewport_rect(context_id);
+            }
         }
     }
 
@@ -955,7 +947,7 @@ impl CompositorCore {
         if let Some(presenting) = self.presenting_of(context_id) {
             presenting.borrow_mut().release_all_presented_stores();
         }
-        self.update_scroll_capabilities();
+        self.update_scroll_capabilities(now);
         if let Some(presenting) = self.presenting_of(context_id) {
             presenting.borrow_mut().invalidate_backing_stores();
         }
@@ -999,7 +991,7 @@ impl CompositorCore {
             .presenting_of(root_context_id)
             .and_then(|presenting| presenting.borrow().frame_rect_to_repaint());
         if let Some(frame_rect) = frame_rect {
-            self.schedule_present_frame_repainting_everything(root_context_id, frame_rect, now);
+            self.schedule_present_frame_in_full(root_context_id, frame_rect, now);
         }
     }
 
@@ -1040,7 +1032,7 @@ impl CompositorCore {
         }
         self.clear_parent_context(context_id, now);
         context.borrow_mut().set_parent_context(parent_context_id);
-        self.update_scroll_capabilities();
+        self.update_scroll_capabilities(now);
         // The context can be shown now, or on another display.
         self.resume_display_ticks_of_contexts_nested_in(context_id, now);
         let Some(parent_context_id) = parent_context_id else {
@@ -1264,7 +1256,7 @@ impl CompositorCore {
                 {
                     presenting
                         .borrow_mut()
-                        .queue_present_frame(PendingFrame::repainting_changes(viewport_rect));
+                        .queue_present_frame(PendingFrame::within(viewport_rect));
                 }
                 let has_pending_present_frame = presenting.borrow().has_pending_present_frame();
                 if has_pending_present_frame {
@@ -1288,11 +1280,7 @@ impl CompositorCore {
                 continue;
             };
             if tick.needs_animation_frames {
-                self.schedule_present_frame(
-                    context_id,
-                    PendingFrame::repainting_changes(pending_frame.viewport_rect),
-                    now,
-                );
+                self.schedule_present_frame(context_id, PendingFrame::within(pending_frame.viewport_rect), now);
             }
             self.present_frame(context_id, pending_frame, now);
         }
@@ -1324,14 +1312,7 @@ impl CompositorCore {
         if screenshot_inputs.scrollbar_fades_changed {
             let viewport_rect = presenting.borrow().viewport_rect_of_current_frame();
             if let Some(viewport_rect) = viewport_rect {
-                self.schedule_present_frame(
-                    context_id,
-                    PendingFrame {
-                        viewport_rect,
-                        forced_damage_rect: Default::default(),
-                    },
-                    now,
-                );
+                self.schedule_present_frame(context_id, PendingFrame::within(viewport_rect), now);
             }
         }
         true
@@ -1359,7 +1340,7 @@ impl CompositorCore {
             .presenting_of(context_id)
             .and_then(|presenting| presenting.borrow().self_present_rect());
         if let Some(rect) = rect {
-            self.schedule_present_frame(context_id, PendingFrame::repainting_changes(rect), now);
+            self.schedule_present_frame(context_id, PendingFrame::within(rect), now);
         }
     }
 

@@ -17,10 +17,8 @@
 #include <Compositor/CompositorCore.h>
 #include <Compositor/ContextRasterTargets.h>
 #include <Compositor/DisplayListPlayerSkia.h>
-#include <Compositor/RemoteLayer.h>
 #include <Compositor/SkiaBackendContext.h>
 #include <Compositor/VSyncScheduler.h>
-#include <Compositor/WindowServer.h>
 #include <LibCompositing/DisplayList/DisplayListResources.h>
 #include <LibCompositing/Forward.h>
 #include <LibCompositing/Types.h>
@@ -199,7 +197,7 @@ private:
     static RustFFI::GpuBackend gpu_backend(RefPtr<Gfx::SkiaBackendContext> const&);
     Compositing::RustFFI::FfiRasterPainter begin_painting(Web::CompositorContextId, Gfx::PaintingSurface&, RustFFI::PaintingResources, bool allows_lcd_text);
     void end_painting();
-    bool create_store(Web::CompositorContextId, RustFFI::StoreKind, Gfx::IntSize, WindowServer* window_server_showing_stores, RustFFI::FfiNewStore&);
+    bool create_store(Web::CompositorContextId, RustFFI::StoreKind, Gfx::IntSize, RustFFI::FfiNewStore&);
     void publish_stores(PresentationId, Web::CompositorContextId, bool added, ReadonlySpan<i32> bitmap_ids, ReadonlySpan<void*> images);
     void retire_published_stores(PresentationId, Web::CompositorContextId, ReadonlySpan<i32> bitmap_ids);
     bool take_registered_image_frames(Web::CompositorContextId, ReadonlySpan<u64> image_frame_ids);
@@ -207,6 +205,8 @@ private:
     void set_drawn_video_sinks(Web::CompositorContextId, ReadonlySpan<u64> handles);
     void set_drawn_vector_images(Web::CompositorContextId, ReadonlySpan<u64> vector_image_ids);
     void set_drawn_fonts(Web::CompositorContextId, ReadonlySpan<u64> font_ids);
+    void set_drawn_clip_paths(Web::CompositorContextId, ReadonlySpan<u64> path_identities);
+    void set_drawn_layer_filters(Web::CompositorContextId, ReadonlySpan<u64> layer_filter_cache_keys);
     bool context_holds_fonts(Web::CompositorContextId, ReadonlySpan<u64> font_ids);
     struct StagedRasterization;
     StagedRasterization* staged_rasterization(WebContentClientId, u64 token);
@@ -217,9 +217,9 @@ private:
     void begin_canvas_2d_painting(WebContentClientId, Compositing::CanvasId, RustFFI::FfiCanvas2DPainter&);
     bool end_canvas_2d_painting_reporting_whether_video_frames_were_sampled_on_gpu();
     void report_live_content(Web::CompositorContextId, ReadonlySpan<u64> canvas_ids, void* receiver, void (*receive)(void*, RustFFI::FfiLiveContent const*));
-    Optional<RemoteLayer::Content> remote_layer_content(PresentedContext&, RustFFI::MediaKind, u64 media_id);
-    bool remote_layer_can_show(RemoteLayer&, Web::CompositorContextId, RustFFI::MediaKind, u64 media_id, RustFFI::FfiSublayerPlacement const&, double device_pixel_ratio);
-    Vector<RemoteSublayer>* build_sublayers(Web::CompositorContextId, ReadonlySpan<RustFFI::FfiSublayer>);
+    bool window_server_gpu_device(RustFFI::FfiWindowServerGpuDevice&);
+    Gfx::PaintingSurface const* wrap_d3d12_resource_as_surface(void* resource, Gfx::IntSize);
+    void finish_gpu_work();
     u64 submit_frame(Gfx::PaintingSurface*);
     void hand_off_once_gpu_work_is_scheduled(u64 token);
     void release_store_later(Web::CompositorContextId, i32 bitmap_id);

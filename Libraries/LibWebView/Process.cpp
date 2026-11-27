@@ -185,7 +185,7 @@ static void watch_with_process_reaper(pid_t pid)
 
     if (!s_tried_to_start_process_reaper) {
         s_tried_to_start_process_reaper = true;
-        auto candidate_paths = get_paths_for_helper_process("ProcessReaper"sv);
+        auto candidate_paths = get_paths_for_helper_process("ladybird-reaper"sv);
         if (!candidate_paths.is_error()) {
             for (auto const& path : candidate_paths.value()) {
                 if (!FileSystem::exists(path))
@@ -288,7 +288,7 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(P
     auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
 
     // The child may receive startup messages before it has constructed its transport.
-    IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
+    IPC::Transport::raise_receive_queue_limit(port_b_recv);
 
     MutexLocker child_registration_locker(Application::transport_bootstrap_server().child_registration_lock());
     process = TRY(Core::Process::spawn(spawn_options));
@@ -337,11 +337,8 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process(P
 
     process = TRY(Core::Process::spawn(spawn_options));
 
-    auto ipc_socket = TRY(Core::LocalSocket::adopt_fd(socket_fds[0]));
     guard_fd_0.disarm();
-    TRY(ipc_socket->set_blocking(true));
-
-    auto transport = make<IPC::Transport>(move(ipc_socket));
+    auto transport = TRY(IPC::Transport::adopt_fd(socket_fds[0]));
 #endif
 
     if (capture_output) {

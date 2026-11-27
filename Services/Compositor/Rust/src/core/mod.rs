@@ -18,7 +18,7 @@ use crate::host::{
     ContextTimer, DisplayTickInputs, DisplayTickResult, Host, PendingFrame, PresentRequest, PresentScheduling,
     PresentationId, Timer, WebContentClientId,
 };
-use crate::overlays::{UIOverlays, UIOverlaysChange};
+use crate::overlays::UIOverlays;
 use crate::presenting::ContextPresenting;
 use crate::raster_host::RasterHost;
 use crate::remote_layers::RemoteLayers;
@@ -218,7 +218,7 @@ impl CompositorCore {
         self.host
             .destroy_timers(|timer| matches!(timer, Timer::Context(id, _) if *id == context_id));
         self.display_list_chunk_stores.borrow_mut().forget_context(context_id);
-        self.update_scroll_capabilities();
+        self.update_scroll_capabilities(now);
         self.raster
             .set_maximum_display_refresh_rate(self.maximum_display_refresh_rate());
         self.finish_entry(now);
@@ -311,7 +311,7 @@ impl CompositorCore {
         else {
             return;
         };
-        let overlays_repaint_everything = context
+        let overlays_need_frame = context
             .borrow_mut()
             .viewport_size_updated(viewport_size, device_pixel_ratio);
         let is_page_presentation_context = {
@@ -324,8 +324,8 @@ impl CompositorCore {
             is_page_presentation_context && window_resize_in_progress,
         );
         self.resize_backing_stores_if_needed(context_id, now);
-        if overlays_repaint_everything {
-            self.request_present_repainting_everything(context_id, context);
+        if overlays_need_frame {
+            self.request_present_at_presented_viewport_rect(context_id);
         }
         if presenting.borrow().window_resize_in_progress() {
             presenting
@@ -341,30 +341,16 @@ impl CompositorCore {
         let Some(context) = self.context_if_present(context_id) else {
             return;
         };
-        let change = context.borrow_mut().set_ui_overlays(ui_overlays, now);
-        match change {
-            UIOverlaysChange::Nothing => {}
-            UIOverlaysChange::OnlyCompositorLayers => self.request_present_keeping_tiles(context_id),
-            UIOverlaysChange::RepaintsEverything => self.request_present_repainting_everything(context_id, context),
+        if context.borrow_mut().set_ui_overlays(ui_overlays, now) {
+            self.request_present_at_presented_viewport_rect(context_id);
         }
         self.finish_entry(now);
     }
 
-    fn request_present_keeping_tiles(&self, context_id: CompositorContextId) {
+    fn request_present_at_presented_viewport_rect(&self, context_id: CompositorContextId) {
         self.present_requests.borrow_mut().push(PresentRequest {
             context_id,
             viewport_rect: None,
-            forced_damage_rect: Default::default(),
-            scheduling: PresentScheduling::OnNextDisplayTick,
-        });
-    }
-
-    // A frame at the viewport rect the context is presented at, which repaints all of it.
-    fn request_present_repainting_everything(&self, context_id: CompositorContextId, context: &RefCell<ContextState>) {
-        self.present_requests.borrow_mut().push(PresentRequest {
-            context_id,
-            viewport_rect: None,
-            forced_damage_rect: context.borrow().viewport_rect(),
             scheduling: PresentScheduling::OnNextDisplayTick,
         });
     }
@@ -373,9 +359,10 @@ impl CompositorCore {
         let _entered = self.enter();
 
         self.presentations.borrow_mut().insert(presentation_id, capabilities);
+        let window_server = crate::window_server::create_for_presentation(&self.raster);
         self.remote_layers
             .borrow_mut()
-            .register_presentation(presentation_id, &self.raster);
+            .register_presentation(presentation_id, window_server);
     }
 
     // Leaves every context bound to the presentation unbound.
@@ -383,10 +370,7 @@ impl CompositorCore {
         let _entered = self.enter();
 
         let was_holding_changes = self.remote_layers.borrow().is_holding_changes();
-        let stopped = self
-            .remote_layers
-            .borrow_mut()
-            .unregister_presentation(presentation_id, &self.raster);
+        let stopped = self.remote_layers.borrow_mut().unregister_presentation(presentation_id);
         self.update_synchronized_resize_hold_timer(was_holding_changes);
         for context_id in stopped {
             self.stop_showing_context_in_remote_layer(context_id, now);
@@ -441,13 +425,24 @@ impl CompositorCore {
         self.finish_entry(now);
     }
 
-    pub fn set_scrollbar_track_press_jumps(&self, presentation_id: PresentationId, jumps: bool) {
+    pub fn set_scrollbar_track_press_jumps(&self, presentation_id: PresentationId, jumps: bool, now: MonotonicTime) {
         let _entered = self.enter();
 
         if let Some(capabilities) = self.presentations.borrow_mut().get_mut(&presentation_id) {
             capabilities.scrollbar_track_press_jumps = jumps;
         }
-        self.update_scroll_capabilities();
+        self.update_scroll_capabilities(now);
+        self.finish_entry(now);
+    }
+
+    pub fn set_scrollbars_always_shown(&self, presentation_id: PresentationId, always_shown: bool, now: MonotonicTime) {
+        let _entered = self.enter();
+
+        if let Some(capabilities) = self.presentations.borrow_mut().get_mut(&presentation_id) {
+            capabilities.scrollbars_always_shown = always_shown;
+        }
+        self.update_scroll_capabilities(now);
+        self.finish_entry(now);
     }
 
     fn invalidate_and_resize_backing_stores(&self, context_id: CompositorContextId, now: MonotonicTime) {
@@ -494,7 +489,7 @@ impl CompositorCore {
         }
         self.unbind_presentation_inner(context_id, now);
         context.borrow_mut().set_bound_presentation(Some(presentation_id));
-        self.update_scroll_capabilities();
+        self.update_scroll_capabilities(now);
         // The new presentation has seen none of the context's buffers, so it gets buffers of its own.
         self.invalidate_and_resize_backing_stores(context_id, now);
         self.finish_entry(now);
@@ -642,7 +637,7 @@ impl CompositorCore {
                 height: viewport_rect.height,
             };
             // The frame joins whatever is queued, so a frame queued earlier cannot be presented after it.
-            presenting.queue_present_frame(PendingFrame::repainting_changes(viewport_rect));
+            presenting.queue_present_frame(PendingFrame::within(viewport_rect));
         }
         if !self.try_present_frame_during_resize(context_id, now) {
             self.schedule_pending_present_frame(context_id, now);
@@ -795,8 +790,9 @@ impl CompositorCore {
         context.borrow_mut().take_layer_plan_of_scroll_state(layer_plan)
     }
 
-    /// Tells the host which fonts, image frames, video sinks and SVG images the context draws, now that it took a
-    /// display list or a visual context tree. The host keeps those for it, and lets go of the others.
+    /// Tells the host which fonts, image frames, video sinks, SVG images, clip paths and layer filters the context
+    /// draws, now that it took a display list or a visual context tree. The host keeps those for it, and lets go of the
+    /// others.
     pub fn keep_only_drawn_resources(&self, context_id: CompositorContextId) {
         let _entered = self.enter();
 
@@ -811,6 +807,11 @@ impl CompositorCore {
         self.raster.set_drawn_video_sinks(context_id, &video_sink_handles);
         let vector_image_ids = context.borrow().vector_image_ids_drawn();
         self.raster.set_drawn_vector_images(context_id, &vector_image_ids);
+        let clip_path_identities = context.borrow().clip_path_identities_drawn();
+        self.raster.set_drawn_clip_paths(context_id, &clip_path_identities);
+        let layer_filter_cache_keys = context.borrow().layer_filter_cache_keys_drawn();
+        self.raster
+            .set_drawn_layer_filters(context_id, &layer_filter_cache_keys);
     }
 
     // Returns false for a tree that does not fit the installed display list, of which only the scroll state is taken.
@@ -878,6 +879,7 @@ impl CompositorCore {
         match self.host.timer_of_number(number) {
             Some(Timer::Context(context_id, timer)) => self.context_timer_fired(context_id, timer, now),
             Some(Timer::SynchronizedResizeHold) => self.synchronized_resize_hold_timed_out(),
+            Some(Timer::ReleaseContentWindowServerLetGoOf) => self.release_content_window_server_let_go_of(),
             None => {}
         }
         self.finish_entry(now);
@@ -915,12 +917,7 @@ impl CompositorCore {
             }
             _ => {
                 if context.borrow_mut().timer_fired(timer, now) {
-                    self.present_requests.borrow_mut().push(PresentRequest {
-                        context_id,
-                        viewport_rect: None,
-                        forced_damage_rect: Default::default(),
-                        scheduling: PresentScheduling::OnNextDisplayTick,
-                    });
+                    self.request_present_at_presented_viewport_rect(context_id);
                 }
             }
         }
@@ -980,7 +977,6 @@ impl CompositorCore {
         self.present_requests.borrow_mut().push(PresentRequest {
             context_id,
             viewport_rect: Some(frame.viewport_rect),
-            forced_damage_rect: frame.forced_damage_rect,
             scheduling: PresentScheduling::OnNextDisplayTick,
         });
     }
@@ -1007,7 +1003,6 @@ impl CompositorCore {
                 self.present_requests.borrow_mut().push(PresentRequest {
                     context_id,
                     viewport_rect: Some(animation_frame),
-                    forced_damage_rect: Default::default(),
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }
@@ -1016,7 +1011,6 @@ impl CompositorCore {
                 self.present_requests.borrow_mut().push(PresentRequest {
                     context_id,
                     viewport_rect: Some(rebound_frame),
-                    forced_damage_rect: Default::default(),
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }
@@ -1024,7 +1018,6 @@ impl CompositorCore {
                 self.present_requests.borrow_mut().push(PresentRequest {
                     context_id,
                     viewport_rect: None,
-                    forced_damage_rect: Default::default(),
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }
@@ -1044,16 +1037,13 @@ impl CompositorCore {
                 self.present_requests.borrow_mut().push(PresentRequest {
                     context_id,
                     viewport_rect: None,
-                    forced_damage_rect: Default::default(),
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }
-            let overlay_fade_damage_rect = context.borrow_mut().advance_overlay_fades(frame_time);
-            if let Some(overlay_fade_damage_rect) = overlay_fade_damage_rect {
+            if context.borrow_mut().advance_overlay_fades(frame_time) {
                 self.present_requests.borrow_mut().push(PresentRequest {
                     context_id,
                     viewport_rect: None,
-                    forced_damage_rect: overlay_fade_damage_rect,
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }
@@ -1061,7 +1051,6 @@ impl CompositorCore {
                 self.present_requests.borrow_mut().push(PresentRequest {
                     context_id,
                     viewport_rect: None,
-                    forced_damage_rect: Default::default(),
                     scheduling: PresentScheduling::WithDisplayTickInProgress,
                 });
             }

@@ -40,8 +40,8 @@
 #    include <AK/AtomicRefCounted.h>
 #    include <LibCore/MachPort.h>
 #    include <LibIPC/MachBootstrapListener.h>
+#    include <LibIPC/Transport.h>
 #    include <LibIPC/TransportBootstrapMach.h>
-#    include <LibIPC/TransportMachPort.h>
 #    include <LibWebView/MediaSessionPlatformBackendMacOS.h>
 #    include <LibWebView/NotificationBackendMacOS.h>
 #    include <mach/mach.h>
@@ -126,6 +126,7 @@
 #include <QScreen>
 #include <QShortcut>
 #include <QStandardPaths>
+#include <QStringDecoder>
 #include <QTimer>
 
 #if defined(AK_OS_MACOS)
@@ -768,7 +769,7 @@ struct HubBootstrap : public AtomicRefCounted<HubBootstrap> {
 
 ErrorOr<ByteString> Application::hub_executable_path()
 {
-    for (auto const& path : TRY(WebView::get_paths_for_helper_process("Hub"sv))) {
+    for (auto const& path : TRY(WebView::get_paths_for_helper_process("ladybird-hub"sv))) {
         if (!Core::System::access(path, X_OK).is_error())
             return path;
     }
@@ -802,6 +803,7 @@ Hub::UIInfo Application::current_ui_info() const
     info.reports_scroll_momentum = platform_reports_scroll_momentum();
     info.scrolls_elastically = platform_scrolls_elastically();
     info.scrollbar_track_press_jumps = platform_scrollbar_track_press_jumps();
+    info.scrollbars_always_shown = platform_scrollbars_always_shown();
     info.prefers_reduced_motion = platform_prefers_reduced_motion();
     info.prefers_more_contrast = platform_prefers_more_contrast();
     info.preferred_languages = platform_preferred_languages();
@@ -897,7 +899,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
         [[maybe_unused]] auto time_before_round = UnixDateTime::now();
 
         Core::ProcessSpawnOptions spawn_options {
-            .name = "Hub"sv,
+            .name = "ladybird-hub"sv,
             .executable = hub_path,
             .arguments = round_arguments,
         };
@@ -909,7 +911,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
         auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
 
         // The Hub may receive startup messages before it has constructed its transport.
-        IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
+        IPC::Transport::raise_receive_queue_limit(port_b_recv);
 
         auto transport = TRY(IPC::Transport::create(move(port_a_recv), move(port_b_send)));
 
@@ -930,9 +932,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
         TRY(Core::Environment::unset("SOCKET_TAKEOVER"sv));
         TRY(Core::System::close(socket_fds[1]));
 
-        auto ipc_socket = TRY(Core::LocalSocket::adopt_fd(socket_fds[0]));
-        TRY(ipc_socket->set_blocking(true));
-        auto transport = make<IPC::Transport>(move(ipc_socket));
+        auto transport = TRY(IPC::Transport::adopt_fd(socket_fds[0]));
 #    endif
         m_hub_connection = adopt_ref(*new HubConnection(move(transport)));
 
@@ -1366,6 +1366,9 @@ void Application::will_create_event_loop(Main::Arguments& arguments)
     qputenv("NO_AT_BRIDGE", "1");
 #endif
     m_application = make<LadybirdQApplication>(arguments);
+    // NB: Qt names the application after its executable by default, but accessibility tools and window managers know
+    //     it by this name.
+    QCoreApplication::setApplicationName(QStringLiteral("Ladybird"));
 #if defined(AK_OS_MACOS)
     // NB: Qt owns its converters, and deletes them along with the QApplication.
     new PNGMimeConverter;
@@ -1386,6 +1389,10 @@ void Application::did_create_event_loop(Core::EventLoop& event_loop)
 #endif
 #if defined(AK_OS_MACOS)
     Ladybird::on_scrollbar_track_press_behavior_change([] {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_ui_info_changed(Application::the().current_ui_info());
+    });
+    Ladybird::on_scrollbar_visibility_change([] {
         if (auto* hub = HubConnection::the_if_connected())
             hub->async_ui_info_changed(Application::the().current_ui_info());
     });
@@ -1437,6 +1444,15 @@ bool Application::platform_scrollbar_track_press_jumps() const
     return scrollbar_track_press_jumps();
 #else
     return false;
+#endif
+}
+
+bool Application::platform_scrollbars_always_shown() const
+{
+#if defined(AK_OS_MACOS)
+    return scrollbars_always_shown();
+#else
+    return true;
 #endif
 }
 
@@ -2783,17 +2799,51 @@ void Application::set_clipboard_text(String text, ClipboardType type)
 
 Web::Clipboard::SystemClipboardItem Application::clipboard_item() const
 {
-    Vector<Web::Clipboard::SystemClipboardRepresentation> representations;
-    auto const* clipboard = QGuiApplication::clipboard();
-
-    auto const* mime_data = clipboard->mimeData();
+    auto const* mime_data = QGuiApplication::clipboard()->mimeData();
     if (!mime_data)
         return {};
+    return clipboard_item_from_mime_data(*mime_data);
+}
 
-    if (mime_data->hasUrls()) {
+// QStringDecoder holds on to a character its input ends partway through, as if more input were to come, rather than
+// taking it as an error, and it has no call that finishes the input. So this reads whether a character was left over.
+class FinishingStringDecoder final : public QStringDecoder {
+public:
+    using QStringDecoder::QStringDecoder;
+
+    bool ends_partway_through_a_character() const { return state.remainingChars != 0; }
+};
+
+static bool is_utf8_plain_text(Web::MimeSniff::MimeType const& mime_type)
+{
+    auto charset = mime_type.parameters().get("charset"sv);
+    return !charset.has_value() || charset->equals_ignoring_ascii_case("utf-8"sv);
+}
+
+// The page reads plain text as UTF-8, so text in another charset is decoded from that charset first. Text in a charset
+// Qt doesn't know reads as empty, so that another type the text is offered under is read instead.
+static ByteString plain_text_as_utf8(QByteArray const& data, Web::MimeSniff::MimeType const& mime_type)
+{
+    if (is_utf8_plain_text(mime_type))
+        return ak_byte_string_from_qbytearray(data);
+
+    FinishingStringDecoder decoder(mime_type.parameters().get("charset"sv)->to_byte_string().characters());
+    if (!decoder.isValid())
+        return {};
+    QString text = decoder.decode(data);
+    if (decoder.hasError() || decoder.ends_partway_through_a_character())
+        return {};
+    return ak_byte_string_from_qstring(text);
+}
+
+Web::Clipboard::SystemClipboardItem clipboard_item_from_mime_data(QMimeData const& mime_data)
+{
+    Vector<Web::Clipboard::SystemClipboardRepresentation> representations;
+
+    if (mime_data.hasUrls()) {
         QMimeDatabase mime_database;
 
-        for (auto const& url : mime_data->urls()) {
+        for (auto const& url : mime_data.urls()) {
             if (!url.isLocalFile())
                 continue;
 
@@ -2809,17 +2859,44 @@ Web::Clipboard::SystemClipboardItem Application::clipboard_item() const
     }
 
     if (representations.is_empty()) {
-        for (auto const& format : mime_data->formats()) {
+        bool read_plain_text = false;
+
+        for (auto const& format : mime_data.formats()) {
             auto mime_type = ak_string_from_qstring(format);
             if (mime_type == "text/uri-list"sv)
                 continue;
 
             // Qt can expose X11 selection targets such as SAVE_TARGETS alongside MIME types. These are clipboard
             // protocol requests, not pasteable data, and reading them can block until Qt's Wayland pipe times out.
-            if (!Web::MimeSniff::MimeType::parse(mime_type).has_value())
+            auto parsed_mime_type = Web::MimeSniff::MimeType::parse(mime_type);
+            if (!parsed_mime_type.has_value())
                 continue;
 
-            auto data = ak_byte_string_from_qbytearray(mime_data->data(format));
+            // An app can offer its text under several types and answer only some of them, as with a password manager
+            // that offers text/plain;charset=utf-8 but answers only UTF8_STRING on X11. So the plain-text types are
+            // read in the order they're offered, and the first text one answers goes over as the one text/plain
+            // representation, rather than one for each type, where a type the app doesn't answer reads as empty text.
+            if (parsed_mime_type->essence() == "text/plain"sv) {
+                if (!exchange(read_plain_text, true)) {
+                    // The UTF-8 types are read first, so that text goes over as it's offered wherever it can.
+                    ByteString text;
+                    for (auto utf8 : { true, false }) {
+                        for (auto const& text_format : mime_data.formats()) {
+                            if (!text.is_empty())
+                                break;
+                            auto text_mime_type = Web::MimeSniff::MimeType::parse(ak_string_from_qstring(text_format));
+                            if (!text_mime_type.has_value() || text_mime_type->essence() != "text/plain"sv)
+                                continue;
+                            if (is_utf8_plain_text(*text_mime_type) == utf8)
+                                text = plain_text_as_utf8(mime_data.data(text_format), *text_mime_type);
+                        }
+                    }
+                    representations.empend("text/plain"_string, move(text));
+                }
+                continue;
+            }
+
+            auto data = ak_byte_string_from_qbytearray(mime_data.data(format));
             representations.empend(move(mime_type), move(data));
         }
     }

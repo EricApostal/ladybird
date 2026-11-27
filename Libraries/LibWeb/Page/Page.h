@@ -272,6 +272,9 @@ public:
     // Whether the UI process replaces self-signed certificate error pages with trust prompts.
     bool offers_to_trust_self_signed_certificates() const { return m_offers_to_trust_self_signed_certificates; }
     void set_offers_to_trust_self_signed_certificates(bool b) { m_offers_to_trust_self_signed_certificates = b; }
+    // The same, for certificates that fail verification for any other reason.
+    bool offers_to_trust_invalid_certificates() const { return m_offers_to_trust_invalid_certificates; }
+    void set_offers_to_trust_invalid_certificates(bool b) { m_offers_to_trust_invalid_certificates = b; }
 
     u64 wheel_event_listener_state_generation() const { return m_wheel_event_listener_state_generation; }
     u64 keyboard_scroll_state_generation() const { return m_keyboard_scroll_state_generation; }
@@ -620,6 +623,7 @@ private:
     bool m_enable_autoscroll { true };
     bool m_enable_primary_paste { true };
     bool m_offers_to_trust_self_signed_certificates { false };
+    bool m_offers_to_trust_invalid_certificates { false };
     u64 m_wheel_event_listener_state_generation { 0 };
     u64 m_keyboard_scroll_state_generation { 0 };
     bool m_keyboard_scroll_state_is_current { false };
@@ -1002,6 +1006,7 @@ public:
     virtual void page_did_request_color_picker([[maybe_unused]] Color current_color) { }
     virtual void page_did_request_date_picker([[maybe_unused]] Utf16String input_type, [[maybe_unused]] Utf16String value, [[maybe_unused]] Utf16String minimum, [[maybe_unused]] Utf16String maximum) { }
     virtual void page_did_request_file_picker([[maybe_unused]] HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles) { }
+    virtual void page_did_show_validation_message(HTML::CrossProcessId, CSSPixelPoint, Utf16String) { }
     virtual void page_did_request_select_dropdown([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Web::CSSPixelPoint content_position, [[maybe_unused]] Web::CSSPixels minimum_width, [[maybe_unused]] Vector<Web::HTML::SelectItem> items) { }
     virtual void page_did_request_geolocation_position([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId requesting_document_id) { }
     virtual void page_did_cancel_geolocation_position_request([[maybe_unused]] u64 request_id) { }

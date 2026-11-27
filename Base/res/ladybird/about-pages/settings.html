@@ -73,6 +73,10 @@
                 width: 50%;
             }
 
+            .config-row.dependent {
+                padding-left: 24px;
+            }
+
             .config-row > input[type="number"] {
                 max-width: 256px;
                 flex-shrink: 0;
@@ -1105,6 +1109,10 @@
                                 <option value="right">Right</option>
                             </select>
                         </div>
+                        <div class="card-group inline-container control-row">
+                            <label for="always-show-scrollbars">Always show scrollbars</label>
+                            <input id="always-show-scrollbars" type="checkbox" switch />
+                        </div>
                         <div class="card-group inline-container control-row" id="show-menu-bar-group">
                             <label for="show-menu-bar">Show system menu bar</label>
                             <input id="show-menu-bar" type="checkbox" switch />
@@ -1330,7 +1338,8 @@
                         <label for="update-checks">
                             Update checks
                             <p id="update-checks-description" class="description">
-                                Periodically check whether a newer version of Ladybird is available.
+                                Ladybird tells you when a newer version is available. Shares your version and system
+                                type, without an identifier.
                             </p>
                         </label>
                         <input id="update-checks" type="checkbox" switch />

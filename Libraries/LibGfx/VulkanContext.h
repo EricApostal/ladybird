@@ -16,6 +16,11 @@
 #        include <vulkan/vulkan_android.h>
 #    endif
 
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+#        include <AK/Optional.h>
+#        include <sys/types.h>
+#    endif
+
 namespace Gfx {
 
 struct VulkanContext {
@@ -34,6 +39,10 @@ struct VulkanContext {
 #    if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_VULKAN_AHB_IMAGES)
     VkCommandPool command_pool { VK_NULL_HANDLE };
     VkCommandBuffer command_buffer { VK_NULL_HANDLE };
+#        ifdef USE_VULKAN_DMABUF_IMAGES
+    // The DRM render node of the device, for allocating memory outside of Vulkan.
+    Optional<dev_t> render_node;
+#        endif
     struct
     {
 #        ifdef USE_VULKAN_DMABUF_IMAGES

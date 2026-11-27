@@ -2,12 +2,16 @@
 #include <LibHTTP/Cache/DiskCacheSettings.h>
 #include <LibHTTP/Proxy.h>
 #include <LibIPC/TransportHandle.h>
+#include <LibRequests/CertificateError.h>
 #include <RequestServer/IsPrivate.h>
 #include <RequestServer/RequestType.h>
 #include <RequestServer/SiteBinding.h>
 
 endpoint RequestServerControl
 {
+    // The top-level site a per-site RequestServer serves. The UI process sends it before anything else, rather than on
+    // the command line, where any local process could read it.
+    set_top_level_site(Utf16String top_level_site) =|
 
     // The client IDs let the UI process tell whose cookies a client may use.
     connect_new_client(::RequestServer::IsPrivate is_private, ::RequestServer::SiteBinding site_binding) => (IPC::TransportHandle handle, int client_id)
@@ -29,7 +33,7 @@ endpoint RequestServerControl
     set_proxy_configuration(HTTP::ProxyConfiguration proxy_configuration) =|
 
     // Synchronous so the exception applies before the UI process reloads.
-    trust_certificate(ByteString host, u16 port, ByteString fingerprint) => ()
+    trust_certificate(ByteString host, u16 port, ByteString fingerprint, Requests::CertificateError errors, ByteString error_details) => ()
 
     set_performance_monitor_enabled(bool enabled) =|
 

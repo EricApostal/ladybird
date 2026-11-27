@@ -32,6 +32,7 @@
 class QAction;
 class QMenu;
 class QMenuBar;
+class QMimeData;
 class QWidget;
 
 namespace Ladybird {
@@ -311,6 +312,7 @@ private:
     virtual bool platform_reports_scroll_momentum() const override;
     virtual bool platform_scrolls_elastically() const override;
     virtual bool platform_scrollbar_track_press_jumps() const override;
+    virtual bool platform_scrollbars_always_shown() const override;
     virtual bool platform_prefers_reduced_motion() const override;
     virtual bool platform_prefers_more_contrast() const override;
     virtual Vector<String> platform_preferred_languages() const override;
@@ -425,5 +427,7 @@ private:
     // Kept until a window shows it: on macOS, the last window can close while the system probe is still running.
     Optional<OpenSSLMismatch> m_openssl_mismatch_awaiting_window;
 };
+
+Web::Clipboard::SystemClipboardItem clipboard_item_from_mime_data(QMimeData const&);
 
 }

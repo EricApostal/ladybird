@@ -1534,8 +1534,8 @@ pub struct PaintVectorImage {
     pub rect: FloatRect,
     pub recorded_size: IntSize,
     pub records: DisplayListDataSpan,
-    // Whether a raster of the records can differ from replaying them in place: they read what was painted before them,
-    // or draw content that changes under them.
+    // Whether a raster of the records can differ from replaying them in place: they draw content that changes under
+    // them.
     pub requires_direct_replay: bool,
 }
 display_list_record_fields!(PaintVectorImage {
@@ -1827,6 +1827,7 @@ display_list_record_fields!(Canvas2DShadow {
 pub struct Canvas2DCompositing {
     pub filter: DisplayListDataSpan,
     pub has_filter: bool,
+    pub filter_in_bitmap_space: bool,
     pub global_alpha: f32,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub has_shadow: bool,
@@ -1835,6 +1836,7 @@ pub struct Canvas2DCompositing {
 display_list_record_fields!(Canvas2DCompositing {
     filter,
     has_filter,
+    filter_in_bitmap_space,
     global_alpha = 1.0,
     compositing_and_blending_operator,
     has_shadow,
