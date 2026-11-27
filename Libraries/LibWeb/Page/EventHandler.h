@@ -242,6 +242,12 @@ private:
         GC::Weak<DOM::Node> capture_target;
         // NB: The contact's latest Touch, which the touch lists of later touch events include.
         GC::Ptr<UIEvents::Touch> touch;
+        // AD-HOC: The embedder pans with a touch the page leaves to the browser, so it is told when the page does not:
+        //         it canceled a touch event, or its touch-action keeps the direction of a drag for itself.
+        Optional<CSSPixelPoint> touch_start;
+        bool may_pan_horizontally { true };
+        bool may_pan_vertically { true };
+        bool touch_claimed { false };
     };
     struct AdditionalPointerState : public RefCounted<AdditionalPointerState> {
         PointerState state;

@@ -765,6 +765,8 @@ public:
     Function<void(Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)> on_request_select_dropdown;
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
     Function<void(Web::MouseEvent const&, Web::EventResult)> on_finish_handling_mouse_event;
+    // AD-HOC: For an embedder that pans with the touches pages leave to it. A canceled one is the page's.
+    Function<void(Web::MouseEvent const&, Web::EventResult)> on_finish_handling_touch_event;
     Function<void(Compositing::PictureInPictureControl)> on_picture_in_picture_control_activated;
     // Answers request_picture_in_picture_availability(): whether the page has a video that can float, or one floating.
     Function<void(bool available, bool active)> on_picture_in_picture_availability;

@@ -22,6 +22,7 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/Clipboard/ClipboardEvent.h>
 #include <LibWeb/Compositor/NavigablePresenter.h>
@@ -5118,6 +5119,41 @@ bool EventHandler::has_pointer_capture_in_subtree(i32 pointer_id) const
     return child && child->event_handler().has_pointer_capture_in_subtree(pointer_id);
 }
 
+// How far a finger may move and still be a tap, in CSS pixels.
+static constexpr double touch_tap_slop = 15;
+// How far it moves before the direction it is going in is taken as meant.
+static constexpr double touch_direction_slop = 6;
+
+struct AllowedTouchPanning {
+    bool horizontal { true };
+    bool vertical { true };
+};
+
+// https://w3c.github.io/pointerevents/#determining-supported-touch-behavior
+// The directions the browser may pan a touch that starts on a node: what the touch-action of it and of its ancestors, up
+// to the nearest scroll container, all allow.
+static AllowedTouchPanning allowed_touch_panning(Layout::BegunRead const& read, DOM::Node& target)
+{
+    AllowedTouchPanning allowed;
+    for (auto* node = &target; node; node = node->parent_or_shadow_host()) {
+        auto* element = as_if<DOM::Element>(node);
+        if (!element)
+            continue;
+        if (auto computed_style = element->computed_style()) {
+            if (auto value = computed_style->computed_style_value(CSS::PropertyID::TouchAction)) {
+                auto touch_action = value->to_string(CSS::SerializationMode::Normal);
+                if (!touch_action.contains("auto"sv) && !touch_action.contains("manipulation"sv)) {
+                    allowed.horizontal &= touch_action.contains("pan-x"sv) || touch_action.contains("pan-left"sv) || touch_action.contains("pan-right"sv);
+                    allowed.vertical &= touch_action.contains("pan-y"sv) || touch_action.contains("pan-up"sv) || touch_action.contains("pan-down"sv);
+                }
+            }
+        }
+        if (auto const* layout_node = element->layout_node(read); layout_node && layout_node->is_scroll_container())
+            break;
+    }
+    return allowed;
+}
+
 // https://w3c.github.io/pointerevents/#firing-events-using-the-pointerevent-interface
 EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, Optional<RemoteInputEventTarget>* remote_target)
 {
@@ -5353,6 +5389,7 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
             if (!dispatch_touch_event(pointer, *original_touch_target, touch_name, coordinates, screen_position)) {
                 pointer.prevent_mouse_event = true;
                 pointer.suppress_click = true;
+                pointer.touch_claimed = true;
             }
             if (m_navigable->active_document() != document)
                 return EventResult::Handled;
@@ -5364,7 +5401,7 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
         } else if (!target) {
             pointer.active = pointer.buttons != 0;
         }
-        return EventResult::Handled;
+        return is_touch && pointer.touch_claimed ? EventResult::Cancelled : EventResult::Handled;
     }
     if (m_navigable->active_document() != document)
         return EventResult::Handled;
@@ -5385,6 +5422,13 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
         pointer.down_target = target;
         if (pointer.properties.pointer_type == PointerType::Touch && is<DOM::Element>(*target))
             pointer.pending_capture_target = as<DOM::Element>(*target);
+        if (is_touch) {
+            auto allowed = allowed_touch_panning(read, *target);
+            pointer.touch_start = screen_position;
+            pointer.may_pan_horizontally = allowed.horizontal;
+            pointer.may_pan_vertically = allowed.vertical;
+            pointer.touch_claimed = !allowed.horizontal && !allowed.vertical;
+        }
         if (pointer.properties.pointer_type == PointerType::Touch) {
             for (auto const& navigable : m_navigable->page().hosted_navigables()) {
                 for (auto const& entry : navigable->event_handler().m_additional_pointers) {
@@ -5396,6 +5440,16 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
                 }
             }
         }
+    }
+    if (is_touch && name == UIEvents::EventNames::pointermove && pointer.touch_start.has_value()) {
+        auto moved = screen_position - *pointer.touch_start;
+        auto across = AK::abs(moved.x().to_double());
+        auto down = AK::abs(moved.y().to_double());
+        // A finger that has gone this far is dragging, and a drag ends in no click.
+        if (max(across, down) > touch_tap_slop)
+            pointer.suppress_click = true;
+        if (max(across, down) > touch_direction_slop && !(across > down ? pointer.may_pan_horizontally : pointer.may_pan_vertically))
+            pointer.touch_claimed = true;
     }
     if (pointer.is_primary && !cancelled && pointer.properties.pointer_type != PointerType::Touch) {
         DOM::HoverEventData hover_data {
@@ -5455,6 +5509,7 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
         if (!allowed && touch_name != UIEvents::EventNames::touchcancel) {
             pointer.prevent_mouse_event = true;
             pointer.suppress_click = true;
+            pointer.touch_claimed = true;
         }
         if (m_navigable->active_document() != document)
             return EventResult::Handled;
@@ -5517,9 +5572,16 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
                     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
                     if (auto focus_target = focus_candidate_for_position(read, visual_viewport_position))
                         HTML::run_focusing_steps(focus_target, nullptr, HTML::FocusTrigger::Click);
+                    if (m_navigable->active_document() != document)
+                        return EventResult::Handled;
+                    // AD-HOC: A tap puts the caret where it lands, as a press of the mouse does.
+                    document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
+                    run_mousedown_default_actions(read, *document, visual_viewport_position, screen_position, UIEvents::MouseButton::Primary, pointer.modifiers, 1);
                 }
                 if (m_navigable->active_document() != document)
                     return EventResult::Handled;
+                // The finger is already up, so no selection is left to be dragged out.
+                stop_updating_selection();
                 fire_mouse(UIEvents::EventNames::mouseup, 0, 1);
             }
         } else if (!is_touch && !pointer.prevent_mouse_event) {
@@ -5582,7 +5644,7 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
             m_additional_pointers.remove(properties->pointer_id);
         }
     }
-    return EventResult::Handled;
+    return is_touch && pointer.touch_claimed ? EventResult::Cancelled : EventResult::Handled;
 }
 
 void EventHandler::reset_mouse_input_tracking(Badge<Page>)
