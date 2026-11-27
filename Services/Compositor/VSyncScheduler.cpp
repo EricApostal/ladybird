@@ -26,8 +26,6 @@
 #    include <android/choreographer.h>
 #    include <android/looper.h>
 #    include <pthread.h>
-#    include <stdlib.h>
-#    include <sys/system_properties.h>
 #endif
 
 namespace Compositor {
@@ -365,6 +363,9 @@ static constexpr i64 choreographer_idle_stop_delay_nanoseconds = 250'000'000;
 static constexpr int choreographer_overdue_delay_ms = 100;
 // How long the first refresh may take to arrive before the choreographer is given up on.
 static constexpr int choreographer_first_tick_delay_ms = 500;
+// No screen refreshes faster than this. An embedder that asks for more wants frames made at that rate, seen or not, as
+// to measure how fast a page can be drawn.
+static constexpr double fastest_screen_refresh_rate = 240.0;
 
 // Android's choreographer, which reports the screen's refreshes to a looper, and so has a thread of its own to run one
 // on. A frame made on a clock that is not the screen's cannot keep step with it: now and then two are made for one
@@ -516,6 +517,8 @@ public:
     virtual void schedule(double refresh_rate) override
     {
         m_refresh_rate = refresh_rate;
+        if (!m_fallback && refresh_rate > fastest_screen_refresh_rate)
+            use_timer_instead();
         if (m_fallback) {
             m_fallback->schedule(refresh_rate);
             return;
@@ -558,6 +561,7 @@ private:
 
     void use_timer_instead()
     {
+        m_overdue_timer->stop();
         m_fallback = make<TimerVSyncScheduler>([this](MonotonicTime frame_time) {
             m_tick_callback(frame_time);
         });
@@ -571,18 +575,8 @@ private:
     OwnPtr<TimerVSyncScheduler> m_fallback;
 };
 
-// For finding out how fast pages can be drawn, whatever the screen shows: with
-// `adb shell setprop debug.ladybird.frame_rate 480`, frames are paced by a timer, at whatever rate they are asked for.
-static bool a_test_frame_rate_is_set()
-{
-    char value[PROP_VALUE_MAX] {};
-    return __system_property_get("debug.ladybird.frame_rate", value) > 0 && atof(value) > 0;
-}
-
 OwnPtr<VSyncScheduler> create_vsync_scheduler(Optional<u64>, Function<void(MonotonicTime)>&& tick_callback)
 {
-    if (a_test_frame_rate_is_set())
-        return make<TimerVSyncScheduler>(move(tick_callback));
     return make<ChoreographerVSyncScheduler>(move(tick_callback));
 }
 
