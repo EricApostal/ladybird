@@ -583,6 +583,10 @@ public:
     void unmark_text_from_input_method();
     InputMethodState const& input_method_state() const { return m_input_method_state; }
     void set_input_method_state(Badge<WebContentPage>, InputMethodState);
+    // AD-HOC: What the focused field takes, as JSON, or empty where nothing that takes text has the focus. It is up to
+    //         date by the time on_input_method_state_change is called.
+    String const& focused_field() const { return m_focused_field; }
+    void set_focused_field(Badge<WebContentPage>, String description) { m_focused_field = move(description); }
 
     Web::HTML::MuteState page_mute_state() const { return m_mute_state; }
     void toggle_page_mute_state();
@@ -1273,6 +1277,7 @@ protected:
 
     // Most recent input-method state pushed by WebContent. Used for platform IME callbacks without a sync IPC.
     InputMethodState m_input_method_state;
+    String m_focused_field;
 
     Web::ViewportIsFullscreen m_is_fullscreen { Web::ViewportIsFullscreen::No };
 

@@ -10,6 +10,7 @@
  */
 
 #include <AK/Debug.h>
+#include <AK/GenericShorthands.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/Math.h>
@@ -61,12 +62,14 @@
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/Gamepad/GamepadRegistry.h>
+#include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/AutoplaySettings.h>
 #include <LibWeb/HTML/BroadcastChannel.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
+#include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLOptionElement.h>
@@ -3386,6 +3389,65 @@ void ConnectionFromClient::unmark_text_from_input_method(Web::PageId page_id)
 
 static constexpr size_t maximum_input_method_surrounding_text_length = 1024;
 
+// AD-HOC: Whether text is typed into an element, which is what a keyboard's "next" key goes on to.
+static bool takes_typed_text(Web::DOM::Node const& node)
+{
+    if (auto const* input = as_if<Web::HTML::HTMLInputElement>(node)) {
+        using Type = Web::HTML::HTMLInputElement::TypeAttributeState;
+        return input->is_mutable()
+            && first_is_one_of(input->type_state(), Type::Text, Type::Search, Type::Telephone, Type::URL, Type::Email, Type::Password, Type::Number);
+    }
+    auto const* text_area = as_if<Web::HTML::HTMLTextAreaElement>(node);
+    return text_area && text_area->is_mutable();
+}
+
+// AD-HOC: What the focused field takes and what the page says of it, which an on-screen keyboard suits itself to. JSON,
+//         or an empty string where nothing that takes text has the focus.
+static String describe_focused_field(Web::DOM::Document& document)
+{
+    auto focused_area = document.focused_area();
+    auto* element = as_if<Web::DOM::Element>(focused_area.ptr());
+    if (!element)
+        return {};
+
+    JsonObject field;
+    if (auto* input = as_if<Web::HTML::HTMLInputElement>(element)) {
+        field.set("tag"sv, "input"sv);
+        field.set("type"sv, input->type().to_utf16_string().to_utf8());
+        field.set("editable"sv, input->is_mutable());
+        if (auto* form = input->form()) {
+            field.set("inForm"sv, true);
+            for (auto* node = element->next_in_pre_order(); node && form->is_inclusive_ancestor_of(*node); node = node->next_in_pre_order()) {
+                if (takes_typed_text(*node)) {
+                    field.set("hasNext"sv, true);
+                    break;
+                }
+            }
+        }
+    } else if (auto* text_area = as_if<Web::HTML::HTMLTextAreaElement>(element)) {
+        field.set("tag"sv, "textarea"sv);
+        field.set("editable"sv, text_area->is_mutable());
+    } else if (element->is_editable_or_editing_host()) {
+        field.set("tag"sv, "contenteditable"sv);
+        field.set("editable"sv, true);
+    } else {
+        return {};
+    }
+
+    // Which field it is, so that the keyboard starts afresh on moving to another like it.
+    field.set("id"sv, element->unique_id().value());
+    auto add_attribute = [&](StringView key, Utf16FlyString const& name) {
+        auto value = element->get_attribute_value(name);
+        if (!value.is_empty())
+            field.set(key, value.to_utf8());
+    };
+    add_attribute("inputmode"sv, Web::HTML::AttributeNames::inputmode);
+    add_attribute("enterkeyhint"sv, Web::HTML::AttributeNames::enterkeyhint);
+    add_attribute("autocorrect"sv, Web::HTML::AttributeNames::autocorrect);
+    add_attribute("autocapitalize"sv, Web::HTML::AttributeNames::autocapitalize);
+    return field.serialized();
+}
+
 void ConnectionFromClient::update_input_method_state(Web::PageId page_id)
 {
     auto page = this->page(page_id);
@@ -3457,6 +3519,11 @@ void ConnectionFromClient::update_input_method_state(Web::PageId page_id)
         }
     }
 
+    // Sent first, so that whoever hears of the new state knows which field it is of.
+    String focused_field;
+    if (auto document = navigable ? navigable->active_document() : nullptr)
+        focused_field = describe_focused_field(*document);
+    async_did_update_focused_field(page_id, move(focused_field));
     async_did_update_input_method_state(page_id, caret_rect, is_enabled, cursor_position, anchor_position, move(text_before_cursor), move(text_after_cursor));
 }
 

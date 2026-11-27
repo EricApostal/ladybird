@@ -2282,6 +2282,14 @@ void WebContentPage::did_update_input_method_state(Optional<Web::DevicePixelRect
     view().set_input_method_state({}, { is_enabled, cursor_position, anchor_position, move(text_before_cursor), move(text_after_cursor), caret_rect });
 }
 
+void WebContentPage::did_update_focused_field(String description)
+{
+    // As for the input method state, the page hosting the focused navigable is the one that describes it.
+    if (view().traversable().focused_navigable_host() != *this)
+        return;
+    view().set_focused_field({}, move(description));
+}
+
 void WebContentPage::did_change_theme_color(Gfx::Color color)
 {
     if (displays_tab()) {
