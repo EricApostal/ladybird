@@ -551,30 +551,30 @@ RefPtr<Fetch::Engine::NetworkTransportHandle> ResourceLoader::load(LoadRequest& 
         // AD-HOC: The files of a browser extension are read by the browser process and sent here.
         auto* hooks = HTML::ExtensionHooks::the();
         if (!hooks) {
-            on_complete->function()(false, {}, "Extensions are not available"sv, {});
+            on_complete(false, {}, "Extensions are not available"sv, {});
             return nullptr;
         }
 
         // NB: The browser process answers for the page that asked. A load with no page, such as a worker's, has none.
         auto* page = request.page().ptr();
         if (!hooks || !page || !page->has_top_level_traversable()) {
-            on_complete->function()(false, {}, "Extensions are not available here"sv, {});
+            on_complete(false, {}, "Extensions are not available here"sv, {});
             return nullptr;
         }
 
         hooks->load_extension_resource(url, page->client().id(),
-            [request, url, on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](Optional<HTML::ExtensionHooks::ExtensionResource> resource) {
+            [request, url, on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete = move(on_complete)](Optional<HTML::ExtensionHooks::ExtensionResource> resource) {
                 if (!resource.has_value()) {
                     log_failure(request, "The extension has no such file"sv);
-                    on_complete->function()(false, {}, "The extension has no such file"sv, {});
+                    on_complete(false, {}, "The extension has no such file"sv, {});
                     return;
                 }
 
                 auto headers = response_headers_for_file(url.serialize_path(), resource->data.size(), resource->modified_time);
                 log_success(request);
-                on_headers_received->function()(nullptr, headers, {}, {}, Requests::CacheState::NotCached);
-                on_data_received->function()(nullptr, Requests::ResponseData::from_bytes(resource->data.bytes()));
-                on_complete->function()(true, {}, {}, {});
+                on_headers_received(nullptr, headers, {}, {}, Requests::CacheState::NotCached);
+                on_data_received(nullptr, Requests::ResponseData::from_bytes(resource->data.bytes()));
+                on_complete(true, {}, {}, {});
             });
         return nullptr;
     }
