@@ -18,6 +18,14 @@
 #    include <CoreGraphics/CoreGraphics.h>
 #    include <CoreVideo/CoreVideo.h>
 #    include <LibCore/EventLoop.h>
+#elif defined(AK_OS_ANDROID)
+#    include <AK/Atomic.h>
+#    include <AK/AtomicRefCounted.h>
+#    include <AK/NonnullRefPtr.h>
+#    include <LibCore/EventLoop.h>
+#    include <android/choreographer.h>
+#    include <android/looper.h>
+#    include <pthread.h>
 #endif
 
 namespace Compositor {
@@ -344,6 +352,224 @@ OwnPtr<VSyncScheduler> create_vsync_scheduler(Optional<u64> display_id, Function
     }
 
     return make<TimerVSyncScheduler>(move(tick_callback));
+}
+
+#elif defined(AK_OS_ANDROID)
+
+// How long the screen's refreshes are followed after a tick was last asked for. A tick asked for just after a refresh
+// can still be given that one, so long as it was seen.
+static constexpr i64 choreographer_idle_stop_delay_nanoseconds = 250'000'000;
+// How long a tick may be overdue before a timer gives it instead.
+static constexpr int choreographer_overdue_delay_ms = 100;
+// How long the first refresh may take to arrive before the choreographer is given up on.
+static constexpr int choreographer_first_tick_delay_ms = 500;
+
+// Android's choreographer, which reports the screen's refreshes to a looper, and so has a thread of its own to run one
+// on. A frame made on a clock that is not the screen's cannot keep step with it: now and then two are made for one
+// refresh and none for the next.
+class ChoreographerThread final : public AtomicRefCounted<ChoreographerThread> {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    explicit ChoreographerThread(Core::EventLoop& event_loop)
+        : m_event_loop(event_loop)
+    {
+    }
+
+    // Called on the compositor's thread, as the rest of what is public is.
+    bool start()
+    {
+        // The thread holds a reference of its own until it ends.
+        ref();
+        pthread_t thread;
+        auto result = pthread_create(
+            &thread, nullptr, [](void* self) -> void* {
+                static_cast<ChoreographerThread*>(self)->run();
+                static_cast<ChoreographerThread*>(self)->unref();
+                return nullptr;
+            },
+            this);
+        if (result != 0) {
+            unref();
+            return false;
+        }
+        pthread_detach(thread);
+        return true;
+    }
+
+    void stop()
+    {
+        m_stopped.store(true);
+        wake();
+    }
+
+    void request_tick()
+    {
+        m_last_request_time_nanoseconds.store(MonotonicTime::now().nanoseconds());
+        m_tick_requested.store(true);
+        wake();
+    }
+
+    i64 most_recent_tick_time_nanoseconds() const { return m_most_recent_tick_time_nanoseconds.load(); }
+
+    Function<void(MonotonicTime)> on_tick;
+
+private:
+    // NB: There is no looper to wake before the thread has made one, and it looks for what was asked of it once it has.
+    void wake()
+    {
+        if (auto* looper = m_looper.load())
+            ALooper_wake(looper);
+    }
+
+    void run()
+    {
+        auto* looper = ALooper_prepare(0);
+        m_choreographer = AChoreographer_getInstance();
+        if (!m_choreographer) {
+            dbgln("VSyncScheduler: this process has no choreographer");
+            return;
+        }
+        // Never released, so that it can be woken for as long as this object lives.
+        ALooper_acquire(looper);
+        m_looper.store(looper);
+
+        while (!m_stopped.load()) {
+            post_frame_callback_if_wanted();
+            ALooper_pollOnce(-1, nullptr, nullptr, nullptr);
+        }
+    }
+
+    // On the choreographer's thread, which alone calls into the choreographer.
+    void post_frame_callback_if_wanted()
+    {
+        if (m_frame_callback_posted)
+            return;
+        auto since_last_request = MonotonicTime::now().nanoseconds() - m_last_request_time_nanoseconds.load();
+        if (!m_tick_requested.load() && since_last_request >= choreographer_idle_stop_delay_nanoseconds)
+            return;
+        m_frame_callback_posted = true;
+        AChoreographer_postFrameCallback64(
+            m_choreographer, [](int64_t, void* self) { static_cast<ChoreographerThread*>(self)->did_refresh(); }, this);
+    }
+
+    void did_refresh()
+    {
+        m_frame_callback_posted = false;
+        // NB: Sampled here, so that delivery to the Compositor's event loop does not shift the frame's time.
+        auto frame_time = MonotonicTime::now();
+        m_most_recent_tick_time_nanoseconds.store(frame_time.nanoseconds());
+        if (m_tick_requested.exchange(false)) {
+            m_event_loop.deferred_invoke([self = NonnullRefPtr { *this }, frame_time] {
+                if (self->on_tick)
+                    self->on_tick(frame_time);
+            });
+        }
+        post_frame_callback_if_wanted();
+    }
+
+    Core::EventLoop& m_event_loop;
+    Atomic<ALooper*> m_looper { nullptr };
+    Atomic<bool> m_stopped { false };
+    Atomic<bool> m_tick_requested { false };
+    Atomic<i64> m_last_request_time_nanoseconds { 0 };
+    Atomic<i64> m_most_recent_tick_time_nanoseconds { 0 };
+
+    // The choreographer's thread's own.
+    AChoreographer* m_choreographer { nullptr };
+    bool m_frame_callback_posted { false };
+};
+
+class ChoreographerVSyncScheduler final : public VSyncScheduler {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    explicit ChoreographerVSyncScheduler(Function<void(MonotonicTime)>&& tick_callback)
+        : m_tick_callback(move(tick_callback))
+        , m_overdue_timer(Core::Timer::create_single_shot(AK::Duration::from_milliseconds(choreographer_overdue_delay_ms), [this] {
+            tick_is_overdue();
+        }))
+        , m_thread(adopt_ref(*new ChoreographerThread(Core::EventLoop::current())))
+    {
+        m_thread->on_tick = [this](MonotonicTime frame_time) {
+            if (m_fallback)
+                return;
+            m_overdue_timer->stop();
+            m_tick_callback(frame_time);
+        };
+        if (!m_thread->start())
+            use_timer_instead();
+    }
+
+    virtual ~ChoreographerVSyncScheduler() override
+    {
+        m_overdue_timer->on_timeout = {};
+        m_overdue_timer->stop();
+        m_thread->on_tick = {};
+        m_thread->stop();
+    }
+
+    virtual void schedule(double refresh_rate) override
+    {
+        m_refresh_rate = refresh_rate;
+        if (m_fallback) {
+            m_fallback->schedule(refresh_rate);
+            return;
+        }
+        m_thread->request_tick();
+        if (!m_overdue_timer->is_active()) {
+            auto has_ticked = m_thread->most_recent_tick_time_nanoseconds() != 0;
+            m_overdue_timer->restart(AK::Duration::from_milliseconds(has_ticked ? choreographer_overdue_delay_ms : choreographer_first_tick_delay_ms));
+        }
+    }
+
+    virtual Optional<MonotonicTime> most_recent_tick_time(MonotonicTime now, double refresh_rate) override
+    {
+        if (m_fallback)
+            return m_fallback->most_recent_tick_time(now, refresh_rate);
+
+        auto tick_time_nanoseconds = m_thread->most_recent_tick_time_nanoseconds();
+        if (tick_time_nanoseconds == 0 || tick_time_nanoseconds > now.nanoseconds())
+            return {};
+
+        auto age_nanoseconds = now.nanoseconds() - tick_time_nanoseconds;
+        auto frame_interval_nanoseconds = static_cast<i64>((1'000'000'000.0 / refresh_rate) + 0.5);
+        if (age_nanoseconds >= frame_interval_nanoseconds)
+            return {};
+        return now - AK::Duration::from_nanoseconds(age_nanoseconds);
+    }
+
+private:
+    void tick_is_overdue()
+    {
+        if (m_thread->most_recent_tick_time_nanoseconds() == 0) {
+            dbgln("VSyncScheduler: the choreographer reports no refreshes, so frames are paced by a timer");
+            use_timer_instead();
+            m_fallback->schedule(m_refresh_rate);
+            return;
+        }
+        // The refreshes have stopped, as when the screen is turned off. What waits for a frame must not wait for good.
+        m_tick_callback(MonotonicTime::now());
+    }
+
+    void use_timer_instead()
+    {
+        m_fallback = make<TimerVSyncScheduler>([this](MonotonicTime frame_time) {
+            m_tick_callback(frame_time);
+        });
+        m_thread->stop();
+    }
+
+    Function<void(MonotonicTime)> m_tick_callback;
+    double m_refresh_rate { 60.0 };
+    NonnullRefPtr<Core::Timer> m_overdue_timer;
+    NonnullRefPtr<ChoreographerThread> m_thread;
+    OwnPtr<TimerVSyncScheduler> m_fallback;
+};
+
+OwnPtr<VSyncScheduler> create_vsync_scheduler(Optional<u64>, Function<void(MonotonicTime)>&& tick_callback)
+{
+    return make<ChoreographerVSyncScheduler>(move(tick_callback));
 }
 
 #else

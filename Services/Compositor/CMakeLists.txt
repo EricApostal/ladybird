@@ -63,6 +63,11 @@ target_link_libraries(Compositor PRIVATE compositorservice LibCore LibGfx LibMai
 # OpenGL framework pulled in by Skia.
 target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibImageDecoderClient LibIPC LibMedia LibCompositing compositor_core ${ANGLE_TARGETS} skia)
 
+if (ANDROID)
+    # AChoreographer and ALooper, which pace frames by the screen's refreshes.
+    target_link_libraries(compositorservice PRIVATE android)
+endif()
+
 if ((LINUX OR BSD) AND NOT BUILD_SHARED_LIBS)
     target_link_options(compositorservice INTERFACE LINKER:--allow-multiple-definition)
 endif()
